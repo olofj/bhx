@@ -10,7 +10,7 @@ pub struct SlirpConfig {
     _data: [u8; 512], // Opaque, initialized by vdeslirp_init
 }
 
-pub const VDE_INIT_DEFAULT: libc::c_int = 0;
+pub const VDE_INIT_DEFAULT: libc::c_int = 1;
 
 #[repr(C)]
 pub struct VdeSlirp {
