@@ -39,7 +39,7 @@ extern "C" {
         slirp: *mut VdeSlirp,
         buf: *const u8,
         len: libc::size_t,
-    ) -> libc::c_int;
+    ) -> libc::ssize_t;
 
     pub fn inet_aton(cp: *const libc::c_char, inp: *mut InAddr) -> libc::c_int;
 }
