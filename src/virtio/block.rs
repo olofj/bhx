@@ -39,13 +39,28 @@ pub struct VirtioBlk {
     sector_size: usize,
     mapped_data: *mut u8,
     file_size: usize,
-    _fd: RawFd,
+    fd: RawFd,
     req: *const VirtioBlkOuthdr,
     /// Accumulated byte offset within the current I/O request (across data descriptors).
     data_offset: u64,
 }
 
 unsafe impl Send for VirtioBlk {}
+
+impl Drop for VirtioBlk {
+    fn drop(&mut self) {
+        if !self.mapped_data.is_null() {
+            unsafe {
+                libc::munmap(self.mapped_data as *mut libc::c_void, self.file_size);
+            }
+        }
+        if self.fd >= 0 {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+}
 
 impl VirtioBlk {
     pub fn new(image_path: &Path) -> std::io::Result<Self> {
@@ -79,7 +94,7 @@ impl VirtioBlk {
             sector_size: 512,
             mapped_data: mapped_data as *mut u8,
             file_size,
-            _fd: fd,
+            fd,
             req: ptr::null(),
             data_offset: 0,
         })
