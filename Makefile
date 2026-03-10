@@ -185,9 +185,14 @@ build_opensbi: _need_riscv64_toolchain _need_gcc _need_python _need_opensbi_tree
 	$(MAKE) -C opensbi PLATFORM="generic" FW_JUMP="y" FW_JUMP_OFFSET="0x200000" FW_JUMP_FDT_OFFSET="0x100000" BUILD_INFO="y" -j $(nproc) $(quiet_make)
 	ln -f opensbi/build/platform/generic/firmware/fw_jump.bin fw_jump.bin
 
-# Build tt-bh-linux
+# Build tt-bh-linux (C++ version)
 build_hosttool: _need_gcc _need_libvdevslirp
 	$(MAKE) -C console -j $(nproc) $(quiet_make)
+
+# Build tt-bh-linux (Rust version)
+build_hosttool_rs: _need_libvdevslirp
+	cargo build --release --manifest-path tt-bh-linux-rs/Cargo.toml
+	ln -f tt-bh-linux-rs/target/release/tt-bh-linux console/tt-bh-linux-rs
 
 # Generate a SSH key and add it to the image
 build_ssh_key: _need_e2tools
@@ -222,6 +227,8 @@ clean_opensbi:
 clean_hosttool:
 	if [ -d console ]; then $(MAKE) -C console -j $(nproc) $(quiet_make) clean; fi
 	rm -f console/tt-bh-linux
+	if [ -d tt-bh-linux-rs ]; then cargo clean --manifest-path tt-bh-linux-rs/Cargo.toml 2>/dev/null; fi
+	rm -f console/tt-bh-linux-rs
 
 # Clean cloned trees
 clean_clones:
@@ -457,6 +464,7 @@ endef
 	boot_all \
 	build_all \
 	build_hosttool \
+	build_hosttool_rs \
 	build_linux \
 	build_opensbi \
 	clean \
