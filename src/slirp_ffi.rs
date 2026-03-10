@@ -37,6 +37,7 @@ extern "C" {
         guest_port: libc::c_int,
     ) -> libc::c_int;
     pub fn vdeslirp_fd(slirp: *mut VdeSlirp) -> RawFd;
+    pub fn vdeslirp_close(slirp: *mut VdeSlirp) -> libc::c_int;
     pub fn vdeslirp_recv(slirp: *mut VdeSlirp, buf: *mut u8, len: libc::size_t) -> libc::ssize_t;
     pub fn vdeslirp_send(
         slirp: *mut VdeSlirp,

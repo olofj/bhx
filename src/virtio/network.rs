@@ -40,6 +40,14 @@ pub struct VirtioNet {
 
 unsafe impl Send for VirtioNet {}
 
+impl Drop for VirtioNet {
+    fn drop(&mut self) {
+        if !self.slirp.is_null() {
+            unsafe { vdeslirp_close(self.slirp); }
+        }
+    }
+}
+
 impl VirtioNet {
     pub fn new(ttdevice: u32, l2cpu_idx: usize) -> std::io::Result<Self> {
         let mut cfg: SlirpConfig = unsafe { std::mem::zeroed() };
