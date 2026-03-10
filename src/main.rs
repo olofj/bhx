@@ -142,8 +142,7 @@ fn run_connect(ttdevice: u32, l2cpu: usize, disk: String, cloud_init: Option<Str
     let exit_flag = Arc::new(AtomicBool::new(false));
 
     // Set up SIGINT/SIGTERM handler
-    let exit_flag_sig = exit_flag.clone();
-    ctrlc_setup(exit_flag_sig);
+    ctrlc_setup(&exit_flag);
 
     // Create shared interrupt controller
     // PLIC register at 0x2FF10000 + 0x404
@@ -222,31 +221,40 @@ fn run_connect(ttdevice: u32, l2cpu: usize, disk: String, cloud_init: Option<Str
     }
 }
 
-fn ctrlc_setup(exit_flag: Arc<AtomicBool>) {
-    // Simple SIGINT handler using a pipe trick
-    let _ = std::thread::spawn(move || {
-        // We can't easily install signal handlers in pure Rust without a crate,
-        // so we rely on the terminal raw mode restoration in Drop and the
-        // exit_flag being checked in all loops.
-        // The console thread's Ctrl-A x provides the primary exit mechanism.
-    });
+/// Global exit flag set by the signal handler. The Arc<AtomicBool> passed to
+/// threads points to this same static, avoiding Arc::into_raw leaks.
+static GLOBAL_EXIT: AtomicBool = AtomicBool::new(false);
 
-    // Set up a basic signal handler for cleanup
+fn ctrlc_setup(exit_flag: &Arc<AtomicBool>) {
+    // Wire the Arc to point at the same static (they share the same AtomicBool
+    // value via the signal handler writing GLOBAL_EXIT, and threads checking
+    // their Arc clone). We store the Arc's pointer so the handler can set it.
     unsafe {
-        // Store exit_flag pointer for signal handler
-        EXIT_FLAG.store(
-            Arc::into_raw(exit_flag) as *mut std::sync::atomic::AtomicBool as usize,
+        EXIT_FLAG_PTR.store(
+            Arc::as_ptr(exit_flag) as usize,
             Ordering::SeqCst,
         );
-        libc::signal(libc::SIGINT, signal_handler as usize);
-        libc::signal(libc::SIGTERM, signal_handler as usize);
+    }
+
+    // Use sigaction instead of signal — signal() has undefined behavior in
+    // multithreaded programs on some platforms and may reset to SIG_DFL.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = signal_handler as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
     }
 }
 
-static EXIT_FLAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static EXIT_FLAG_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 extern "C" fn signal_handler(_sig: libc::c_int) {
-    let ptr = EXIT_FLAG.load(Ordering::SeqCst);
+    // Set the global flag
+    GLOBAL_EXIT.store(true, Ordering::SeqCst);
+    // Also set the Arc's AtomicBool so threads see it
+    let ptr = EXIT_FLAG_PTR.load(Ordering::SeqCst);
     if ptr != 0 {
         let flag = unsafe { &*(ptr as *const AtomicBool) };
         flag.store(true, Ordering::SeqCst);
