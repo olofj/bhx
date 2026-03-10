@@ -209,10 +209,14 @@ fn uart_loop(l2cpu: &L2Cpu, exit_flag: &AtomicBool) -> io::Result<i32> {
 
         if retval > 0 {
             let mut input = [0u8; 1];
-            if io::stdin().read(&mut input).unwrap_or(0) > 0 {
+            // Use raw libc::read instead of Rust's buffered io::stdin().read()
+            // to avoid the internal buffer consuming bytes that select() won't
+            // see on subsequent iterations (causing dropped keystrokes).
+            let n = unsafe { libc::read(libc::STDIN_FILENO, input.as_mut_ptr() as *mut libc::c_void, 1) };
+            if n > 0 {
                 if ctrl_a_pressed {
                     if input[0] == b'x' {
-                        print!("\n\n");
+                        let _ = io::stdout().write_all(b"\n\n");
                         return Ok(0);
                     }
                     ctrl_a_pressed = false;
@@ -228,7 +232,9 @@ fn uart_loop(l2cpu: &L2Cpu, exit_flag: &AtomicBool) -> io::Result<i32> {
         // Check for output from device
         if unsafe { can_pop(q) } {
             let c = unsafe { pop_char(q) };
-            print!("{}", c as char);
+            // Write raw byte directly — print!("{}", c as char) would corrupt
+            // bytes > 127 by expanding them into multi-byte UTF-8 sequences.
+            let _ = io::stdout().write_all(&[c]);
             let _ = io::stdout().flush();
         }
     }
