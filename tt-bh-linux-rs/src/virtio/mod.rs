@@ -217,11 +217,19 @@ pub fn run_device(
     let mut used_ring_address = vec![0u64; num_queues as usize];
 
     // Phase 3: Queue address exchange
+    let mem_end = starting_address + l2cpu.memory_size();
     while !exit_flag.load(Ordering::Relaxed) {
         let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
         unsafe { ptr::write_volatile(regs.queue_ready, 0); }
         if curr_gen != prev_gen {
             let q = unsafe { ptr::read_volatile(regs.queue_select) } as usize;
+            if q >= num_queues as usize {
+                // Invalid queue index from guest — skip this generation
+                unsafe { ptr::write_volatile(regs.sel_generation, curr_gen + 1); }
+                prev_gen = curr_gen + 1;
+                unsafe { libc::usleep(1); }
+                continue;
+            }
 
             descriptor_table_address[q] = unsafe {
                 ((ptr::read_volatile(regs.queue_desc_high) as u64) << 32)
@@ -251,15 +259,27 @@ pub fn run_device(
     let mut avail_ptrs: Vec<*mut VringAvail> = Vec::new();
     let mut used_ptrs: Vec<*mut VringUsed> = Vec::new();
 
+    // Validate and compute pointers to virtqueue structures in L2CPU memory.
+    // Addresses must fall within the L2CPU's memory region.
+    let validate_addr = |addr: u64, label: &str, qi: usize| -> usize {
+        if addr < starting_address || addr >= mem_end {
+            panic!(
+                "virtqueue {} address {:#x} for queue {} is outside L2CPU memory [{:#x}, {:#x})",
+                label, addr, qi, starting_address, mem_end
+            );
+        }
+        (addr - starting_address) as usize
+    };
+
     for i in 0..num_queues as usize {
         desc_ptrs.push(unsafe {
-            memory.add((descriptor_table_address[i] - starting_address) as usize) as *mut VringDesc
+            memory.add(validate_addr(descriptor_table_address[i], "desc", i)) as *mut VringDesc
         });
         avail_ptrs.push(unsafe {
-            memory.add((available_ring_address[i] - starting_address) as usize) as *mut VringAvail
+            memory.add(validate_addr(available_ring_address[i], "avail", i)) as *mut VringAvail
         });
         used_ptrs.push(unsafe {
-            memory.add((used_ring_address[i] - starting_address) as usize) as *mut VringUsed
+            memory.add(validate_addr(used_ring_address[i], "used", i)) as *mut VringUsed
         });
     }
 
@@ -308,6 +328,17 @@ pub fn run_device(
                     let d = unsafe {
                         ptr::read_volatile(desc_q.add((desc_idx % QUEUE_SIZE) as usize))
                     };
+
+                    // Validate descriptor address is within L2CPU memory
+                    if d.addr < starting_address || d.addr >= mem_end
+                        || d.addr + d.len as u64 > mem_end
+                    {
+                        eprintln!(
+                            "virtio: descriptor addr {:#x} len {} outside memory [{:#x}, {:#x}), skipping",
+                            d.addr, d.len, starting_address, mem_end
+                        );
+                        break;
+                    }
                     let addr = unsafe {
                         memory.add((d.addr - starting_address) as usize)
                     };
