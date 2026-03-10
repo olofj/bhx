@@ -265,7 +265,7 @@ fn download_file(url: &str, dir: &Path, compression: Compression) -> Result<Path
         Compression::Zip => {
             eprintln!("  Extracting (zip)...");
             let status = Command::new("unzip")
-                .args(["-o", "-d"])
+                .args(["-o", "-j", "-d"])
                 .arg(dir)
                 .arg(&temp_path)
                 .status()
