@@ -41,6 +41,8 @@ pub struct VirtioBlk {
     file_size: usize,
     _fd: RawFd,
     req: *const VirtioBlkOuthdr,
+    /// Accumulated byte offset within the current I/O request (across data descriptors).
+    data_offset: u64,
 }
 
 unsafe impl Send for VirtioBlk {}
@@ -79,6 +81,7 @@ impl VirtioBlk {
             file_size,
             _fd: fd,
             req: ptr::null(),
+            data_offset: 0,
         })
     }
 
@@ -95,11 +98,23 @@ impl VirtioDeviceImpl for VirtioBlk {
 
     fn process_queue_start(&mut self, _queue_idx: u32, addr: *mut u8, _len: u64) {
         self.req = addr as *const VirtioBlkOuthdr;
+        self.data_offset = 0;
     }
 
     fn process_queue_data(&mut self, _queue_idx: u32, addr: *mut u8, len: u64) {
         let req = unsafe { &*self.req };
-        let disk_offset = self.sector_size as u64 * req.sector;
+        let disk_offset = self.sector_size as u64 * req.sector + self.data_offset;
+        let end = disk_offset + len;
+
+        if end > self.file_size as u64 {
+            eprintln!(
+                "block: I/O at offset {:#x} len {} exceeds disk size {:#x}, ignoring",
+                disk_offset, len, self.file_size
+            );
+            self.data_offset += len;
+            return;
+        }
+
         match req.type_ {
             VIRTIO_BLK_T_IN => {
                 // Read from disk to guest memory
@@ -125,6 +140,7 @@ impl VirtioDeviceImpl for VirtioBlk {
                 eprintln!("Unimplemented block request type: {} len: {}", t, len);
             }
         }
+        self.data_offset += len;
     }
 
     fn process_queue_complete(&mut self, _queue_idx: u32, addr: *mut u8, _len: u64) {
