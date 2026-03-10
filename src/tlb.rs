@@ -14,6 +14,12 @@ pub const TWO_MEG: usize = 1 << 21;
 pub const FOUR_GIG: usize = 1usize << 32;
 
 /// Raw TLB allocation handle. Drops in order: munmap, then FREE_TLB ioctl.
+///
+/// # Safety
+/// The caller must ensure that the file descriptor `fd` remains open for the
+/// entire lifetime of this `TlbHandle`. Closing the fd before dropping the
+/// handle will cause the FREE_TLB ioctl to fail (leaking kernel TLB resources)
+/// or, worse, to operate on a recycled fd.
 pub struct TlbHandle {
     fd: RawFd,
     tlb_id: u32,
