@@ -3,6 +3,7 @@
 
 //! L2CPU tile abstraction — manages TLB windows to X280 RISC-V CPU memory.
 
+use std::mem::ManuallyDrop;
 use std::os::unix::io::RawFd;
 use std::ptr;
 
@@ -52,9 +53,11 @@ pub struct L2Cpu {
     /// Base of the 8GB reserved VA region.
     memory: *mut u8,
     /// First 4GB TLB window (0x4000_0000_0000).
-    _first: TlbWindow,
+    /// ManuallyDrop so we control drop order in Drop::drop.
+    _first: ManuallyDrop<TlbWindow>,
     /// Second 4GB TLB window (0x4001_0000_0000).
-    _second: TlbWindow,
+    /// ManuallyDrop so we control drop order in Drop::drop.
+    _second: ManuallyDrop<TlbWindow>,
 }
 
 // L2Cpu is Send because the raw pointers are to memory-mapped device regions
@@ -147,8 +150,8 @@ impl L2Cpu {
             memory_size,
             coordinates,
             memory,
-            _first: first,
-            _second: second,
+            _first: ManuallyDrop::new(first),
+            _second: ManuallyDrop::new(second),
         })
     }
 
@@ -202,26 +205,13 @@ impl L2Cpu {
 
 impl Drop for L2Cpu {
     fn drop(&mut self) {
-        // Drop order: TLB windows drop first (via struct field drop order: _second then _first),
-        // then we munmap the 8GB reservation, then close fd.
-        // Rust drops fields in declaration order, but _first and _second are already
-        // about to be dropped. We need the munmap to happen AFTER them.
-        // Since we can't control field drop order easily, we'll just munmap here
-        // after fields have been dropped — but actually fields are dropped AFTER
-        // Drop::drop() returns. So we use a different approach: the TlbWindow Drop
-        // does not munmap the 8GB region, only the TLB-specific mappings.
-        // The 8GB mmap(PROT_NONE) reservation is independent and we unmap it here.
-        // Actually the TlbWindow4G MAP_FIXED mappings replace parts of the 8GB region,
-        // and TlbWindow::drop will munmap those 4GB segments. After that, the remaining
-        // 8GB reservation is gone. But to be safe, we munmap the whole 8GB here.
-        // Since Drop::drop runs before field destructors, we need to manually drop
-        // the windows first.
-        //
-        // We can't move out of &mut self, so we just let normal drop order handle it.
-        // The 8GB reservation overlaps with the MAP_FIXED windows, so after the windows
-        // munmap their 4GB each, the reservation is already gone. No need to munmap again.
-        // But we still need to close fd.
+        // Drop order is critical: TLB windows must be freed (ioctl) before closing
+        // the fd, because ioctl_free_tlb uses the fd. We use ManuallyDrop to control
+        // this explicitly: drop windows first (second before first, matching C++),
+        // then close the fd.
         unsafe {
+            ManuallyDrop::drop(&mut self._second);
+            ManuallyDrop::drop(&mut self._first);
             libc::close(self.fd);
         }
     }
