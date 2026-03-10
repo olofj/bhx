@@ -13,6 +13,7 @@ mod kernel;
 mod kmd;
 mod l2cpu;
 mod ramdisk;
+#[cfg(feature = "slirp")]
 mod slirp_ffi;
 mod tlb;
 mod virtio;
@@ -25,6 +26,7 @@ use clap::{Parser, Subcommand};
 
 use virtio::block;
 use virtio::interrupt::InterruptController;
+#[cfg(feature = "slirp")]
 use virtio::network;
 
 #[derive(Parser)]
@@ -183,7 +185,8 @@ fn run_connect(ttdevice: u32, l2cpu: usize, disk: String, cloud_init: Option<Str
         }));
     }
 
-    // Network thread
+    // Network thread (requires slirp feature)
+    #[cfg(feature = "slirp")]
     {
         let exit_flag = exit_flag.clone();
         let interrupt_ctl = interrupt_ctl.clone();
