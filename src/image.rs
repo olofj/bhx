@@ -224,7 +224,8 @@ fn download_file(url: &str, dir: &Path, compression: Compression) -> Result<Path
     eprintln!("  Downloading...");
 
     let status = Command::new("wget")
-        .args(["-O", temp_path.to_str().unwrap()])
+        .arg("-O")
+        .arg(&temp_path)
         .arg("--progress=bar:force:noscroll")
         .arg(url)
         .status()
@@ -368,14 +369,12 @@ fn extract_root_partition(disk: &Path, output: &Path) -> Result<(), String> {
 
     // Extract with dd (sector size = 512)
     let status = Command::new("dd")
-        .args([
-            &format!("if={}", disk.to_str().unwrap()),
-            &format!("of={}", output.to_str().unwrap()),
-            "bs=512",
-            &format!("skip={}", start_sectors),
-            &format!("count={}", size_sectors),
-            "status=progress",
-        ])
+        .arg(format!("if={}", disk.display()))
+        .arg(format!("of={}", output.display()))
+        .arg("bs=512")
+        .arg(format!("skip={}", start_sectors))
+        .arg(format!("count={}", size_sectors))
+        .arg("status=progress")
         .status()
         .map_err(|e| format!("Failed to run dd: {}", e))?;
 
