@@ -30,19 +30,28 @@ impl InterruptController {
     }
 
     /// Set interrupt: write bit to PLIC, fence, then clear.
-    /// BUG PRESERVED: overwrites entire register instead of OR-ing.
+    /// BUG PRESERVED: overwrites entire register instead of OR-ing (matches C++).
     pub fn set_interrupt(
         &self,
         interrupt_status: *mut u32,
         interrupt_number: u32,
     ) {
+        assert!(
+            interrupt_number >= 5,
+            "interrupt_number ({}) must be >= 5 to avoid underflow in PLIC bit shift",
+            interrupt_number
+        );
+
+        // Acquire the lock first, protecting both the MMIO interrupt_status
+        // read-modify-write AND the PLIC register access.
+        let _guard = self.lock.lock().unwrap();
+
         // Set VIRTIO_MMIO_INT_VRING in interrupt_status
         let status_val = unsafe { ptr::read_volatile(interrupt_status) };
         unsafe {
             ptr::write_volatile(interrupt_status, 1 | status_val);
         }
 
-        let _guard = self.lock.lock().unwrap();
         let reg = self.window.get_window() as *mut u32;
         unsafe {
             // BUG PRESERVED: sets only our interrupt, doesn't OR with existing
