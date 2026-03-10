@@ -139,11 +139,6 @@ fn run_connect(ttdevice: u32, l2cpu: usize, disk: String, cloud_init: Option<Str
         std::process::exit(1);
     }
 
-    // Ignore SIGPIPE
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-    }
-
     let exit_flag = Arc::new(AtomicBool::new(false));
 
     // Set up SIGINT/SIGTERM handler
@@ -259,6 +254,12 @@ extern "C" fn signal_handler(_sig: libc::c_int) {
 }
 
 fn main() {
+    // Ignore SIGPIPE globally — affects all subcommands (network slirp,
+    // wget subprocesses, piped stdout, etc.)
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
