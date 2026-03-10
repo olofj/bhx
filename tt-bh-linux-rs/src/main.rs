@@ -8,6 +8,7 @@
 mod boot;
 mod clock;
 mod console;
+mod image;
 mod kmd;
 mod l2cpu;
 mod slirp_ffi;
@@ -32,19 +33,19 @@ struct Cli {
     command: Option<Commands>,
 
     /// Tenstorrent device index
-    #[arg(short = 't', long = "ttdevice", default_value_t = 0)]
+    #[arg(short = 't', long = "ttdevice", default_value_t = 0, global = true)]
     ttdevice: u32,
 
     /// L2CPU index (0-3)
-    #[arg(short = 'l', long = "l2cpu", default_value_t = 0)]
+    #[arg(short = 'l', long = "l2cpu", default_value_t = 0, global = true)]
     l2cpu: usize,
 
     /// Path to disk image
-    #[arg(short = 'd', long = "disk", default_value = "rootfs.ext4")]
+    #[arg(short = 'd', long = "disk", default_value = "rootfs.ext4", global = true)]
     disk: String,
 
     /// Path to cloud-init image (optional)
-    #[arg(short = 'c', long = "cloud-init")]
+    #[arg(short = 'c', long = "cloud-init", global = true)]
     cloud_init: Option<String>,
 }
 
@@ -64,6 +65,31 @@ enum Commands {
     },
     /// Console/disk/net threads only (chip already booted)
     Connect,
+    /// Manage disk images
+    Image {
+        #[command(subcommand)]
+        action: ImageAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImageAction {
+    /// List available images for download
+    #[command(alias = "list-available")]
+    List,
+    /// Show details about a specific image
+    Info {
+        /// Image name or alias
+        name: String,
+    },
+    /// Download and prepare a disk image
+    Pull {
+        /// Image name or alias (e.g., "debian-13", "ubuntu", "fedora")
+        name: String,
+        /// Output path (default: images/<name>.ext4)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
 }
 
 fn run_connect(ttdevice: u32, l2cpu: usize, disk: String, cloud_init: Option<String>) {
@@ -201,7 +227,19 @@ fn main() {
             eprintln!("  opensbi: {}, kernel: {}, dtb: {}", opensbi, kernel, dtb);
             std::process::exit(1);
         }
-        Some(Commands::Connect) | None => {
+        Some(Commands::Connect) => {
+            run_connect(cli.ttdevice, cli.l2cpu, cli.disk, cli.cloud_init);
+        }
+        Some(Commands::Image { action }) => {
+            match action {
+                ImageAction::List => image::cmd_list_available(),
+                ImageAction::Info { name } => image::cmd_image_info(&name),
+                ImageAction::Pull { name, output } => {
+                    image::cmd_pull(&name, output.as_deref());
+                }
+            }
+        }
+        None => {
             run_connect(cli.ttdevice, cli.l2cpu, cli.disk, cli.cloud_init);
         }
     }
