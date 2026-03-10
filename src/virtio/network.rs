@@ -98,32 +98,39 @@ impl VirtioDeviceImpl for VirtioNet {
     }
 
     fn process_queue_complete(&mut self, queue_idx: u32, addr: *mut u8, len: u64) {
-        // Handle single-descriptor edge case
+        // Handle single-descriptor edge case: if header wasn't processed via
+        // a separate descriptor, process it from the start of this one and
+        // advance past it.
         let mut data_addr = addr;
+        let mut data_len = len;
         if !self.header_processed {
             self.process_queue_start(queue_idx, addr, len);
             data_addr = unsafe { addr.add(self.queue_header_size as usize) };
+            data_len = len.saturating_sub(self.queue_header_size);
         }
 
         if queue_idx == 0 {
             // RX: receive packet from slirp
+            let max_copy = (data_len as usize).min(PACKET_SIZE);
             let pktlen = unsafe {
-                vdeslirp_recv(self.slirp, self.buffer.as_mut_ptr(), PACKET_SIZE)
+                vdeslirp_recv(self.slirp, self.buffer.as_mut_ptr(), max_copy)
             };
             if pktlen > 0 {
+                let copy_len = (pktlen as usize).min(max_copy);
                 unsafe {
                     ptr::copy_nonoverlapping(
                         self.buffer.as_ptr(),
                         data_addr,
-                        pktlen as usize,
+                        copy_len,
                     );
                 }
             }
         } else if queue_idx == 1 {
             // TX: send packet to slirp
+            let copy_len = (data_len as usize).min(PACKET_SIZE);
             unsafe {
-                ptr::copy_nonoverlapping(data_addr, self.buffer.as_mut_ptr(), len as usize);
-                let ret = vdeslirp_send(self.slirp, self.buffer.as_ptr(), len as usize);
+                ptr::copy_nonoverlapping(data_addr, self.buffer.as_mut_ptr(), copy_len);
+                let ret = vdeslirp_send(self.slirp, self.buffer.as_ptr(), copy_len);
                 if ret < 0 {
                     eprintln!("vdeslirp_send failed: {}", ret);
                 }
