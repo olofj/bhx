@@ -5,9 +5,12 @@
 
 use std::os::unix::io::RawFd;
 
-#[repr(C)]
+/// Opaque SlirpConfig — sized to hold the libslirp SlirpConfig struct.
+/// Must be zeroed before calling vdeslirp_init(). The actual struct is 192
+/// bytes as of libslirp 4.8; we over-allocate to tolerate future growth.
+#[repr(C, align(8))]
 pub struct SlirpConfig {
-    _data: [u8; 512], // Opaque, initialized by vdeslirp_init
+    _data: [u8; 512],
 }
 
 pub const VDE_INIT_DEFAULT: libc::c_int = 1;
