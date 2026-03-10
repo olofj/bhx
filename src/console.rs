@@ -147,30 +147,36 @@ fn uart_loop(l2cpu: &L2Cpu, exit_flag: &AtomicBool) -> io::Result<i32> {
         tile.x, tile.y, debug_ptr
     );
 
-    // 2. Open window to debug descriptor and verify eye catcher
-    let desc_window =
-        l2cpu.get_persistent_2m_window(starting_address + debug_ptr as u64)?;
-    let desc = desc_window.get_window() as *const DebugDescriptor;
+    // 2. Open window to debug descriptor and verify eye catcher.
+    //    Read uart_base, then drop the window to free the TLB resource
+    //    before opening the UART queue window.
+    let uart_base = {
+        let desc_window =
+            l2cpu.get_persistent_2m_window(starting_address + debug_ptr as u64)?;
+        let desc = desc_window.get_window() as *const DebugDescriptor;
 
-    for i in 0..8 {
-        let byte = unsafe { ptr::read_volatile(&(*desc).eye_catcher[i]) };
-        if byte != EYE_CATCHER[i] {
+        for i in 0..8 {
+            let byte = unsafe { ptr::read_volatile(&(*desc).eye_catcher[i]) };
+            if byte != EYE_CATCHER[i] {
+                eprintln!(
+                    "L2CPU[{}, {}] debug descriptor eye catcher mismatch",
+                    tile.x, tile.y
+                );
+                return Ok(1);
+            }
+        }
+
+        let base = unsafe { ptr::read_volatile(&(*desc).virtuart_base) };
+        if base == !0u64 {
             eprintln!(
-                "L2CPU[{}, {}] debug descriptor eye catcher mismatch",
+                "L2CPU[{}, {}] failed to find the virtual UART; exiting",
                 tile.x, tile.y
             );
             return Ok(1);
         }
-    }
-
-    let uart_base = unsafe { ptr::read_volatile(&(*desc).virtuart_base) };
-    if uart_base == !0u64 {
-        eprintln!(
-            "L2CPU[{}, {}] failed to find the virtual UART; exiting",
-            tile.x, tile.y
-        );
-        return Ok(1);
-    }
+        base
+        // desc_window dropped here, freeing the TLB
+    };
     eprintln!(
         "L2CPU[{}, {}] found the virtual UART at 0x{:x}",
         tile.x, tile.y, uart_base
