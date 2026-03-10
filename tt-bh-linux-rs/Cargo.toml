@@ -12,6 +12,5 @@ slirp = [] # Links libvdeslirp/libslirp for network device support
 libc = "0.2"
 nix = { version = "0.29", features = ["ioctl", "mman", "fs", "term", "signal"] }
 clap = { version = "4", features = ["derive"] }
-vm-fdt = "0.3"
 
 [build-dependencies]
