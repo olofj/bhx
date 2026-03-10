@@ -17,8 +17,8 @@ pub fn frequency_solution(mhz: u32) -> (u16, [u8; 4]) {
     }
 }
 
-/// PLLCNTL1 register: {refdiv: u8, postdiv: u8, fbdiv: u16} — little-endian packed
-#[repr(C)]
+/// PLLCNTL1 register layout: {refdiv: u8, postdiv: u8, fbdiv: u16} — little-endian.
+/// Represented as raw bytes to avoid unsafe transmute.
 #[derive(Clone, Copy)]
 struct PllCntl1 {
     refdiv: u8,
@@ -26,11 +26,34 @@ struct PllCntl1 {
     fbdiv: u16,
 }
 
-/// PLLCNTL5 register: {postdiv: [u8; 4]} — little-endian packed
-#[repr(C)]
+impl PllCntl1 {
+    fn from_u32(val: u32) -> Self {
+        let b = val.to_le_bytes();
+        PllCntl1 {
+            refdiv: b[0],
+            postdiv: b[1],
+            fbdiv: u16::from_le_bytes([b[2], b[3]]),
+        }
+    }
+    fn to_u32(self) -> u32 {
+        let fb = self.fbdiv.to_le_bytes();
+        u32::from_le_bytes([self.refdiv, self.postdiv, fb[0], fb[1]])
+    }
+}
+
+/// PLLCNTL5 register: 4 postdiv bytes — little-endian.
 #[derive(Clone, Copy)]
 struct PllCntl5 {
     postdiv: [u8; 4],
+}
+
+impl PllCntl5 {
+    fn from_u32(val: u32) -> Self {
+        PllCntl5 { postdiv: val.to_le_bytes() }
+    }
+    fn to_u32(self) -> u32 {
+        u32::from_le_bytes(self.postdiv)
+    }
 }
 
 /// Trait for accessing PLL registers, abstracting over TLB windows vs AXI.
@@ -49,18 +72,14 @@ pub fn set_frequency(access: &dyn PllAccess, mhz: u32) {
     let (target_fbdiv, target_postdiv) = frequency_solution(mhz);
 
     // Read current values
-    let raw5 = access.pll_read32(PLL4_BASE + PLL_CNTL_5);
-    let mut current_postdivs: PllCntl5 = unsafe { std::mem::transmute(raw5) };
-
-    let raw1 = access.pll_read32(PLL4_BASE + PLL_CNTL_1);
-    let mut current_fbdiv: PllCntl1 = unsafe { std::mem::transmute(raw1) };
+    let mut current_postdivs = PllCntl5::from_u32(access.pll_read32(PLL4_BASE + PLL_CNTL_5));
+    let mut current_fbdiv = PllCntl1::from_u32(access.pll_read32(PLL4_BASE + PLL_CNTL_1));
 
     // Step 1: Increase postdivs that need to go up
     for i in 0..4 {
         while current_postdivs.postdiv[i] < target_postdiv[i] {
             current_postdivs.postdiv[i] += 1;
-            let raw: u32 = unsafe { std::mem::transmute(current_postdivs) };
-            access.pll_write32(PLL4_BASE + PLL_CNTL_5, raw);
+            access.pll_write32(PLL4_BASE + PLL_CNTL_5, current_postdivs.to_u32());
             sleep_1ns();
         }
     }
@@ -72,8 +91,7 @@ pub fn set_frequency(access: &dyn PllAccess, mhz: u32) {
         } else {
             current_fbdiv.fbdiv -= 1;
         }
-        let raw: u32 = unsafe { std::mem::transmute(current_fbdiv) };
-        access.pll_write32(PLL4_BASE + PLL_CNTL_1, raw);
+        access.pll_write32(PLL4_BASE + PLL_CNTL_1, current_fbdiv.to_u32());
         sleep_1ns();
     }
 
@@ -81,8 +99,7 @@ pub fn set_frequency(access: &dyn PllAccess, mhz: u32) {
     for i in 0..4 {
         while current_postdivs.postdiv[i] > target_postdiv[i] {
             current_postdivs.postdiv[i] -= 1;
-            let raw: u32 = unsafe { std::mem::transmute(current_postdivs) };
-            access.pll_write32(PLL4_BASE + PLL_CNTL_5, raw);
+            access.pll_write32(PLL4_BASE + PLL_CNTL_5, current_postdivs.to_u32());
             sleep_1ns();
         }
     }
