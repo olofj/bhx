@@ -110,7 +110,8 @@ pub fn pull_ramdisk(name: &str, output: Option<&Path>) -> Result<PathBuf, String
     // Download
     eprintln!("  Downloading...");
     let status = Command::new("wget")
-        .args(["-O", download_path.to_str().unwrap()])
+        .arg("-O")
+        .arg(&download_path)
         .arg("--progress=bar:force:noscroll")
         .arg(ramdisk.url)
         .status()

@@ -110,7 +110,8 @@ pub fn pull_kernel(version: Option<&str>, output_dir: Option<&Path>) -> Result<P
 
     eprintln!("  Downloading...");
     let status = Command::new("wget")
-        .args(["-O", temp_path.to_str().unwrap()])
+        .arg("-O")
+        .arg(&temp_path)
         .arg("--progress=bar:force:noscroll")
         .arg(kernel.url)
         .status()
