@@ -127,7 +127,7 @@ pub fn pull_kernel(version: Option<&str>, output_dir: Option<&Path>) -> Result<P
     // Extract
     eprintln!("  Extracting...");
     let status = Command::new("unzip")
-        .args(["-o", "-d"])
+        .args(["-o", "-j", "-d"])
         .arg(&dir)
         .arg(&zip_path)
         .status()
