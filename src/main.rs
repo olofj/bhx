@@ -9,8 +9,10 @@ mod boot;
 mod clock;
 mod console;
 mod image;
+mod kernel;
 mod kmd;
 mod l2cpu;
+mod ramdisk;
 mod slirp_ffi;
 mod tlb;
 mod virtio;
@@ -70,6 +72,16 @@ enum Commands {
         #[command(subcommand)]
         action: ImageAction,
     },
+    /// Manage kernel/firmware (fw_jump.bin + Image + DTB)
+    Kernel {
+        #[command(subcommand)]
+        action: KernelAction,
+    },
+    /// Manage ramdisk/initramfs images
+    Ramdisk {
+        #[command(subcommand)]
+        action: RamdiskAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -87,6 +99,35 @@ enum ImageAction {
         /// Image name or alias (e.g., "debian-13", "ubuntu", "fedora")
         name: String,
         /// Output path (default: images/<name>.ext4)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum KernelAction {
+    /// List available kernel/firmware versions
+    List,
+    /// Download kernel/firmware bundle (fw_jump.bin + Image + DTB)
+    Pull {
+        /// Kernel version (e.g., "0.10", "v0.9"); defaults to latest
+        #[arg(short, long)]
+        version: Option<String>,
+        /// Output directory (default: current directory)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RamdiskAction {
+    /// List available ramdisk/initramfs images
+    List,
+    /// Download a ramdisk/initramfs
+    Pull {
+        /// Ramdisk name or alias (e.g., "debian-13-netboot")
+        name: String,
+        /// Output path
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -236,6 +277,22 @@ fn main() {
                 ImageAction::Info { name } => image::cmd_image_info(&name),
                 ImageAction::Pull { name, output } => {
                     image::cmd_pull(&name, output.as_deref());
+                }
+            }
+        }
+        Some(Commands::Kernel { action }) => {
+            match action {
+                KernelAction::List => kernel::cmd_list(),
+                KernelAction::Pull { version, output } => {
+                    kernel::cmd_pull(version.as_deref(), output.as_deref());
+                }
+            }
+        }
+        Some(Commands::Ramdisk { action }) => {
+            match action {
+                RamdiskAction::List => ramdisk::cmd_list(),
+                RamdiskAction::Pull { name, output } => {
+                    ramdisk::cmd_pull(&name, output.as_deref());
                 }
             }
         }
