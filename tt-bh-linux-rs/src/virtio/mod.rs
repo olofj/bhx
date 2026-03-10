@@ -5,6 +5,7 @@
 
 pub mod block;
 pub mod interrupt;
+#[cfg(feature = "slirp")]
 pub mod network;
 
 use std::ptr;
