@@ -69,21 +69,23 @@ unsafe fn can_pop(q: *const u8) -> bool {
     head != tail
 }
 
-unsafe fn push_char(q: *mut u8, c: u8) {
-    while !can_push(q) {}
+unsafe fn push_char(q: *mut u8, c: u8, exit_flag: &AtomicBool) {
+    while !can_push(q) {
+        if exit_flag.load(Ordering::Relaxed) { return; }
+    }
     let head = read_rx_head(q) % BUFFER_SIZE;
     ptr::write_volatile(q.add(OFF_RX_BUF + head as usize), c);
     atomic::fence(Ordering::Release);
     write_rx_head(q, (read_rx_head(q) + 1) % BUFFER_SIZE);
 }
 
-unsafe fn pop_char(q: *mut u8) -> u8 {
-    while !can_pop(q) {}
+unsafe fn pop_char(q: *mut u8) -> Option<u8> {
+    // Non-blocking: caller checks can_pop() first
     let tail = read_tx_tail(q) % BUFFER_SIZE;
     let c = ptr::read_volatile(q.add(OFF_TX_BUF + tail as usize));
     atomic::fence(Ordering::Release);
     write_tx_tail(q, (read_tx_tail(q) + 1) % BUFFER_SIZE);
-    c
+    Some(c)
 }
 
 /// Debug descriptor struct written by OpenSBI at a known location.
@@ -228,25 +230,26 @@ fn uart_loop(l2cpu: &L2Cpu, exit_flag: &AtomicBool) -> io::Result<i32> {
                     }
                     // Forward both the Ctrl-A and the character to the device
                     unsafe {
-                        push_char(q, 1); // Ctrl-A
-                        push_char(q, input[0]);
+                        push_char(q, 1, exit_flag); // Ctrl-A
+                        push_char(q, input[0], exit_flag);
                     }
                 } else if input[0] == 1 {
                     // Ctrl-A
                     ctrl_a_pressed = true;
                 } else {
-                    unsafe { push_char(q, input[0]); }
+                    unsafe { push_char(q, input[0], exit_flag); }
                 }
             }
         }
 
         // Check for output from device
         if unsafe { can_pop(q) } {
-            let c = unsafe { pop_char(q) };
-            // Write raw byte directly — print!("{}", c as char) would corrupt
-            // bytes > 127 by expanding them into multi-byte UTF-8 sequences.
-            let _ = io::stdout().write_all(&[c]);
-            let _ = io::stdout().flush();
+            if let Some(c) = unsafe { pop_char(q) } {
+                // Write raw byte directly — print!("{}", c as char) would corrupt
+                // bytes > 127 by expanding them into multi-byte UTF-8 sequences.
+                let _ = io::stdout().write_all(&[c]);
+                let _ = io::stdout().flush();
+            }
         }
     }
 
