@@ -264,7 +264,7 @@ extern "C" fn signal_handler(_sig: libc::c_int) {
     }
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     // Ignore SIGPIPE globally — affects all subcommands (network slirp,
     // wget subprocesses, piped stdout, etc.)
     unsafe {
@@ -278,7 +278,7 @@ fn main() {
             eprintln!("Boot command requires luwen crate integration.");
             eprintln!("Use boot.py for now, then run: tt-bh-linux connect");
             eprintln!("  opensbi: {}, kernel: {}, dtb: {}", opensbi, kernel, dtb);
-            std::process::exit(1);
+            return std::process::ExitCode::FAILURE;
         }
         Some(Commands::Connect) => {
             run_connect(cli.ttdevice, cli.l2cpu, cli.disk, cli.cloud_init);
@@ -312,4 +312,6 @@ fn main() {
             run_connect(cli.ttdevice, cli.l2cpu, cli.disk, cli.cloud_init);
         }
     }
+
+    std::process::ExitCode::SUCCESS
 }
