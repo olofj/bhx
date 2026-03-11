@@ -51,7 +51,13 @@ impl Drop for VirtioNet {
 impl VirtioNet {
     pub fn new(ttdevice: u32, l2cpu_idx: usize) -> std::io::Result<Self> {
         let mut cfg: SlirpConfig = unsafe { std::mem::zeroed() };
-        unsafe { vdeslirp_init(&mut cfg, VDE_INIT_DEFAULT); }
+        let ret = unsafe { vdeslirp_init(&mut cfg, VDE_INIT_DEFAULT) };
+        if ret != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("vdeslirp_init failed with code {}", ret),
+            ));
+        }
         let slirp = unsafe { vdeslirp_open(&mut cfg) };
         if slirp.is_null() {
             return Err(std::io::Error::new(

@@ -52,7 +52,8 @@ impl InAddr {
     pub fn from_str(s: &str) -> Self {
         let c_str = std::ffi::CString::new(s).unwrap();
         let mut addr = InAddr { s_addr: 0 };
-        unsafe { inet_aton(c_str.as_ptr(), &mut addr); }
+        let ret = unsafe { inet_aton(c_str.as_ptr(), &mut addr) };
+        assert!(ret != 0, "inet_aton failed to parse address: {}", s);
         addr
     }
 }
