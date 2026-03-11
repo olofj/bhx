@@ -10,6 +10,10 @@ use crate::kmd::{
     self, AllocateTlb, ConfigureTlb, FreeTlb, FreeTlbIn, NocTlbConfig,
 };
 
+// This code requires 64-bit pointers for 4GB TLB windows and NOC addresses.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("tt-bh-linux requires a 64-bit target");
+
 pub const TWO_MEG: usize = 1 << 21;
 pub const FOUR_GIG: usize = 1usize << 32;
 
@@ -187,9 +191,10 @@ impl TlbWindow {
 
     /// Write a 32-bit value at the given offset within the window. Uses volatile write.
     pub fn write32(&self, addr: u64, value: u32) {
-        let off = self.offset + addr as usize;
-        assert!(off + 4 <= self.window_size);
-        assert!(off % 4 == 0);
+        let off = self.offset.checked_add(addr as usize)
+            .expect("TLB window offset overflow");
+        assert!(off + 4 <= self.window_size, "TLB write32 out of bounds");
+        assert!(off % 4 == 0, "TLB write32 unaligned");
         unsafe {
             ptr::write_volatile(self.window.data().add(off) as *mut u32, value);
         }
@@ -197,9 +202,10 @@ impl TlbWindow {
 
     /// Read a 32-bit value at the given offset within the window. Uses volatile read.
     pub fn read32(&self, addr: u64) -> u32 {
-        let off = self.offset + addr as usize;
-        assert!(off + 4 <= self.window_size);
-        assert!(off % 4 == 0);
+        let off = self.offset.checked_add(addr as usize)
+            .expect("TLB window offset overflow");
+        assert!(off + 4 <= self.window_size, "TLB read32 out of bounds");
+        assert!(off % 4 == 0, "TLB read32 unaligned");
         unsafe { ptr::read_volatile(self.window.data().add(off) as *const u32) }
     }
 
