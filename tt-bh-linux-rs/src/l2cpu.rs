@@ -208,10 +208,11 @@ impl Drop for L2Cpu {
         // Drop order is critical: TLB windows must be freed (ioctl) before closing
         // the fd, because ioctl_free_tlb uses the fd. We use ManuallyDrop to control
         // this explicitly: drop windows first (second before first, matching C++),
-        // then close the fd.
+        // then munmap the 8GB reservation, then close the fd.
         unsafe {
             ManuallyDrop::drop(&mut self._second);
             ManuallyDrop::drop(&mut self._first);
+            libc::munmap(self.memory as *mut libc::c_void, 2usize << 32);
             libc::close(self.fd);
         }
     }
