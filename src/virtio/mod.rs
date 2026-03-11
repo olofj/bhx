@@ -315,8 +315,6 @@ pub fn run_device(
             let mut should_set_interrupt = false;
 
             if processed[qi] != avail_idx && device.queue_has_data(queue_idx) {
-                should_set_interrupt = true;
-
                 let desc_idx_first = unsafe {
                     let ring_ptr = (*avail_q).ring.as_ptr();
                     ptr::read_volatile(ring_ptr.add((processed[qi] % QUEUE_SIZE) as usize))
@@ -324,20 +322,34 @@ pub fn run_device(
                 let mut desc_idx = desc_idx_first;
 
                 let mut num_bytes_written: u64 = 0;
+                let mut chain_valid = true;
+                let mut steps: u16 = 0;
 
                 loop {
+                    // Cycle detection: a valid chain can visit at most QUEUE_SIZE descriptors
+                    if steps >= QUEUE_SIZE {
+                        eprintln!("virtio: descriptor chain exceeded {} steps, breaking", QUEUE_SIZE);
+                        chain_valid = false;
+                        break;
+                    }
+                    steps += 1;
+
                     let d = unsafe {
                         ptr::read_volatile(desc_q.add((desc_idx % QUEUE_SIZE) as usize))
                     };
 
-                    // Validate descriptor address is within L2CPU memory
+                    // Validate descriptor address is within L2CPU memory.
+                    // Use checked arithmetic to prevent overflow bypassing the check.
+                    let addr_end = (d.addr).checked_add(d.len as u64);
                     if d.addr < starting_address || d.addr >= mem_end
-                        || d.addr + d.len as u64 > mem_end
+                        || addr_end.is_none()
+                        || addr_end.unwrap() > mem_end
                     {
                         eprintln!(
-                            "virtio: descriptor addr {:#x} len {} outside memory [{:#x}, {:#x}), skipping",
+                            "virtio: descriptor addr {:#x} len {} outside memory [{:#x}, {:#x}), skipping chain",
                             d.addr, d.len, starting_address, mem_end
                         );
+                        chain_valid = false;
                         break;
                     }
                     let addr = unsafe {
@@ -359,17 +371,22 @@ pub fn run_device(
                     }
                 }
 
-                // Update used ring
-                let used_idx = unsafe { ptr::read_volatile(&(*used_q).idx) };
-                unsafe {
-                    let ring_ptr = (*used_q).ring.as_mut_ptr();
-                    let elem = ring_ptr.add((used_idx % QUEUE_SIZE) as usize);
-                    ptr::write_volatile(&mut (*elem).id, desc_idx_first as u32);
-                    ptr::write_volatile(&mut (*elem).len, num_bytes_written as u32);
-                }
-                std::sync::atomic::fence(Ordering::SeqCst);
-                unsafe {
-                    ptr::write_volatile(&mut (*used_q).idx, used_idx.wrapping_add(1));
+                // Only update the used ring if the entire chain was processed
+                // successfully. Posting a partial completion confuses the guest driver.
+                if chain_valid {
+                    should_set_interrupt = true;
+
+                    let used_idx = unsafe { ptr::read_volatile(&(*used_q).idx) };
+                    unsafe {
+                        let ring_ptr = (*used_q).ring.as_mut_ptr();
+                        let elem = ring_ptr.add((used_idx % QUEUE_SIZE) as usize);
+                        ptr::write_volatile(&mut (*elem).id, desc_idx_first as u32);
+                        ptr::write_volatile(&mut (*elem).len, num_bytes_written as u32);
+                    }
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    unsafe {
+                        ptr::write_volatile(&mut (*used_q).idx, used_idx.wrapping_add(1));
+                    }
                 }
 
                 processed[qi] = processed[qi].wrapping_add(1);
