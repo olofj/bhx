@@ -221,11 +221,16 @@ fn uart_loop(l2cpu: &L2Cpu, exit_flag: &AtomicBool) -> io::Result<i32> {
             let n = unsafe { libc::read(libc::STDIN_FILENO, input.as_mut_ptr() as *mut libc::c_void, 1) };
             if n > 0 {
                 if ctrl_a_pressed {
+                    ctrl_a_pressed = false;
                     if input[0] == b'x' {
                         let _ = io::stdout().write_all(b"\n\n");
                         return Ok(0);
                     }
-                    ctrl_a_pressed = false;
+                    // Forward both the Ctrl-A and the character to the device
+                    unsafe {
+                        push_char(q, 1); // Ctrl-A
+                        push_char(q, input[0]);
+                    }
                 } else if input[0] == 1 {
                     // Ctrl-A
                     ctrl_a_pressed = true;
