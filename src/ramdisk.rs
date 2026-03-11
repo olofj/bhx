@@ -96,14 +96,15 @@ pub fn pull_ramdisk(name: &str, output: Option<&Path>) -> Result<PathBuf, String
     let download_path = match ramdisk.compression {
         Compression::None => output_path.clone(),
         Compression::Gz => {
-            let mut p = output_path.clone();
-            p.set_extension("initrd.gz");
-            p
+            // Append .gz suffix so gunzip produces the correct output filename
+            let mut name = output_path.as_os_str().to_owned();
+            name.push(".gz");
+            PathBuf::from(name)
         }
         Compression::Xz => {
-            let mut p = output_path.clone();
-            p.set_extension("initrd.xz");
-            p
+            let mut name = output_path.as_os_str().to_owned();
+            name.push(".xz");
+            PathBuf::from(name)
         }
     };
 
