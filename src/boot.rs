@@ -144,26 +144,19 @@ pub fn configure_prefetchers(chip: &dyn AxiAccess, l2cpu_idx: usize) {
 }
 
 /// Modify a DTB to add bootargs, reserved memory, and virtio devices.
-/// Uses the vm-fdt crate for DTB creation, but since we need to MODIFY an existing
-/// DTB, we use manual FDT manipulation.
 ///
 /// This function takes raw DTB bytes and returns modified DTB bytes.
-/// For now, this is a simplified version — full DTB patching requires libfdt bindings
-/// or a Rust FDT library that supports modification of existing DTBs.
+/// Full DTB patching requires libfdt bindings or a Rust FDT library that
+/// supports modification of existing DTBs.
 pub fn modify_dtb(
     dtb_bytes: &[u8],
     _boot_device: &str,
     _mem_end: u64,
 ) -> Result<Vec<u8>, String> {
     // DTB modification requires parsing and modifying an existing FDT.
-    // The vm-fdt crate only creates new FDTs, it cannot modify existing ones.
-    // For a complete implementation, we would need either:
-    // 1. Rust bindings to libfdt (like the pylibfdt used in boot.py)
-    // 2. A Rust FDT library that supports modification (e.g., fdt-rs with write support)
-    //
-    // For now, we provide the DTB bytes as-is and document what modifications are needed.
-    // The boot.py script should still be used for DTB modification until proper
-    // Rust FDT modification support is added.
+    // For a complete implementation, we need Rust bindings to libfdt or a
+    // Rust FDT library that supports modification.
+    // For now, the boot.py script should be used for DTB modification.
 
     // In a full implementation, we would:
     // 1. Parse DTB, resize with +2000 bytes
