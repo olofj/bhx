@@ -1,6 +1,8 @@
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+
     // Only link slirp libraries when the "slirp" feature is enabled.
     // This allows building without libvdeslirp/libslirp for users who
     // only need image/kernel/ramdisk management or console+disk support.
@@ -10,13 +12,20 @@ fn main() {
 
         // Verify that our opaque SlirpConfig buffer (512 bytes) is large enough
         // for the actual struct. Fail at build time if the library has grown.
+        // Use a unique temp path based on PID to avoid race conditions with
+        // parallel builds.
+        let pid = std::process::id();
+        let tmp_bin = format!("/tmp/slirp_size_check_{}", pid);
         let output = Command::new("sh")
             .arg("-c")
-            .arg(concat!(
-                "echo '#include <slirp/libslirp.h>\n",
-                "#include <stdio.h>\n",
-                "int main(){printf(\"%zu\",sizeof(SlirpConfig));return 0;}' ",
-                "| cc -x c - -o /tmp/slirp_size_check 2>/dev/null && /tmp/slirp_size_check"
+            .arg(format!(
+                concat!(
+                    "echo '#include <slirp/libslirp.h>\n",
+                    "#include <stdio.h>\n",
+                    "int main(){{printf(\"%zu\",sizeof(SlirpConfig));return 0;}}' ",
+                    "| cc -x c - -o {0} 2>/dev/null && {0}; rm -f {0}"
+                ),
+                tmp_bin
             ))
             .output();
 
