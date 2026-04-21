@@ -271,8 +271,8 @@ fn run_boot(
         // fd must be closed before the reset — PCI re-enumeration invalidates it.
         drop(chip);
         chip::reset_board(ttdevice)?;
-        eprintln!("[boot] board reset complete; sleeping 5s for chip to re-initialize");
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        eprintln!("[boot] board reset complete; sleeping 1s for chip to re-initialize");
+        std::thread::sleep(std::time::Duration::from_secs(1));
         eprintln!("[boot] reopening /dev/tenstorrent/{} post-reset", ttdevice);
         chip::BootChip::new(ttdevice)
             .map_err(|e| std::io::Error::other(format!("open /dev/tenstorrent/{}: {}", ttdevice, e)))?
