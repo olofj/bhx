@@ -51,16 +51,18 @@ impl Drop for VirtioNet {
 impl VirtioNet {
     pub fn new(ttdevice: u32, l2cpu_idx: usize) -> std::io::Result<Self> {
         let mut cfg: SlirpConfig = unsafe { std::mem::zeroed() };
-        let ret = unsafe { vdeslirp_init(&mut cfg, VDE_INIT_DEFAULT) };
-        if ret != 0 {
-            return Err(std::io::Error::other(format!(
-                "vdeslirp_init failed with code {}",
-                ret
-            )));
-        }
+        unsafe { vdeslirp_init(&mut cfg, VDE_INIT_DEFAULT) };
         let slirp = unsafe { vdeslirp_open(&mut cfg) };
         if slirp.is_null() {
-            return Err(std::io::Error::other("vdeslirp_open failed"));
+            let err = std::io::Error::last_os_error();
+            return Err(std::io::Error::other(format!(
+                "vdeslirp_open returned NULL (errno: {}). \
+                 Likely causes: (1) file descriptor limit reached — check `ulimit -n`; \
+                 (2) thread or socketpair creation blocked by a seccomp/container policy; \
+                 (3) libvdeslirp/libslirp ABI mismatch — this build expects libvdeslirp \
+                 0.1.x linked against libslirp 4.x (check `pkg-config --modversion vdeslirp libslirp`)",
+                err
+            )));
         }
 
         let host = InAddr::from_str("127.0.0.1");
@@ -197,7 +199,7 @@ pub fn network_main(
         let mut net = match VirtioNet::new(ttdevice, l2cpu_idx) {
             Ok(n) => n,
             Err(e) => {
-                eprintln!("network: failed to initialize slirp: {}", e);
+                eprintln!("network: failed to initialize slirp user-mode networking: {}", e);
                 return;
             }
         };

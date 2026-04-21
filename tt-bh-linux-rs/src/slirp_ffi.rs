@@ -26,7 +26,7 @@ pub struct InAddr {
 }
 
 extern "C" {
-    pub fn vdeslirp_init(cfg: *mut SlirpConfig, flags: libc::c_int) -> libc::c_int;
+    pub fn vdeslirp_init(cfg: *mut SlirpConfig, flags: libc::c_int);
     pub fn vdeslirp_open(cfg: *mut SlirpConfig) -> *mut VdeSlirp;
     pub fn vdeslirp_add_fwd(
         slirp: *mut VdeSlirp,
