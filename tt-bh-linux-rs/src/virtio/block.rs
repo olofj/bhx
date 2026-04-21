@@ -19,7 +19,9 @@ const VIRTIO_BLK_T_OUT: u32 = 1; // write to disk
 
 // VirtIO IDs
 const VIRTIO_ID_BLOCK: u32 = 2;
-const VIRTIO_F_VERSION_1_BIT: u32 = 1 << (32 - 32); // bit 0 of features[1]
+// VIRTIO_F_VERSION_1 is bit 32 in the combined feature space; in features[1]
+// (the high 32 bits) that's bit 0.
+const VIRTIO_F_VERSION_1_BIT: u32 = 1;
 
 /// VirtIO block request header (from virtio_blk_outhdr).
 #[repr(C)]
@@ -101,7 +103,7 @@ impl VirtioBlk {
     }
 
     pub fn num_sectors(&self) -> u64 {
-        ((self.file_size + self.sector_size - 1) / self.sector_size) as u64
+        self.file_size.div_ceil(self.sector_size) as u64
     }
 }
 

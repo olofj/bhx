@@ -4,7 +4,10 @@
 //! tt-bh-linux — unified Rust binary for booting and managing Linux on
 //! Tenstorrent Blackhole L2CPU (SiFive X280) RISC-V cores.
 
-#[allow(dead_code)]
+// Many items across the tree are scaffolding for partially-implemented
+// subcommands (boot, kmd ioctls, etc.) — keep them compiled without noise.
+#![allow(dead_code)]
+
 mod boot;
 mod clock;
 mod console;
@@ -54,7 +57,6 @@ struct Cli {
 
     /// Attach the interactive console (default)
     #[arg(long = "console", global = true, overrides_with = "no_console")]
-    #[allow(dead_code)]
     console: bool,
 
     /// Skip attaching the interactive console
@@ -280,18 +282,13 @@ fn ctrlc_setup(exit_flag: &Arc<AtomicBool>) {
     // Wire the Arc to point at the same static (they share the same AtomicBool
     // value via the signal handler writing GLOBAL_EXIT, and threads checking
     // their Arc clone). We store the Arc's pointer so the handler can set it.
-    unsafe {
-        EXIT_FLAG_PTR.store(
-            Arc::as_ptr(exit_flag) as usize,
-            Ordering::SeqCst,
-        );
-    }
+    EXIT_FLAG_PTR.store(Arc::as_ptr(exit_flag) as usize, Ordering::SeqCst);
 
     // Use sigaction instead of signal — signal() has undefined behavior in
     // multithreaded programs on some platforms and may reset to SIG_DFL.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = signal_handler as usize;
+        sa.sa_sigaction = signal_handler as *const () as usize;
         sa.sa_flags = libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());

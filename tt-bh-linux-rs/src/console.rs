@@ -3,7 +3,7 @@
 
 //! Virtual UART console — circular buffer communication with OpenSBI on X280.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::ptr;
 use std::sync::atomic::{self, AtomicBool, Ordering};
 use std::sync::Arc;
@@ -157,9 +157,9 @@ fn uart_loop(l2cpu: &L2Cpu, exit_flag: &AtomicBool) -> io::Result<i32> {
             l2cpu.get_persistent_2m_window(starting_address + debug_ptr as u64)?;
         let desc = desc_window.get_window() as *const DebugDescriptor;
 
-        for i in 0..8 {
+        for (i, &expected) in EYE_CATCHER.iter().enumerate() {
             let byte = unsafe { ptr::read_volatile(&(*desc).eye_catcher[i]) };
-            if byte != EYE_CATCHER[i] {
+            if byte != expected {
                 eprintln!(
                     "L2CPU[{}, {}] debug descriptor eye catcher mismatch",
                     tile.x, tile.y
