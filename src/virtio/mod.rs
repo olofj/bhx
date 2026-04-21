@@ -93,6 +93,11 @@ pub trait VirtioDeviceImpl {
     fn process_queue_data(&mut self, queue_idx: u32, addr: *mut u8, len: u64);
     fn process_queue_complete(&mut self, queue_idx: u32, addr: *mut u8, len: u64);
     fn queue_has_data(&self, queue_idx: u32) -> bool;
+    /// Populate device-specific config at MMIO offset 0x100. Called once
+    /// during cold-start, after the framework has zeroed the standard
+    /// register window (0x00..0x200). Must happen *after* the zero; writing
+    /// config before `run_device` would be wiped out.
+    fn init_config(&self, _config: *mut u8) {}
 }
 
 /// MMIO register pointers — all volatile.
@@ -269,6 +274,10 @@ pub fn run_device(
             ptr::write_volatile(mmio_base.add(0x018) as *mut u32, 1); // sw_impl
             ptr::write_volatile(regs.sel_generation, 0);
         }
+
+        // Populate device-specific config region now that the zero above
+        // has cleared it. The guest will read this during probe.
+        device.init_config(unsafe { mmio_base.add(VIRTIO_MMIO_CONFIG) });
 
         let features = device.device_features();
 
