@@ -147,6 +147,14 @@ impl MmioRegs {
 
 const QUEUE_SIZE: u16 = 16384;
 
+// Warm-restart stash: we persist the per-queue descriptor/avail/used ring
+// addresses in the high half of the MMIO region so a fresh server can resume
+// a guest that's already past virtio init (e.g., after Ctrl-C + reconnect).
+// The standard virtio registers live in [0x000, 0x100); device-specific config
+// in [0x100, ~0x120); we use [0x200, 0x200 + 24*num_queues) for the stash.
+const STASH_OFFSET: usize = 0x200;
+const STASH_PER_QUEUE: usize = 24; // desc_addr + avail_addr + used_addr, each u64
+
 /// Run a VirtIO device: setup MMIO, negotiate features, process descriptors.
 pub fn run_device(
     device: &mut dyn VirtioDeviceImpl,
@@ -166,93 +174,228 @@ pub fn run_device(
         .expect("failed to create MMIO window");
     let mmio_base = window.get_window();
 
-    // Zero first 0x200 bytes
-    unsafe {
-        ptr::write_bytes(mmio_base, 0, 0x200);
-    }
+    let num_queues = device.num_queues();
+    let mem_end = starting_address + l2cpu.memory_size();
+    let in_range = |addr: u64| addr >= starting_address && addr < mem_end;
+
+    // Warm-restart detection: if the MMIO region already has our magic and a
+    // full set of stashed queue addresses from a prior successful handshake,
+    // the guest driver is already past init and won't re-run it. Skip to the
+    // main loop using the stashed addresses.
+    //
+    // We deliberately don't key off the DRIVER_OK status bit: a previous
+    // server's cold-start may have zeroed the standard register window after
+    // the guest set DRIVER_OK, leaving status=0 even though the guest is
+    // still fully initialized. Valid stash + matching magic is a stronger
+    // signal — stash is only written at the end of a successful Phase 3, so
+    // an all-in-range stash means a prior server got clean queue addresses.
+    let (descriptor_table_address, available_ring_address, used_ring_address, warm_restarted) = unsafe {
+        let existing_magic = ptr::read_volatile(mmio_base.add(VIRTIO_MMIO_MAGIC_VALUE) as *const u32);
+        let existing_dev_id = ptr::read_volatile(mmio_base.add(VIRTIO_MMIO_DEVICE_ID) as *const u32);
+        let existing_status = ptr::read_volatile(mmio_base.add(VIRTIO_MMIO_STATUS) as *const u32);
+
+        let mut desc = vec![0u64; num_queues as usize];
+        let mut avail = vec![0u64; num_queues as usize];
+        let mut used = vec![0u64; num_queues as usize];
+        let mut stash_all_valid = true;
+        let mut stash_all_zero = true;
+        for i in 0..num_queues as usize {
+            let base = mmio_base.add(STASH_OFFSET + i * STASH_PER_QUEUE);
+            desc[i] = ptr::read_volatile(base as *const u64);
+            avail[i] = ptr::read_volatile(base.add(8) as *const u64);
+            used[i] = ptr::read_volatile(base.add(16) as *const u64);
+            if desc[i] != 0 || avail[i] != 0 || used[i] != 0 {
+                stash_all_zero = false;
+            }
+            if !in_range(desc[i]) || !in_range(avail[i]) || !in_range(used[i]) {
+                stash_all_valid = false;
+            }
+        }
+
+        let magic_matches = existing_magic == VIRTIO_MAGIC
+            && existing_dev_id == device.device_id();
+
+        if magic_matches && stash_all_valid {
+            eprintln!(
+                "virtio: device {} warm restart — resuming from stashed queue state (status={:#x})",
+                existing_dev_id, existing_status
+            );
+            (desc, avail, used, true)
+        } else {
+            if magic_matches && !stash_all_zero {
+                // We've been here before but the stash is incomplete — a
+                // previous cold-start handshake was interrupted partway
+                // through Phase 3. Zeroing and trying again is the best we
+                // can do; it'll only succeed if the guest is still mid-init.
+                eprintln!(
+                    "virtio: device {} has partial stashed state (magic set but stash invalid). \
+                     Retrying cold-start handshake — if the guest already finished init this will hang; \
+                     reboot the guest (`sudo reboot` on the guest console) to recover.",
+                    existing_dev_id
+                );
+            } else if magic_matches {
+                eprintln!(
+                    "virtio: device {} has no stashed state from a prior run (probably first use of a \
+                     server version with warm-restart support). If the guest is already past virtio init \
+                     the cold-start handshake will hang; reboot the guest to recover.",
+                    existing_dev_id
+                );
+            }
+            (
+                vec![0u64; num_queues as usize],
+                vec![0u64; num_queues as usize],
+                vec![0u64; num_queues as usize],
+                false,
+            )
+        }
+    };
 
     let regs = MmioRegs::new(mmio_base);
 
-    // Initialize MMIO registers
-    unsafe {
-        ptr::write_volatile(regs.magic_value, VIRTIO_MAGIC);
-        ptr::write_volatile(mmio_base.add(VIRTIO_MMIO_VERSION) as *mut u32, 2);
-        ptr::write_volatile(mmio_base.add(VIRTIO_MMIO_DEVICE_ID) as *mut u32, device.device_id());
-        ptr::write_volatile(regs.queue_num_max, QUEUE_SIZE as u32);
-        ptr::write_volatile(mmio_base.add(0x018) as *mut u32, 1); // sw_impl
-        ptr::write_volatile(regs.sel_generation, 0);
-    }
-
-    // Write device-specific config
-    let features = device.device_features();
-
-    // Phase 1: Wait for DRIVER status
-    while !exit_flag.load(Ordering::Relaxed) {
-        if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_DRIVER != 0 {
-            break;
+    let (descriptor_table_address, available_ring_address, used_ring_address) = if warm_restarted {
+        (descriptor_table_address, available_ring_address, used_ring_address)
+    } else {
+        // Cold start: zero the standard register window (preserving stash at
+        // 0x200+) and drive the guest through the init handshake.
+        unsafe {
+            ptr::write_bytes(mmio_base, 0, 0x200);
         }
-    }
 
-    // Phase 2: Feature negotiation via sel_generation
-    let mut prev_gen: u32 = 0;
-    while !exit_flag.load(Ordering::Relaxed) {
-        let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
-        if curr_gen != prev_gen {
-            let sel = unsafe { ptr::read_volatile(regs.device_features_sel) };
-            unsafe {
-                ptr::write_volatile(regs.device_features, features[sel as usize & 1]);
+        unsafe {
+            ptr::write_volatile(regs.magic_value, VIRTIO_MAGIC);
+            ptr::write_volatile(mmio_base.add(VIRTIO_MMIO_VERSION) as *mut u32, 2);
+            ptr::write_volatile(mmio_base.add(VIRTIO_MMIO_DEVICE_ID) as *mut u32, device.device_id());
+            ptr::write_volatile(regs.queue_num_max, QUEUE_SIZE as u32);
+            ptr::write_volatile(mmio_base.add(0x018) as *mut u32, 1); // sw_impl
+            ptr::write_volatile(regs.sel_generation, 0);
+        }
+
+        let features = device.device_features();
+
+        // Phase 1: Wait for DRIVER status.
+        //
+        // If the guest was already past virtio init when the server started,
+        // it won't re-assert DRIVER and this loop waits forever. Nudge the
+        // user every few seconds so it's clear what's happening.
+        let phase1_start = std::time::Instant::now();
+        let mut next_hint = phase1_start + std::time::Duration::from_secs(5);
+        while !exit_flag.load(Ordering::Relaxed) {
+            if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_DRIVER != 0 {
+                break;
             }
-            unsafe {
-                ptr::write_volatile(regs.sel_generation, curr_gen + 1);
+            if std::time::Instant::now() >= next_hint {
+                eprintln!(
+                    "virtio: device {} still waiting for the guest to start virtio init (DRIVER bit). \
+                     If the guest is already up, reboot it (`sudo reboot` on the guest console) to re-run init.",
+                    device.device_id()
+                );
+                next_hint += std::time::Duration::from_secs(15);
             }
-            prev_gen = curr_gen + 1;
+            unsafe { libc::usleep(1000); }
         }
-        if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_FEATURES_OK != 0 {
-            break;
+
+        // Phase 2: Feature negotiation via sel_generation.
+        //
+        // sel_generation is shared with Phase 3, so we must be careful not to
+        // consume a queue-setup bump as if it were a feature event. The guest
+        // sets FEATURES_OK between the last feature bump and the first queue
+        // bump; if FEATURES_OK is observed, any outstanding bump belongs to
+        // Phase 3 and we leave it for that loop to handle.
+        let mut prev_gen: u32 = 0;
+        while !exit_flag.load(Ordering::Relaxed) {
+            if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_FEATURES_OK != 0 {
+                break;
+            }
+            let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
+            if curr_gen != prev_gen {
+                // Re-check status *after* reading sel_generation to close the
+                // window where the guest flipped FEATURES_OK and bumped the
+                // generation for queue setup between our two reads.
+                if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_FEATURES_OK != 0 {
+                    break;
+                }
+                let sel = unsafe { ptr::read_volatile(regs.device_features_sel) };
+                unsafe {
+                    ptr::write_volatile(regs.device_features, features[sel as usize & 1]);
+                }
+                unsafe {
+                    ptr::write_volatile(regs.sel_generation, curr_gen + 1);
+                }
+                prev_gen = curr_gen + 1;
+            }
         }
-    }
 
-    let num_queues = device.num_queues();
-    let mut descriptor_table_address = vec![0u64; num_queues as usize];
-    let mut available_ring_address = vec![0u64; num_queues as usize];
-    let mut used_ring_address = vec![0u64; num_queues as usize];
+        let mut desc = vec![0u64; num_queues as usize];
+        let mut avail = vec![0u64; num_queues as usize];
+        let mut used = vec![0u64; num_queues as usize];
 
-    // Phase 3: Queue address exchange
-    let mem_end = starting_address + l2cpu.memory_size();
-    while !exit_flag.load(Ordering::Relaxed) {
-        let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
-        unsafe { ptr::write_volatile(regs.queue_ready, 0); }
-        if curr_gen != prev_gen {
-            let q = unsafe { ptr::read_volatile(regs.queue_select) } as usize;
-            if q >= num_queues as usize {
-                // Invalid queue index from guest — skip this generation
+        // Phase 3: Queue address exchange. Track which queues have been
+        // configured; only break when every queue has been seen. The earlier
+        // version broke on the last queue index, which loses addresses if a
+        // stray sel_generation bump during the Phase 2/3 transition gets
+        // consumed by Phase 2.
+        let mut queues_seen = vec![false; num_queues as usize];
+        while !exit_flag.load(Ordering::Relaxed) {
+            let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
+            unsafe { ptr::write_volatile(regs.queue_ready, 0); }
+            if curr_gen != prev_gen {
+                let q = unsafe { ptr::read_volatile(regs.queue_select) } as usize;
+                if q >= num_queues as usize {
+                    // Invalid queue index from guest — skip this generation
+                    unsafe { ptr::write_volatile(regs.sel_generation, curr_gen + 1); }
+                    prev_gen = curr_gen + 1;
+                    unsafe { libc::usleep(1); }
+                    continue;
+                }
+
+                desc[q] = unsafe {
+                    ((ptr::read_volatile(regs.queue_desc_high) as u64) << 32)
+                        | (ptr::read_volatile(regs.queue_desc_low) as u64)
+                };
+                avail[q] = unsafe {
+                    ((ptr::read_volatile(regs.queue_avail_high) as u64) << 32)
+                        | (ptr::read_volatile(regs.queue_avail_low) as u64)
+                };
+                used[q] = unsafe {
+                    ((ptr::read_volatile(regs.queue_used_high) as u64) << 32)
+                        | (ptr::read_volatile(regs.queue_used_low) as u64)
+                };
+                queues_seen[q] = true;
+
                 unsafe { ptr::write_volatile(regs.sel_generation, curr_gen + 1); }
                 prev_gen = curr_gen + 1;
-                unsafe { libc::usleep(1); }
-                continue;
+
+                if queues_seen.iter().all(|&b| b) {
+                    break;
+                }
             }
+            unsafe { libc::usleep(1); }
+        }
 
-            descriptor_table_address[q] = unsafe {
-                ((ptr::read_volatile(regs.queue_desc_high) as u64) << 32)
-                    | (ptr::read_volatile(regs.queue_desc_low) as u64)
-            };
-            available_ring_address[q] = unsafe {
-                ((ptr::read_volatile(regs.queue_avail_high) as u64) << 32)
-                    | (ptr::read_volatile(regs.queue_avail_low) as u64)
-            };
-            used_ring_address[q] = unsafe {
-                ((ptr::read_volatile(regs.queue_used_high) as u64) << 32)
-                    | (ptr::read_volatile(regs.queue_used_low) as u64)
-            };
+        // Persist the queue addresses so a future server instance can resume.
+        unsafe {
+            for i in 0..num_queues as usize {
+                let base = mmio_base.add(STASH_OFFSET + i * STASH_PER_QUEUE);
+                ptr::write_volatile(base as *mut u64, desc[i]);
+                ptr::write_volatile(base.add(8) as *mut u64, avail[i]);
+                ptr::write_volatile(base.add(16) as *mut u64, used[i]);
+            }
+        }
 
-            unsafe { ptr::write_volatile(regs.sel_generation, curr_gen + 1); }
-            prev_gen = curr_gen + 1;
-
-            if q == (num_queues as usize - 1) {
+        // Wait for DRIVER_OK
+        while !exit_flag.load(Ordering::Relaxed) {
+            if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_DRIVER_OK != 0 {
                 break;
             }
         }
-        unsafe { libc::usleep(1); }
+
+        (desc, avail, used)
+    };
+
+    // If the user interrupted the handshake, bail out cleanly rather than
+    // falling through to validate_addr with zeroed addresses.
+    if exit_flag.load(Ordering::Relaxed) {
+        return;
     }
 
     // Compute pointers to virtqueue structures in L2CPU memory
@@ -284,15 +427,15 @@ pub fn run_device(
         });
     }
 
-    // Wait for DRIVER_OK
-    while !exit_flag.load(Ordering::Relaxed) {
-        if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_DRIVER_OK != 0 {
-            break;
+    // Main device loop. On warm restart, resume processed[qi] from the used
+    // ring's idx — everything before that was completed by the previous server,
+    // so we pick up exactly where it left off.
+    let mut processed = vec![0u16; num_queues as usize];
+    if warm_restarted {
+        for qi in 0..num_queues as usize {
+            processed[qi] = unsafe { ptr::read_volatile(&(*used_ptrs[qi]).idx) };
         }
     }
-
-    // Main device loop
-    let mut processed = vec![0u16; num_queues as usize];
     let queue_header_size = device.queue_header_size();
 
     while !exit_flag.load(Ordering::Relaxed) {
