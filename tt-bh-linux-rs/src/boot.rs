@@ -11,6 +11,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::clock::{self, PllAccess};
+use crate::fdt_ffi::Fdt;
 use crate::l2cpu::L2CPU_TILES;
 
 /// Read a binary file and pad to 4-byte alignment.
@@ -52,25 +53,61 @@ impl<'a> PllAccess for AxiPllAccess<'a> {
     }
 }
 
+/// Check if the given L2CPU is currently released from reset (i.e. running).
+///
+/// In `L2CPU_RESET` at `0x80030014`, bit `idx + 4` is the release bit: 0 means
+/// held in reset, 1 means running. The register sits in AXI tile `(8, 0)` and
+/// is readable regardless of L2CPU state.
+pub fn l2cpu_is_running(chip: &dyn AxiAccess, l2cpu_idx: usize) -> bool {
+    let reset_reg: u64 = 0x80030014;
+    let val = chip.axi_read32(reset_reg);
+    let bit_idx = l2cpu_idx + 4;
+    let running = (val >> bit_idx) & 1 == 1;
+    eprintln!(
+        "[l2cpu_is_running] L2CPU_RESET@0x{:x}={:#010x}, bit {}={}, running={}",
+        reset_reg,
+        val,
+        bit_idx,
+        (val >> bit_idx) & 1,
+        running,
+    );
+    running
+}
+
 /// Reset the X280 CPUs via the reset unit.
+///
+/// In `L2CPU_RESET` at `reset_unit_base + 0x14`, bit `idx + 4` releases L2CPU
+/// `idx` from reset when set. This mirrors boot.py exactly: a preceding PCIe
+/// link reset is assumed to have zeroed the register, so a pure OR-in is an
+/// effective 0→1 edge. Calling this on a running L2CPU *in place* (without a
+/// prior link reset) is not supported — it will leave PCIe/NOC traffic in
+/// flight and has been observed to hard-crash the host.
 pub fn reset_x280(chip: &dyn AxiAccess, l2cpu_indices: &[usize]) {
     let reset_unit_base: u64 = 0x80030000;
+    let reset_reg = reset_unit_base + 0x14;
 
-    // Step down to 200MHz
+    eprintln!("[reset_x280] stepping PLL down to 200 MHz");
     let access = AxiPllAccess { chip };
     clock::set_frequency(&access, 200);
 
-    // Assert reset for each L2CPU
-    let mut reset_val = chip.axi_read32(reset_unit_base + 0x14);
+    let reset_val_before = chip.axi_read32(reset_reg);
+    let mut reset_val = reset_val_before;
+    let mut mask: u32 = 0;
     for &idx in l2cpu_indices {
+        mask |= 1 << (idx + 4);
         reset_val |= 1 << (idx + 4);
     }
-    chip.axi_write32(reset_unit_base + 0x14, reset_val);
-    // Read-back to ensure write committed
-    let _ = chip.axi_read32(reset_unit_base + 0x14);
+    eprintln!(
+        "[reset_x280] L2CPU_RESET@0x{:x}: {:#010x} | {:#010x} -> {:#010x} (releasing L2CPU {:?})",
+        reset_reg, reset_val_before, mask, reset_val, l2cpu_indices
+    );
+    chip.axi_write32(reset_reg, reset_val);
+    let reset_val_after = chip.axi_read32(reset_reg);
+    eprintln!("[reset_x280] L2CPU_RESET readback: {:#010x}", reset_val_after);
 
-    // Step up to 1750MHz
+    eprintln!("[reset_x280] stepping PLL up to 1750 MHz");
     clock::set_frequency(&access, 1750);
+    eprintln!("[reset_x280] done");
 }
 
 /// Boot sequence for a single L2CPU.
@@ -89,47 +126,72 @@ pub fn boot_l2cpu(
 ) -> std::io::Result<()> {
     let tile = L2CPU_TILES[l2cpu_idx];
     let l2cpu_base: u64 = 0xfffff7fefff10000;
+    eprintln!(
+        "[boot_l2cpu] L2CPU {} -> tile ({}, {}), l2cpu_base=0x{:x}",
+        l2cpu_idx, tile.x, tile.y, l2cpu_base
+    );
 
-    // Enable L3 cache
     let l3_reg_base: u64 = 0x02010000;
+    eprintln!("[boot_l2cpu] enabling L3 cache at 0x{:x}+8", l3_reg_base);
     chip.noc_write32(0, tile.x, tile.y, l3_reg_base + 8, 0x0f);
-    let _ = chip.noc_read32(0, tile.x, tile.y, l3_reg_base + 8);
+    let l3_readback = chip.noc_read32(0, tile.x, tile.y, l3_reg_base + 8);
+    eprintln!("[boot_l2cpu]   L3 readback: {:#x}", l3_readback);
 
-    // Load OpenSBI
     let opensbi_bytes = read_bin_file(opensbi_path)?;
-    eprintln!("Writing OpenSBI to 0x{:x}", opensbi_addr);
+    eprintln!(
+        "[boot_l2cpu] Writing OpenSBI ({} bytes from {}) to 0x{:x}",
+        opensbi_bytes.len(),
+        opensbi_path.display(),
+        opensbi_addr
+    );
     chip.noc_write(0, tile.x, tile.y, opensbi_addr, &opensbi_bytes);
 
-    // Load kernel if provided
     if let Some(kpath) = kernel_path {
         let kernel_bytes = read_bin_file(kpath)?;
-        eprintln!("Writing Kernel to 0x{:x}", kernel_addr);
+        eprintln!(
+            "[boot_l2cpu] Writing Kernel ({} bytes from {}) to 0x{:x}",
+            kernel_bytes.len(),
+            kpath.display(),
+            kernel_addr
+        );
         chip.noc_write(0, tile.x, tile.y, kernel_addr, &kernel_bytes);
     }
 
-    // Load DTB
-    eprintln!("Writing DTB to 0x{:x}", dtb_addr);
     let mut dtb_padded = dtb_bytes.to_vec();
     let padding = dtb_padded.len() % 4;
     if padding != 0 {
         dtb_padded.extend(std::iter::repeat_n(0u8, 4 - padding));
     }
+    eprintln!(
+        "[boot_l2cpu] Writing DTB ({} bytes, padded to {}) to 0x{:x}",
+        dtb_bytes.len(),
+        dtb_padded.len(),
+        dtb_addr
+    );
     chip.noc_write(0, tile.x, tile.y, dtb_addr, &dtb_padded);
 
-    // Load rootfs if provided (initramfs mode)
     if let Some(rpath) = rootfs_path {
         let rootfs_bytes = read_bin_file(rpath)?;
-        eprintln!("Writing rootfs to 0x{:x}", rootfs_addr);
+        eprintln!(
+            "[boot_l2cpu] Writing rootfs ({} bytes from {}) to 0x{:x}",
+            rootfs_bytes.len(),
+            rpath.display(),
+            rootfs_addr
+        );
         chip.noc_write(0, tile.x, tile.y, rootfs_addr, &rootfs_bytes);
     }
 
-    // Set reset vectors for all 4 cores
     let reset_vector_0 = (opensbi_addr & 0xffffffff) as u32;
     let reset_vector_1 = (opensbi_addr >> 32) as u32;
+    eprintln!(
+        "[boot_l2cpu] Setting reset vectors for 4 cores: lo={:#x}, hi={:#x}",
+        reset_vector_0, reset_vector_1
+    );
     for core in 0..4u64 {
         chip.noc_write32(0, tile.x, tile.y, l2cpu_base + core * 8, reset_vector_0);
         chip.noc_write32(0, tile.x, tile.y, l2cpu_base + core * 8 + 4, reset_vector_1);
     }
+    eprintln!("[boot_l2cpu] L2CPU {} image + vectors loaded", l2cpu_idx);
 
     Ok(())
 }
@@ -138,36 +200,117 @@ pub fn boot_l2cpu(
 pub fn configure_prefetchers(chip: &dyn AxiAccess, l2cpu_idx: usize) {
     let tile = L2CPU_TILES[l2cpu_idx];
     let l2_prefetch_base: u64 = 0x02030000;
+    eprintln!(
+        "[configure_prefetchers] L2CPU {} tile ({}, {}) base=0x{:x}",
+        l2cpu_idx, tile.x, tile.y, l2_prefetch_base
+    );
     for offset in &[0x0000u64, 0x2000, 0x4000, 0x6000] {
         chip.noc_write32(0, tile.x, tile.y, l2_prefetch_base + offset, 0x15811);
         chip.noc_write32(0, tile.x, tile.y, l2_prefetch_base + offset + 4, 0x38c84e);
     }
+    eprintln!("[configure_prefetchers] done");
 }
 
-/// Modify a DTB to add bootargs, reserved memory, and virtio devices.
+/// Boot-device selection for the guest kernel. Controls the `bootargs` value
+/// and whether an initramfs is referenced.
+#[derive(Debug, Clone)]
+pub enum BootDevice {
+    /// `root=/dev/vda` or similar — a virtio-block backed rootfs.
+    Vda(String),
+    /// `initrd=<addr>,<len>` — no persistent disk, use the in-memory image.
+    Initramfs { addr: u64, len: u64 },
+}
+
+/// Patch a DTB to match the layout boot.py produces.
 ///
-/// This function takes raw DTB bytes and returns modified DTB bytes.
-/// Full DTB patching requires libfdt bindings or a Rust FDT library that
-/// supports modification of existing DTBs.
+/// Adds `/chosen/bootargs`, a `reserved-memory` entry for the virtio MMIO
+/// region, and four virtio MMIO nodes under `/soc`. `mem_end` is computed by
+/// the caller from the target L2CPU's `starting_address + memory_size` so we
+/// don't depend on being able to parse every vendor's memory-node naming.
 pub fn modify_dtb(
     dtb_bytes: &[u8],
-    _boot_device: &str,
-    _mem_end: u64,
+    boot_device: &BootDevice,
+    mem_end: u64,
 ) -> Result<Vec<u8>, String> {
-    // DTB modification requires parsing and modifying an existing FDT.
-    // For a complete implementation, we need Rust bindings to libfdt or a
-    // Rust FDT library that supports modification.
-    // For now, the boot.py script should be used for DTB modification.
+    eprintln!(
+        "[modify_dtb] input DTB {} bytes, mem_end=0x{:x}, boot_device={:?}",
+        dtb_bytes.len(),
+        mem_end,
+        boot_device
+    );
+    let mut fdt = Fdt::open_into(dtb_bytes, 2000)?;
 
-    // In a full implementation, we would:
-    // 1. Parse DTB, resize with +2000 bytes
-    // 2. Add/set /chosen/bootargs
-    // 3. Parse /memory@400030000000/reg -> mem_start, mem_size -> mem_end
-    // 4. Add /reserved-memory with reg=(mem_end-0x600000, 0x600000), no-map
-    // 5. Get/create PLIC phandle
-    // 6. Add 4 virtio,mmio nodes under /soc
+    let chosen = match fdt.path_offset("/chosen") {
+        Some(o) => o,
+        None => fdt.add_subnode(0, "chosen")?,
+    };
+    let bootargs = match boot_device {
+        BootDevice::Vda(dev) => format!("rw console=hvc0 earlycon=sbi root=/dev/{}", dev),
+        BootDevice::Initramfs { addr, len } => {
+            format!("rw console=hvc0 earlycon=sbi initrd=0x{:x},{}", addr, len)
+        }
+    };
+    eprintln!("[modify_dtb]   bootargs = {:?}", bootargs);
+    let mut bootargs_bytes = bootargs.into_bytes();
+    bootargs_bytes.push(0);
+    fdt.setprop(chosen, "bootargs", &bootargs_bytes)?;
 
-    // For now, return the input unchanged
-    eprintln!("WARNING: DTB modification not yet implemented in Rust. Use boot.py for DTB patching.");
-    Ok(dtb_bytes.to_vec())
+    // /reserved-memory (create if missing, mirroring boot.py)
+    let reserved = match fdt.path_offset("/reserved-memory") {
+        Some(o) => o,
+        None => {
+            let r = fdt.add_subnode(0, "reserved-memory")?;
+            fdt.setprop_u32(r, "#address-cells", 2)?;
+            fdt.setprop_u32(r, "#size-cells", 2)?;
+            fdt.setprop(r, "ranges", &[])?;
+            r
+        }
+    };
+    let virtio_reserved = fdt.add_subnode(reserved, "memory@4000afa00000")?;
+    let reserved_reg = {
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&(mem_end - 0x600000).to_be_bytes());
+        buf.extend_from_slice(&0x600000u64.to_be_bytes());
+        buf
+    };
+    fdt.setprop(virtio_reserved, "reg", &reserved_reg)?;
+    fdt.setprop(virtio_reserved, "no-map", &[])?;
+
+    // /soc and PLIC phandle
+    let soc = fdt
+        .path_offset("/soc")
+        .ok_or_else(|| "soc node not found in DT".to_string())?;
+    let plic = fdt
+        .path_offset("/soc/interrupt-controller@c000000")
+        .ok_or_else(|| "plic node not found in DT".to_string())?;
+    let mut plic_phandle = fdt.get_phandle(plic);
+    if plic_phandle == 0 {
+        plic_phandle = fdt.find_max_phandle()? + 1;
+        eprintln!("[modify_dtb]   PLIC had no phandle, allocating {}", plic_phandle);
+        fdt.setprop_u32(plic, "phandle", plic_phandle)?;
+    } else {
+        eprintln!("[modify_dtb]   PLIC phandle = {}", plic_phandle);
+    }
+
+    for i in (0..4u64).rev() {
+        let virtio_addr = mem_end - 0x200000 * (i + 1);
+        let virtio_irq = 33 - i as u32;
+        let name = format!("virtio@{:x}", virtio_addr);
+        eprintln!(
+            "[modify_dtb]   adding {} irq={} parent={}",
+            name, virtio_irq, plic_phandle
+        );
+        let node = fdt.add_subnode(soc, &name)?;
+        fdt.setprop_string(node, "compatible", "virtio,mmio")?;
+        let mut reg = Vec::with_capacity(16);
+        reg.extend_from_slice(&virtio_addr.to_be_bytes());
+        reg.extend_from_slice(&0x200000u64.to_be_bytes());
+        fdt.setprop(node, "reg", &reg)?;
+        fdt.setprop_u32(node, "interrupts", virtio_irq)?;
+        fdt.setprop_u32(node, "interrupt-parent", plic_phandle)?;
+    }
+
+    let packed = fdt.pack()?;
+    eprintln!("[modify_dtb] packed DTB {} bytes", packed.len());
+    Ok(packed)
 }

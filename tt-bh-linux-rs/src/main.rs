@@ -9,8 +9,10 @@
 #![allow(dead_code)]
 
 mod boot;
+mod chip;
 mod clock;
 mod console;
+mod fdt_ffi;
 mod image;
 mod kernel;
 mod kmd;
@@ -81,6 +83,36 @@ enum Commands {
         /// Path to device tree blob
         #[arg(long, default_value = "blackhole-card.dtb")]
         dtb: String,
+        /// Offset (relative to the L2CPU starting address) to place OpenSBI
+        #[arg(long, default_value_t = 0x0)]
+        opensbi_offset: u64,
+        /// Offset (relative to the L2CPU starting address) to place the kernel
+        #[arg(long, default_value_t = 0x200000)]
+        kernel_offset: u64,
+        /// Offset (relative to the L2CPU starting address) to place the DTB
+        #[arg(long, default_value_t = 0x100000)]
+        dtb_offset: u64,
+        /// Offset (relative to the L2CPU starting address) to place the initramfs
+        #[arg(long, default_value_t = 0xb5000000)]
+        initramfs_offset: u64,
+        /// Boot with an initramfs image instead of a virtio-block rootfs
+        #[arg(long)]
+        initramfs: Option<String>,
+        /// Root device name passed to the kernel (ignored when --initramfs is set)
+        #[arg(long, default_value = "vda")]
+        root_device: String,
+        /// Always do a full board-level PCIe link reset before booting, even
+        /// if the target L2CPU is already in reset. Disrupts other L2CPUs on
+        /// the same card (they see a PCIe blip), so by default we probe
+        /// `L2CPU_RESET` first and only reset when necessary. Use this as a
+        /// recovery escape hatch when a previous boot left the card in a
+        /// wedged state the probe can't detect.
+        #[arg(long)]
+        force_reset_pcie: bool,
+        /// After the boot sequence, do not attach the console/disk/net threads
+        /// (equivalent to exiting like boot.py does).
+        #[arg(long)]
+        no_connect: bool,
     },
     /// Console/disk/net threads only (chip already booted)
     Connect,
@@ -167,6 +199,130 @@ fn resolve_disk_path(
         None if default_exists => Some(default_path.to_string()),
         None => None,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_boot(
+    ttdevice: u32,
+    l2cpu_idx: usize,
+    opensbi_path: &str,
+    kernel_path: &str,
+    dtb_path: &str,
+    opensbi_offset: u64,
+    kernel_offset: u64,
+    dtb_offset: u64,
+    initramfs_offset: u64,
+    initramfs_path: Option<&str>,
+    root_device: &str,
+    force_reset_pcie: bool,
+) -> std::io::Result<()> {
+    if l2cpu_idx > 3 {
+        return Err(std::io::Error::other("l2cpu must be one of 0,1,2,3"));
+    }
+
+    let starting_address = l2cpu::L2CPU_STARTING_ADDRESS[l2cpu_idx];
+    let memory_size = l2cpu::L2CPU_MEMORY_SIZE[l2cpu_idx];
+    let mem_end = starting_address + memory_size;
+
+    let opensbi_addr = starting_address + opensbi_offset;
+    let kernel_addr = starting_address + kernel_offset;
+    let dtb_addr = starting_address + dtb_offset;
+    let rootfs_addr = starting_address + initramfs_offset;
+
+    eprintln!("[boot] tt device: /dev/tenstorrent/{}", ttdevice);
+    eprintln!("[boot] L2CPU index: {}", l2cpu_idx);
+    eprintln!(
+        "[boot] L2CPU memory: start=0x{:x}, size=0x{:x}, end=0x{:x}",
+        starting_address, memory_size, mem_end
+    );
+    eprintln!("[boot] load addresses:");
+    eprintln!("[boot]   opensbi    @ 0x{:x} ({})", opensbi_addr, opensbi_path);
+    eprintln!("[boot]   kernel     @ 0x{:x} ({})", kernel_addr, kernel_path);
+    eprintln!("[boot]   dtb        @ 0x{:x} ({})", dtb_addr, dtb_path);
+    if let Some(p) = initramfs_path {
+        eprintln!("[boot]   initramfs  @ 0x{:x} ({})", rootfs_addr, p);
+    }
+    eprintln!(
+        "[boot] root device: {} (ignored if initramfs is set)",
+        root_device
+    );
+    eprintln!("[boot] force_reset_pcie: {}", force_reset_pcie);
+
+    eprintln!("[boot] opening /dev/tenstorrent/{} to probe L2CPU state", ttdevice);
+    let chip = chip::BootChip::new(ttdevice)
+        .map_err(|e| std::io::Error::other(format!("open /dev/tenstorrent/{}: {}", ttdevice, e)))?;
+
+    let running = boot::l2cpu_is_running(&chip, l2cpu_idx);
+    let need_reset = force_reset_pcie || running;
+    eprintln!(
+        "[boot] L2CPU {} running={}, force_reset_pcie={} -> need_reset={}",
+        l2cpu_idx, running, force_reset_pcie, need_reset
+    );
+
+    let chip = if need_reset {
+        if running {
+            eprintln!(
+                "[boot] target L2CPU is running; full board reset is required \
+                 (other L2CPUs on this card will see a PCIe blip)"
+            );
+        } else {
+            eprintln!("[boot] --force-reset-pcie set; doing full board reset anyway");
+        }
+        // fd must be closed before the reset — PCI re-enumeration invalidates it.
+        drop(chip);
+        chip::reset_board(ttdevice)?;
+        eprintln!("[boot] board reset complete; sleeping 5s for chip to re-initialize");
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        eprintln!("[boot] reopening /dev/tenstorrent/{} post-reset", ttdevice);
+        chip::BootChip::new(ttdevice)
+            .map_err(|e| std::io::Error::other(format!("open /dev/tenstorrent/{}: {}", ttdevice, e)))?
+    } else {
+        eprintln!(
+            "[boot] target L2CPU is held in reset; skipping board reset \
+             (other L2CPUs on this card are untouched)"
+        );
+        chip
+    };
+
+    eprintln!("[boot] reading DTB from {}", dtb_path);
+    let dtb_raw = boot::read_bin_file(std::path::Path::new(dtb_path))?;
+    eprintln!("[boot] DTB read, {} bytes", dtb_raw.len());
+
+    let boot_device = match initramfs_path {
+        Some(path) => {
+            let bytes = boot::read_bin_file(std::path::Path::new(path))?;
+            let len = bytes.len() as u64;
+            boot::BootDevice::Initramfs {
+                addr: rootfs_addr,
+                len,
+            }
+        }
+        None => boot::BootDevice::Vda(root_device.to_string()),
+    };
+    let dtb_patched = boot::modify_dtb(&dtb_raw, &boot_device, mem_end)
+        .map_err(std::io::Error::other)?;
+
+    let initramfs_path_buf = initramfs_path.map(std::path::PathBuf::from);
+    eprintln!("[boot] loading L2CPU {} image via NOC tile writes", l2cpu_idx);
+    boot::boot_l2cpu(
+        &chip,
+        l2cpu_idx,
+        std::path::Path::new(opensbi_path),
+        opensbi_addr,
+        Some(std::path::Path::new(kernel_path)),
+        kernel_addr,
+        &dtb_patched,
+        dtb_addr,
+        initramfs_path_buf.as_deref(),
+        rootfs_addr,
+    )?;
+
+    eprintln!("[boot] releasing L2CPU {} from reset", l2cpu_idx);
+    boot::reset_x280(&chip, &[l2cpu_idx]);
+    eprintln!("[boot] configuring L2 prefetchers for L2CPU {}", l2cpu_idx);
+    boot::configure_prefetchers(&chip, l2cpu_idx);
+    eprintln!("[boot] complete");
+    Ok(())
 }
 
 fn run_connect(
@@ -319,11 +475,46 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Boot { opensbi, kernel, dtb }) => {
-            eprintln!("Boot command requires luwen crate integration.");
-            eprintln!("Use boot.py for now, then run: tt-bh-linux connect");
-            eprintln!("  opensbi: {}, kernel: {}, dtb: {}", opensbi, kernel, dtb);
-            return std::process::ExitCode::FAILURE;
+        Some(Commands::Boot {
+            opensbi,
+            kernel,
+            dtb,
+            opensbi_offset,
+            kernel_offset,
+            dtb_offset,
+            initramfs_offset,
+            initramfs,
+            root_device,
+            force_reset_pcie,
+            no_connect,
+        }) => {
+            if let Err(e) = run_boot(
+                cli.ttdevice,
+                cli.l2cpu,
+                &opensbi,
+                &kernel,
+                &dtb,
+                opensbi_offset,
+                kernel_offset,
+                dtb_offset,
+                initramfs_offset,
+                initramfs.as_deref(),
+                &root_device,
+                force_reset_pcie,
+            ) {
+                eprintln!("boot: {}", e);
+                return std::process::ExitCode::FAILURE;
+            }
+            if !no_connect {
+                run_connect(
+                    cli.ttdevice,
+                    cli.l2cpu,
+                    cli.disk,
+                    cli.network,
+                    !cli.no_console,
+                    cli.cloud_init,
+                );
+            }
         }
         Some(Commands::Connect) => {
             run_connect(

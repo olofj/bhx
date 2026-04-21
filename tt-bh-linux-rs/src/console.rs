@@ -96,14 +96,20 @@ struct DebugDescriptor {
     virtuart_base: u64,
 }
 
-/// RAII struct that saves/restores terminal settings.
+/// RAII struct that saves/restores terminal settings. When stdin is not a
+/// tty (e.g. piped from /dev/null in a test harness), this is a no-op.
 pub struct TerminalRawMode {
-    orig: nix::sys::termios::Termios,
+    orig: Option<nix::sys::termios::Termios>,
 }
 
 impl TerminalRawMode {
     pub fn new() -> io::Result<Self> {
         use nix::sys::termios::*;
+        let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+        if !stdin_is_tty {
+            eprintln!("[console] stdin is not a tty; skipping raw-mode setup");
+            return Ok(TerminalRawMode { orig: None });
+        }
         let orig = tcgetattr(std::io::stdin())
             .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
         let mut raw = orig.clone();
@@ -123,17 +129,19 @@ impl TerminalRawMode {
         tcsetattr(std::io::stdin(), SetArg::TCSAFLUSH, &raw)
             .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
 
-        Ok(TerminalRawMode { orig })
+        Ok(TerminalRawMode { orig: Some(orig) })
     }
 }
 
 impl Drop for TerminalRawMode {
     fn drop(&mut self) {
-        let _ = nix::sys::termios::tcsetattr(
-            std::io::stdin(),
-            nix::sys::termios::SetArg::TCSAFLUSH,
-            &self.orig,
-        );
+        if let Some(orig) = self.orig.as_ref() {
+            let _ = nix::sys::termios::tcsetattr(
+                std::io::stdin(),
+                nix::sys::termios::SetArg::TCSAFLUSH,
+                orig,
+            );
+        }
     }
 }
 

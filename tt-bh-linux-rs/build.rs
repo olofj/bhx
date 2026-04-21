@@ -3,6 +3,9 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
+    // libfdt is always needed for the DTB-patching done by the `boot` subcommand.
+    println!("cargo:rustc-link-lib=fdt");
+
     // Only link slirp libraries when the "slirp" feature is enabled.
     // This allows building without libvdeslirp/libslirp for users who
     // only need image/kernel/ramdisk management or console+disk support.

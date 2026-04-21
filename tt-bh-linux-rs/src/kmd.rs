@@ -35,6 +35,34 @@ pub struct GetDeviceInfo {
     pub output: GetDeviceInfoOut,
 }
 
+// --- RESET_DEVICE ---
+// Reset flags. RESET_PCIE_LINK=1 performs a PCIe link reset (equivalent to
+// `tt-smi -r 0`) without reloading the FW.
+pub const TENSTORRENT_RESET_DEVICE_RESTORE_STATE: u32 = 0;
+pub const TENSTORRENT_RESET_DEVICE_RESET_PCIE_LINK: u32 = 1;
+pub const TENSTORRENT_RESET_DEVICE_CONFIG_WRITE: u32 = 2;
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ResetDeviceIn {
+    pub output_size_bytes: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ResetDeviceOut {
+    pub output_size_bytes: u32,
+    pub result: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ResetDevice {
+    pub input: ResetDeviceIn,
+    pub output: ResetDeviceOut,
+}
+
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NocTlbConfig {
@@ -121,6 +149,7 @@ const fn io(magic: u8, nr: u8) -> u64 {
 }
 
 pub const IOCTL_GET_DEVICE_INFO: u64 = io(TENSTORRENT_IOCTL_MAGIC, 0);
+pub const IOCTL_RESET_DEVICE: u64 = io(TENSTORRENT_IOCTL_MAGIC, 6);
 pub const IOCTL_ALLOCATE_TLB: u64 = io(TENSTORRENT_IOCTL_MAGIC, 11);
 pub const IOCTL_FREE_TLB: u64 = io(TENSTORRENT_IOCTL_MAGIC, 12);
 pub const IOCTL_CONFIGURE_TLB: u64 = io(TENSTORRENT_IOCTL_MAGIC, 13);
@@ -128,6 +157,7 @@ pub const IOCTL_CONFIGURE_TLB: u64 = io(TENSTORRENT_IOCTL_MAGIC, 13);
 // --- Ioctl wrappers using nix ---
 
 nix::ioctl_readwrite_bad!(ioctl_get_device_info, IOCTL_GET_DEVICE_INFO, GetDeviceInfo);
+nix::ioctl_readwrite_bad!(ioctl_reset_device, IOCTL_RESET_DEVICE, ResetDevice);
 nix::ioctl_readwrite_bad!(ioctl_allocate_tlb, IOCTL_ALLOCATE_TLB, AllocateTlb);
 nix::ioctl_readwrite_bad!(ioctl_free_tlb, IOCTL_FREE_TLB, FreeTlb);
 nix::ioctl_readwrite_bad!(ioctl_configure_tlb, IOCTL_CONFIGURE_TLB, ConfigureTlb);
@@ -142,6 +172,31 @@ pub fn open_device(card: u32) -> std::io::Result<RawFd> {
     )
     .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
     Ok(fd)
+}
+
+/// Request a PCIe link reset on the given open fd.
+///
+/// `flags` is one of `TENSTORRENT_RESET_DEVICE_*`. The kernel reports a
+/// non-zero `result` for chip-side failures; we surface those as EIO.
+pub fn reset_device(fd: RawFd, flags: u32) -> std::io::Result<()> {
+    let mut req = ResetDevice {
+        input: ResetDeviceIn {
+            output_size_bytes: std::mem::size_of::<ResetDeviceOut>() as u32,
+            flags,
+        },
+        output: ResetDeviceOut::default(),
+    };
+    unsafe {
+        ioctl_reset_device(fd, &mut req)
+            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+    }
+    if req.output.result != 0 {
+        return Err(std::io::Error::other(format!(
+            "RESET_DEVICE ioctl reported result={}",
+            req.output.result
+        )));
+    }
+    Ok(())
 }
 
 /// Read device info from an open fd.
