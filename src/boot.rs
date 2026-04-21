@@ -18,7 +18,7 @@ pub fn read_bin_file(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut data = fs::read(path)?;
     let padding = data.len() % 4;
     if padding != 0 {
-        data.extend(std::iter::repeat(0u8).take(4 - padding));
+        data.extend(std::iter::repeat_n(0u8, 4 - padding));
     }
     Ok(data)
 }
@@ -74,6 +74,7 @@ pub fn reset_x280(chip: &dyn AxiAccess, l2cpu_indices: &[usize]) {
 }
 
 /// Boot sequence for a single L2CPU.
+#[allow(clippy::too_many_arguments)]
 pub fn boot_l2cpu(
     chip: &dyn AxiAccess,
     l2cpu_idx: usize,
@@ -111,7 +112,7 @@ pub fn boot_l2cpu(
     let mut dtb_padded = dtb_bytes.to_vec();
     let padding = dtb_padded.len() % 4;
     if padding != 0 {
-        dtb_padded.extend(std::iter::repeat(0u8).take(4 - padding));
+        dtb_padded.extend(std::iter::repeat_n(0u8, 4 - padding));
     }
     chip.noc_write(0, tile.x, tile.y, dtb_addr, &dtb_padded);
 

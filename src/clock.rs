@@ -68,6 +68,7 @@ fn sleep_1ns() {
 }
 
 /// Step PLL to the target frequency using the given register accessor.
+#[allow(clippy::needless_range_loop)]
 pub fn set_frequency(access: &dyn PllAccess, mhz: u32) {
     let (target_fbdiv, target_postdiv) = frequency_solution(mhz);
 

@@ -53,17 +53,14 @@ impl VirtioNet {
         let mut cfg: SlirpConfig = unsafe { std::mem::zeroed() };
         let ret = unsafe { vdeslirp_init(&mut cfg, VDE_INIT_DEFAULT) };
         if ret != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("vdeslirp_init failed with code {}", ret),
-            ));
+            return Err(std::io::Error::other(format!(
+                "vdeslirp_init failed with code {}",
+                ret
+            )));
         }
         let slirp = unsafe { vdeslirp_open(&mut cfg) };
         if slirp.is_null() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "vdeslirp_open failed",
-            ));
+            return Err(std::io::Error::other("vdeslirp_open failed"));
         }
 
         let host = InAddr::from_str("127.0.0.1");

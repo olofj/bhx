@@ -168,7 +168,7 @@ pub fn pull_ramdisk(name: &str, output: Option<&Path>) -> Result<PathBuf, String
 
 /// Print available ramdisks.
 pub fn cmd_list() {
-    println!("{:<25} {}", "NAME", "DESCRIPTION");
+    println!("{:<25} DESCRIPTION", "NAME");
     println!("{}", "-".repeat(80));
     for r in KNOWN_RAMDISKS {
         println!("{:<25} {}", r.name, r.description);

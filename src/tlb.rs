@@ -194,7 +194,7 @@ impl TlbWindow {
         let off = self.offset.checked_add(addr as usize)
             .expect("TLB window offset overflow");
         assert!(off + 4 <= self.window_size, "TLB write32 out of bounds");
-        assert!(off % 4 == 0, "TLB write32 unaligned");
+        assert!(off.is_multiple_of(4), "TLB write32 unaligned");
         unsafe {
             ptr::write_volatile(self.window.data().add(off) as *mut u32, value);
         }
@@ -205,7 +205,7 @@ impl TlbWindow {
         let off = self.offset.checked_add(addr as usize)
             .expect("TLB window offset overflow");
         assert!(off + 4 <= self.window_size, "TLB read32 out of bounds");
-        assert!(off % 4 == 0, "TLB read32 unaligned");
+        assert!(off.is_multiple_of(4), "TLB read32 unaligned");
         unsafe { ptr::read_volatile(self.window.data().add(off) as *const u32) }
     }
 

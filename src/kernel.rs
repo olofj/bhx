@@ -169,7 +169,7 @@ pub fn pull_kernel(version: Option<&str>, output_dir: Option<&Path>) -> Result<P
 
 /// Print available kernel versions.
 pub fn cmd_list() {
-    println!("{:<12} {:<8} {}", "VERSION", "DEFAULT", "DESCRIPTION");
+    println!("{:<12} {:<8} DESCRIPTION", "VERSION", "DEFAULT");
     println!("{}", "-".repeat(80));
     for k in KNOWN_KERNELS {
         let default_marker = if k.is_default { "*" } else { "" };
