@@ -168,6 +168,13 @@ impl VirtioDeviceImpl for VirtioBlk {
     fn queue_has_data(&self, _queue_idx: u32) -> bool {
         true
     }
+
+    fn init_config(&self, config: *mut u8) {
+        let cfg = config as *mut VirtioBlkConfig;
+        unsafe {
+            ptr::write_volatile(&mut (*cfg).capacity, self.num_sectors());
+        }
+    }
 }
 
 /// Block device thread main function.
@@ -198,18 +205,8 @@ pub fn disk_main(
             }
         };
 
-        // Write capacity to device config
-        {
-            let address = l2cpu.starting_address() + l2cpu.memory_size() - mmio_region_offset;
-            let config_window = l2cpu
-                .get_persistent_2m_window(address)
-                .expect("failed to create config window");
-            let config_ptr =
-                unsafe { config_window.get_window().add(0x100) as *mut VirtioBlkConfig };
-            unsafe {
-                ptr::write_volatile(&mut (*config_ptr).capacity, blk.num_sectors());
-            }
-        }
+        // Capacity is written by VirtioBlk::init_config inside run_device,
+        // after the cold-start memset. Writing it here would be clobbered.
 
         virtio::run_device(
             &mut blk,
