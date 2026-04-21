@@ -230,15 +230,38 @@ pub enum BootDevice {
 pub fn modify_dtb(
     dtb_bytes: &[u8],
     boot_device: &BootDevice,
-    mem_end: u64,
+    mem_start: u64,
+    mem_size: u64,
 ) -> Result<Vec<u8>, String> {
+    let mem_end = mem_start + mem_size;
     eprintln!(
-        "[modify_dtb] input DTB {} bytes, mem_end=0x{:x}, boot_device={:?}",
+        "[modify_dtb] input DTB {} bytes, mem=[0x{:x}..0x{:x}) ({} MB), boot_device={:?}",
         dtb_bytes.len(),
+        mem_start,
         mem_end,
+        mem_size / (1024 * 1024),
         boot_device
     );
     let mut fdt = Fdt::open_into(dtb_bytes, 2000)?;
+
+    // Patch /memory@400030000000 so the guest kernel sees only the memory
+    // this L2CPU actually owns. The input DTB is baked for L2CPU 0 (4 GiB
+    // starting at 0x4000_3000_0000); without this patch, booting L2CPU 2 or
+    // 3 (2 GiB each, with L2CPU 3 starting at 0x4000_b000_0000) leaves the
+    // kernel thinking it has 4 GiB and allocating virtio buffers past the
+    // end of its DRAM window, which our server then rejects as out-of-range.
+    // boot.py has the same bug — it reads but never writes /memory.
+    let memory_node = fdt
+        .path_offset("/memory@400030000000")
+        .ok_or_else(|| "memory@400030000000 node not found in DT".to_string())?;
+    let mut reg = Vec::with_capacity(16);
+    reg.extend_from_slice(&mem_start.to_be_bytes());
+    reg.extend_from_slice(&mem_size.to_be_bytes());
+    fdt.setprop(memory_node, "reg", &reg)?;
+    eprintln!(
+        "[modify_dtb]   /memory reg patched -> start=0x{:x} size=0x{:x}",
+        mem_start, mem_size
+    );
 
     let chosen = match fdt.path_offset("/chosen") {
         Some(o) => o,

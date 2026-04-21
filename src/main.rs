@@ -299,7 +299,7 @@ fn run_boot(
         }
         None => boot::BootDevice::Vda(root_device.to_string()),
     };
-    let dtb_patched = boot::modify_dtb(&dtb_raw, &boot_device, mem_end)
+    let dtb_patched = boot::modify_dtb(&dtb_raw, &boot_device, starting_address, memory_size)
         .map_err(std::io::Error::other)?;
 
     let initramfs_path_buf = initramfs_path.map(std::path::PathBuf::from);
