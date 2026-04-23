@@ -12,6 +12,7 @@ mod boot;
 mod chip;
 mod clock;
 mod console;
+mod daemon;
 mod fdt_ffi;
 mod image;
 mod kernel;
@@ -72,7 +73,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Boot sequence + console/disk/net threads
+    /// Boot an L2CPU via the daemon (starts the chip + guest; use `connect`
+    /// afterwards to attach a terminal).
     Boot {
         /// Path to OpenSBI binary
         #[arg(long, default_value = "fw_jump.bin")]
@@ -83,18 +85,6 @@ enum Commands {
         /// Path to device tree blob
         #[arg(long, default_value = "blackhole-card.dtb")]
         dtb: String,
-        /// Offset (relative to the L2CPU starting address) to place OpenSBI
-        #[arg(long, default_value_t = 0x0)]
-        opensbi_offset: u64,
-        /// Offset (relative to the L2CPU starting address) to place the kernel
-        #[arg(long, default_value_t = 0x200000)]
-        kernel_offset: u64,
-        /// Offset (relative to the L2CPU starting address) to place the DTB
-        #[arg(long, default_value_t = 0x100000)]
-        dtb_offset: u64,
-        /// Offset (relative to the L2CPU starting address) to place the initramfs
-        #[arg(long, default_value_t = 0xb5000000)]
-        initramfs_offset: u64,
         /// Boot with an initramfs image instead of a virtio-block rootfs
         #[arg(long)]
         initramfs: Option<String>,
@@ -104,18 +94,36 @@ enum Commands {
         /// Always do a full board-level PCIe link reset before booting, even
         /// if the target L2CPU is already in reset. Disrupts other L2CPUs on
         /// the same card (they see a PCIe blip), so by default we probe
-        /// `L2CPU_RESET` first and only reset when necessary. Use this as a
-        /// recovery escape hatch when a previous boot left the card in a
-        /// wedged state the probe can't detect.
+        /// `L2CPU_RESET` first and only reset when necessary.
         #[arg(long)]
         force_reset_pcie: bool,
-        /// After the boot sequence, do not attach the console/disk/net threads
-        /// (equivalent to exiting like boot.py does).
-        #[arg(long)]
-        no_connect: bool,
     },
-    /// Console/disk/net threads only (chip already booted)
-    Connect,
+    /// Attach a terminal to a booted L2CPU's console via the daemon.
+    Connect {
+        /// Console attach mode: ro | rw | takeover.
+        #[arg(long, default_value = "rw")]
+        mode: String,
+    },
+    /// Per-card daemon lifecycle.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+    /// Stop an L2CPU's device workers (chip stays up; warm-reattach works).
+    Stop,
+    /// Show daemon + per-L2CPU status.
+    Status,
+    /// Attach a disk image to a running L2CPU.
+    AddDisk {
+        /// Path to the disk image (.ext4 / .img).
+        path: String,
+    },
+    /// Attach virtio-net (slirp) to a running L2CPU.
+    AddNet {
+        /// SSH port to forward (for informational use; currently fixed in the daemon).
+        #[arg(long)]
+        ssh_port: Option<u16>,
+    },
     /// Manage disk images
     Image {
         #[command(subcommand)]
@@ -130,6 +138,31 @@ enum Commands {
     Ramdisk {
         #[command(subcommand)]
         action: RamdiskAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Start the daemon (double-forks unless --foreground).
+    Start {
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Stop the daemon: SIGTERM, 5s grace, SIGKILL; idempotent.
+    Stop,
+    /// Stop then start the daemon.
+    Restart {
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Show daemon + per-L2CPU status.
+    Status,
+    /// Tail the daemon log.
+    Logs {
+        #[arg(short = 'n', long, default_value_t = 200)]
+        lines: usize,
+        #[arg(long)]
+        no_follow: bool,
     },
 }
 
@@ -482,58 +515,44 @@ fn main() -> std::process::ExitCode {
 
     let cli = Cli::parse();
 
-    match cli.command {
+    let res: std::io::Result<()> = (|| match cli.command {
         Some(Commands::Boot {
             opensbi,
             kernel,
             dtb,
-            opensbi_offset,
-            kernel_offset,
-            dtb_offset,
-            initramfs_offset,
             initramfs,
             root_device,
             force_reset_pcie,
-            no_connect,
-        }) => {
-            if let Err(e) = run_boot(
-                cli.ttdevice,
-                cli.l2cpu,
-                &opensbi,
-                &kernel,
-                &dtb,
-                opensbi_offset,
-                kernel_offset,
-                dtb_offset,
-                initramfs_offset,
-                initramfs.as_deref(),
-                &root_device,
-                force_reset_pcie,
-            ) {
-                eprintln!("boot: {}", e);
-                return std::process::ExitCode::FAILURE;
-            }
-            if !no_connect {
-                run_connect(
-                    cli.ttdevice,
-                    cli.l2cpu,
-                    cli.disk,
-                    cli.network,
-                    !cli.no_console,
-                    cli.cloud_init,
-                );
-            }
+        }) => run_boot_client(
+            cli.ttdevice,
+            cli.l2cpu as u8,
+            opensbi,
+            kernel,
+            dtb,
+            initramfs,
+            root_device,
+            force_reset_pcie,
+            cli.disk,
+            cli.network,
+        ),
+        Some(Commands::Connect { mode }) => {
+            let pmode = parse_console_mode(&mode)?;
+            run_connect_client(cli.ttdevice, cli.l2cpu as u8, pmode)
         }
-        Some(Commands::Connect) => {
-            run_connect(
-                cli.ttdevice,
-                cli.l2cpu,
-                cli.disk,
-                cli.network,
-                !cli.no_console,
-                cli.cloud_init,
-            );
+        Some(Commands::Stop) => {
+            let mut sock = daemon::client::connect(cli.ttdevice)?;
+            daemon::client::stop_l2cpu(&mut sock, cli.l2cpu as u8)
         }
+        Some(Commands::Status) => daemon::runner::status(cli.ttdevice),
+        Some(Commands::AddDisk { path }) => {
+            let mut sock = daemon::client::connect(cli.ttdevice)?;
+            daemon::client::add_disk(&mut sock, cli.l2cpu as u8, path)
+        }
+        Some(Commands::AddNet { ssh_port }) => {
+            let mut sock = daemon::client::connect(cli.ttdevice)?;
+            daemon::client::add_net(&mut sock, cli.l2cpu as u8, ssh_port)
+        }
+        Some(Commands::Daemon { action }) => run_daemon_cmd(cli.ttdevice, action),
         Some(Commands::Image { action }) => {
             match action {
                 ImageAction::List => image::cmd_list_available(),
@@ -542,6 +561,7 @@ fn main() -> std::process::ExitCode {
                     image::cmd_pull(&name, output.as_deref());
                 }
             }
+            Ok(())
         }
         Some(Commands::Kernel { action }) => {
             match action {
@@ -550,6 +570,7 @@ fn main() -> std::process::ExitCode {
                     kernel::cmd_pull(version.as_deref(), output.as_deref());
                 }
             }
+            Ok(())
         }
         Some(Commands::Ramdisk { action }) => {
             match action {
@@ -558,20 +579,108 @@ fn main() -> std::process::ExitCode {
                     ramdisk::cmd_pull(&name, output.as_deref());
                 }
             }
+            Ok(())
         }
         None => {
-            run_connect(
+            // Bare invocation → attach console in rw mode, same as `connect`.
+            run_connect_client(
                 cli.ttdevice,
-                cli.l2cpu,
-                cli.disk,
-                cli.network,
-                !cli.no_console,
-                cli.cloud_init,
-            );
+                cli.l2cpu as u8,
+                daemon::protocol::ConsoleMode::Rw,
+            )
+        }
+    })();
+
+    match res {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::ExitCode::FAILURE
         }
     }
+}
 
-    std::process::ExitCode::SUCCESS
+fn parse_console_mode(s: &str) -> std::io::Result<daemon::protocol::ConsoleMode> {
+    match s {
+        "ro" => Ok(daemon::protocol::ConsoleMode::Ro),
+        "rw" => Ok(daemon::protocol::ConsoleMode::Rw),
+        "takeover" => Ok(daemon::protocol::ConsoleMode::Takeover),
+        other => Err(std::io::Error::other(format!(
+            "invalid --mode {}; expected ro|rw|takeover",
+            other
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_boot_client(
+    card: u32,
+    l2cpu: u8,
+    opensbi: String,
+    kernel: String,
+    dtb: String,
+    initramfs: Option<String>,
+    root_device: String,
+    force_reset_pcie: bool,
+    disk: Option<String>,
+    network: bool,
+) -> std::io::Result<()> {
+    let mut sock = daemon::client::connect(card)?;
+    daemon::client::boot(
+        &mut sock,
+        l2cpu,
+        opensbi,
+        kernel,
+        dtb,
+        initramfs,
+        root_device,
+        force_reset_pcie,
+    )?;
+
+    // Convenience: also wire up disk + net if the user passed --disk / -n on
+    // the boot command. Mirrors the old boot-then-connect flow minus the
+    // console (use `connect` to attach).
+    if let Some(path) = disk {
+        let mut sock = daemon::client::connect(card)?;
+        daemon::client::add_disk(&mut sock, l2cpu, path)?;
+    }
+    if network {
+        let mut sock = daemon::client::connect(card)?;
+        daemon::client::add_net(&mut sock, l2cpu, None)?;
+    }
+    Ok(())
+}
+
+fn run_connect_client(
+    card: u32,
+    l2cpu: u8,
+    mode: daemon::protocol::ConsoleMode,
+) -> std::io::Result<()> {
+    let mut sock = daemon::client::connect(card)?;
+    let (scrollback_bytes, fd) = daemon::client::attach_console(&mut sock, l2cpu, mode)?;
+    eprintln!(
+        "[connect] attached l2cpu {} ({} bytes scrollback)",
+        l2cpu, scrollback_bytes
+    );
+    let exit = Arc::new(AtomicBool::new(false));
+    daemon::terminal::pump(fd, exit)?;
+    Ok(())
+}
+
+fn run_daemon_cmd(card: u32, action: DaemonAction) -> std::io::Result<()> {
+    match action {
+        DaemonAction::Start { foreground } => {
+            daemon::runner::start(daemon::runner::StartOpts { card, foreground })
+        }
+        DaemonAction::Stop => daemon::runner::stop(card),
+        DaemonAction::Restart { foreground } => daemon::runner::restart(card, foreground),
+        DaemonAction::Status => daemon::runner::status(card),
+        DaemonAction::Logs { lines, no_follow } => daemon::runner::logs(daemon::runner::LogsOpts {
+            card,
+            follow: !no_follow,
+            lines,
+        }),
+    }
 }
 
 #[cfg(test)]
