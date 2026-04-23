@@ -349,12 +349,18 @@ fn run_connect(
     // Set up SIGINT/SIGTERM handler
     ctrlc_setup(&exit_flag);
 
-    // Create shared interrupt controller
-    // PLIC register at 0x2FF10000 + 0x404
+    // One L2Cpu per L2CPU, shared across all worker threads via Arc. This
+    // holds the two persistent 4 GB TLB windows once instead of per worker,
+    // so a single `connect` costs 2 × 4 GB TLB slots total (vs. 6 × 4 GB
+    // when console/disk/net each had their own L2Cpu).
+    let l2cpu_arc = Arc::new(
+        l2cpu::L2Cpu::new(l2cpu, ttdevice)
+            .expect("failed to create L2CPU"),
+    );
+
+    // PLIC register at 0x2FF10000 + 0x404 — carved from the shared L2Cpu.
     let interrupt_ctl = {
-        let temp_l2cpu = l2cpu::L2Cpu::new(l2cpu, ttdevice)
-            .expect("failed to create L2CPU for interrupt controller");
-        let window = temp_l2cpu
+        let window = l2cpu_arc
             .get_persistent_2m_window(0x2FF10000 + 0x404)
             .expect("failed to create interrupt window");
         Arc::new(InterruptController::new(window))
@@ -365,8 +371,9 @@ fn run_connect(
     // Console thread (default; suppress with --no-console)
     if console_enabled {
         let exit_flag = exit_flag.clone();
+        let l2cpu_arc = l2cpu_arc.clone();
         threads.push(thread::spawn(move || {
-            console::console_main(ttdevice, l2cpu, exit_flag);
+            console::console_main(l2cpu_arc, exit_flag);
         }));
     }
 
@@ -374,10 +381,10 @@ fn run_connect(
     if let Some(disk_path) = disk_path {
         let exit_flag = exit_flag.clone();
         let interrupt_ctl = interrupt_ctl.clone();
+        let l2cpu_arc = l2cpu_arc.clone();
         threads.push(thread::spawn(move || {
             block::disk_main(
-                ttdevice,
-                l2cpu,
+                l2cpu_arc,
                 interrupt_ctl,
                 33,
                 2 * 1024 * 1024,
@@ -392,10 +399,11 @@ fn run_connect(
     if network {
         let exit_flag = exit_flag.clone();
         let interrupt_ctl = interrupt_ctl.clone();
+        let l2cpu_arc = l2cpu_arc.clone();
         threads.push(thread::spawn(move || {
             network::network_main(
                 ttdevice,
-                l2cpu,
+                l2cpu_arc,
                 interrupt_ctl,
                 32,
                 4 * 1024 * 1024,
@@ -412,10 +420,10 @@ fn run_connect(
     if let Some(ci_path) = cloud_init {
         let exit_flag = exit_flag.clone();
         let interrupt_ctl = interrupt_ctl.clone();
+        let l2cpu_arc = l2cpu_arc.clone();
         threads.push(thread::spawn(move || {
             block::disk_main(
-                ttdevice,
-                l2cpu,
+                l2cpu_arc,
                 interrupt_ctl,
                 31,
                 6 * 1024 * 1024,

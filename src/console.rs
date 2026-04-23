@@ -265,17 +265,15 @@ fn uart_loop(l2cpu: &L2Cpu, exit_flag: &AtomicBool) -> io::Result<i32> {
 }
 
 /// Console thread main function. Retries on EAGAIN (chip reset).
-pub fn console_main(ttdevice: u32, l2cpu_idx: usize, exit_flag: Arc<AtomicBool>) {
+///
+/// The `L2Cpu` is shared with the disk / network / cloud-init workers so we
+/// don't burn a pair of 4 GB TLB windows per worker. If the chip is reset
+/// mid-run the shared TLB windows become stale and all workers have to bail
+/// out together — the host-level recovery is a fresh `connect` (or, in the
+/// daemon model, a fresh `daemon start`).
+pub fn console_main(l2cpu: Arc<L2Cpu>, exit_flag: Arc<AtomicBool>) {
     eprintln!("Press Ctrl-A x to exit.\n");
     while !exit_flag.load(Ordering::Relaxed) {
-        let l2cpu = match L2Cpu::new(l2cpu_idx, ttdevice) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("Error ({}) -- was the chip reset?  Retrying...", e);
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                continue;
-            }
-        };
         match uart_loop(&l2cpu, &exit_flag) {
             Ok(r) if r == -libc::EAGAIN => {
                 eprintln!("Error (UART vanished) -- was the chip reset?  Retrying...");
