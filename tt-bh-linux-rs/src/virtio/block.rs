@@ -179,8 +179,7 @@ impl VirtioDeviceImpl for VirtioBlk {
 
 /// Block device thread main function.
 pub fn disk_main(
-    ttdevice: u32,
-    l2cpu_idx: usize,
+    l2cpu: Arc<L2Cpu>,
     interrupt_ctl: Arc<InterruptController>,
     interrupt_number: u32,
     mmio_region_offset: u64,
@@ -188,15 +187,6 @@ pub fn disk_main(
     exit_flag: Arc<AtomicBool>,
 ) {
     while !exit_flag.load(Ordering::Relaxed) {
-        let l2cpu = match L2Cpu::new(l2cpu_idx, ttdevice) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("disk: failed to create L2CPU: {}", e);
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                continue;
-            }
-        };
-
         let mut blk = match VirtioBlk::new(Path::new(&disk_image_path)) {
             Ok(b) => b,
             Err(e) => {

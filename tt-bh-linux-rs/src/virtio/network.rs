@@ -180,22 +180,14 @@ impl VirtioDeviceImpl for VirtioNet {
 /// Network device thread main function.
 pub fn network_main(
     ttdevice: u32,
-    l2cpu_idx: usize,
+    l2cpu: Arc<L2Cpu>,
     interrupt_ctl: Arc<InterruptController>,
     interrupt_number: u32,
     mmio_region_offset: u64,
     exit_flag: Arc<AtomicBool>,
 ) {
+    let l2cpu_idx = l2cpu.idx();
     while !exit_flag.load(Ordering::Relaxed) {
-        let l2cpu = match L2Cpu::new(l2cpu_idx, ttdevice) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("network: failed to create L2CPU: {}", e);
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                continue;
-            }
-        };
-
         let mut net = match VirtioNet::new(ttdevice, l2cpu_idx) {
             Ok(n) => n,
             Err(e) => {

@@ -6,6 +6,7 @@
 use std::mem::ManuallyDrop;
 use std::os::unix::io::RawFd;
 use std::ptr;
+use std::sync::Mutex;
 
 use crate::clock::{self, TlbPllAccess};
 use crate::kmd;
@@ -58,11 +59,21 @@ pub struct L2Cpu {
     /// Second 4GB TLB window (0x4001_0000_0000).
     /// ManuallyDrop so we control drop order in Drop::drop.
     _second: ManuallyDrop<TlbWindow>,
+    /// Serializes `ALLOCATE_TLB` / `CONFIGURE_TLB` / `FREE_TLB` ioctls on `fd`.
+    /// The kernel driver is not safe against concurrent TLB allocation on the
+    /// same fd, so every on-demand 2 MB window goes through this mutex.
+    alloc_lock: Mutex<()>,
 }
 
-// L2Cpu is Send because the raw pointers are to memory-mapped device regions
-// that are not shared across threads without explicit synchronization.
+// Safety: L2Cpu may be shared across threads via `Arc<L2Cpu>`. The raw pointer
+// `memory` points at a per-process VA region backed by the two persistent 4 GB
+// TLB windows — those are set up once at construction and never remapped, so
+// reads/writes through `memory` are sound from any thread (the chip itself is
+// the synchronization domain, same as virtio MMIO is already racey with the
+// guest). The one path that *isn't* safe by default is TLB allocation on `fd`,
+// which is serialized by `alloc_lock`.
 unsafe impl Send for L2Cpu {}
+unsafe impl Sync for L2Cpu {}
 
 impl L2Cpu {
     pub fn new(idx: usize, card_idx: u32) -> std::io::Result<Self> {
@@ -152,6 +163,7 @@ impl L2Cpu {
             memory,
             _first: ManuallyDrop::new(first),
             _second: ManuallyDrop::new(second),
+            alloc_lock: Mutex::new(()),
         })
     }
 
@@ -185,6 +197,10 @@ impl L2Cpu {
 
     /// Create a temporary 2M TLB window and write a 32-bit value.
     pub fn write32(&self, addr: u64, value: u32) {
+        // Hold the allocator lock for the whole op so that the window's Drop
+        // (which issues FREE_TLB) also happens under the lock — concurrent
+        // FREE/ALLOCATE on the same fd would race the driver.
+        let _guard = self.alloc_lock.lock().unwrap();
         let window = TlbWindow::new_2m(self.fd, self.coordinates.x, self.coordinates.y, addr)
             .expect("failed to create TLB window for write32");
         window.write32(0, value);
@@ -192,13 +208,21 @@ impl L2Cpu {
 
     /// Create a temporary 2M TLB window and read a 32-bit value.
     pub fn read32(&self, addr: u64) -> u32 {
+        let _guard = self.alloc_lock.lock().unwrap();
         let window = TlbWindow::new_2m(self.fd, self.coordinates.x, self.coordinates.y, addr)
             .expect("failed to create TLB window for read32");
         window.read32(0)
     }
 
     /// Create a persistent 2M TLB window at the given address.
+    ///
+    /// The returned window's Drop is *not* serialized against concurrent TLB
+    /// allocations on this fd. In practice persistent windows are dropped
+    /// during shutdown or device-teardown, not while other threads are still
+    /// actively allocating, so this is acceptable. If that ever stops being
+    /// true, embed an `Arc<Mutex<()>>` into `TlbHandle` so its Drop can lock.
     pub fn get_persistent_2m_window(&self, addr: u64) -> std::io::Result<TlbWindow> {
+        let _guard = self.alloc_lock.lock().unwrap();
         TlbWindow::new_2m(self.fd, self.coordinates.x, self.coordinates.y, addr)
     }
 }
