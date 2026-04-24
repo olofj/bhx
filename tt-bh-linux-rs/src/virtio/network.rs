@@ -14,7 +14,19 @@ use crate::virtio::{self, VirtioDeviceImpl};
 
 const PACKET_SIZE: usize = 1514;
 const VIRTIO_ID_NET: u32 = 1;
-const VIRTIO_NET_F_GUEST_CSUM: u32 = 1 << 0;
+// VirtIO spec 5.1.3: feature bits of virtio-net. We advertise only
+// VIRTIO_F_VERSION_1 (bit 32 — bit 0 of features[1]) and nothing else.
+// In particular we deliberately do NOT advertise VIRTIO_NET_F_CSUM
+// (bit 0 of features[0]). That bit means "device handles packets with
+// partial checksum" — if we claim it, the guest's networking stack
+// flags outbound UDP/TCP with NETIF_F_HW_CSUM and virtio-net sets
+// VIRTIO_NET_HDR_F_NEEDS_CSUM in the vnet header, expecting us to
+// compute the L4 checksum before forwarding. We don't; we pass the
+// frame straight to slirp, which then drops the packet for failing
+// checksum validation. ICMP survived the misconfiguration only because
+// the kernel computes ICMP checksums itself regardless of device
+// offload. By advertising no csum offload, the guest stack does the
+// checksum in software and slirp accepts the packets.
 const VIRTIO_F_VERSION_1_BIT: u32 = 1 << 0; // bit 0 of features[1]
 
 /// VirtIO net header (virtio_net_hdr_mrg_rxbuf).
@@ -89,7 +101,7 @@ impl VirtioDeviceImpl for VirtioNet {
     fn queue_header_size(&self) -> u64 { self.queue_header_size }
     fn device_id(&self) -> u32 { VIRTIO_ID_NET }
     fn device_features(&self) -> [u32; 2] {
-        [VIRTIO_NET_F_GUEST_CSUM, VIRTIO_F_VERSION_1_BIT]
+        [0, VIRTIO_F_VERSION_1_BIT]
     }
 
     fn process_queue_start(&mut self, queue_idx: u32, addr: *mut u8, _len: u64) {
