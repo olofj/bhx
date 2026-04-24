@@ -411,35 +411,28 @@ fn extract_root_partition(disk: &Path, output: &Path) -> Result<(), String> {
 
 /// Parse sfdisk JSON output to find the largest partition (by sector count).
 /// Returns (start_sector, size_sectors).
+///
+/// sfdisk emits `{"partitiontable":{"partitions":[{"start":N,"size":N,...},...]}}`.
+/// We pick the partition with the largest `size`; that's reliably the rootfs
+/// for the cloud images we convert (much larger than the `/boot` / EFI
+/// partitions that sit alongside it).
 fn parse_largest_partition(json: &str) -> Result<(u64, u64), String> {
-    // Simple parser: find all "start":N and "size":N pairs
-    let mut best_start: u64 = 0;
-    let mut best_size: u64 = 0;
+    let root: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| format!("sfdisk emitted non-JSON: {}", e))?;
+    let partitions = root
+        .pointer("/partitiontable/partitions")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "sfdisk JSON missing /partitiontable/partitions array".to_string())?;
 
-    // Split by partition entries — look for "start" and "size" fields
-    let mut i = 0;
-    let bytes = json.as_bytes();
-    while i < bytes.len() {
-        if let Some(pos) = json[i..].find("\"start\"") {
-            let abs_pos = i + pos;
-            let start = parse_json_number(&json[abs_pos..], "start");
-            let size = parse_json_number(&json[abs_pos..], "size");
-
-            if let (Some(s), Some(sz)) = (start, size) {
-                if sz > best_size {
-                    best_start = s;
-                    best_size = sz;
-                }
-            }
-            i = abs_pos + 7;
-        } else {
-            break;
-        }
-    }
-
-    if best_size == 0 {
-        return Err("No partitions found in disk image".to_string());
-    }
+    let (best_start, best_size) = partitions
+        .iter()
+        .filter_map(|p| {
+            let start = p.get("start")?.as_u64()?;
+            let size = p.get("size")?.as_u64()?;
+            Some((start, size))
+        })
+        .max_by_key(|(_, size)| *size)
+        .ok_or_else(|| "No partitions found in disk image".to_string())?;
 
     eprintln!(
         "  Found root partition: start={}, size={} sectors ({} MB)",
@@ -449,22 +442,6 @@ fn parse_largest_partition(json: &str) -> Result<(u64, u64), String> {
     );
 
     Ok((best_start, best_size))
-}
-
-/// Parse a JSON number field like `"fieldname": 12345` from a substring.
-fn parse_json_number(s: &str, field: &str) -> Option<u64> {
-    let pattern = format!("\"{}\"", field);
-    let pos = s.find(&pattern)?;
-    let after_key = &s[pos + pattern.len()..];
-    // Skip whitespace and colon
-    let after_colon = after_key.find(':')? + 1;
-    let num_start = &after_key[after_colon..];
-    let num_str: String = num_start
-        .chars()
-        .skip_while(|c| c.is_whitespace())
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    num_str.parse().ok()
 }
 
 /// Resize an ext4 image to the given size.
@@ -598,5 +575,69 @@ pub fn cmd_pull(name: &str, output: Option<&str>) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Representative sfdisk JSON for a two-partition cloud image (a tiny
+    /// EFI/boot partition + a large root partition). The root is the one
+    /// with the larger `size`, which is what `parse_largest_partition`
+    /// must select regardless of partition order in the array.
+    const SFDISK_SAMPLE: &str = r#"{
+        "partitiontable": {
+            "label": "gpt",
+            "id": "A1B2C3D4-0000-0000-0000-000000000000",
+            "device": "/tmp/img.raw",
+            "unit": "sectors",
+            "firstlba": 34,
+            "lastlba": 4194270,
+            "partitions": [
+                {"node": "/tmp/img.raw1", "start": 2048,   "size": 204800,  "type": "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"},
+                {"node": "/tmp/img.raw2", "start": 206848, "size": 3985407, "type": "0FC63DAF-8483-4772-8E79-3D69D8477DE4"}
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn parse_largest_partition_picks_biggest_by_size() {
+        let (start, size) = parse_largest_partition(SFDISK_SAMPLE).unwrap();
+        assert_eq!(start, 206848);
+        assert_eq!(size, 3985407);
+    }
+
+    #[test]
+    fn parse_largest_partition_rejects_non_json() {
+        let err = parse_largest_partition("<html>nope</html>").unwrap_err();
+        assert!(err.contains("non-JSON"), "got: {}", err);
+    }
+
+    #[test]
+    fn parse_largest_partition_rejects_missing_partitions_array() {
+        let err = parse_largest_partition(r#"{"partitiontable": {}}"#).unwrap_err();
+        assert!(err.contains("partitions array"), "got: {}", err);
+    }
+
+    #[test]
+    fn parse_largest_partition_rejects_empty_partitions_array() {
+        let err = parse_largest_partition(
+            r#"{"partitiontable": {"partitions": []}}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("No partitions"), "got: {}", err);
+    }
+
+    #[test]
+    fn parse_largest_partition_survives_partitions_without_start_or_size() {
+        // A buggy sfdisk emitting a partition record with missing fields
+        // shouldn't crash us — we skip it and pick from the well-formed ones.
+        let json = r#"{"partitiontable": {"partitions": [
+            {"node": "/tmp/x1"},
+            {"node": "/tmp/x2", "start": 2048, "size": 42}
+        ]}}"#;
+        let (start, size) = parse_largest_partition(json).unwrap();
+        assert_eq!((start, size), (2048, 42));
     }
 }
