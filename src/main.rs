@@ -592,6 +592,10 @@ fn main() -> std::process::ExitCode {
         }
         Some(Commands::Status) => daemon::runner::status(cli.ttdevice),
         Some(Commands::AddDisk { path }) => {
+            // Canonicalize client-side — daemon runs with cwd=/ after
+            // double-fork, so relative paths from the user's shell would
+            // resolve against the wrong base otherwise.
+            let path = absolutize(&path)?;
             let mut sock = daemon::client::connect(cli.ttdevice)?;
             daemon::client::add_disk(&mut sock, cli.l2cpu as u8, path)
         }
