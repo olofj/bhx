@@ -49,7 +49,10 @@ pub fn serve(card: u32, listener: UnixListener) -> io::Result<()> {
     listener.set_nonblocking(true)?;
 
     eprintln!("[daemon] accepting connections on card {}", card);
-    probe_initial_chip_state(card);
+    let released = probe_initial_chip_state(card);
+    if !released.is_empty() {
+        warm_resume_released(&state, &released);
+    }
     while !state.shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((sock, _addr)) => {
@@ -80,15 +83,12 @@ pub fn serve(card: u32, listener: UnixListener) -> io::Result<()> {
 }
 
 /// Probe the chip's L2CPU_RESET register once at daemon startup and log
-/// each L2CPU's state (held-in-reset vs. released/running). Purely
-/// diagnostic today — gives the user visibility into what the chip was
-/// left in after a prior daemon run or reboot, *before* they issue any
-/// RPCs. A future iteration can use this to auto-warm-resume cores that
-/// were left running (Phase C, per graceful-baking-tulip.md).
+/// each L2CPU's state. Returns the list of core indices that are
+/// released (bit idx+4 == 1) — warm-resume candidates.
 ///
 /// Safe to call even when the chip is wedged: reading the reset register
 /// is a single AXI read to tile (8,0), no state change.
-fn probe_initial_chip_state(card: u32) {
+fn probe_initial_chip_state(card: u32) -> Vec<u8> {
     use crate::boot::AxiAccess;
     let chip = match chip::BootChip::new(card) {
         Ok(c) => c,
@@ -97,7 +97,7 @@ fn probe_initial_chip_state(card: u32) {
                 "[probe] skipping chip-state probe: open /dev/tenstorrent/{} failed: {}",
                 card, e
             );
-            return;
+            return Vec::new();
         }
     };
     let reset_reg: u64 = 0x80030014;
@@ -106,7 +106,8 @@ fn probe_initial_chip_state(card: u32) {
         "[probe] L2CPU_RESET@0x{:x}={:#010x} (card {})",
         reset_reg, val, card
     );
-    for idx in 0..4 {
+    let mut released = Vec::new();
+    for idx in 0..4u8 {
         let bit = (val >> (idx + 4)) & 1;
         let state = if bit == 1 {
             "released (running or wedged — warm-resume candidate)"
@@ -114,6 +115,46 @@ fn probe_initial_chip_state(card: u32) {
             "held in reset (cold-bootable)"
         };
         eprintln!("[probe]   L2CPU {} bit {} = {} -> {}", idx, idx + 4, bit, state);
+        if bit == 1 {
+            released.push(idx);
+        }
+    }
+    released
+}
+
+/// For each released core, construct an L2CPU runtime slot without
+/// running a boot sequence. This lets the daemon adopt cores that were
+/// left running by a previous daemon run (crash-resume) or by an
+/// out-of-band boot.
+///
+/// Only the console worker is started — the daemon has no way to know
+/// which disk image or network config was attached before, so the user
+/// must re-issue `add-disk` / `add-net` to rewire those. The chip's
+/// guest kernel stays up throughout; virtio descriptor chains re-sync
+/// on the next queue kick once workers come back.
+///
+/// On make_slot failure we log and skip the core — a failure here
+/// usually means the chip is wedged beyond what we can probe, which is
+/// non-fatal to the daemon as a whole.
+fn warm_resume_released(state: &Arc<DaemonState>, released: &[u8]) {
+    for &idx in released {
+        dlog!(
+            "[warm-resume l2cpu {}] adopting released core (console only — use add-disk/add-net to reattach)",
+            idx
+        );
+        match make_slot(state.card, idx) {
+            Ok(slot) => {
+                *state.l2cpus[idx as usize].lock().unwrap() = Some(slot);
+                dlog!("[warm-resume l2cpu {}] slot adopted", idx);
+            }
+            Err(e) => {
+                dlog!(
+                    "[warm-resume l2cpu {}] make_slot failed: {} — skipping (core stays orphaned; daemon won't manage it)",
+                    idx,
+                    e
+                );
+            }
+        }
     }
 }
 
