@@ -24,16 +24,10 @@ mod slirp_ffi;
 mod tlb;
 mod virtio;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::thread;
 
 use clap::{Parser, Subcommand};
-
-use virtio::block;
-use virtio::interrupt::InterruptController;
-#[cfg(feature = "slirp")]
-use virtio::network;
 
 #[derive(Parser)]
 #[command(name = "tt-bh-linux")]
@@ -400,154 +394,6 @@ fn run_boot(
     boot::configure_prefetchers(&chip, l2cpu_idx);
     eprintln!("[boot] complete");
     Ok(())
-}
-
-fn run_connect(
-    ttdevice: u32,
-    l2cpu: usize,
-    disk: Option<String>,
-    network: bool,
-    console_enabled: bool,
-    cloud_init: Option<String>,
-) {
-    if l2cpu > 3 {
-        eprintln!("l2cpu must be one of 0,1,2,3");
-        std::process::exit(1);
-    }
-
-    let disk_path = resolve_disk_path(
-        disk,
-        DEFAULT_DISK_PATH,
-        std::path::Path::new(DEFAULT_DISK_PATH).exists(),
-    );
-
-    let exit_flag = Arc::new(AtomicBool::new(false));
-
-    // Set up SIGINT/SIGTERM handler
-    ctrlc_setup(&exit_flag);
-
-    // One L2Cpu per L2CPU, shared across all worker threads via Arc. This
-    // holds the two persistent 4 GB TLB windows once instead of per worker,
-    // so a single `connect` costs 2 × 4 GB TLB slots total (vs. 6 × 4 GB
-    // when console/disk/net each had their own L2Cpu).
-    let l2cpu_arc = Arc::new(
-        l2cpu::L2Cpu::new(l2cpu, ttdevice)
-            .expect("failed to create L2CPU"),
-    );
-
-    // PLIC register at 0x2FF10000 + 0x404 — carved from the shared L2Cpu.
-    let interrupt_ctl = {
-        let window = l2cpu_arc
-            .get_persistent_2m_window(0x2FF10000 + 0x404)
-            .expect("failed to create interrupt window");
-        Arc::new(InterruptController::new(window))
-    };
-
-    let mut threads = Vec::new();
-
-    // Console thread (default; suppress with --no-console)
-    if console_enabled {
-        let exit_flag = exit_flag.clone();
-        let l2cpu_arc = l2cpu_arc.clone();
-        threads.push(thread::spawn(move || {
-            console::console_main(l2cpu_arc, exit_flag);
-        }));
-    }
-
-    // Disk thread (only if we have an image to serve)
-    if let Some(disk_path) = disk_path {
-        let exit_flag = exit_flag.clone();
-        let interrupt_ctl = interrupt_ctl.clone();
-        let l2cpu_arc = l2cpu_arc.clone();
-        threads.push(thread::spawn(move || {
-            block::disk_main(
-                l2cpu_arc,
-                interrupt_ctl,
-                33,
-                2 * 1024 * 1024,
-                disk_path,
-                exit_flag,
-            );
-        }));
-    }
-
-    // Network thread (requires --network and slirp feature)
-    #[cfg(feature = "slirp")]
-    if network {
-        let exit_flag = exit_flag.clone();
-        let interrupt_ctl = interrupt_ctl.clone();
-        let l2cpu_arc = l2cpu_arc.clone();
-        threads.push(thread::spawn(move || {
-            network::network_main(
-                ttdevice,
-                l2cpu_arc,
-                interrupt_ctl,
-                32,
-                4 * 1024 * 1024,
-                exit_flag,
-            );
-        }));
-    }
-    #[cfg(not(feature = "slirp"))]
-    if network {
-        eprintln!("--network requested but binary was built without the slirp feature");
-    }
-
-    // Cloud-init disk thread (optional)
-    if let Some(ci_path) = cloud_init {
-        let exit_flag = exit_flag.clone();
-        let interrupt_ctl = interrupt_ctl.clone();
-        let l2cpu_arc = l2cpu_arc.clone();
-        threads.push(thread::spawn(move || {
-            block::disk_main(
-                l2cpu_arc,
-                interrupt_ctl,
-                31,
-                6 * 1024 * 1024,
-                ci_path,
-                exit_flag,
-            );
-        }));
-    }
-
-    for t in threads {
-        let _ = t.join();
-    }
-}
-
-/// Global exit flag set by the signal handler. The Arc<AtomicBool> passed to
-/// threads points to this same static, avoiding Arc::into_raw leaks.
-static GLOBAL_EXIT: AtomicBool = AtomicBool::new(false);
-
-fn ctrlc_setup(exit_flag: &Arc<AtomicBool>) {
-    // Wire the Arc to point at the same static (they share the same AtomicBool
-    // value via the signal handler writing GLOBAL_EXIT, and threads checking
-    // their Arc clone). We store the Arc's pointer so the handler can set it.
-    EXIT_FLAG_PTR.store(Arc::as_ptr(exit_flag) as usize, Ordering::SeqCst);
-
-    // Use sigaction instead of signal — signal() has undefined behavior in
-    // multithreaded programs on some platforms and may reset to SIG_DFL.
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = signal_handler as *const () as usize;
-        sa.sa_flags = libc::SA_RESTART;
-        libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
-    }
-}
-
-static EXIT_FLAG_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-extern "C" fn signal_handler(_sig: libc::c_int) {
-    // Set the global flag
-    GLOBAL_EXIT.store(true, Ordering::SeqCst);
-    // Also set the Arc's AtomicBool so threads see it
-    let ptr = EXIT_FLAG_PTR.load(Ordering::SeqCst);
-    if ptr != 0 {
-        let flag = unsafe { &*(ptr as *const AtomicBool) };
-        flag.store(true, Ordering::SeqCst);
-    }
 }
 
 fn main() -> std::process::ExitCode {
@@ -953,7 +799,8 @@ mod tests {
 
     #[test]
     fn cli_bare_invocation_parses_like_connect() {
-        // When no subcommand is given, `main` falls through to run_connect;
+        // When no subcommand is given, `main` falls through to
+        // run_connect_client (same as the explicit `connect` subcommand);
         // the global flags must still apply.
         let cli = parse(&["tt-bh-linux", "--no-console", "-n", "-d", "x.ext4"]);
         assert!(cli.command.is_none());
