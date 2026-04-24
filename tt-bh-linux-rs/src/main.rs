@@ -704,6 +704,32 @@ mod tests {
         Cli::try_parse_from(args).expect("clap failed to parse")
     }
 
+    // --- absolutize ---------------------------------------------------------
+
+    #[test]
+    fn absolutize_errors_on_missing_file() {
+        // The canonicalize() under absolutize requires the path to exist; a
+        // typo'd rootfs needs to fail client-side before we send the bogus
+        // path over the daemon wire.
+        let res = absolutize("/definitely/not/a/real/path/xyzzy.ext4");
+        assert!(res.is_err());
+        // And the error message must name the offending path, so a cold-
+        // booted user can see which argument went wrong.
+        let msg = format!("{}", res.err().unwrap());
+        assert!(msg.contains("xyzzy.ext4"), "error should name path: {}", msg);
+    }
+
+    #[test]
+    fn absolutize_returns_absolute_for_existing_relative_path() {
+        // /etc/hosts is nearly always present on Linux and is absolute, so
+        // start from a relative form and round-trip through absolutize.
+        let abs = absolutize("/etc/hosts").expect("canonicalize /etc/hosts");
+        assert!(std::path::Path::new(&abs).is_absolute());
+        // Also exercise a relative-to-cwd case: cwd itself via ".".
+        let dot = absolutize(".").expect("canonicalize .");
+        assert!(std::path::Path::new(&dot).is_absolute());
+    }
+
     // --- resolve_disk_path ---------------------------------------------------
 
     #[test]

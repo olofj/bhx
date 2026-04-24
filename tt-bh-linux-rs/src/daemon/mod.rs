@@ -121,3 +121,41 @@ impl DaemonState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn fresh_daemon_state_has_no_slots_and_no_wedged_cores() {
+        let s = DaemonState::new(0);
+        for idx in 0..4 {
+            assert!(
+                s.l2cpus[idx].lock().unwrap().is_none(),
+                "slot {} should start empty",
+                idx
+            );
+            assert!(
+                !s.wedged[idx].load(Ordering::Relaxed),
+                "wedged[{}] should start false",
+                idx
+            );
+        }
+        assert!(!s.shutdown.load(Ordering::Relaxed));
+        assert_eq!(s.card, 0);
+    }
+
+    #[test]
+    fn wedged_flag_set_and_clear_per_core() {
+        // Exercises the read/write semantics dispatch_status relies on.
+        let s = DaemonState::new(1);
+        s.wedged[2].store(true, Ordering::SeqCst);
+        assert!(s.wedged[2].load(Ordering::Relaxed));
+        assert!(!s.wedged[0].load(Ordering::Relaxed));
+        assert!(!s.wedged[1].load(Ordering::Relaxed));
+        assert!(!s.wedged[3].load(Ordering::Relaxed));
+        s.wedged[2].store(false, Ordering::SeqCst);
+        assert!(!s.wedged[2].load(Ordering::Relaxed));
+    }
+}
