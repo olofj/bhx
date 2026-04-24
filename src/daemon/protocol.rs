@@ -54,8 +54,16 @@ pub enum Request {
     },
     /// Add a virtio-block device to a running L2CPU.
     AddDisk { l2cpu: u8, path: String },
+    /// Remove the virtio-block device from a running L2CPU (Phase A: only
+    /// one disk per L2CPU, so no selector). Joins the worker thread and
+    /// drops the disk handle. The image file is unlocked and available
+    /// to the host again.
+    RemoveDisk { l2cpu: u8 },
     /// Add a virtio-net device to a running L2CPU.
     AddNet { l2cpu: u8, ssh_port: Option<u16> },
+    /// Remove the virtio-net device from a running L2CPU. Joins the
+    /// worker thread; libvdeslirp state (TCP/NAT) is dropped.
+    RemoveNet { l2cpu: u8 },
     /// Stop a single L2CPU's device threads.
     Stop { l2cpu: u8 },
     /// Ask the daemon to exit.

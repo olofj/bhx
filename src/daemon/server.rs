@@ -230,7 +230,9 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             dispatch_attach_console(sock, &state, l2cpu, mode)
         }
         Request::AddDisk { l2cpu, path } => dispatch_add_disk(&sock, &state, l2cpu, path),
+        Request::RemoveDisk { l2cpu } => dispatch_remove_disk(&sock, &state, l2cpu),
         Request::AddNet { l2cpu, ssh_port } => dispatch_add_net(&sock, &state, l2cpu, ssh_port),
+        Request::RemoveNet { l2cpu } => dispatch_remove_net(&sock, &state, l2cpu),
         Request::Stop { l2cpu } => dispatch_stop(&sock, &state, l2cpu),
         Request::Shutdown => dispatch_shutdown(&sock, &state),
     }
@@ -802,6 +804,43 @@ fn dispatch_add_disk(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8,
     reply_ok(sock);
 }
 
+fn dispatch_remove_disk(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) {
+    dlog!("[remove_disk l2cpu {}] dispatch entry", l2cpu_idx);
+    if l2cpu_idx >= 4 {
+        reply_err(sock, "l2cpu must be 0..3");
+        return;
+    }
+    // Take the disks out under the lock, then release and join outside.
+    // stop_and_join blocks until the worker's poll loop notices the exit
+    // flag (~100 ms worst case); holding the state mutex for that long
+    // would block every other RPC on other L2CPUs.
+    let disks = {
+        let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
+        let slot = match slot_guard.as_mut() {
+            Some(s) => s,
+            None => {
+                reply_err(sock, format!("l2cpu {} is not booted", l2cpu_idx));
+                return;
+            }
+        };
+        if slot.disks.is_empty() {
+            reply_err(sock, "no disk attached");
+            return;
+        }
+        std::mem::take(&mut slot.disks)
+    };
+    for d in disks {
+        dlog!(
+            "[remove_disk l2cpu {}] joining worker for {}",
+            l2cpu_idx,
+            d.path
+        );
+        d.worker.stop_and_join();
+    }
+    dlog!("[remove_disk l2cpu {}] done — replying ok", l2cpu_idx);
+    reply_ok(sock);
+}
+
 // ---------------------------------------------------------------------------
 // AddNet
 // ---------------------------------------------------------------------------
@@ -860,6 +899,37 @@ fn dispatch_add_net(
     _ssh_port: Option<u16>,
 ) {
     reply_err(sock, "daemon built without the slirp feature");
+}
+
+fn dispatch_remove_net(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) {
+    dlog!("[remove_net l2cpu {}] dispatch entry", l2cpu_idx);
+    if l2cpu_idx >= 4 {
+        reply_err(sock, "l2cpu must be 0..3");
+        return;
+    }
+    // Take the net handle under the lock, join outside (same reasoning as
+    // dispatch_remove_disk).
+    let net = {
+        let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
+        let slot = match slot_guard.as_mut() {
+            Some(s) => s,
+            None => {
+                reply_err(sock, format!("l2cpu {} is not booted", l2cpu_idx));
+                return;
+            }
+        };
+        match slot.net.take() {
+            Some(n) => n,
+            None => {
+                reply_err(sock, "no net attached");
+                return;
+            }
+        }
+    };
+    dlog!("[remove_net l2cpu {}] joining worker", l2cpu_idx);
+    net.stop_and_join();
+    dlog!("[remove_net l2cpu {}] done — replying ok", l2cpu_idx);
+    reply_ok(sock);
 }
 
 // ---------------------------------------------------------------------------

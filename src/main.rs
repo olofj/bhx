@@ -125,12 +125,18 @@ enum Commands {
         /// Path to the disk image (.ext4 / .img).
         path: String,
     },
+    /// Detach the disk from a running L2CPU. Joins the worker thread and
+    /// releases the image file (Phase A: one disk per L2CPU, no selector).
+    RemoveDisk,
     /// Attach virtio-net (slirp) to a running L2CPU.
     AddNet {
         /// SSH port to forward (for informational use; currently fixed in the daemon).
         #[arg(long)]
         ssh_port: Option<u16>,
     },
+    /// Detach virtio-net from a running L2CPU. Drops libvdeslirp state
+    /// (active TCP/NAT sessions on the guest will reset).
+    RemoveNet,
     /// Manage disk images
     Image {
         #[command(subcommand)]
@@ -599,9 +605,17 @@ fn main() -> std::process::ExitCode {
             let mut sock = daemon::client::connect(cli.ttdevice)?;
             daemon::client::add_disk(&mut sock, cli.l2cpu as u8, path)
         }
+        Some(Commands::RemoveDisk) => {
+            let mut sock = daemon::client::connect(cli.ttdevice)?;
+            daemon::client::remove_disk(&mut sock, cli.l2cpu as u8)
+        }
         Some(Commands::AddNet { ssh_port }) => {
             let mut sock = daemon::client::connect(cli.ttdevice)?;
             daemon::client::add_net(&mut sock, cli.l2cpu as u8, ssh_port)
+        }
+        Some(Commands::RemoveNet) => {
+            let mut sock = daemon::client::connect(cli.ttdevice)?;
+            daemon::client::remove_net(&mut sock, cli.l2cpu as u8)
         }
         Some(Commands::Daemon { action }) => run_daemon_cmd(cli.ttdevice, action),
         Some(Commands::Image { action }) => {
