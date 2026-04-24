@@ -92,6 +92,10 @@ pub struct DaemonState {
     pub card: u32,
     pub started: Instant,
     pub l2cpus: [Mutex<Option<L2CpuSlot>>; 4],
+    /// Set by the startup warm-resume probe when a core's reset bit is 1
+    /// but its OSBIdbug / VIRTUART magic is missing. Cleared on successful
+    /// cold `boot`. Read by `dispatch_status` to report `Wedged`.
+    pub wedged: [AtomicBool; 4],
     /// Set by the shutdown handler to make the accept loop exit.
     pub shutdown: Arc<AtomicBool>,
 }
@@ -106,6 +110,12 @@ impl DaemonState {
                 Mutex::new(None),
                 Mutex::new(None),
                 Mutex::new(None),
+            ],
+            wedged: [
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+                AtomicBool::new(false),
             ],
             shutdown: Arc::new(AtomicBool::new(false)),
         }
