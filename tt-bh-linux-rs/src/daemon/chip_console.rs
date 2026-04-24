@@ -146,6 +146,17 @@ fn uart_pass(
     // down; the hub's fan-out is one syscall per client per push.
     let mut out_buf = [0u8; 256];
 
+    // Hysteresis for the poll-rate choice at the bottom of the loop: a
+    // single dry iteration shouldn't drop us back to the slow (idle)
+    // sleep, because bursty guest output has many small gaps. Track the
+    // time of the last observed activity and stay in fast mode until
+    // the console has been quiet for `FAST_WINDOW`. After that, switch
+    // to the slow sleep to save CPU.
+    const FAST_SLEEP: Duration = Duration::from_micros(100);
+    const SLOW_SLEEP: Duration = Duration::from_millis(1);
+    const FAST_WINDOW: Duration = Duration::from_millis(200);
+    let mut last_active = std::time::Instant::now();
+
     loop {
         if exit_flag.load(Ordering::Relaxed) {
             return Ok(UartExit::Done);
@@ -198,17 +209,23 @@ fn uart_pass(
             }
         }
 
-        // Always yield at the end of a pass; the pace depends on whether
-        // we did anything. 100 µs when active keeps latency low while
-        // still letting other threads on the same CPU run; 1 ms when
-        // fully idle stops us burning CPU on pure MMIO-poll spins. This
-        // is a coarse pair of fixed values — see
+        // Pick the sleep length based on how long it's been since we last
+        // did real work. Anything touched in the last FAST_WINDOW keeps
+        // us at FAST_SLEEP (100 µs — responsive, still yields the CPU);
+        // after that we drop to SLOW_SLEEP (1 ms) to avoid burning CPU on
+        // an idle guest. The window gives hysteresis so a single empty
+        // iteration in the middle of a bursty output stream doesn't flap
+        // us back to the slow sleep and then back again the next time
+        // bytes show up. See
         // <https://github.com/olofj/tt-bh-rust/issues/2> for the proper
         // adaptive backoff follow-up.
-        let sleep = if got_output || got_input {
-            Duration::from_micros(100)
+        if got_output || got_input {
+            last_active = std::time::Instant::now();
+        }
+        let sleep = if last_active.elapsed() < FAST_WINDOW {
+            FAST_SLEEP
         } else {
-            Duration::from_millis(1)
+            SLOW_SLEEP
         };
         std::thread::sleep(sleep);
     }
