@@ -96,6 +96,17 @@ pub struct DaemonState {
     /// but its OSBIdbug / VIRTUART magic is missing. Cleared on successful
     /// cold `boot`. Read by `dispatch_status` to report `Wedged`.
     pub wedged: [AtomicBool; 4],
+    /// Serializes the chip-touching phase of `dispatch_boot`
+    /// (`run_boot_sequence` + `make_slot`). Concurrent cold boots race on the
+    /// shared AXI tile (8,0) register block (PLL stepping, `L2CPU_RESET`
+    /// read-modify-write) and on kmd's rapid `ALLOCATE_TLB`/`CONFIGURE_TLB`/
+    /// `FREE_TLB` churn driven by `BootChip`'s per-op TLB windows. Observed to
+    /// panic a virtio worker and take the host down on a 4-way parallel cold
+    /// boot. Post-boot RPCs (add/remove/status/attach-console) run against the
+    /// per-L2CPU persistent TLB windows and are unaffected. See
+    /// <https://github.com/olofj/tt-bh-rust/issues/1> for the long-term fix
+    /// (persistent boot-path TLBs + fine-grained register locks).
+    pub boot_lock: Mutex<()>,
     /// Set by the shutdown handler to make the accept loop exit.
     pub shutdown: Arc<AtomicBool>,
 }
@@ -117,6 +128,7 @@ impl DaemonState {
                 AtomicBool::new(false),
                 AtomicBool::new(false),
             ],
+            boot_lock: Mutex::new(()),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
