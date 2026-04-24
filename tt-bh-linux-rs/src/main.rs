@@ -141,6 +141,11 @@ enum Commands {
         #[command(subcommand)]
         action: KernelAction,
     },
+    /// Low-level diagnostic probes that bypass the daemon.
+    Debug {
+        #[command(subcommand)]
+        action: DebugAction,
+    },
     /// Manage ramdisk/initramfs images
     Ramdisk {
         #[command(subcommand)]
@@ -215,6 +220,23 @@ enum KernelAction {
         #[arg(short, long)]
         output: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum DebugAction {
+    /// Read the L2CPU_RESET register (0x80030014) and print it.
+    ReadResetReg,
+    /// Call `boot::reset_x280` on the given L2CPU (OR-in bit idx+4, bracketed
+    /// by PLL step 1750→200→1750). Safe only when the daemon is not running
+    /// against this card. Use `--l2cpu N` / `-l N`.
+    ResetX280,
+    /// Clear bit idx+4 of L2CPU_RESET — puts the L2CPU *into* reset in-place
+    /// (halts it). Sibling cores keep running. No PLL manipulation.
+    AssertReset,
+    /// Set bit idx+4 of L2CPU_RESET — releases the L2CPU from reset. Pure
+    /// register write, no PLL manipulation. Useful to re-start a core that
+    /// was held by `assert-reset`.
+    DeassertReset,
 }
 
 #[derive(Subcommand)]
@@ -606,6 +628,7 @@ fn main() -> std::process::ExitCode {
             }
             Ok(())
         }
+        Some(Commands::Debug { action }) => run_debug_cmd(cli.ttdevice, cli.l2cpu, action),
         None => {
             // Bare invocation → attach console in rw mode, same as `connect`.
             run_connect_client(
@@ -701,6 +724,86 @@ fn run_connect_client(
     );
     let exit = Arc::new(AtomicBool::new(false));
     daemon::terminal::pump(fd, exit)?;
+    Ok(())
+}
+
+fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Result<()> {
+    // Debug ops bypass the daemon and write the chip directly, so if the
+    // daemon is up for this card it has no visibility into what we're
+    // doing. That's exactly the silent-state-divergence footgun that
+    // crashed the host on 2026-04-24: a CLI `assert-reset` (or similar)
+    // put L2CPU 0 back into reset while the daemon still had a live slot
+    // pointing at mmaps of that core. Refuse write ops when the daemon
+    // is up; read ops warn and proceed.
+    let daemon_up = daemon::lifetime::is_running(card);
+    let writes_chip = !matches!(action, DebugAction::ReadResetReg);
+    if daemon_up && writes_chip {
+        return Err(std::io::Error::other(format!(
+            "daemon is running for card {} — refusing to write chip state from outside the daemon \
+             (stop the daemon first with `tt-bh-linux daemon stop`, then retry)",
+            card
+        )));
+    }
+    if daemon_up {
+        eprintln!(
+            "[debug] warning: daemon is running for card {} — read is racy with daemon's own ops",
+            card
+        );
+    }
+
+    let chip = chip::BootChip::new(card)
+        .map_err(|e| std::io::Error::other(format!("open /dev/tenstorrent/{}: {}", card, e)))?;
+    match action {
+        DebugAction::ReadResetReg => {
+            use boot::AxiAccess;
+            let reg = 0x80030014u64;
+            let val = chip.axi_read32(reg);
+            println!("L2CPU_RESET@0x{:x} = {:#010x}", reg, val);
+            for i in 0..4 {
+                let bit = (val >> (i + 4)) & 1;
+                println!("  bit {} (L2CPU {} release): {}", i + 4, i, bit);
+            }
+            Ok(())
+        }
+        DebugAction::ResetX280 => {
+            if l2cpu > 3 {
+                return Err(std::io::Error::other("l2cpu must be 0..3"));
+            }
+            eprintln!(
+                "[debug] invoking boot::reset_x280 on L2CPU {} (PLL step + OR-in bit {})",
+                l2cpu,
+                l2cpu + 4
+            );
+            boot::reset_x280(&chip, &[l2cpu]);
+            eprintln!("[debug] reset_x280 returned without panic");
+            Ok(())
+        }
+        DebugAction::AssertReset => toggle_reset_bit(&chip, l2cpu, false),
+        DebugAction::DeassertReset => toggle_reset_bit(&chip, l2cpu, true),
+    }
+}
+
+fn toggle_reset_bit(chip: &chip::BootChip, l2cpu: usize, release: bool) -> std::io::Result<()> {
+    use boot::AxiAccess;
+    if l2cpu > 3 {
+        return Err(std::io::Error::other("l2cpu must be 0..3"));
+    }
+    let reg: u64 = 0x80030014;
+    let bit = 1u32 << (l2cpu + 4);
+    let before = chip.axi_read32(reg);
+    let after = if release { before | bit } else { before & !bit };
+    eprintln!(
+        "[debug] L2CPU_RESET@0x{:x}: {:#010x} -> {:#010x} ({} bit {} for L2CPU {})",
+        reg,
+        before,
+        after,
+        if release { "setting" } else { "clearing" },
+        l2cpu + 4,
+        l2cpu
+    );
+    chip.axi_write32(reg, after);
+    let readback = chip.axi_read32(reg);
+    eprintln!("[debug] readback: {:#010x}", readback);
     Ok(())
 }
 
