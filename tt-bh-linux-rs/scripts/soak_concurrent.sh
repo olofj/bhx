@@ -83,6 +83,7 @@ note "phase 1: parallel boot of 4 L2CPUs"
 BOOT_STATUS_DIR=$(mktemp -d)
 trap 'rm -rf "$BOOT_STATUS_DIR"; cleanup' EXIT
 
+boot_pids=()
 for i in "${CORES[@]}"; do
     (
         set +e
@@ -91,8 +92,9 @@ for i in "${CORES[@]}"; do
             > "$BOOT_STATUS_DIR/boot-${i}.out" 2>&1
         echo $? > "$BOOT_STATUS_DIR/boot-${i}.rc"
     ) &
+    boot_pids+=("$!")
 done
-wait
+for pid in "${boot_pids[@]}"; do wait "$pid"; done
 
 for i in "${CORES[@]}"; do
     rc=$(cat "$BOOT_STATUS_DIR/boot-${i}.rc")
@@ -138,6 +140,7 @@ trap 'rm -rf "$BOOT_STATUS_DIR" "$HAMMER_DIR" "$POLL_RC_FILE"; cleanup' EXIT
 for iter in $(seq 1 "$ITERATIONS"); do
     echo "---- iter $iter/$ITERATIONS ----"
 
+    hammer_pids=()
     for i in "${CORES[@]}"; do
         (
             set +e
@@ -151,8 +154,11 @@ for iter in $(seq 1 "$ITERATIONS"); do
             printf '%s\n' "$out" > "$HAMMER_DIR/iter${iter}-core${i}.out"
             echo "$rc" > "$HAMMER_DIR/iter${iter}-core${i}.rc"
         ) &
+        hammer_pids+=("$!")
     done
-    wait
+    # NB: must wait for these pids explicitly — a bare `wait` also blocks on
+    # the infinite status poller ($POLL_PID) and would hang the script.
+    for pid in "${hammer_pids[@]}"; do wait "$pid"; done
 
     for i in "${CORES[@]}"; do
         rc=$(cat "$HAMMER_DIR/iter${iter}-core${i}.rc")
@@ -164,11 +170,13 @@ for iter in $(seq 1 "$ITERATIONS"); do
     done
 
     # After each iteration all 4 should end on "disk=rootfs-N.ext4 net=y".
-    status=$("$BINARY" daemon status -t "$CARD")
+    note "iter $iter: fetching daemon status (post-hammer assertion)"
+    status=$(timeout 10 "$BINARY" daemon status -t "$CARD") || fail "iter $iter: daemon status timed out or errored"
     for i in "${CORES[@]}"; do
         echo "$status" | grep -qE "l2cpu $i: Running disk=.*rootfs-${i}.ext4 net=y" \
             || fail "iter $iter: post-hammer status mismatch for L2CPU $i:\n$status"
     done
+    note "iter $iter: OK"
 done
 
 # ---------------------------------------------------------------------------
