@@ -43,13 +43,20 @@ const NET_MMIO: u64 = 4 * 1024 * 1024;
 /// once the shutdown flag has been tripped. Caller is responsible for
 /// daemonization (double-fork) before calling this.
 pub fn serve(card: u32, listener: UnixListener) -> io::Result<()> {
-    let state = Arc::new(DaemonState::new(card));
+    // Open the one-and-only persistent TLB window to tile (8,0) before
+    // anything else touches chip state, so the daemon has a single
+    // serialization point for PLL / reset register access. Fallible because
+    // it opens the card fd and issues ALLOCATE_TLB; propagate the error so
+    // the daemon exits cleanly if /dev/tenstorrent/<card> is missing or
+    // the kmd rejects the allocation.
+    let shared_chip = Arc::new(crate::shared_chip::SharedChip::new(card)?);
+    let state = Arc::new(DaemonState::new(card, shared_chip));
     install_signal_handlers(state.shutdown.clone());
 
     listener.set_nonblocking(true)?;
 
     eprintln!("[daemon] accepting connections on card {}", card);
-    let released = probe_initial_chip_state(card);
+    let released = probe_initial_chip_state(&state.shared_chip, card);
     if !released.is_empty() {
         warm_resume_released(&state, &released);
     }
@@ -88,23 +95,14 @@ pub fn serve(card: u32, listener: UnixListener) -> io::Result<()> {
 ///
 /// Safe to call even when the chip is wedged: reading the reset register
 /// is a single AXI read to tile (8,0), no state change.
-fn probe_initial_chip_state(card: u32) -> Vec<u8> {
-    use crate::boot::AxiAccess;
-    let chip = match chip::BootChip::new(card) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "[probe] skipping chip-state probe: open /dev/tenstorrent/{} failed: {}",
-                card, e
-            );
-            return Vec::new();
-        }
-    };
-    let reset_reg: u64 = 0x80030014;
-    let val = chip.axi_read32(reset_reg);
+fn probe_initial_chip_state(
+    shared: &crate::shared_chip::SharedChip,
+    card: u32,
+) -> Vec<u8> {
+    let val = shared.read_l2cpu_reset();
     eprintln!(
-        "[probe] L2CPU_RESET@0x{:x}={:#010x} (card {})",
-        reset_reg, val, card
+        "[probe] L2CPU_RESET={:#010x} (card {})",
+        val, card
     );
     let mut released = Vec::new();
     for idx in 0..4u8 {
@@ -366,7 +364,7 @@ fn dispatch_boot(
         let _boot_guard = state.boot_lock.lock().unwrap();
         dlog!("[boot l2cpu {}] starting boot sequence", l2cpu_idx);
         if let Err(e) = run_boot_sequence(
-            state.card,
+            state,
             l2cpu_idx,
             opensbi,
             kernel,
@@ -485,7 +483,7 @@ fn start_net_worker(_card: u32, _slot: &mut L2CpuSlot) -> io::Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_boot_sequence(
-    card: u32,
+    state: &Arc<DaemonState>,
     l2cpu_idx: u8,
     opensbi: &str,
     kernel: &str,
@@ -496,6 +494,7 @@ fn run_boot_sequence(
 ) -> io::Result<()> {
     // Same sequence as `main::run_boot` but inlined here so the daemon owns
     // the boot path without going through CLI plumbing.
+    let card = state.card;
     let starting_address = crate::l2cpu::L2CPU_STARTING_ADDRESS[l2cpu_idx as usize];
     let memory_size = crate::l2cpu::L2CPU_MEMORY_SIZE[l2cpu_idx as usize];
 
@@ -509,15 +508,10 @@ fn run_boot_sequence(
     let dtb_addr = starting_address + dtb_offset;
     let rootfs_addr = starting_address + initramfs_offset;
 
-    dlog!(
-        "[run_boot l2cpu {}] opening /dev/tenstorrent/{} to probe state",
-        l2cpu_idx,
-        card
-    );
-    let chip = chip::BootChip::new(card)
-        .map_err(|e| io::Error::other(format!("open /dev/tenstorrent/{}: {}", card, e)))?;
-
-    let running = boot::l2cpu_is_running(&chip, l2cpu_idx as usize);
+    // Pre-reset state check goes through the daemon's SharedChip — one
+    // persistent TLB to tile (8,0) for all L2CPUs, so this read can't race
+    // with other boots' reads/writes of the same register.
+    let running = state.shared_chip.l2cpu_is_running(l2cpu_idx as usize);
     let need_reset = force_reset_pcie || running;
     dlog!(
         "[run_boot l2cpu {}] running={} force_reset_pcie={} need_reset={}",
@@ -527,32 +521,39 @@ fn run_boot_sequence(
         need_reset
     );
 
-    let chip = if need_reset {
+    if need_reset {
         dlog!(
-            "[run_boot l2cpu {}] closing fd and issuing full board reset (other L2CPUs on this card will see a PCIe blip)",
+            "[run_boot l2cpu {}] issuing full board reset (other L2CPUs on this card will see a PCIe blip)",
             l2cpu_idx
         );
-        drop(chip);
-        chip::reset_board(card)?;
+        // SharedChip::reset_board internally drops its fd+window, issues the
+        // PCIe LDS reset, and reopens fresh — callers never see stale fd
+        // errors across the reset.
+        state.shared_chip.reset_board(card)?;
         dlog!(
             "[run_boot l2cpu {}] board reset complete; sleeping 1s",
             l2cpu_idx
         );
         std::thread::sleep(std::time::Duration::from_secs(1));
-        dlog!(
-            "[run_boot l2cpu {}] reopening /dev/tenstorrent/{} post-reset",
-            l2cpu_idx,
-            card
-        );
-        chip::BootChip::new(card)
-            .map_err(|e| io::Error::other(format!("reopen /dev/tenstorrent/{}: {}", card, e)))?
     } else {
         dlog!(
             "[run_boot l2cpu {}] target held in reset; skipping board reset (siblings untouched)",
             l2cpu_idx
         );
-        chip
-    };
+    }
+
+    // BootChip is still used for the per-L2CPU NOC bulk writes
+    // (OpenSBI / kernel / DTB image loads to that core's DRAM and NOC
+    // register pokes to its tile). Those targets are disjoint across
+    // L2CPUs, so the residual concurrent-boot hazard is only the
+    // `L2Cpu::new` PLL step in `make_slot` — still covered by `boot_lock`.
+    dlog!(
+        "[run_boot l2cpu {}] opening /dev/tenstorrent/{} for NOC image load",
+        l2cpu_idx,
+        card
+    );
+    let chip = chip::BootChip::new(card)
+        .map_err(|e| io::Error::other(format!("open /dev/tenstorrent/{}: {}", card, e)))?;
 
     dlog!("[run_boot l2cpu {}] reading DTB from {}", l2cpu_idx, dtb);
     let dtb_raw = boot::read_bin_file(Path::new(dtb))?;
@@ -594,7 +595,10 @@ fn run_boot_sequence(
     )?;
 
     dlog!("[run_boot l2cpu {}] releasing from reset", l2cpu_idx);
-    boot::reset_x280(&chip, &[l2cpu_idx as usize]);
+    // reset_x280 goes through SharedChip so the PLL step and the
+    // L2CPU_RESET R-M-W serialize against any other boot RPC issuing the
+    // same sequence.
+    state.shared_chip.reset_x280(&[l2cpu_idx as usize]);
     dlog!("[run_boot l2cpu {}] configuring prefetchers", l2cpu_idx);
     boot::configure_prefetchers(&chip, l2cpu_idx as usize);
     dlog!("[run_boot l2cpu {}] run_boot_sequence done", l2cpu_idx);

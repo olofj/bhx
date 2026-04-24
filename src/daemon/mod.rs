@@ -31,6 +31,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::l2cpu::L2Cpu;
+use crate::shared_chip::SharedChip;
 use crate::virtio::interrupt::InterruptController;
 
 use console_hub::ConsoleHub;
@@ -96,23 +97,31 @@ pub struct DaemonState {
     /// but its OSBIdbug / VIRTUART magic is missing. Cleared on successful
     /// cold `boot`. Read by `dispatch_status` to report `Wedged`.
     pub wedged: [AtomicBool; 4],
+    /// Single shared access point for chip-wide AXI registers on NOC tile
+    /// (8,0) — PLL, reset unit, `L2CPU_RESET`. Phase 1 of the refactor in
+    /// issue #1: concurrent boots now serialize PLL steps and reset R-M-W
+    /// through this type's internal mutex instead of racing through four
+    /// independently-configured TLB windows. Kept as an `Arc` so worker
+    /// threads can hold their own references if needed.
+    pub shared_chip: Arc<SharedChip>,
     /// Serializes the chip-touching phase of `dispatch_boot`
-    /// (`run_boot_sequence` + `make_slot`). Concurrent cold boots race on the
-    /// shared AXI tile (8,0) register block (PLL stepping, `L2CPU_RESET`
-    /// read-modify-write) and on kmd's rapid `ALLOCATE_TLB`/`CONFIGURE_TLB`/
-    /// `FREE_TLB` churn driven by `BootChip`'s per-op TLB windows. Observed to
-    /// panic a virtio worker and take the host down on a 4-way parallel cold
-    /// boot. Post-boot RPCs (add/remove/status/attach-console) run against the
-    /// per-L2CPU persistent TLB windows and are unaffected. See
-    /// <https://github.com/olofj/tt-bh-rust/issues/1> for the long-term fix
-    /// (persistent boot-path TLBs + fine-grained register locks).
+    /// (`run_boot_sequence` + `make_slot`). Still needed in Phase 1 because
+    /// `BootChip`'s per-L2CPU NOC bulk writes (image loads) and `L2Cpu::new`'s
+    /// own tile-(8,0) PLL step remain outside `SharedChip`. Once those move to
+    /// `Arc<L2Cpu>` / `SharedChip` in later phases, `boot_lock` can shrink or
+    /// go away entirely. See
+    /// <https://github.com/olofj/tt-bh-rust/issues/1>.
     pub boot_lock: Mutex<()>,
     /// Set by the shutdown handler to make the accept loop exit.
     pub shutdown: Arc<AtomicBool>,
 }
 
 impl DaemonState {
-    pub fn new(card: u32) -> Self {
+    /// Build daemon state with a ready-made `SharedChip`. The server
+    /// constructs the `SharedChip` at daemon startup (`SharedChip::new(card)`)
+    /// and passes an `Arc` in here; tests pass a placeholder (see
+    /// `SharedChip::placeholder`) so `DaemonState::new` stays hardware-free.
+    pub fn new(card: u32, shared_chip: Arc<SharedChip>) -> Self {
         DaemonState {
             card,
             started: Instant::now(),
@@ -128,6 +137,7 @@ impl DaemonState {
                 AtomicBool::new(false),
                 AtomicBool::new(false),
             ],
+            shared_chip,
             boot_lock: Mutex::new(()),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
@@ -141,7 +151,7 @@ mod tests {
 
     #[test]
     fn fresh_daemon_state_has_no_slots_and_no_wedged_cores() {
-        let s = DaemonState::new(0);
+        let s = DaemonState::new(0, Arc::new(SharedChip::placeholder()));
         for idx in 0..4 {
             assert!(
                 s.l2cpus[idx].lock().unwrap().is_none(),
@@ -161,7 +171,7 @@ mod tests {
     #[test]
     fn wedged_flag_set_and_clear_per_core() {
         // Exercises the read/write semantics dispatch_status relies on.
-        let s = DaemonState::new(1);
+        let s = DaemonState::new(1, Arc::new(SharedChip::placeholder()));
         s.wedged[2].store(true, Ordering::SeqCst);
         assert!(s.wedged[2].load(Ordering::Relaxed));
         assert!(!s.wedged[0].load(Ordering::Relaxed));
