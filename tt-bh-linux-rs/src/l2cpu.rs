@@ -8,7 +8,6 @@ use std::os::unix::io::RawFd;
 use std::ptr;
 use std::sync::Mutex;
 
-use crate::clock::{self, TlbPllAccess};
 use crate::kmd;
 use crate::tlb::TlbWindow;
 
@@ -78,18 +77,16 @@ impl L2Cpu {
 
         let fd = kmd::open_device(card_idx)?;
 
-        // Set PLL frequency to 1750MHz via TLB windows to NOC (8, 0)
-        {
-            let window_cntl5 =
-                TlbWindow::new_2m(fd, 8, 0, 0x80020500 + 0x14)?;
-            let window_cntl1 =
-                TlbWindow::new_2m(fd, 8, 0, 0x80020500 + 0x04)?;
-            let access = TlbPllAccess {
-                window_cntl1: &window_cntl1,
-                window_cntl5: &window_cntl5,
-            };
-            clock::set_frequency(&access, 1750);
-        }
+        // PLL4 (L2CPU core clock) is *not* configured here. Cold-boot path:
+        // `run_boot_sequence` calls `SharedChip::reset_x280` right after the
+        // image load, which does a PLL 1750→200→release→1750 sequence
+        // authoritatively. Warm-resume path: the core is already released
+        // and running, i.e. the chip's PLL4 must already be at 1750 for the
+        // guest to be alive — no action needed. Leaving PLL setup as a
+        // responsibility of this per-core constructor used to require a
+        // tile-(8,0) aliasing TLB on every L2Cpu we built, which was the
+        // last concurrent-boot race path holding `boot_lock` in place; see
+        // <https://github.com/olofj/tt-bh-rust/issues/1>.
 
         let coordinates = L2CPU_TILES[idx];
         let starting_address = L2CPU_STARTING_ADDRESS[idx];

@@ -5,9 +5,11 @@
 #
 # What this exercises:
 #   1. Parallel cold boots — 4 simultaneous `boot` RPCs, one per L2CPU,
-#      each with its own rootfs. Stresses the kmd allocate/configure-TLB
-#      ioctl path, the shared BootChip access, and the first-boot reset
-#      logic when multiple slots race to probe L2CPU_RESET.
+#      each with its own rootfs. After issue #1 Phase 3 the daemon has no
+#      `boot_lock`: tile-(8,0) AXI access serializes via
+#      `SharedChip::seq_lock`, per-L2CPU NOC traffic runs on each core's
+#      own fd. This used to crash the host; it's now the gating signal
+#      that the refactor holds under concurrency.
 #   2. Parallel add/remove hammer — for N iterations, 4 background
 #      subshells each do `remove-disk && add-disk && remove-net &&
 #      add-net` against their own slot, in parallel. Verifies the daemon
