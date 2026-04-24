@@ -105,11 +105,15 @@ pub struct DaemonState {
     /// threads can hold their own references if needed.
     pub shared_chip: Arc<SharedChip>,
     /// Serializes the chip-touching phase of `dispatch_boot`
-    /// (`run_boot_sequence` + `make_slot`). Still needed in Phase 1 because
-    /// `BootChip`'s per-L2CPU NOC bulk writes (image loads) and `L2Cpu::new`'s
-    /// own tile-(8,0) PLL step remain outside `SharedChip`. Once those move to
-    /// `Arc<L2Cpu>` / `SharedChip` in later phases, `boot_lock` can shrink or
-    /// go away entirely. See
+    /// (`run_boot_sequence`). After Phase 2 the only remaining race path is
+    /// `L2Cpu::new`'s one-shot PLL step to 1750 MHz, which uses transient
+    /// TLB windows to tile (8,0) on the per-L2CPU fd — concurrent
+    /// constructor calls would still alias the PLL registers. The path
+    /// forward is to either (a) drop the PLL step from `L2Cpu::new` (it's
+    /// redundant with `reset_x280` on the cold-boot path and the chip is
+    /// already at 1750 on the warm-resume path), or (b) route it through
+    /// `SharedChip::seq_lock` by passing `&SharedChip` into the
+    /// constructor. Until then `boot_lock` stays. See
     /// <https://github.com/olofj/tt-bh-rust/issues/1>.
     pub boot_lock: Mutex<()>,
     /// Set by the shutdown handler to make the accept loop exit.

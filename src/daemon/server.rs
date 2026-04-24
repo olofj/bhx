@@ -17,7 +17,6 @@ use std::thread;
 use std::time::Duration;
 
 use crate::boot;
-use crate::chip;
 use crate::daemon::chip_console;
 use crate::dlog;
 use crate::daemon::console_hub::ConsoleHub;
@@ -363,7 +362,7 @@ fn dispatch_boot(
         dlog!("[boot l2cpu {}] waiting for boot_lock", l2cpu_idx);
         let _boot_guard = state.boot_lock.lock().unwrap();
         dlog!("[boot l2cpu {}] starting boot sequence", l2cpu_idx);
-        if let Err(e) = run_boot_sequence(
+        let l2cpu = match run_boot_sequence(
             state,
             l2cpu_idx,
             opensbi,
@@ -373,19 +372,22 @@ fn dispatch_boot(
             root_device,
             force_reset_pcie,
         ) {
-            dlog!("[boot l2cpu {}] boot sequence failed: {}", l2cpu_idx, e);
-            reply_err(sock, format!("boot failed: {}", e));
-            return;
-        }
+            Ok(l) => l,
+            Err(e) => {
+                dlog!("[boot l2cpu {}] boot sequence failed: {}", l2cpu_idx, e);
+                reply_err(sock, format!("boot failed: {}", e));
+                return;
+            }
+        };
         dlog!(
             "[boot l2cpu {}] boot sequence returned ok; initializing runtime slot",
             l2cpu_idx
         );
 
-        let slot = match make_slot(state.card, l2cpu_idx) {
+        let slot = match make_slot_from_l2cpu(l2cpu, l2cpu_idx) {
             Ok(s) => s,
             Err(e) => {
-                dlog!("[boot l2cpu {}] make_slot failed: {}", l2cpu_idx, e);
+                dlog!("[boot l2cpu {}] make_slot_from_l2cpu failed: {}", l2cpu_idx, e);
                 reply_err(sock, format!("post-boot L2Cpu init failed: {}", e));
                 return;
             }
@@ -491,9 +493,7 @@ fn run_boot_sequence(
     initramfs: Option<&str>,
     root_device: &str,
     force_reset_pcie: bool,
-) -> io::Result<()> {
-    // Same sequence as `main::run_boot` but inlined here so the daemon owns
-    // the boot path without going through CLI plumbing.
+) -> io::Result<Arc<L2Cpu>> {
     let card = state.card;
     let starting_address = crate::l2cpu::L2CPU_STARTING_ADDRESS[l2cpu_idx as usize];
     let memory_size = crate::l2cpu::L2CPU_MEMORY_SIZE[l2cpu_idx as usize];
@@ -542,18 +542,16 @@ fn run_boot_sequence(
         );
     }
 
-    // BootChip is still used for the per-L2CPU NOC bulk writes
-    // (OpenSBI / kernel / DTB image loads to that core's DRAM and NOC
-    // register pokes to its tile). Those targets are disjoint across
-    // L2CPUs, so the residual concurrent-boot hazard is only the
-    // `L2Cpu::new` PLL step in `make_slot` — still covered by `boot_lock`.
+    // Construct the runtime L2Cpu handle BEFORE the image load so the load
+    // can go through its persistent fd + `get_persistent_2m_window` UC
+    // path (no shared tile-(8,0) aliasing). Returned from this function so
+    // the caller hands the same Arc to `make_slot_from_l2cpu` — one
+    // construction, one PLL step, no double-init.
     dlog!(
-        "[run_boot l2cpu {}] opening /dev/tenstorrent/{} for NOC image load",
-        l2cpu_idx,
-        card
+        "[run_boot l2cpu {}] constructing L2Cpu (ioctls + 8GB VA + TLB windows)",
+        l2cpu_idx
     );
-    let chip = chip::BootChip::new(card)
-        .map_err(|e| io::Error::other(format!("open /dev/tenstorrent/{}: {}", card, e)))?;
+    let l2cpu = Arc::new(L2Cpu::new(l2cpu_idx as usize, card)?);
 
     dlog!("[run_boot l2cpu {}] reading DTB from {}", l2cpu_idx, dtb);
     let dtb_raw = boot::read_bin_file(Path::new(dtb))?;
@@ -582,8 +580,7 @@ fn run_boot_sequence(
         l2cpu_idx
     );
     boot::boot_l2cpu(
-        &chip,
-        l2cpu_idx as usize,
+        &l2cpu,
         Path::new(opensbi),
         opensbi_addr,
         Some(Path::new(kernel)),
@@ -600,26 +597,14 @@ fn run_boot_sequence(
     // same sequence.
     state.shared_chip.reset_x280(&[l2cpu_idx as usize]);
     dlog!("[run_boot l2cpu {}] configuring prefetchers", l2cpu_idx);
-    boot::configure_prefetchers(&chip, l2cpu_idx as usize);
+    boot::configure_prefetchers(&l2cpu);
     dlog!("[run_boot l2cpu {}] run_boot_sequence done", l2cpu_idx);
-    Ok(())
+    Ok(l2cpu)
 }
 
-/// Construct the `L2Cpu` + interrupt controller + console hub + chip console
-/// worker for a freshly-booted L2CPU.
-fn make_slot(card: u32, l2cpu_idx: u8) -> io::Result<L2CpuSlot> {
-    dlog!(
-        "[make_slot l2cpu {}] constructing L2Cpu (ioctls + 8GB VA + TLB windows)",
-        l2cpu_idx
-    );
-    let l2cpu = Arc::new(L2Cpu::new(l2cpu_idx as usize, card)?);
-    make_slot_from_l2cpu(l2cpu, l2cpu_idx)
-}
-
-/// Build the runtime slot on top of an already-constructed L2Cpu. Used by
-/// the startup warm-resume path so it can probe the chip before committing
-/// to adoption — otherwise we'd construct an L2Cpu twice (once for the
-/// probe, once here).
+/// Build the runtime slot on top of an already-constructed `L2Cpu`. All
+/// callers (dispatch_boot, warm-resume) construct the `L2Cpu` themselves
+/// so the chip-touching phase runs exactly once per boot / adoption.
 fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlot> {
     dlog!(
         "[make_slot l2cpu {}] L2Cpu ready; mapping PLIC interrupt window",

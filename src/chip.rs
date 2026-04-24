@@ -1,90 +1,22 @@
 // SPDX-FileCopyrightText: © 2026 Olof Johansson
 // SPDX-License-Identifier: MIT
 
-//! Minimal chip-access surface used by the boot sequence.
+//! PCIe link-reset helper.
 //!
-//! Implements the [`AxiAccess`](crate::boot::AxiAccess) trait that
-//! [`boot_l2cpu`](crate::boot::boot_l2cpu) and [`reset_x280`](crate::boot::reset_x280)
-//! expect. AXI register reads/writes (`0x8000_xxxx` register block) are routed
-//! through a NOC TLB window to tile `(8, 0)` — the same path already used by
-//! the PLL-stepping code in [`crate::clock`]. NOC writes go through a TLB
-//! window to the requested `(x, y)` tile. Bulk writes iterate 2 MiB TLB
-//! windows because that's the window size exposed by the kernel driver.
+//! Minimal chip-access surface: what used to be `BootChip` (ephemeral per-op
+//! TLB windows to AXI tile (8,0) + per-L2CPU NOC tiles) has been retired.
+//! AXI tile (8,0) access now lives in [`crate::shared_chip::SharedChip`] as
+//! a single persistent mapping with an internal mutex; per-L2CPU NOC writes
+//! use [`crate::l2cpu::L2Cpu`]'s persistent fd. What remains here is the raw
+//! `RESET_DEVICE` ioctl sequence that the kmd requires a fresh fd for.
 
-use std::os::unix::io::RawFd;
-use std::ptr;
-
-use crate::boot::AxiAccess;
 use crate::kmd;
-use crate::tlb::{TlbWindow, TWO_MEG};
-
-/// AXI register tile on Blackhole. Accessing `0x8000_xxxx` via NOC `(8, 0)`
-/// hits the same register block that pyluwen's `axi_*` methods hit.
-const AXI_TILE_X: u16 = 8;
-const AXI_TILE_Y: u16 = 0;
-
-/// Holds an open handle to `/dev/tenstorrent/<card>` for the duration of the
-/// boot sequence.
-pub struct BootChip {
-    fd: RawFd,
-}
-
-impl BootChip {
-    pub fn new(card: u32) -> std::io::Result<Self> {
-        let fd = kmd::open_device(card)?;
-        Ok(BootChip { fd })
-    }
-
-    pub fn fd(&self) -> RawFd {
-        self.fd
-    }
-
-    fn axi_window(&self, addr: u64) -> TlbWindow {
-        TlbWindow::new_2m(self.fd, AXI_TILE_X, AXI_TILE_Y, addr)
-            .expect("failed to create AXI TLB window")
-    }
-
-    fn noc_window(&self, x: u16, y: u16, addr: u64) -> TlbWindow {
-        TlbWindow::new_2m(self.fd, x, y, addr).expect("failed to create NOC TLB window")
-    }
-
-    /// Copy `data` to NOC address `addr` on tile `(x, y)` using a sequence of
-    /// 2 MiB TLB windows. Crosses window boundaries cleanly by remapping.
-    fn noc_write_bulk(&self, x: u16, y: u16, addr: u64, data: &[u8]) {
-        let mut written = 0usize;
-        while written < data.len() {
-            let cur_addr = addr + written as u64;
-            let window_base = cur_addr & !(TWO_MEG as u64 - 1);
-            let offset_in_window = (cur_addr - window_base) as usize;
-            let remaining_in_window = TWO_MEG - offset_in_window;
-            let chunk = remaining_in_window.min(data.len() - written);
-
-            let window = TlbWindow::new_2m(self.fd, x, y, window_base)
-                .expect("failed to create NOC TLB window for bulk write");
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    data.as_ptr().add(written),
-                    window.data().add(offset_in_window),
-                    chunk,
-                );
-            }
-            written += chunk;
-        }
-    }
-}
-
-impl Drop for BootChip {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.fd); }
-    }
-}
 
 /// Full board reset mirroring tt-smi's `BHChipReset.full_lds_reset`.
 ///
-/// Run this *before* opening a long-lived [`BootChip`]: the PCI device is
-/// re-enumerated across the reset, so any fd held across it returns `ENODEV`
-/// on the follow-up `RESTORE_STATE` ioctl. tt-smi sidesteps this by opening a
-/// fresh fd for each ioctl step; we do the same.
+/// The PCI device is re-enumerated across the reset, so any fd held across
+/// it returns `ENODEV` on the follow-up `RESTORE_STATE` ioctl. tt-smi
+/// sidesteps this by opening a fresh fd for each ioctl step; we do the same.
 ///
 /// Sequence (taken from `tt_tools_common/reset_common/bh_reset.py`):
 ///   1. Open fd, `CONFIG_WRITE` ioctl (triggers the LDS reset), close fd.
@@ -159,49 +91,4 @@ pub fn reset_board(card: u32) -> std::io::Result<()> {
     }
     eprintln!("[reset_board] complete");
     Ok(())
-}
-
-impl AxiAccess for BootChip {
-    fn axi_read32(&self, addr: u64) -> u32 {
-        self.axi_window(addr).read32(0)
-    }
-
-    fn axi_write32(&self, addr: u64, value: u32) {
-        self.axi_window(addr).write32(0, value);
-    }
-
-    fn axi_read(&self, addr: u64, buf: &mut [u8]) {
-        // Only 32-bit aligned reads are needed by boot; loop them.
-        assert!(addr.is_multiple_of(4), "axi_read: addr must be 4-byte aligned");
-        assert!(buf.len().is_multiple_of(4), "axi_read: len must be 4-byte aligned");
-        let mut off = 0usize;
-        while off < buf.len() {
-            let v = self.axi_read32(addr + off as u64).to_le_bytes();
-            buf[off..off + 4].copy_from_slice(&v);
-            off += 4;
-        }
-    }
-
-    fn axi_write(&self, addr: u64, data: &[u8]) {
-        assert!(addr.is_multiple_of(4), "axi_write: addr must be 4-byte aligned");
-        assert!(data.len().is_multiple_of(4), "axi_write: len must be 4-byte aligned");
-        let mut off = 0usize;
-        while off < data.len() {
-            let v = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-            self.axi_write32(addr + off as u64, v);
-            off += 4;
-        }
-    }
-
-    fn noc_read32(&self, _noc: u8, x: u16, y: u16, addr: u64) -> u32 {
-        self.noc_window(x, y, addr).read32(0)
-    }
-
-    fn noc_write32(&self, _noc: u8, x: u16, y: u16, addr: u64, value: u32) {
-        self.noc_window(x, y, addr).write32(0, value);
-    }
-
-    fn noc_write(&self, _noc: u8, x: u16, y: u16, addr: u64, data: &[u8]) {
-        self.noc_write_bulk(x, y, addr, data);
-    }
 }

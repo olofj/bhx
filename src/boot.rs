@@ -1,18 +1,20 @@
 // SPDX-FileCopyrightText: © 2026 Olof Johansson
 // SPDX-License-Identifier: MIT
 
-//! Boot loader — loads firmware, kernel, and DTB into X280 DRAM via luwen.
+//! Boot-time per-L2CPU work: loading OpenSBI + kernel + DTB into the core's
+//! DRAM, patching the DTB, writing reset vectors, enabling L3, configuring
+//! prefetchers.
 //!
-//! This module replicates boot.py functionality using the luwen Rust crate directly.
-//! Since luwen may not be available as a crate dependency, this module provides
-//! the boot sequence logic that can be connected when luwen becomes available.
+//! All per-core register / NOC access goes through [`crate::l2cpu::L2Cpu`]
+//! (persistent per-L2CPU fd + TLB windows). Chip-wide AXI tile (8,0) work
+//! (`L2CPU_RESET` R-M-W, PLL stepping, PCIe reset) lives in
+//! [`crate::shared_chip::SharedChip`].
 
 use std::fs;
 use std::path::Path;
 
-use crate::clock::{self, PllAccess};
 use crate::fdt_ffi::Fdt;
-use crate::l2cpu::L2CPU_TILES;
+use crate::l2cpu::{L2Cpu, L2CPU_TILES};
 
 /// Read a binary file and pad to 4-byte alignment.
 pub fn read_bin_file(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -24,97 +26,47 @@ pub fn read_bin_file(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(data)
 }
 
-/// PLL access via AXI (used at boot time through luwen).
-/// This is a placeholder — the actual implementation requires the luwen crate.
-pub struct AxiPllAccess<'a> {
-    pub chip: &'a dyn AxiAccess,
-}
+/// Bulk-write `data` to the given NOC address on the L2CPU's own tile, using
+/// a transient uncacheable 2 MiB TLB window per chunk. Ordering semantics
+/// match the old `BootChip::noc_write_bulk` (UC stores are strictly ordered
+/// at the device), but the allocation goes through `L2Cpu`'s per-card fd
+/// and its `alloc_lock` — so concurrent bulk writes on different L2CPUs
+/// don't stomp each other's kmd state and no longer touch the shared AXI
+/// tile (8,0).
+fn l2cpu_noc_write_bulk(l2cpu: &L2Cpu, addr: u64, data: &[u8]) -> std::io::Result<()> {
+    const TWO_MEG: u64 = crate::tlb::TWO_MEG as u64;
+    let mut written: u64 = 0;
+    let total = data.len() as u64;
+    while written < total {
+        let cur_addr = addr + written;
+        let window_base = cur_addr & !(TWO_MEG - 1);
+        let offset_in_window = (cur_addr - window_base) as usize;
+        let remaining_in_window = TWO_MEG - offset_in_window as u64;
+        let chunk = remaining_in_window.min(total - written) as usize;
 
-/// Trait abstracting AXI register access (provided by luwen's PciChip).
-pub trait AxiAccess {
-    fn axi_read32(&self, addr: u64) -> u32;
-    fn axi_write32(&self, addr: u64, value: u32);
-    fn axi_read(&self, addr: u64, buf: &mut [u8]);
-    fn axi_write(&self, addr: u64, data: &[u8]);
-    fn noc_read32(&self, noc: u8, x: u16, y: u16, addr: u64) -> u32;
-    fn noc_write32(&self, noc: u8, x: u16, y: u16, addr: u64, value: u32);
-    fn noc_write(&self, noc: u8, x: u16, y: u16, addr: u64, data: &[u8]);
-}
-
-impl<'a> PllAccess for AxiPllAccess<'a> {
-    fn pll_read32(&self, addr: u64) -> u32 {
-        let mut buf = [0u8; 4];
-        self.chip.axi_read(addr, &mut buf);
-        u32::from_le_bytes(buf)
+        // Transient UC 2 MiB window on this L2CPU's tile via its persistent
+        // fd. `get_persistent_2m_window` is a misnomer — it creates a new
+        // window that's dropped when we drop our handle (after this chunk);
+        // the "persistent" in its name refers to the caller holding it, not
+        // to it outliving a single use.
+        let window = l2cpu.get_persistent_2m_window(window_base)?;
+        let dst = unsafe { window.get_window().add(offset_in_window) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(written as usize),
+                dst,
+                chunk,
+            );
+        }
+        written += chunk as u64;
     }
-
-    fn pll_write32(&self, addr: u64, value: u32) {
-        self.chip.axi_write(addr, &value.to_le_bytes());
-    }
-}
-
-/// Check if the given L2CPU is currently released from reset (i.e. running).
-///
-/// In `L2CPU_RESET` at `0x80030014`, bit `idx + 4` is the release bit: 0 means
-/// held in reset, 1 means running. The register sits in AXI tile `(8, 0)` and
-/// is readable regardless of L2CPU state.
-pub fn l2cpu_is_running(chip: &dyn AxiAccess, l2cpu_idx: usize) -> bool {
-    let reset_reg: u64 = 0x80030014;
-    let val = chip.axi_read32(reset_reg);
-    let bit_idx = l2cpu_idx + 4;
-    let running = (val >> bit_idx) & 1 == 1;
-    eprintln!(
-        "[l2cpu_is_running] L2CPU_RESET@0x{:x}={:#010x}, bit {}={}, running={}",
-        reset_reg,
-        val,
-        bit_idx,
-        (val >> bit_idx) & 1,
-        running,
-    );
-    running
-}
-
-/// Reset the X280 CPUs via the reset unit.
-///
-/// In `L2CPU_RESET` at `reset_unit_base + 0x14`, bit `idx + 4` releases L2CPU
-/// `idx` from reset when set. This mirrors boot.py exactly: a preceding PCIe
-/// link reset is assumed to have zeroed the register, so a pure OR-in is an
-/// effective 0→1 edge. Calling this on a running L2CPU *in place* (without a
-/// prior link reset) is not supported — it will leave PCIe/NOC traffic in
-/// flight and has been observed to hard-crash the host.
-pub fn reset_x280(chip: &dyn AxiAccess, l2cpu_indices: &[usize]) {
-    let reset_unit_base: u64 = 0x80030000;
-    let reset_reg = reset_unit_base + 0x14;
-
-    eprintln!("[reset_x280] stepping PLL down to 200 MHz");
-    let access = AxiPllAccess { chip };
-    clock::set_frequency(&access, 200);
-
-    let reset_val_before = chip.axi_read32(reset_reg);
-    let mut reset_val = reset_val_before;
-    let mut mask: u32 = 0;
-    for &idx in l2cpu_indices {
-        mask |= 1 << (idx + 4);
-        reset_val |= 1 << (idx + 4);
-    }
-    eprintln!(
-        "[reset_x280] L2CPU_RESET@0x{:x}: {:#010x} | {:#010x} -> {:#010x} (releasing L2CPU {:?})",
-        reset_reg, reset_val_before, mask, reset_val, l2cpu_indices
-    );
-    chip.axi_write32(reset_reg, reset_val);
-    let reset_val_after = chip.axi_read32(reset_reg);
-    eprintln!("[reset_x280] L2CPU_RESET readback: {:#010x}", reset_val_after);
-
-    eprintln!("[reset_x280] stepping PLL up to 1750 MHz");
-    clock::set_frequency(&access, 1750);
-    eprintln!("[reset_x280] done");
+    Ok(())
 }
 
 /// Boot sequence for a single L2CPU.
 #[allow(clippy::too_many_arguments)]
 pub fn boot_l2cpu(
-    chip: &dyn AxiAccess,
-    l2cpu_idx: usize,
+    l2cpu: &L2Cpu,
     opensbi_path: &Path,
     opensbi_addr: u64,
     kernel_path: Option<&Path>,
@@ -124,6 +76,7 @@ pub fn boot_l2cpu(
     rootfs_path: Option<&Path>,
     rootfs_addr: u64,
 ) -> std::io::Result<()> {
+    let l2cpu_idx = l2cpu.idx();
     let tile = L2CPU_TILES[l2cpu_idx];
     let l2cpu_base: u64 = 0xfffff7fefff10000;
     eprintln!(
@@ -133,8 +86,8 @@ pub fn boot_l2cpu(
 
     let l3_reg_base: u64 = 0x02010000;
     eprintln!("[boot_l2cpu] enabling L3 cache at 0x{:x}+8", l3_reg_base);
-    chip.noc_write32(0, tile.x, tile.y, l3_reg_base + 8, 0x0f);
-    let l3_readback = chip.noc_read32(0, tile.x, tile.y, l3_reg_base + 8);
+    l2cpu.write32(l3_reg_base + 8, 0x0f);
+    let l3_readback = l2cpu.read32(l3_reg_base + 8);
     eprintln!("[boot_l2cpu]   L3 readback: {:#x}", l3_readback);
 
     let opensbi_bytes = read_bin_file(opensbi_path)?;
@@ -144,7 +97,7 @@ pub fn boot_l2cpu(
         opensbi_path.display(),
         opensbi_addr
     );
-    chip.noc_write(0, tile.x, tile.y, opensbi_addr, &opensbi_bytes);
+    l2cpu_noc_write_bulk(l2cpu, opensbi_addr, &opensbi_bytes)?;
 
     if let Some(kpath) = kernel_path {
         let kernel_bytes = read_bin_file(kpath)?;
@@ -154,7 +107,7 @@ pub fn boot_l2cpu(
             kpath.display(),
             kernel_addr
         );
-        chip.noc_write(0, tile.x, tile.y, kernel_addr, &kernel_bytes);
+        l2cpu_noc_write_bulk(l2cpu, kernel_addr, &kernel_bytes)?;
     }
 
     let mut dtb_padded = dtb_bytes.to_vec();
@@ -168,7 +121,7 @@ pub fn boot_l2cpu(
         dtb_padded.len(),
         dtb_addr
     );
-    chip.noc_write(0, tile.x, tile.y, dtb_addr, &dtb_padded);
+    l2cpu_noc_write_bulk(l2cpu, dtb_addr, &dtb_padded)?;
 
     if let Some(rpath) = rootfs_path {
         let rootfs_bytes = read_bin_file(rpath)?;
@@ -178,7 +131,7 @@ pub fn boot_l2cpu(
             rpath.display(),
             rootfs_addr
         );
-        chip.noc_write(0, tile.x, tile.y, rootfs_addr, &rootfs_bytes);
+        l2cpu_noc_write_bulk(l2cpu, rootfs_addr, &rootfs_bytes)?;
     }
 
     let reset_vector_0 = (opensbi_addr & 0xffffffff) as u32;
@@ -188,8 +141,8 @@ pub fn boot_l2cpu(
         reset_vector_0, reset_vector_1
     );
     for core in 0..4u64 {
-        chip.noc_write32(0, tile.x, tile.y, l2cpu_base + core * 8, reset_vector_0);
-        chip.noc_write32(0, tile.x, tile.y, l2cpu_base + core * 8 + 4, reset_vector_1);
+        l2cpu.write32(l2cpu_base + core * 8, reset_vector_0);
+        l2cpu.write32(l2cpu_base + core * 8 + 4, reset_vector_1);
     }
     eprintln!("[boot_l2cpu] L2CPU {} image + vectors loaded", l2cpu_idx);
 
@@ -197,7 +150,8 @@ pub fn boot_l2cpu(
 }
 
 /// Configure L2 prefetchers for a booted L2CPU.
-pub fn configure_prefetchers(chip: &dyn AxiAccess, l2cpu_idx: usize) {
+pub fn configure_prefetchers(l2cpu: &L2Cpu) {
+    let l2cpu_idx = l2cpu.idx();
     let tile = L2CPU_TILES[l2cpu_idx];
     let l2_prefetch_base: u64 = 0x02030000;
     eprintln!(
@@ -205,8 +159,8 @@ pub fn configure_prefetchers(chip: &dyn AxiAccess, l2cpu_idx: usize) {
         l2cpu_idx, tile.x, tile.y, l2_prefetch_base
     );
     for offset in &[0x0000u64, 0x2000, 0x4000, 0x6000] {
-        chip.noc_write32(0, tile.x, tile.y, l2_prefetch_base + offset, 0x15811);
-        chip.noc_write32(0, tile.x, tile.y, l2_prefetch_base + offset + 4, 0x38c84e);
+        l2cpu.write32(l2_prefetch_base + offset, 0x15811);
+        l2cpu.write32(l2_prefetch_base + offset + 4, 0x38c84e);
     }
     eprintln!("[configure_prefetchers] done");
 }
