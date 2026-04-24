@@ -772,6 +772,7 @@ fn dispatch_add_net(
 // ---------------------------------------------------------------------------
 
 fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) {
+    dlog!("[stop l2cpu {}] dispatch_stop entry", l2cpu_idx);
     if l2cpu_idx >= 4 {
         reply_err(sock, "l2cpu must be 0..3");
         return;
@@ -779,14 +780,23 @@ fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) {
     let taken = state.l2cpus[l2cpu_idx as usize].lock().unwrap().take();
     match taken {
         Some(slot) => {
+            dlog!(
+                "[stop l2cpu {}] slot taken; joining workers",
+                l2cpu_idx
+            );
             slot.shutdown();
+            dlog!("[stop l2cpu {}] workers joined — replying ok", l2cpu_idx);
             reply_ok(sock);
         }
-        None => reply_err(sock, format!("l2cpu {} is not booted", l2cpu_idx)),
+        None => {
+            dlog!("[stop l2cpu {}] no slot present — replying err", l2cpu_idx);
+            reply_err(sock, format!("l2cpu {} is not booted", l2cpu_idx));
+        }
     }
 }
 
 fn dispatch_shutdown(sock: &UnixStream, state: &Arc<DaemonState>) {
+    dlog!("[shutdown] dispatch_shutdown entry — setting shutdown flag");
     state.shutdown.store(true, Ordering::SeqCst);
     // We don't reach the `serve()` teardown until the accept loop notices the
     // flag, but the accept loop's sleep is 50 ms — client gets Ok promptly.
