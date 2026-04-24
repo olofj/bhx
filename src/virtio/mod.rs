@@ -327,10 +327,14 @@ pub fn run_device(
                 unsafe {
                     ptr::write_volatile(regs.device_features, features[sel as usize & 1]);
                 }
+                // wrapping_add: sel_generation is a u32 MMIO counter whose
+                // native semantics are unsigned wrap. Plain `+ 1` panics in
+                // debug builds once the guest's counter reaches u32::MAX.
+                let next_gen = curr_gen.wrapping_add(1);
                 unsafe {
-                    ptr::write_volatile(regs.sel_generation, curr_gen + 1);
+                    ptr::write_volatile(regs.sel_generation, next_gen);
                 }
-                prev_gen = curr_gen + 1;
+                prev_gen = next_gen;
             }
         }
 
@@ -351,8 +355,9 @@ pub fn run_device(
                 let q = unsafe { ptr::read_volatile(regs.queue_select) } as usize;
                 if q >= num_queues as usize {
                     // Invalid queue index from guest — skip this generation
-                    unsafe { ptr::write_volatile(regs.sel_generation, curr_gen + 1); }
-                    prev_gen = curr_gen + 1;
+                    let next_gen = curr_gen.wrapping_add(1);
+                    unsafe { ptr::write_volatile(regs.sel_generation, next_gen); }
+                    prev_gen = next_gen;
                     unsafe { libc::usleep(1); }
                     continue;
                 }
@@ -371,8 +376,9 @@ pub fn run_device(
                 };
                 queues_seen[q] = true;
 
-                unsafe { ptr::write_volatile(regs.sel_generation, curr_gen + 1); }
-                prev_gen = curr_gen + 1;
+                let next_gen = curr_gen.wrapping_add(1);
+                unsafe { ptr::write_volatile(regs.sel_generation, next_gen); }
+                prev_gen = next_gen;
 
                 if queues_seen.iter().all(|&b| b) {
                     break;
