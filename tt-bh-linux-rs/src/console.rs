@@ -73,18 +73,24 @@ unsafe fn push_char(q: *mut u8, c: u8, exit_flag: &AtomicBool) {
     while !can_push(q) {
         if exit_flag.load(Ordering::Relaxed) { return; }
     }
-    let head = read_rx_head(q) % BUFFER_SIZE;
-    ptr::write_volatile(q.add(OFF_RX_BUF + head as usize), c);
+    // One MMIO read of rx_head; reuse for both the slot index and the
+    // next-head write. The old code called `read_rx_head(q)` twice, which
+    // is a PCIe round-trip per byte written — and racy in principle if the
+    // guest ever advanced its side concurrently (we'd wrap past it).
+    let head = read_rx_head(q);
+    let slot = (head % BUFFER_SIZE) as usize;
+    ptr::write_volatile(q.add(OFF_RX_BUF + slot), c);
     atomic::fence(Ordering::Release);
-    write_rx_head(q, (read_rx_head(q) + 1) % BUFFER_SIZE);
+    write_rx_head(q, (head + 1) % BUFFER_SIZE);
 }
 
 unsafe fn pop_char(q: *mut u8) -> Option<u8> {
     // Non-blocking: caller checks can_pop() first
-    let tail = read_tx_tail(q) % BUFFER_SIZE;
-    let c = ptr::read_volatile(q.add(OFF_TX_BUF + tail as usize));
+    let tail = read_tx_tail(q);
+    let slot = (tail % BUFFER_SIZE) as usize;
+    let c = ptr::read_volatile(q.add(OFF_TX_BUF + slot));
     atomic::fence(Ordering::Release);
-    write_tx_tail(q, (read_tx_tail(q) + 1) % BUFFER_SIZE);
+    write_tx_tail(q, (tail + 1) % BUFFER_SIZE);
     Some(c)
 }
 

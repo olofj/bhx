@@ -76,17 +76,22 @@ unsafe fn push_char(q: *mut u8, c: u8) -> bool {
     if !can_push(q) {
         return false;
     }
-    let head = read_rx_head(q) % BUFFER_SIZE;
-    ptr::write_volatile(q.add(OFF_RX_BUF + head as usize), c);
+    // Single MMIO read of rx_head — reuse for slot index and next-head
+    // write. Two reads would mean two PCIe round-trips per byte and a
+    // principled race window if the guest advanced its side in between.
+    let head = read_rx_head(q);
+    let slot = (head % BUFFER_SIZE) as usize;
+    ptr::write_volatile(q.add(OFF_RX_BUF + slot), c);
     atomic::fence(Ordering::Release);
-    write_rx_head(q, (read_rx_head(q) + 1) % BUFFER_SIZE);
+    write_rx_head(q, (head + 1) % BUFFER_SIZE);
     true
 }
 unsafe fn pop_char(q: *mut u8) -> u8 {
-    let tail = read_tx_tail(q) % BUFFER_SIZE;
-    let c = ptr::read_volatile(q.add(OFF_TX_BUF + tail as usize));
+    let tail = read_tx_tail(q);
+    let slot = (tail % BUFFER_SIZE) as usize;
+    let c = ptr::read_volatile(q.add(OFF_TX_BUF + slot));
     atomic::fence(Ordering::Release);
-    write_tx_tail(q, (read_tx_tail(q) + 1) % BUFFER_SIZE);
+    write_tx_tail(q, (tail + 1) % BUFFER_SIZE);
     c
 }
 
