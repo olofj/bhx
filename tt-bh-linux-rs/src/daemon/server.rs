@@ -19,6 +19,7 @@ use std::time::Duration;
 use crate::boot;
 use crate::chip;
 use crate::daemon::chip_console;
+use crate::dlog;
 use crate::daemon::console_hub::ConsoleHub;
 use crate::daemon::lifetime;
 use crate::daemon::protocol::{
@@ -128,6 +129,9 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             initramfs,
             root_device,
             force_reset_pcie,
+            disk,
+            network,
+            force,
         } => dispatch_boot(
             &sock,
             &state,
@@ -138,6 +142,9 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             initramfs.as_deref(),
             &root_device,
             force_reset_pcie,
+            disk,
+            network,
+            force,
         ),
         Request::AttachConsole { l2cpu, mode } => {
             dispatch_attach_console(sock, &state, l2cpu, mode)
@@ -211,22 +218,54 @@ fn dispatch_boot(
     initramfs: Option<&str>,
     root_device: &str,
     force_reset_pcie: bool,
+    disk: Option<String>,
+    network: bool,
+    force: bool,
 ) {
+    dlog!(
+        "[boot l2cpu {}] dispatch_boot entry: opensbi={} kernel={} dtb={} initramfs={:?} root={} force_reset_pcie={} disk={:?} network={} force={}",
+        l2cpu_idx, opensbi, kernel, dtb, initramfs, root_device, force_reset_pcie, disk, network, force
+    );
     if l2cpu_idx >= 4 {
         reply_err(sock, "l2cpu must be 0..3");
         return;
     }
+
+    // Slot-already-exists handling. Re-imaging on top of a live slot —
+    // even if the core itself is currently held in reset — leaves the
+    // prior workers' TLB mmaps live; the new boot's NOC tile writes then
+    // race the stale mappings and can panic the host (observed
+    // 2026-04-24: mid-OpenSBI write hard-crashed the box). So we either
+    // reject or explicitly tear the slot down first, gated by `force`.
     {
-        let slot = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
-        if slot.is_some() {
+        let slot_exists = state.l2cpus[l2cpu_idx as usize]
+            .lock()
+            .unwrap()
+            .is_some();
+        if slot_exists && !force {
             reply_err(
                 sock,
-                format!("l2cpu {} is already booted; stop it first", l2cpu_idx),
+                format!(
+                    "l2cpu {} is already booted; stop it first, or re-run with --force",
+                    l2cpu_idx
+                ),
             );
             return;
         }
     }
+    if force {
+        let existing = state.l2cpus[l2cpu_idx as usize].lock().unwrap().take();
+        if let Some(prior) = existing {
+            dlog!(
+                "[boot l2cpu {}] --force: tearing down existing slot before re-imaging",
+                l2cpu_idx
+            );
+            prior.shutdown();
+            dlog!("[boot l2cpu {}] prior slot torn down", l2cpu_idx);
+        }
+    }
 
+    dlog!("[boot l2cpu {}] starting boot sequence", l2cpu_idx);
     if let Err(e) = run_boot_sequence(
         state.card,
         l2cpu_idx,
@@ -237,17 +276,106 @@ fn dispatch_boot(
         root_device,
         force_reset_pcie,
     ) {
+        dlog!("[boot l2cpu {}] boot sequence failed: {}", l2cpu_idx, e);
         reply_err(sock, format!("boot failed: {}", e));
         return;
     }
+    dlog!(
+        "[boot l2cpu {}] boot sequence returned ok; initializing runtime slot",
+        l2cpu_idx
+    );
 
-    match make_slot(state.card, l2cpu_idx) {
-        Ok(slot) => {
-            *state.l2cpus[l2cpu_idx as usize].lock().unwrap() = Some(slot);
-            reply_ok(sock);
+    let mut slot = match make_slot(state.card, l2cpu_idx) {
+        Ok(s) => s,
+        Err(e) => {
+            dlog!("[boot l2cpu {}] make_slot failed: {}", l2cpu_idx, e);
+            reply_err(sock, format!("post-boot L2Cpu init failed: {}", e));
+            return;
         }
-        Err(e) => reply_err(sock, format!("post-boot L2Cpu init failed: {}", e)),
+    };
+    dlog!(
+        "[boot l2cpu {}] slot ready (console worker spawned)",
+        l2cpu_idx
+    );
+
+    // Spawn the virtio workers *before* replying Ok — kernel hits VFS mount
+    // at ~0.137s and has no retry. Three sequential RPCs (boot + add-disk +
+    // add-net) lose that race; bundling them keeps the worker threads up
+    // within a few ms of L2CPU reset release.
+    if let Some(path) = disk {
+        dlog!(
+            "[boot l2cpu {}] spawning disk worker for {}",
+            l2cpu_idx,
+            path
+        );
+        if let Err(e) = start_disk_worker(&mut slot, &path) {
+            dlog!(
+                "[boot l2cpu {}] start_disk_worker failed: {}",
+                l2cpu_idx,
+                e
+            );
+            reply_err(sock, format!("start disk worker failed: {}", e));
+            return;
+        }
     }
+    if network {
+        dlog!("[boot l2cpu {}] spawning net worker", l2cpu_idx);
+        if let Err(e) = start_net_worker(state.card, &mut slot) {
+            dlog!("[boot l2cpu {}] start_net_worker failed: {}", l2cpu_idx, e);
+            reply_err(sock, format!("start net worker failed: {}", e));
+            return;
+        }
+    }
+
+    *state.l2cpus[l2cpu_idx as usize].lock().unwrap() = Some(slot);
+    dlog!(
+        "[boot l2cpu {}] dispatch_boot complete — replying ok",
+        l2cpu_idx
+    );
+    reply_ok(sock);
+}
+
+fn start_disk_worker(slot: &mut L2CpuSlot, path: &str) -> io::Result<()> {
+    let exit = Arc::new(AtomicBool::new(false));
+    let l2cpu = slot.l2cpu.clone();
+    let interrupt = slot.interrupt.clone();
+    let exit_thread = exit.clone();
+    let path_thread = path.to_string();
+    let t = thread::spawn(move || {
+        block::disk_main(l2cpu, interrupt, DISK_INT, DISK_MMIO, path_thread, exit_thread);
+    });
+    slot.disks.push(DiskWorker {
+        path: path.to_string(),
+        worker: WorkerHandle {
+            exit,
+            thread: Some(t),
+            description: format!("disk l2cpu {} @ {}", slot.idx, path),
+        },
+    });
+    Ok(())
+}
+
+#[cfg(feature = "slirp")]
+fn start_net_worker(card: u32, slot: &mut L2CpuSlot) -> io::Result<()> {
+    let exit = Arc::new(AtomicBool::new(false));
+    let l2cpu = slot.l2cpu.clone();
+    let interrupt = slot.interrupt.clone();
+    let exit_thread = exit.clone();
+    let idx = slot.idx;
+    let t = thread::spawn(move || {
+        network::network_main(card, l2cpu, interrupt, NET_INT, NET_MMIO, exit_thread);
+    });
+    slot.net = Some(WorkerHandle {
+        exit,
+        thread: Some(t),
+        description: format!("net l2cpu {}", idx),
+    });
+    Ok(())
+}
+
+#[cfg(not(feature = "slirp"))]
+fn start_net_worker(_card: u32, _slot: &mut L2CpuSlot) -> io::Result<()> {
+    Err(io::Error::other("daemon built without the slirp feature"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -276,22 +404,52 @@ fn run_boot_sequence(
     let dtb_addr = starting_address + dtb_offset;
     let rootfs_addr = starting_address + initramfs_offset;
 
+    dlog!(
+        "[run_boot l2cpu {}] opening /dev/tenstorrent/{} to probe state",
+        l2cpu_idx,
+        card
+    );
     let chip = chip::BootChip::new(card)
         .map_err(|e| io::Error::other(format!("open /dev/tenstorrent/{}: {}", card, e)))?;
 
     let running = boot::l2cpu_is_running(&chip, l2cpu_idx as usize);
     let need_reset = force_reset_pcie || running;
+    dlog!(
+        "[run_boot l2cpu {}] running={} force_reset_pcie={} need_reset={}",
+        l2cpu_idx,
+        running,
+        force_reset_pcie,
+        need_reset
+    );
 
     let chip = if need_reset {
+        dlog!(
+            "[run_boot l2cpu {}] closing fd and issuing full board reset (other L2CPUs on this card will see a PCIe blip)",
+            l2cpu_idx
+        );
         drop(chip);
         chip::reset_board(card)?;
+        dlog!(
+            "[run_boot l2cpu {}] board reset complete; sleeping 1s",
+            l2cpu_idx
+        );
         std::thread::sleep(std::time::Duration::from_secs(1));
+        dlog!(
+            "[run_boot l2cpu {}] reopening /dev/tenstorrent/{} post-reset",
+            l2cpu_idx,
+            card
+        );
         chip::BootChip::new(card)
             .map_err(|e| io::Error::other(format!("reopen /dev/tenstorrent/{}: {}", card, e)))?
     } else {
+        dlog!(
+            "[run_boot l2cpu {}] target held in reset; skipping board reset (siblings untouched)",
+            l2cpu_idx
+        );
         chip
     };
 
+    dlog!("[run_boot l2cpu {}] reading DTB from {}", l2cpu_idx, dtb);
     let dtb_raw = boot::read_bin_file(Path::new(dtb))?;
     let boot_device = match initramfs {
         Some(p) => {
@@ -303,10 +461,20 @@ fn run_boot_sequence(
         }
         None => boot::BootDevice::Vda(root_device.to_string()),
     };
+    dlog!(
+        "[run_boot l2cpu {}] patching DTB (memory start=0x{:x} size=0x{:x})",
+        l2cpu_idx,
+        starting_address,
+        memory_size
+    );
     let dtb_patched = boot::modify_dtb(&dtb_raw, &boot_device, starting_address, memory_size)
         .map_err(io::Error::other)?;
 
     let initramfs_pb = initramfs.map(std::path::PathBuf::from);
+    dlog!(
+        "[run_boot l2cpu {}] loading image via NOC tile writes",
+        l2cpu_idx
+    );
     boot::boot_l2cpu(
         &chip,
         l2cpu_idx as usize,
@@ -320,15 +488,26 @@ fn run_boot_sequence(
         rootfs_addr,
     )?;
 
+    dlog!("[run_boot l2cpu {}] releasing from reset", l2cpu_idx);
     boot::reset_x280(&chip, &[l2cpu_idx as usize]);
+    dlog!("[run_boot l2cpu {}] configuring prefetchers", l2cpu_idx);
     boot::configure_prefetchers(&chip, l2cpu_idx as usize);
+    dlog!("[run_boot l2cpu {}] run_boot_sequence done", l2cpu_idx);
     Ok(())
 }
 
 /// Construct the `L2Cpu` + interrupt controller + console hub + chip console
 /// worker for a freshly-booted L2CPU.
 fn make_slot(card: u32, l2cpu_idx: u8) -> io::Result<L2CpuSlot> {
+    dlog!(
+        "[make_slot l2cpu {}] constructing L2Cpu (ioctls + 8GB VA + TLB windows)",
+        l2cpu_idx
+    );
     let l2cpu = Arc::new(L2Cpu::new(l2cpu_idx as usize, card)?);
+    dlog!(
+        "[make_slot l2cpu {}] L2Cpu ready; mapping PLIC interrupt window",
+        l2cpu_idx
+    );
     let interrupt = {
         let window = l2cpu.get_persistent_2m_window(0x2FF10000 + 0x404)?;
         Arc::new(InterruptController::new(window))
@@ -338,6 +517,7 @@ fn make_slot(card: u32, l2cpu_idx: u8) -> io::Result<L2CpuSlot> {
     let (input_tx, input_rx) = mpsc::channel::<u8>();
     let exit = Arc::new(AtomicBool::new(false));
 
+    dlog!("[make_slot l2cpu {}] spawning chip_console thread", l2cpu_idx);
     let t = thread::spawn({
         let l2cpu = l2cpu.clone();
         let hub = hub.clone();
@@ -538,6 +718,7 @@ fn dispatch_add_net(
     l2cpu_idx: u8,
     _ssh_port: Option<u16>,
 ) {
+    dlog!("[add_net l2cpu {}] dispatch entry", l2cpu_idx);
     if l2cpu_idx >= 4 {
         reply_err(sock, "l2cpu must be 0..3");
         return;
@@ -560,6 +741,10 @@ fn dispatch_add_net(
     let interrupt = slot.interrupt.clone();
     let exit_thread = exit.clone();
     let card = state.card;
+    dlog!(
+        "[add_net l2cpu {}] spawning network worker thread",
+        l2cpu_idx
+    );
     let t = thread::spawn(move || {
         network::network_main(card, l2cpu, interrupt, NET_INT, NET_MMIO, exit_thread);
     });
@@ -568,6 +753,7 @@ fn dispatch_add_net(
         thread: Some(t),
         description: format!("net l2cpu {}", l2cpu_idx),
     });
+    dlog!("[add_net l2cpu {}] dispatch complete — replying ok", l2cpu_idx);
     reply_ok(sock);
 }
 

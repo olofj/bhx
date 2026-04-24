@@ -55,6 +55,9 @@ pub fn boot(
     initramfs: Option<String>,
     root_device: String,
     force_reset_pcie: bool,
+    disk: Option<String>,
+    network: bool,
+    force: bool,
 ) -> io::Result<()> {
     write_frame(
         &mut *sock,
@@ -66,6 +69,9 @@ pub fn boot(
             initramfs,
             root_device,
             force_reset_pcie,
+            disk,
+            network,
+            force,
         },
     )?;
     expect_ok(read_frame(&mut *sock)?)

@@ -186,6 +186,13 @@ pub fn disk_main(
     disk_image_path: String,
     exit_flag: Arc<AtomicBool>,
 ) {
+    crate::dlog!(
+        "[disk l2cpu {}] worker thread entered (image={}, mmio_offset=0x{:x}, irq={})",
+        l2cpu.idx(),
+        disk_image_path,
+        mmio_region_offset,
+        interrupt_number
+    );
     while !exit_flag.load(Ordering::Relaxed) {
         let mut blk = match VirtioBlk::new(Path::new(&disk_image_path)) {
             Ok(b) => b,

@@ -10,6 +10,7 @@
 //! in `lifetime.rs` already speak that format.
 
 use std::io::{self, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
@@ -19,6 +20,35 @@ use crate::daemon::server;
 pub struct StartOpts {
     pub card: u32,
     pub foreground: bool,
+    /// If set, redirect daemon stdout/stderr here instead of the default
+    /// tmpfs log path. Written to `<runtime_dir>/logpath` so `daemon logs`
+    /// knows where to tail. Opened with `O_DSYNC` so lines survive a host
+    /// crash (trading throughput for durability — see `runner::open_log`).
+    pub log_file: Option<PathBuf>,
+}
+
+/// Resolve the caller-supplied log path against the current working dir and
+/// open it with `O_APPEND | O_DSYNC`. Daemonize chdirs to `/`, so any
+/// relative path has to be made absolute beforehand. `O_DSYNC` forces each
+/// write to hit disk synchronously — necessary because we're specifically
+/// trying to capture logs across host crashes.
+fn open_log(path: &PathBuf) -> io::Result<(PathBuf, std::fs::File)> {
+    let abs = if path.is_absolute() {
+        path.clone()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    // Make sure the parent directory exists — a typo'd subdir would
+    // otherwise surface only after daemonize has forked.
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_DSYNC)
+        .open(&abs)?;
+    Ok((abs, file))
 }
 
 pub fn start(opts: StartOpts) -> io::Result<()> {
@@ -26,7 +56,27 @@ pub fn start(opts: StartOpts) -> io::Result<()> {
     lifetime::ensure_runtime_dir(card)?;
     let sock_path = lifetime::socket_path(card);
     let pid_path = lifetime::pidfile_path(card);
-    let log_path = lifetime::log_path(card);
+    let default_log_path = lifetime::log_path(card);
+    // Resolve the actual log file path up front so the pre-fork "listening
+    // on …" message can report it. For explicit paths we also persist the
+    // absolute location to a sidecar so `daemon logs` can find it.
+    let (log_path, log_is_override) = match opts.log_file.as_ref() {
+        Some(p) => {
+            let (abs, _f) = open_log(p)?;
+            // Drop the test open; real open happens below for the daemonize
+            // handoff (we can't hand the daemonize crate a cloned fd without
+            // owning a fresh File, and we want to fail fast on bad paths).
+            (abs, true)
+        }
+        None => (default_log_path, false),
+    };
+    if log_is_override {
+        let sidecar = lifetime::runtime_dir(card).join("logpath");
+        let _ = std::fs::write(&sidecar, format!("{}\n", log_path.display()));
+    } else {
+        // Clear any stale sidecar from a previous override-based start.
+        let _ = std::fs::remove_file(lifetime::runtime_dir(card).join("logpath"));
+    }
 
     // If a stale socket file exists (daemon crashed without cleanup), remove
     // it so the bind succeeds.
@@ -70,10 +120,12 @@ pub fn start(opts: StartOpts) -> io::Result<()> {
     // The `daemonize` crate does fork + setsid + fork + chdir + umask + stdio
     // redirect. We skip its pid_file machinery so our own pidfile semantics
     // (flock + stale-recovery) stay authoritative.
-    let log_out = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    //
+    // Opened with O_DSYNC via `open_log` so each stderr line is durably on
+    // disk before the write() returns. Matters because the scenarios we
+    // most want logs from are host machine-check crashes where tmpfs and
+    // pending page-cache writes are gone.
+    let (_abs, log_out) = open_log(&log_path)?;
     let log_err = log_out.try_clone()?;
 
     // Drop pid_guard BEFORE daemonize: the daemonize crate forks, and the
@@ -121,9 +173,13 @@ pub fn stop(card: u32) -> io::Result<()> {
     lifetime::stop(card)
 }
 
-pub fn restart(card: u32, foreground: bool) -> io::Result<()> {
+pub fn restart(card: u32, foreground: bool, log_file: Option<PathBuf>) -> io::Result<()> {
     stop(card)?;
-    start(StartOpts { card, foreground })
+    start(StartOpts {
+        card,
+        foreground,
+        log_file,
+    })
 }
 
 pub fn status(card: u32) -> io::Result<()> {
@@ -170,8 +226,22 @@ pub struct LogsOpts {
     pub lines: usize,
 }
 
+/// If the user started the daemon with `--log-file`, we persisted the path
+/// in a sidecar inside the runtime dir. Fall back to the default tmpfs path
+/// when no sidecar is present.
+fn resolve_log_path(card: u32) -> PathBuf {
+    let sidecar = lifetime::runtime_dir(card).join("logpath");
+    if let Ok(s) = std::fs::read_to_string(&sidecar) {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    lifetime::log_path(card)
+}
+
 pub fn logs(opts: LogsOpts) -> io::Result<()> {
-    let path: PathBuf = lifetime::log_path(opts.card);
+    let path: PathBuf = resolve_log_path(opts.card);
     if !path.exists() {
         return Err(io::Error::other(format!(
             "no log file at {}",

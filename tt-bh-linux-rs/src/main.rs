@@ -97,6 +97,13 @@ enum Commands {
         /// `L2CPU_RESET` first and only reset when necessary.
         #[arg(long)]
         force_reset_pcie: bool,
+        /// If the daemon already has a live slot for this L2CPU, tear it
+        /// down (stop workers, drop mmaps) before re-imaging. Without this,
+        /// a duplicate `boot` returns an error and leaves the prior slot
+        /// untouched. Use when you know you want to re-image a running
+        /// core — e.g. switching rootfs without an explicit `stop` first.
+        #[arg(long)]
+        force: bool,
     },
     /// Attach a terminal to a booted L2CPU's console via the daemon.
     Connect {
@@ -147,6 +154,12 @@ enum DaemonAction {
     Start {
         #[arg(long)]
         foreground: bool,
+        /// Override the log file path (absolute or relative to cwd). Default
+        /// is `$XDG_RUNTIME_DIR/tt-bh-linux/<card>/log` which lives on tmpfs
+        /// and is lost on host crash — set this to a file in the project
+        /// directory when you need post-mortem logs.
+        #[arg(long)]
+        log_file: Option<String>,
     },
     /// Stop the daemon: SIGTERM, 5s grace, SIGKILL; idempotent.
     Stop,
@@ -154,12 +167,15 @@ enum DaemonAction {
     Restart {
         #[arg(long)]
         foreground: bool,
+        /// See `daemon start --log-file`.
+        #[arg(long)]
+        log_file: Option<String>,
     },
     /// Show daemon + per-L2CPU status.
     Status,
     /// Tail the daemon log.
     Logs {
-        #[arg(short = 'n', long, default_value_t = 200)]
+        #[arg(long, default_value_t = 200)]
         lines: usize,
         #[arg(long)]
         no_follow: bool,
@@ -523,18 +539,27 @@ fn main() -> std::process::ExitCode {
             initramfs,
             root_device,
             force_reset_pcie,
-        }) => run_boot_client(
-            cli.ttdevice,
-            cli.l2cpu as u8,
-            opensbi,
-            kernel,
-            dtb,
-            initramfs,
-            root_device,
-            force_reset_pcie,
-            cli.disk,
-            cli.network,
-        ),
+            force,
+        }) => {
+            let disk = resolve_disk_path(
+                cli.disk,
+                DEFAULT_DISK_PATH,
+                std::path::Path::new(DEFAULT_DISK_PATH).exists(),
+            );
+            run_boot_client(
+                cli.ttdevice,
+                cli.l2cpu as u8,
+                opensbi,
+                kernel,
+                dtb,
+                initramfs,
+                root_device,
+                force_reset_pcie,
+                disk,
+                cli.network,
+                force,
+            )
+        }
         Some(Commands::Connect { mode }) => {
             let pmode = parse_console_mode(&mode)?;
             run_connect_client(cli.ttdevice, cli.l2cpu as u8, pmode)
@@ -624,7 +649,20 @@ fn run_boot_client(
     force_reset_pcie: bool,
     disk: Option<String>,
     network: bool,
+    force: bool,
 ) -> std::io::Result<()> {
+    // Bundle disk + network into the Boot RPC so the virtio workers come up
+    // together with the L2CPU reset release. The guest kernel hits its VFS
+    // rootfs mount at ~0.137s and doesn't retry — issuing add-disk as a
+    // separate RPC loses that race.
+    //
+    // Paths are canonicalized here (client side) because the daemon runs
+    // from cwd=/, so relative paths from the user's shell wouldn't resolve.
+    let opensbi = absolutize(&opensbi)?;
+    let kernel = absolutize(&kernel)?;
+    let dtb = absolutize(&dtb)?;
+    let initramfs = initramfs.map(|p| absolutize(&p)).transpose()?;
+    let disk = disk.map(|p| absolutize(&p)).transpose()?;
     let mut sock = daemon::client::connect(card)?;
     daemon::client::boot(
         &mut sock,
@@ -635,20 +673,19 @@ fn run_boot_client(
         initramfs,
         root_device,
         force_reset_pcie,
-    )?;
+        disk,
+        network,
+        force,
+    )
+}
 
-    // Convenience: also wire up disk + net if the user passed --disk / -n on
-    // the boot command. Mirrors the old boot-then-connect flow minus the
-    // console (use `connect` to attach).
-    if let Some(path) = disk {
-        let mut sock = daemon::client::connect(card)?;
-        daemon::client::add_disk(&mut sock, l2cpu, path)?;
-    }
-    if network {
-        let mut sock = daemon::client::connect(card)?;
-        daemon::client::add_net(&mut sock, l2cpu, None)?;
-    }
-    Ok(())
+fn absolutize(path: &str) -> std::io::Result<String> {
+    let p = std::path::Path::new(path);
+    let abs = std::fs::canonicalize(p)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {}", path, e)))?;
+    abs.into_os_string()
+        .into_string()
+        .map_err(|_| std::io::Error::other(format!("non-UTF-8 path: {}", path)))
 }
 
 fn run_connect_client(
@@ -669,11 +706,19 @@ fn run_connect_client(
 
 fn run_daemon_cmd(card: u32, action: DaemonAction) -> std::io::Result<()> {
     match action {
-        DaemonAction::Start { foreground } => {
-            daemon::runner::start(daemon::runner::StartOpts { card, foreground })
-        }
+        DaemonAction::Start {
+            foreground,
+            log_file,
+        } => daemon::runner::start(daemon::runner::StartOpts {
+            card,
+            foreground,
+            log_file: log_file.map(std::path::PathBuf::from),
+        }),
         DaemonAction::Stop => daemon::runner::stop(card),
-        DaemonAction::Restart { foreground } => daemon::runner::restart(card, foreground),
+        DaemonAction::Restart {
+            foreground,
+            log_file,
+        } => daemon::runner::restart(card, foreground, log_file.map(std::path::PathBuf::from)),
         DaemonAction::Status => daemon::runner::status(card),
         DaemonAction::Logs { lines, no_follow } => daemon::runner::logs(daemon::runner::LogsOpts {
             card,

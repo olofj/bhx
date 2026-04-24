@@ -39,7 +39,11 @@ pub fn pump(fd: OwnedFd, exit: Arc<AtomicBool>) -> io::Result<()> {
     // Main thread: stdin → stream, with Ctrl-A x detection.
     let writer_result = writer_loop(&stream, &exit);
 
-    // Close the stream to unblock the reader on EOF; then join it.
+    // Shut down the socket so both the daemon side (which then detaches us
+    // from the hub and closes its end) and our reader clone see EOF. Just
+    // dropping `stream` isn't enough: the reader thread holds a `try_clone`
+    // of the same socket, keeping the client-side endpoint open.
+    let _ = stream.shutdown(std::net::Shutdown::Both);
     drop(stream);
     let _ = reader.join();
     writer_result

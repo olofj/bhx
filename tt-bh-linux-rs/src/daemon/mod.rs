@@ -18,6 +18,7 @@ pub mod chip_console;
 pub mod client;
 pub mod console_hub;
 pub mod lifetime;
+pub mod log;
 pub mod protocol;
 pub mod runner;
 pub mod server;
