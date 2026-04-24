@@ -122,37 +122,58 @@ fn probe_initial_chip_state(card: u32) -> Vec<u8> {
     released
 }
 
-/// For each released core, construct an L2CPU runtime slot without
-/// running a boot sequence. This lets the daemon adopt cores that were
-/// left running by a previous daemon run (crash-resume) or by an
-/// out-of-band boot.
+/// For each released core, probe the chip's VIRTUART / OSBIdbug
+/// signatures. If valid → construct a runtime slot (warm-resume, console
+/// worker starts immediately). If invalid → mark the core `wedged` in
+/// `DaemonState` so `dispatch_status` reports it as such; the user
+/// recovers via `boot --force-reset-pcie`.
 ///
 /// Only the console worker is started — the daemon has no way to know
 /// which disk image or network config was attached before, so the user
 /// must re-issue `add-disk` / `add-net` to rewire those. The chip's
 /// guest kernel stays up throughout; virtio descriptor chains re-sync
 /// on the next queue kick once workers come back.
-///
-/// On make_slot failure we log and skip the core — a failure here
-/// usually means the chip is wedged beyond what we can probe, which is
-/// non-fatal to the daemon as a whole.
 fn warm_resume_released(state: &Arc<DaemonState>, released: &[u8]) {
     for &idx in released {
+        dlog!("[warm-resume l2cpu {}] probing chip state", idx);
+        let l2cpu = match L2Cpu::new(idx as usize, state.card) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                dlog!(
+                    "[warm-resume l2cpu {}] L2Cpu::new failed: {} — marking wedged",
+                    idx,
+                    e
+                );
+                state.wedged[idx as usize].store(true, Ordering::SeqCst);
+                continue;
+            }
+        };
+        if !chip_console::probe_warm_resume(&l2cpu) {
+            dlog!(
+                "[warm-resume l2cpu {}] probe failed — marking wedged, dropping L2Cpu",
+                idx
+            );
+            state.wedged[idx as usize].store(true, Ordering::SeqCst);
+            // Arc<L2Cpu> drops here; TLB windows and 8 GB VA released.
+            continue;
+        }
         dlog!(
-            "[warm-resume l2cpu {}] adopting released core (console only — use add-disk/add-net to reattach)",
+            "[warm-resume l2cpu {}] probe passed; adopting (console only — use add-disk/add-net to reattach)",
             idx
         );
-        match make_slot(state.card, idx) {
+        match make_slot_from_l2cpu(l2cpu, idx) {
             Ok(slot) => {
                 *state.l2cpus[idx as usize].lock().unwrap() = Some(slot);
+                state.wedged[idx as usize].store(false, Ordering::SeqCst);
                 dlog!("[warm-resume l2cpu {}] slot adopted", idx);
             }
             Err(e) => {
                 dlog!(
-                    "[warm-resume l2cpu {}] make_slot failed: {} — skipping (core stays orphaned; daemon won't manage it)",
+                    "[warm-resume l2cpu {}] make_slot_from_l2cpu failed: {} — marking wedged",
                     idx,
                     e
                 );
+                state.wedged[idx as usize].store(true, Ordering::SeqCst);
             }
         }
     }
@@ -260,7 +281,14 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) {
     for (idx, slot_mutex) in state.l2cpus.iter().enumerate() {
         let slot = slot_mutex.lock().unwrap();
         let (st, disk, net, clients) = match slot.as_ref() {
-            None => (L2CpuState::Stopped, None, false, 0),
+            None => {
+                let st = if state.wedged[idx].load(Ordering::Relaxed) {
+                    L2CpuState::Wedged
+                } else {
+                    L2CpuState::Stopped
+                };
+                (st, None, false, 0)
+            }
             Some(s) => (
                 L2CpuState::Running,
                 s.disks.first().map(|d| d.path.clone()),
@@ -410,6 +438,9 @@ fn dispatch_boot(
     }
 
     *state.l2cpus[l2cpu_idx as usize].lock().unwrap() = Some(slot);
+    // Successful cold boot — core is freshly running with valid magic,
+    // so any stale "wedged" mark from a prior startup probe is obsolete.
+    state.wedged[l2cpu_idx as usize].store(false, Ordering::SeqCst);
     dlog!(
         "[boot l2cpu {}] dispatch_boot complete — replying ok",
         l2cpu_idx
@@ -586,6 +617,14 @@ fn make_slot(card: u32, l2cpu_idx: u8) -> io::Result<L2CpuSlot> {
         l2cpu_idx
     );
     let l2cpu = Arc::new(L2Cpu::new(l2cpu_idx as usize, card)?);
+    make_slot_from_l2cpu(l2cpu, l2cpu_idx)
+}
+
+/// Build the runtime slot on top of an already-constructed L2Cpu. Used by
+/// the startup warm-resume path so it can probe the chip before committing
+/// to adoption — otherwise we'd construct an L2Cpu twice (once for the
+/// probe, once here).
+fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlot> {
     dlog!(
         "[make_slot l2cpu {}] L2Cpu ready; mapping PLIC interrupt window",
         l2cpu_idx

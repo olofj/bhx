@@ -204,6 +204,90 @@ enum UartExit {
     Retry,
 }
 
+/// Probe whether a released L2CPU's chip-side memory has the expected
+/// OpenSBI debug descriptor and VIRTUART magic — i.e. whether it's a
+/// warm-resume candidate rather than a wedged or half-booted core.
+///
+/// Called at daemon startup once per released core (bit `idx+4` = 1 in
+/// L2CPU_RESET). Opens transient 2 MiB TLB windows at the descriptor
+/// pointer and queue base; both windows are released when this function
+/// returns. Any failure on the probe path is treated as "not viable"
+/// (caller marks the core wedged).
+///
+/// Allocates one ioctl-backed window each for the descriptor and queue.
+/// Calls about ~2× the allocator cost of a single `read32`. Net cost at
+/// daemon start for 4 released cores is well under 100 ms on BH.
+pub fn probe_warm_resume(l2cpu: &L2Cpu) -> bool {
+    let starting_address = l2cpu.starting_address();
+    let debug_ptr = l2cpu.read32(starting_address + OPENSBI_DEBUG_PTR);
+
+    let desc_window =
+        match l2cpu.get_persistent_2m_window(starting_address + debug_ptr as u64) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!(
+                    "[probe l2cpu {}] descriptor window failed: {}",
+                    l2cpu.idx(),
+                    e
+                );
+                return false;
+            }
+        };
+    let desc = desc_window.get_window() as *const DebugDescriptor;
+    for (i, &expected) in EYE_CATCHER.iter().enumerate() {
+        let byte = unsafe { ptr::read_volatile(&(*desc).eye_catcher[i]) };
+        if byte != expected {
+            eprintln!(
+                "[probe l2cpu {}] OSBIdbug eye catcher mismatch at byte {} (got 0x{:02x}, want 0x{:02x})",
+                l2cpu.idx(),
+                i,
+                byte,
+                expected
+            );
+            return false;
+        }
+    }
+
+    let uart_base = unsafe { ptr::read_volatile(&(*desc).virtuart_base) };
+    if uart_base == !0u64 {
+        eprintln!(
+            "[probe l2cpu {}] virtuart_base is ~0 (chip not fully initialized)",
+            l2cpu.idx()
+        );
+        return false;
+    }
+
+    let queue_window = match l2cpu.get_persistent_2m_window(uart_base) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!(
+                "[probe l2cpu {}] queue window failed: {}",
+                l2cpu.idx(),
+                e
+            );
+            return false;
+        }
+    };
+    let q = queue_window.get_window();
+    let magic = unsafe { read_magic(q) };
+    if u64::from_le(magic) != VIRTUAL_UART_MAGIC {
+        eprintln!(
+            "[probe l2cpu {}] virt UART magic is 0x{:016x} (want 0x{:016x}) — wedged",
+            l2cpu.idx(),
+            u64::from_le(magic),
+            VIRTUAL_UART_MAGIC
+        );
+        return false;
+    }
+
+    eprintln!(
+        "[probe l2cpu {}] warm-resume viable (virtuart @ 0x{:x})",
+        l2cpu.idx(),
+        uart_base
+    );
+    true
+}
+
 /// Daemon's long-running per-L2CPU console loop. Reattaches on chip reset
 /// (magic mismatch) the same way `console::console_main` does.
 pub fn chip_console_main(
