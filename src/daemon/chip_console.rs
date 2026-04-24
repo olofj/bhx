@@ -173,19 +173,21 @@ fn uart_pass(
             match input_rx.try_recv() {
                 Ok(b) => {
                     got_input = true;
-                    // Spin briefly if ring is full — guest SBI will drain it
-                    // within a few iterations.
-                    let mut spins = 0;
+                    // Wait for the guest's SBI layer to drain the 4 KiB RX
+                    // ring. Unbounded with a short sleep per iteration —
+                    // upstream (mpsc channel + socket buffer) naturally
+                    // back-pressures the client if we fall behind, so we
+                    // shouldn't lose bytes on the way in. An earlier
+                    // version capped this at 10 000 spin_loop iterations
+                    // and dropped bytes past that, which caused sha
+                    // mismatches in sustained-write workloads (64 KiB+ at
+                    // a time would lose random bytes as the guest
+                    // couldn't keep up with microsecond-scale spins).
                     while !unsafe { push_char(q, b) } {
                         if exit_flag.load(Ordering::Relaxed) {
                             return Ok(UartExit::Done);
                         }
-                        spins += 1;
-                        if spins > 10_000 {
-                            // Drop a byte rather than block forever.
-                            break;
-                        }
-                        std::hint::spin_loop();
+                        std::thread::sleep(Duration::from_micros(100));
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
