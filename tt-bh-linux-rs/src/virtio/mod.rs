@@ -452,6 +452,18 @@ pub fn run_device(
     }
     let queue_header_size = device.queue_header_size();
 
+    // Adaptive sleep with hysteresis: a single empty pass in the middle
+    // of a bursty workload (e.g. disk I/O between descriptor arrivals)
+    // shouldn't knock us back to the slow sleep and then re-ramp when
+    // the next descriptor arrives. Stay fast for FAST_WINDOW after any
+    // observed work; drop to slow only after sustained idle. Same
+    // treatment `chip_console::uart_pass` uses; see that module and
+    // <https://github.com/olofj/tt-bh-rust/issues/2>.
+    const FAST_SLEEP_US: libc::c_uint = 1;
+    const SLOW_SLEEP_US: libc::c_uint = 1000;
+    const FAST_WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
+    let mut last_active = std::time::Instant::now();
+
     while !exit_flag.load(Ordering::Relaxed) {
         // Check magic still valid
         if unsafe { ptr::read_volatile(regs.magic_value) } != VIRTIO_MAGIC {
@@ -560,15 +572,19 @@ pub fn run_device(
             }
         }
 
-        // usleep(1) is effectively a scheduler round-trip — fine when the
-        // guest is actively pushing descriptors (we want to come back
-        // quickly for low latency) but wasteful when idle. Stretch the
-        // sleep to 1 ms when no queue had work: still polls fast enough
-        // that a burst of descriptors is processed within one driver
-        // timeout, and drops idle-worker CPU by ~3 orders of magnitude.
-        // Coarse stopgap for the more properly tuned adaptive backoff
-        // tracked at <https://github.com/olofj/tt-bh-rust/issues/2>.
-        let sleep_us = if did_work { 1 } else { 1000 };
+        // Adaptive sleep: fast (1 µs) for low latency while the guest is
+        // actively pushing descriptors, slow (1 ms) when idle to stop
+        // burning CPU. Hysteresis keeps us in fast mode for FAST_WINDOW
+        // after any observed work, so bursty workloads don't flap back
+        // to the slow sleep during sub-ms gaps between descriptors.
+        if did_work {
+            last_active = std::time::Instant::now();
+        }
+        let sleep_us = if last_active.elapsed() < FAST_WINDOW {
+            FAST_SLEEP_US
+        } else {
+            SLOW_SLEEP_US
+        };
         unsafe { libc::usleep(sleep_us); }
     }
 }
