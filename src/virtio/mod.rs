@@ -12,7 +12,6 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::l2cpu::L2Cpu;
-use crate::tlb::TlbWindow;
 use interrupt::InterruptController;
 
 // VirtIO MMIO register offsets
@@ -557,14 +556,4 @@ pub fn run_device(
 
         unsafe { libc::usleep(1); }
     }
-}
-
-/// Get a pointer to the device-specific config region (offset 0x100).
-pub fn config_ptr(l2cpu: &L2Cpu, mmio_region_offset: u64) -> (*mut u8, TlbWindow) {
-    let address = l2cpu.starting_address() + l2cpu.memory_size() - mmio_region_offset;
-    let window = l2cpu
-        .get_persistent_2m_window(address)
-        .expect("failed to create config window");
-    let ptr = unsafe { window.get_window().add(VIRTIO_MMIO_CONFIG) };
-    (ptr, window)
 }
