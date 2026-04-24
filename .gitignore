@@ -1,1 +1,23 @@
 /target/
+
+# Downloaded firmware + kernel artifacts (tt-bh-linux kernel pull / manual copy).
+/Image
+/fw_jump.bin
+/blackhole-card.dtb
+/blackhole-p100*.dtb
+
+# Disk images (rootfs.ext4, images/*.ext4).
+*.ext4
+/images/
+
+# Daemon runtime output when --log-file points into the repo.
+/daemon-card*.log
+
+# libvdeslirp source tarballs / build tree (downloaded for linking).
+/libvdeslirp-*/
+/libvdeslirp_*.tar.*
+/libvdeslirp_*.dsc
+/libvdeslirp_*.debian.tar.*
+
+# Claude Code session state (plans, agent notes).
+/.claude/
