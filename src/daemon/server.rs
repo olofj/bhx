@@ -49,6 +49,7 @@ pub fn serve(card: u32, listener: UnixListener) -> io::Result<()> {
     listener.set_nonblocking(true)?;
 
     eprintln!("[daemon] accepting connections on card {}", card);
+    probe_initial_chip_state(card);
     while !state.shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((sock, _addr)) => {
@@ -76,6 +77,44 @@ pub fn serve(card: u32, listener: UnixListener) -> io::Result<()> {
     let _ = std::fs::remove_file(lifetime::socket_path(card));
     eprintln!("[daemon] bye");
     Ok(())
+}
+
+/// Probe the chip's L2CPU_RESET register once at daemon startup and log
+/// each L2CPU's state (held-in-reset vs. released/running). Purely
+/// diagnostic today — gives the user visibility into what the chip was
+/// left in after a prior daemon run or reboot, *before* they issue any
+/// RPCs. A future iteration can use this to auto-warm-resume cores that
+/// were left running (Phase C, per graceful-baking-tulip.md).
+///
+/// Safe to call even when the chip is wedged: reading the reset register
+/// is a single AXI read to tile (8,0), no state change.
+fn probe_initial_chip_state(card: u32) {
+    use crate::boot::AxiAccess;
+    let chip = match chip::BootChip::new(card) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[probe] skipping chip-state probe: open /dev/tenstorrent/{} failed: {}",
+                card, e
+            );
+            return;
+        }
+    };
+    let reset_reg: u64 = 0x80030014;
+    let val = chip.axi_read32(reset_reg);
+    eprintln!(
+        "[probe] L2CPU_RESET@0x{:x}={:#010x} (card {})",
+        reset_reg, val, card
+    );
+    for idx in 0..4 {
+        let bit = (val >> (idx + 4)) & 1;
+        let state = if bit == 1 {
+            "released (running or wedged — warm-resume candidate)"
+        } else {
+            "held in reset (cold-bootable)"
+        };
+        eprintln!("[probe]   L2CPU {} bit {} = {} -> {}", idx, idx + 4, bit, state);
+    }
 }
 
 /// Install handlers for SIGTERM / SIGINT that flip the daemon's shutdown flag.
