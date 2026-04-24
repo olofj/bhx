@@ -42,9 +42,6 @@ pub const L2CPU_MEMORY_SIZE: [u64; 4] = [
     0x8000_0000,   // 2GB
 ];
 
-/// GDDR enable bit mapping for telemetry check.
-pub const L2CPU_GDDR_ENABLE_BIT: [u32; 4] = [5, 6, 7, 7];
-
 pub struct L2Cpu {
     fd: RawFd,
     idx: usize,
