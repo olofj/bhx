@@ -98,24 +98,13 @@ pub struct DaemonState {
     /// cold `boot`. Read by `dispatch_status` to report `Wedged`.
     pub wedged: [AtomicBool; 4],
     /// Single shared access point for chip-wide AXI registers on NOC tile
-    /// (8,0) — PLL, reset unit, `L2CPU_RESET`. Phase 1 of the refactor in
-    /// issue #1: concurrent boots now serialize PLL steps and reset R-M-W
-    /// through this type's internal mutex instead of racing through four
-    /// independently-configured TLB windows. Kept as an `Arc` so worker
-    /// threads can hold their own references if needed.
-    pub shared_chip: Arc<SharedChip>,
-    /// Serializes the chip-touching phase of `dispatch_boot`
-    /// (`run_boot_sequence`). After Phase 2 the only remaining race path is
-    /// `L2Cpu::new`'s one-shot PLL step to 1750 MHz, which uses transient
-    /// TLB windows to tile (8,0) on the per-L2CPU fd — concurrent
-    /// constructor calls would still alias the PLL registers. The path
-    /// forward is to either (a) drop the PLL step from `L2Cpu::new` (it's
-    /// redundant with `reset_x280` on the cold-boot path and the chip is
-    /// already at 1750 on the warm-resume path), or (b) route it through
-    /// `SharedChip::seq_lock` by passing `&SharedChip` into the
-    /// constructor. Until then `boot_lock` stays. See
+    /// (8,0) — PLL, reset unit, `L2CPU_RESET`. Concurrent boots serialize
+    /// their PLL steps and reset R-M-W through `SharedChip::seq_lock`
+    /// instead of racing through independently-configured TLB windows.
+    /// Kept as an `Arc` so worker threads can hold their own references
+    /// if they ever need chip-wide register access. See
     /// <https://github.com/olofj/tt-bh-rust/issues/1>.
-    pub boot_lock: Mutex<()>,
+    pub shared_chip: Arc<SharedChip>,
     /// Set by the shutdown handler to make the accept loop exit.
     pub shutdown: Arc<AtomicBool>,
 }
@@ -142,7 +131,6 @@ impl DaemonState {
                 AtomicBool::new(false),
             ],
             shared_chip,
-            boot_lock: Mutex::new(()),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }

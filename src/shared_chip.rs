@@ -27,15 +27,14 @@
 //! Callers never see the rotation; they acquire a read guard on the inner
 //! state and find a valid `Inner` on the other side.
 //!
-//! ## Phase 1 scope
+//! ## Scope
 //!
-//! This type is introduced for the tile-(8,0) access points that the daemon
-//! itself controls (startup probe, `l2cpu_is_running`, `reset_x280`,
-//! `reset_board`). `BootChip` still handles per-L2CPU NOC bulk writes
-//! (OpenSBI / kernel / DTB loads); those target disjoint tile DRAM regions
-//! across L2CPUs and are not in the race path. The `boot_lock` in
-//! `DaemonState` stays until `BootChip`'s remaining uses are migrated to
-//! `Arc<L2Cpu>` (Phase 2+).
+//! All tile-(8,0) access in the daemon goes through this type: the startup
+//! probe, `l2cpu_is_running`, `reset_x280`, `reset_board`, and the debug
+//! CLI's register pokes. Per-L2CPU NOC traffic (OpenSBI / kernel / DTB
+//! image loads, L3 / L2 prefetch config, reset vectors) goes through the
+//! per-L2CPU `L2Cpu` fd instead, so 4-way parallel cold boots no longer
+//! share a single bus-access point.
 
 use std::io;
 use std::mem::ManuallyDrop;

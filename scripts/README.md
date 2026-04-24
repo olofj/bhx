@@ -15,7 +15,7 @@ Run them from `tt-bh-linux-rs/` after `cargo build`.
 |--------|-------------------|
 | `soak_warm_resume.sh` | N cycles of `daemon stop` + `daemon start`; asserts each restart re-adopts L2CPU 0 via warm-resume (probe passes, slot adopted). |
 | `soak_add_remove.sh`  | N cycles of `add-disk` / `remove-disk` / `add-net` / `remove-net`; asserts `daemon status` after each step. Also verifies double-remove errors cleanly without mutating the slot. |
-| `soak_concurrent.sh`  | Cold-boots all 4 L2CPUs (each with its own `rootfs-N.ext4`), then runs N iterations of **4-way concurrent** `remove-disk`/`add-disk`/`remove-net`/`add-net` hammering sibling slots in parallel, with a background `daemon status` poller alongside. Boots themselves are serialized by the daemon's `boot_lock` ([issue #1](https://github.com/olofj/tt-bh-rust/issues/1)); this soak exercises the post-boot concurrent RPC surface. |
+| `soak_concurrent.sh`  | Boots all 4 L2CPUs in parallel (each with its own `rootfs-N.ext4`), then runs N iterations of **4-way concurrent** `remove-disk`/`add-disk`/`remove-net`/`add-net` hammering sibling slots in parallel, with a background `daemon status` poller alongside. Chip-wide AXI ops go through `SharedChip::seq_lock`; per-L2CPU NOC traffic goes through each core's own fd. See [issue #1](https://github.com/olofj/tt-bh-rust/issues/1). |
 
 ## Env overrides
 
@@ -49,7 +49,6 @@ resets it.
 These only hammer the happy paths with expected values. Things left for
 a separate coverage pass:
 
-- 4-way parallel cold boot (currently gated by the daemon's `boot_lock`; see [issue #1](https://github.com/olofj/tt-bh-rust/issues/1))
 - crash injection (SIGKILL the daemon mid-RPC)
 - long-running guest with I/O pressure during `remove-disk`
 - libvdeslirp TCP session loss on `remove-net`

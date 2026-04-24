@@ -30,7 +30,7 @@ src/
 │   ├── network.rs    # VirtIO net device (libvdeslirp)
 │   └── interrupt.rs  # PLIC interrupt poke (mutex-protected; intentionally overwrites, see gotchas)
 ├── daemon/
-│   ├── mod.rs        # DaemonState, L2CpuSlot, WorkerHandle; boot_lock lives here
+│   ├── mod.rs        # DaemonState, L2CpuSlot, WorkerHandle; holds Arc<SharedChip>
 │   ├── server.rs     # Accept loop + dispatch_{boot,status,attach_console,add/remove_disk/net,stop,shutdown}
 │   ├── client.rs     # Thin RPC helpers used by main.rs
 │   ├── runner.rs     # daemon start/stop/restart/status/logs — double-fork via `daemonize` crate
@@ -170,8 +170,10 @@ If `tt-smi -r` doesn't recover the card, power-cycle the host.
   descriptor from a guest that got torn mid-run. Reset and reboot.
 - **Daemon died / host crashed under load**: check
   `./daemon-card0.log` — it's `O_DSYNC`, so the last line reflects the
-  last thing that actually hit disk. Known hazard: 4-way concurrent cold
-  boot without the `boot_lock` mitigation (see issue #1).
+  last thing that actually hit disk. The historical 4-way concurrent
+  cold boot hazard is fixed (see issue #1); if a fresh crash lands on
+  the boot path, check `SharedChip::seq_lock` holds + `L2Cpu`'s own
+  `alloc_lock` holds before assuming it's a concurrency regression.
 
 ## Building & testing
 
@@ -222,15 +224,17 @@ image/kernel/ramdisk downloaders, the future `SharedChip` abstraction
   `Arc<L2Cpu>`. Persistent windows are set up at `new()` and never
   remapped — `write32` / `read32` / `get_persistent_2m_window` lock the
   mutex only for allocation, not the subsequent volatile ops.
-- **`DaemonState.boot_lock`** (`src/daemon/mod.rs`) serializes the
-  chip-touching phase of `dispatch_boot` (`run_boot_sequence` +
-  `make_slot`). Concurrent 4-way cold boot through independent
-  `BootChip` fds crashes the host: each fd allocates its own TLB id but
-  all four windows alias the **same** physical AXI tile (8,0) registers
-  (PLL, `L2CPU_RESET`), so PLL steps and reset R-M-W race at the
-  hardware. Don't remove or loosen `boot_lock` without the `SharedChip`
-  refactor landing first — see
-  <https://github.com/olofj/tt-bh-rust/issues/1>.
+- **Chip-wide AXI access goes through exactly one place**: the daemon's
+  `SharedChip` (`src/shared_chip.rs`), holding a single persistent 2 MiB
+  TLB window to NOC tile (8,0). `SharedChip::seq_lock` serializes any
+  multi-step register sequence (PLL step + `L2CPU_RESET` R-M-W in
+  `reset_x280`, fd-drop + PCIe reset + fd-reopen in `reset_board`).
+  Do NOT create another mapping to tile (8,0) — concurrent accessors
+  aliasing the PLL or reset registers caused host crashes on 4-way cold
+  boots before the `SharedChip` refactor (see issue #1). Per-L2CPU NOC
+  traffic (DRAM image load, L3 / L2 prefetch, reset vectors) goes
+  through each core's own `L2Cpu` fd + TLB windows, which is fine
+  because those regions are disjoint across cores.
 - `InterruptController::set_interrupt` **intentionally overwrites** the
   PLIC pending register instead of OR-ing — preserves a quirky but
   working behavior from the C++ implementation. Don't "fix" without

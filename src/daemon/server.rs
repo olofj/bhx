@@ -355,50 +355,47 @@ fn dispatch_boot(
         }
     }
 
-    // Serialize the chip-touching phase across concurrent boot RPCs — see the
-    // comment on `DaemonState::boot_lock`. Narrow scope so add/remove/status
-    // RPCs on other cores aren't blocked longer than necessary.
-    let mut slot = {
-        dlog!("[boot l2cpu {}] waiting for boot_lock", l2cpu_idx);
-        let _boot_guard = state.boot_lock.lock().unwrap();
-        dlog!("[boot l2cpu {}] starting boot sequence", l2cpu_idx);
-        let l2cpu = match run_boot_sequence(
-            state,
-            l2cpu_idx,
-            opensbi,
-            kernel,
-            dtb,
-            initramfs,
-            root_device,
-            force_reset_pcie,
-        ) {
-            Ok(l) => l,
-            Err(e) => {
-                dlog!("[boot l2cpu {}] boot sequence failed: {}", l2cpu_idx, e);
-                reply_err(sock, format!("boot failed: {}", e));
-                return;
-            }
-        };
-        dlog!(
-            "[boot l2cpu {}] boot sequence returned ok; initializing runtime slot",
-            l2cpu_idx
-        );
-
-        let slot = match make_slot_from_l2cpu(l2cpu, l2cpu_idx) {
-            Ok(s) => s,
-            Err(e) => {
-                dlog!("[boot l2cpu {}] make_slot_from_l2cpu failed: {}", l2cpu_idx, e);
-                reply_err(sock, format!("post-boot L2Cpu init failed: {}", e));
-                return;
-            }
-        };
-        dlog!(
-            "[boot l2cpu {}] slot ready (console worker spawned)",
-            l2cpu_idx
-        );
-        slot
+    // No daemon-wide serialization of the chip-touching phase here —
+    // tile-(8,0) access is mediated by `SharedChip::seq_lock` inside each
+    // of its typed methods, and per-L2CPU NOC traffic goes through each
+    // L2CPU's own fd + TLB windows. Concurrent boots on different cores
+    // proceed in parallel; the same-core case is still serialized by the
+    // per-slot `Mutex<Option<L2CpuSlot>>` higher up this function.
+    dlog!("[boot l2cpu {}] starting boot sequence", l2cpu_idx);
+    let l2cpu = match run_boot_sequence(
+        state,
+        l2cpu_idx,
+        opensbi,
+        kernel,
+        dtb,
+        initramfs,
+        root_device,
+        force_reset_pcie,
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            dlog!("[boot l2cpu {}] boot sequence failed: {}", l2cpu_idx, e);
+            reply_err(sock, format!("boot failed: {}", e));
+            return;
+        }
     };
-    dlog!("[boot l2cpu {}] released boot_lock", l2cpu_idx);
+    dlog!(
+        "[boot l2cpu {}] boot sequence returned ok; initializing runtime slot",
+        l2cpu_idx
+    );
+
+    let mut slot = match make_slot_from_l2cpu(l2cpu, l2cpu_idx) {
+        Ok(s) => s,
+        Err(e) => {
+            dlog!("[boot l2cpu {}] make_slot_from_l2cpu failed: {}", l2cpu_idx, e);
+            reply_err(sock, format!("post-boot L2Cpu init failed: {}", e));
+            return;
+        }
+    };
+    dlog!(
+        "[boot l2cpu {}] slot ready (console worker spawned)",
+        l2cpu_idx
+    );
 
     // Spawn the virtio workers *before* replying Ok — kernel hits VFS mount
     // at ~0.137s and has no retry. Three sequential RPCs (boot + add-disk +

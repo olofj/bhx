@@ -106,30 +106,3 @@ pub fn set_frequency(access: &dyn PllAccess, mhz: u32) {
     }
 }
 
-/// PLL access via TLB windows (used at runtime by the host tool).
-pub struct TlbPllAccess<'a> {
-    pub window_cntl1: &'a crate::tlb::TlbWindow,
-    pub window_cntl5: &'a crate::tlb::TlbWindow,
-}
-
-impl<'a> PllAccess for TlbPllAccess<'a> {
-    fn pll_read32(&self, addr: u64) -> u32 {
-        if addr == PLL4_BASE + PLL_CNTL_1 {
-            self.window_cntl1.read32(0)
-        } else if addr == PLL4_BASE + PLL_CNTL_5 {
-            self.window_cntl5.read32(0)
-        } else {
-            panic!("unexpected PLL register address: 0x{:x}", addr);
-        }
-    }
-
-    fn pll_write32(&self, addr: u64, value: u32) {
-        if addr == PLL4_BASE + PLL_CNTL_1 {
-            self.window_cntl1.write32(0, value);
-        } else if addr == PLL4_BASE + PLL_CNTL_5 {
-            self.window_cntl5.write32(0, value);
-        } else {
-            panic!("unexpected PLL register address: 0x{:x}", addr);
-        }
-    }
-}
