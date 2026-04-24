@@ -768,6 +768,21 @@ fn dispatch_add_disk(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8,
         return;
     }
 
+    // Pre-check the image is openable before spawning the worker. Without
+    // this, a bad path (e.g. relative path against daemon's cwd=/) spawns
+    // a worker that immediately exits, but `slot.disks` is already populated
+    // with the dead handle — and subsequent `add-disk` calls then hit
+    // "a disk is already attached". Failing fast here keeps the slot clean
+    // and returns the real error (ENOENT etc.) to the client.
+    if let Err(e) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        reply_err(sock, format!("cannot open disk image {}: {}", path, e));
+        return;
+    }
+
     let exit = Arc::new(AtomicBool::new(false));
     let l2cpu = slot.l2cpu.clone();
     let interrupt = slot.interrupt.clone();
