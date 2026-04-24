@@ -198,9 +198,19 @@ fn uart_pass(
             }
         }
 
-        if !got_output && !got_input {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        // Always yield at the end of a pass; the pace depends on whether
+        // we did anything. 100 µs when active keeps latency low while
+        // still letting other threads on the same CPU run; 1 ms when
+        // fully idle stops us burning CPU on pure MMIO-poll spins. This
+        // is a coarse pair of fixed values — see
+        // <https://github.com/olofj/tt-bh-rust/issues/2> for the proper
+        // adaptive backoff follow-up.
+        let sleep = if got_output || got_input {
+            Duration::from_micros(100)
+        } else {
+            Duration::from_millis(1)
+        };
+        std::thread::sleep(sleep);
     }
 }
 

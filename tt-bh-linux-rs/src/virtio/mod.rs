@@ -460,6 +460,11 @@ pub fn run_device(
 
         interrupt_ctl.ack_interrupt(regs.interrupt_ack);
 
+        // Track whether any queue actually had work to do this pass, so we
+        // can stretch the sleep at the bottom when the guest is idle. See
+        // the sleep site below.
+        let mut did_work = false;
+
         for queue_idx in 0..num_queues {
             let qi = queue_idx as usize;
             let desc_q = desc_ptrs[qi];
@@ -551,9 +556,19 @@ pub fn run_device(
 
             if should_set_interrupt {
                 interrupt_ctl.set_interrupt(regs.interrupt_status, interrupt_number);
+                did_work = true;
             }
         }
 
-        unsafe { libc::usleep(1); }
+        // usleep(1) is effectively a scheduler round-trip — fine when the
+        // guest is actively pushing descriptors (we want to come back
+        // quickly for low latency) but wasteful when idle. Stretch the
+        // sleep to 1 ms when no queue had work: still polls fast enough
+        // that a burst of descriptors is processed within one driver
+        // timeout, and drops idle-worker CPU by ~3 orders of magnitude.
+        // Coarse stopgap for the more properly tuned adaptive backoff
+        // tracked at <https://github.com/olofj/tt-bh-rust/issues/2>.
+        let sleep_us = if did_work { 1 } else { 1000 };
+        unsafe { libc::usleep(sleep_us); }
     }
 }
