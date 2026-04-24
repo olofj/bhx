@@ -181,28 +181,11 @@ fn warm_resume_released(state: &Arc<DaemonState>, released: &[u8]) {
 
 /// Install handlers for SIGTERM / SIGINT that flip the daemon's shutdown flag.
 fn install_signal_handlers(flag: Arc<AtomicBool>) {
-    static FLAG_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    FLAG_PTR.store(Arc::as_ptr(&flag) as usize, Ordering::SeqCst);
-    // Leak the Arc so the signal handler can reach it — the daemon runs for
-    // the lifetime of the process anyway.
-    std::mem::forget(flag);
-
-    extern "C" fn handler(_sig: libc::c_int) {
-        let ptr = FLAG_PTR.load(Ordering::SeqCst);
-        if ptr != 0 {
-            let f = unsafe { &*(ptr as *const AtomicBool) };
-            f.store(true, Ordering::SeqCst);
-        }
-    }
-
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handler as *const () as usize;
-        sa.sa_flags = libc::SA_RESTART;
-        libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
-    }
+    // ctrlc handles both SIGINT and SIGTERM via set_handler (it spawns a
+    // dedicated thread that converts signals into handler invocations, so
+    // we don't have to think about async-signal-safety in the closure).
+    ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst))
+        .expect("failed to install SIGINT/SIGTERM handler");
 }
 
 fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
