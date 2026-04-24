@@ -233,29 +233,41 @@ pub fn probe_warm_resume(l2cpu: &L2Cpu) -> bool {
                 return false;
             }
         };
-    let desc = desc_window.get_window() as *const DebugDescriptor;
-    for (i, &expected) in EYE_CATCHER.iter().enumerate() {
-        let byte = unsafe { ptr::read_volatile(&(*desc).eye_catcher[i]) };
-        if byte != expected {
+    let desc_ptr = desc_window.get_window() as *const DebugDescriptor;
+
+    // Pull the descriptor bytes into a stack buffer with volatile reads so
+    // the compiler can't hoist / re-order them against the subsequent magic
+    // read. The pure-decode helper below operates on the copy.
+    let mut desc_bytes = [0u8; DESCRIPTOR_BYTES];
+    for (i, b) in desc_bytes.iter_mut().enumerate() {
+        *b = unsafe { ptr::read_volatile((desc_ptr as *const u8).add(i)) };
+    }
+
+    // The virtuart_base field lives past any eye-catcher byte check, so we
+    // only need the probe_decode helper after we have the magic read too —
+    // but we need virtuart_base first to know where that read lands. Split
+    // the decode in two: first the descriptor half (decides whether to
+    // read magic at all), then combined with the magic bytes.
+    let uart_base = match decode_descriptor(&desc_bytes) {
+        Ok(b) => b,
+        Err(DescriptorError::EyeCatcherMismatch { offset, got, want }) => {
             eprintln!(
                 "[probe l2cpu {}] OSBIdbug eye catcher mismatch at byte {} (got 0x{:02x}, want 0x{:02x})",
                 l2cpu.idx(),
-                i,
-                byte,
-                expected
+                offset,
+                got,
+                want
             );
             return false;
         }
-    }
-
-    let uart_base = unsafe { ptr::read_volatile(&(*desc).virtuart_base) };
-    if uart_base == !0u64 {
-        eprintln!(
-            "[probe l2cpu {}] virtuart_base is ~0 (chip not fully initialized)",
-            l2cpu.idx()
-        );
-        return false;
-    }
+        Err(DescriptorError::VirtuartBaseUninit) => {
+            eprintln!(
+                "[probe l2cpu {}] virtuart_base is ~0 (chip not fully initialized)",
+                l2cpu.idx()
+            );
+            return false;
+        }
+    };
 
     let queue_window = match l2cpu.get_persistent_2m_window(uart_base) {
         Ok(w) => w,
@@ -269,23 +281,79 @@ pub fn probe_warm_resume(l2cpu: &L2Cpu) -> bool {
         }
     };
     let q = queue_window.get_window();
-    let magic = unsafe { read_magic(q) };
-    if u64::from_le(magic) != VIRTUAL_UART_MAGIC {
-        eprintln!(
-            "[probe l2cpu {}] virt UART magic is 0x{:016x} (want 0x{:016x}) — wedged",
-            l2cpu.idx(),
-            u64::from_le(magic),
-            VIRTUAL_UART_MAGIC
-        );
-        return false;
+    let mut magic_bytes = [0u8; 8];
+    for (i, b) in magic_bytes.iter_mut().enumerate() {
+        *b = unsafe { ptr::read_volatile(q.add(OFF_MAGIC + i)) };
     }
+    match decode_magic(&magic_bytes) {
+        Ok(()) => {
+            eprintln!(
+                "[probe l2cpu {}] warm-resume viable (virtuart @ 0x{:x})",
+                l2cpu.idx(),
+                uart_base
+            );
+            true
+        }
+        Err(got) => {
+            eprintln!(
+                "[probe l2cpu {}] virt UART magic is 0x{:016x} (want 0x{:016x}) — wedged",
+                l2cpu.idx(),
+                got,
+                VIRTUAL_UART_MAGIC
+            );
+            false
+        }
+    }
+}
 
-    eprintln!(
-        "[probe l2cpu {}] warm-resume viable (virtuart @ 0x{:x})",
-        l2cpu.idx(),
-        uart_base
+/// Number of bytes we read from the OpenSBI debug descriptor. Matches the
+/// `#[repr(C)]` layout of [`DebugDescriptor`]: 8 (eye_catcher) + 4 (version)
+/// + 4 (pad to u64 alignment) + 8 (virtuart_base) = 24.
+const DESCRIPTOR_BYTES: usize = 24;
+/// Offset of `virtuart_base` inside the descriptor under `#[repr(C)]`.
+const OFF_VIRTUART_BASE_IN_DESC: usize = 16;
+
+#[derive(Debug, PartialEq, Eq)]
+enum DescriptorError {
+    EyeCatcherMismatch { offset: usize, got: u8, want: u8 },
+    VirtuartBaseUninit,
+}
+
+/// Pure-decode half of `probe_warm_resume` for the OpenSBI debug descriptor.
+/// `desc` must be the 24-byte volatile-read snapshot of the descriptor.
+/// Returns the `virtuart_base` value on success.
+fn decode_descriptor(desc: &[u8; DESCRIPTOR_BYTES]) -> Result<u64, DescriptorError> {
+    for (i, &expected) in EYE_CATCHER.iter().enumerate() {
+        if desc[i] != expected {
+            return Err(DescriptorError::EyeCatcherMismatch {
+                offset: i,
+                got: desc[i],
+                want: expected,
+            });
+        }
+    }
+    let virtuart_base = u64::from_le_bytes(
+        desc[OFF_VIRTUART_BASE_IN_DESC..OFF_VIRTUART_BASE_IN_DESC + 8]
+            .try_into()
+            .unwrap(),
     );
-    true
+    if virtuart_base == !0u64 {
+        return Err(DescriptorError::VirtuartBaseUninit);
+    }
+    Ok(virtuart_base)
+}
+
+/// Pure-decode half of `probe_warm_resume` for the virt UART magic.
+/// `magic_bytes` must be the 8-byte volatile-read snapshot of the word at
+/// `virtuart_base + OFF_MAGIC`. Returns `Err(got)` with the decoded u64
+/// on mismatch so the caller can log it.
+fn decode_magic(magic_bytes: &[u8; 8]) -> Result<(), u64> {
+    let magic = u64::from_le_bytes(*magic_bytes);
+    if magic == VIRTUAL_UART_MAGIC {
+        Ok(())
+    } else {
+        Err(magic)
+    }
 }
 
 /// Daemon's long-running per-L2CPU console loop. Reattaches on chip reset
@@ -311,5 +379,152 @@ pub fn chip_console_main(
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Assemble a valid descriptor snapshot for `decode_descriptor` tests.
+    fn valid_descriptor(virtuart_base: u64) -> [u8; DESCRIPTOR_BYTES] {
+        let mut buf = [0u8; DESCRIPTOR_BYTES];
+        buf[..8].copy_from_slice(EYE_CATCHER);
+        // version at 8..12 is ignored by the decoder; leave zero.
+        // padding at 12..16 is ignored.
+        buf[OFF_VIRTUART_BASE_IN_DESC..OFF_VIRTUART_BASE_IN_DESC + 8]
+            .copy_from_slice(&virtuart_base.to_le_bytes());
+        buf
+    }
+
+    // The `probe_warm_resume` code reads `DebugDescriptor` as a raw struct
+    // via `*const DebugDescriptor`, relying on the `#[repr(C)]` layout
+    // matching the OpenSBI firmware-side layout. If the struct ever grows
+    // a field or the compiler reorders something, the helper's fixed
+    // offsets would silently decode wrong bytes. Pin the layout.
+    #[test]
+    fn debug_descriptor_has_expected_size_and_virtuart_offset() {
+        assert_eq!(std::mem::size_of::<DebugDescriptor>(), DESCRIPTOR_BYTES);
+        assert_eq!(
+            std::mem::offset_of!(DebugDescriptor, virtuart_base),
+            OFF_VIRTUART_BASE_IN_DESC
+        );
+        assert_eq!(std::mem::offset_of!(DebugDescriptor, eye_catcher), 0);
+    }
+
+    #[test]
+    fn decode_descriptor_accepts_valid_bytes() {
+        let buf = valid_descriptor(0x4000_1234_5678_abc0);
+        assert_eq!(
+            decode_descriptor(&buf),
+            Ok(0x4000_1234_5678_abc0)
+        );
+    }
+
+    #[test]
+    fn decode_descriptor_rejects_eye_catcher_at_first_byte() {
+        let mut buf = valid_descriptor(0x4000_0000_0000_0000);
+        buf[0] = b'X';
+        assert_eq!(
+            decode_descriptor(&buf),
+            Err(DescriptorError::EyeCatcherMismatch {
+                offset: 0,
+                got: b'X',
+                want: b'O',
+            })
+        );
+    }
+
+    #[test]
+    fn decode_descriptor_rejects_eye_catcher_at_last_byte() {
+        // Ensure the loop covers the full EYE_CATCHER slice, not just the
+        // first character.
+        let mut buf = valid_descriptor(0x4000_0000_0000_0000);
+        buf[7] = 0x00;
+        assert_eq!(
+            decode_descriptor(&buf),
+            Err(DescriptorError::EyeCatcherMismatch {
+                offset: 7,
+                got: 0x00,
+                want: b'g',
+            })
+        );
+    }
+
+    #[test]
+    fn decode_descriptor_rejects_all_zero_eye_catcher_at_offset_zero() {
+        // A chip that's been reset but never ran OpenSBI will leave all
+        // zeros here. We need the first byte (not some later byte) to
+        // name the failure so the log points at the real problem.
+        let buf = [0u8; DESCRIPTOR_BYTES];
+        match decode_descriptor(&buf) {
+            Err(DescriptorError::EyeCatcherMismatch { offset: 0, .. }) => {}
+            other => panic!("expected EyeCatcherMismatch at offset 0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decode_descriptor_rejects_uninitialized_virtuart_base() {
+        // !0u64 is what we observe when OpenSBI cleared the descriptor
+        // but hasn't filled the UART pointer yet.
+        let buf = valid_descriptor(!0u64);
+        assert_eq!(
+            decode_descriptor(&buf),
+            Err(DescriptorError::VirtuartBaseUninit)
+        );
+    }
+
+    #[test]
+    fn decode_descriptor_accepts_zero_virtuart_base() {
+        // Zero is a suspicious but not definitively-invalid address for
+        // the decoder to reject — that's the hardware layer's call.
+        let buf = valid_descriptor(0);
+        assert_eq!(decode_descriptor(&buf), Ok(0));
+    }
+
+    #[test]
+    fn decode_descriptor_ignores_version_and_padding_bytes() {
+        // Fill bytes 8..16 (version + pad) with garbage — decoder must
+        // not care.
+        let mut buf = valid_descriptor(0x4000_dead_beef_0000);
+        for b in buf.iter_mut().take(16).skip(8) {
+            *b = 0xff;
+        }
+        assert_eq!(decode_descriptor(&buf), Ok(0x4000_dead_beef_0000));
+    }
+
+    #[test]
+    fn decode_magic_accepts_virtuart_bytes() {
+        // VIRTUAL_UART_MAGIC is "VIRTUART" as a u64 — the bytes laid out
+        // little-endian on the wire are "TRAUTRIV".
+        let bytes = VIRTUAL_UART_MAGIC.to_le_bytes();
+        assert_eq!(decode_magic(&bytes), Ok(()));
+    }
+
+    #[test]
+    fn decode_magic_rejects_all_zero() {
+        assert_eq!(decode_magic(&[0u8; 8]), Err(0));
+    }
+
+    #[test]
+    fn decode_magic_rejects_nonzero_mismatch() {
+        // Exercise the path where the decoder has to decode a non-zero
+        // value (i.e. something actually there but wrong).
+        let bogus: u64 = 0xdead_beef_cafe_f00d;
+        let bytes = bogus.to_le_bytes();
+        assert_eq!(decode_magic(&bytes), Err(bogus));
+    }
+
+    #[test]
+    fn virtual_uart_magic_constant_matches_ascii_virtuart() {
+        // The constant's hex digits spell the ASCII codes for "VIRTUART"
+        // when read high-to-low — i.e. it's `u64::from_be_bytes(b"VIRTUART")`.
+        // That's how firmware chooses the value. The chip writes this u64 to
+        // DRAM natively; on a little-endian host+chip that's 8 bytes in the
+        // order "TRAUTRIV", which `from_le_bytes` recovers back to the
+        // constant. Lock both readings down so a future refactor that
+        // switches to raw byte comparison can pick whichever is handier.
+        assert_eq!(u64::from_be_bytes(*b"VIRTUART"), VIRTUAL_UART_MAGIC);
+        assert_eq!(u64::from_le_bytes(*b"TRAUTRIV"), VIRTUAL_UART_MAGIC);
     }
 }
