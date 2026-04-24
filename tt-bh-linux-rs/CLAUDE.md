@@ -47,7 +47,7 @@ src/
 ├── fdt_ffi.rs        # Manual FFI to libfdt for DTB patching
 ├── clock.rs          # PLL stepping (200/1750 MHz) via SharedChip's PllAccess impl
 ├── boot.rs           # boot_l2cpu, modify_dtb, configure_prefetchers (all via Arc<L2Cpu>)
-├── console.rs        # Shared UART ring-buffer constants + TerminalRawMode RAII
+├── console.rs        # TerminalRawMode RAII (tcgetattr/tcsetattr guard) used by daemon/terminal
 ├── virtio/
 │   ├── mod.rs        # run_device(): cold-start handshake (Phase 1-3) + warm-restart stash + desc loop
 │   ├── block.rs      # VirtIO block device (mmaps .ext4)
