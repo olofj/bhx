@@ -273,130 +273,6 @@ fn resolve_disk_path(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_boot(
-    ttdevice: u32,
-    l2cpu_idx: usize,
-    opensbi_path: &str,
-    kernel_path: &str,
-    dtb_path: &str,
-    opensbi_offset: u64,
-    kernel_offset: u64,
-    dtb_offset: u64,
-    initramfs_offset: u64,
-    initramfs_path: Option<&str>,
-    root_device: &str,
-    force_reset_pcie: bool,
-) -> std::io::Result<()> {
-    if l2cpu_idx > 3 {
-        return Err(std::io::Error::other("l2cpu must be one of 0,1,2,3"));
-    }
-
-    let starting_address = l2cpu::L2CPU_STARTING_ADDRESS[l2cpu_idx];
-    let memory_size = l2cpu::L2CPU_MEMORY_SIZE[l2cpu_idx];
-    let mem_end = starting_address + memory_size;
-
-    let opensbi_addr = starting_address + opensbi_offset;
-    let kernel_addr = starting_address + kernel_offset;
-    let dtb_addr = starting_address + dtb_offset;
-    let rootfs_addr = starting_address + initramfs_offset;
-
-    eprintln!("[boot] tt device: /dev/tenstorrent/{}", ttdevice);
-    eprintln!("[boot] L2CPU index: {}", l2cpu_idx);
-    eprintln!(
-        "[boot] L2CPU memory: start=0x{:x}, size=0x{:x}, end=0x{:x}",
-        starting_address, memory_size, mem_end
-    );
-    eprintln!("[boot] load addresses:");
-    eprintln!("[boot]   opensbi    @ 0x{:x} ({})", opensbi_addr, opensbi_path);
-    eprintln!("[boot]   kernel     @ 0x{:x} ({})", kernel_addr, kernel_path);
-    eprintln!("[boot]   dtb        @ 0x{:x} ({})", dtb_addr, dtb_path);
-    if let Some(p) = initramfs_path {
-        eprintln!("[boot]   initramfs  @ 0x{:x} ({})", rootfs_addr, p);
-    }
-    eprintln!(
-        "[boot] root device: {} (ignored if initramfs is set)",
-        root_device
-    );
-    eprintln!("[boot] force_reset_pcie: {}", force_reset_pcie);
-
-    eprintln!("[boot] opening /dev/tenstorrent/{} to probe L2CPU state", ttdevice);
-    let chip = chip::BootChip::new(ttdevice)
-        .map_err(|e| std::io::Error::other(format!("open /dev/tenstorrent/{}: {}", ttdevice, e)))?;
-
-    let running = boot::l2cpu_is_running(&chip, l2cpu_idx);
-    let need_reset = force_reset_pcie || running;
-    eprintln!(
-        "[boot] L2CPU {} running={}, force_reset_pcie={} -> need_reset={}",
-        l2cpu_idx, running, force_reset_pcie, need_reset
-    );
-
-    let chip = if need_reset {
-        if running {
-            eprintln!(
-                "[boot] target L2CPU is running; full board reset is required \
-                 (other L2CPUs on this card will see a PCIe blip)"
-            );
-        } else {
-            eprintln!("[boot] --force-reset-pcie set; doing full board reset anyway");
-        }
-        // fd must be closed before the reset — PCI re-enumeration invalidates it.
-        drop(chip);
-        chip::reset_board(ttdevice)?;
-        eprintln!("[boot] board reset complete; sleeping 1s for chip to re-initialize");
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        eprintln!("[boot] reopening /dev/tenstorrent/{} post-reset", ttdevice);
-        chip::BootChip::new(ttdevice)
-            .map_err(|e| std::io::Error::other(format!("open /dev/tenstorrent/{}: {}", ttdevice, e)))?
-    } else {
-        eprintln!(
-            "[boot] target L2CPU is held in reset; skipping board reset \
-             (other L2CPUs on this card are untouched)"
-        );
-        chip
-    };
-
-    eprintln!("[boot] reading DTB from {}", dtb_path);
-    let dtb_raw = boot::read_bin_file(std::path::Path::new(dtb_path))?;
-    eprintln!("[boot] DTB read, {} bytes", dtb_raw.len());
-
-    let boot_device = match initramfs_path {
-        Some(path) => {
-            let bytes = boot::read_bin_file(std::path::Path::new(path))?;
-            let len = bytes.len() as u64;
-            boot::BootDevice::Initramfs {
-                addr: rootfs_addr,
-                len,
-            }
-        }
-        None => boot::BootDevice::Vda(root_device.to_string()),
-    };
-    let dtb_patched = boot::modify_dtb(&dtb_raw, &boot_device, starting_address, memory_size)
-        .map_err(std::io::Error::other)?;
-
-    let initramfs_path_buf = initramfs_path.map(std::path::PathBuf::from);
-    eprintln!("[boot] loading L2CPU {} image via NOC tile writes", l2cpu_idx);
-    boot::boot_l2cpu(
-        &chip,
-        l2cpu_idx,
-        std::path::Path::new(opensbi_path),
-        opensbi_addr,
-        Some(std::path::Path::new(kernel_path)),
-        kernel_addr,
-        &dtb_patched,
-        dtb_addr,
-        initramfs_path_buf.as_deref(),
-        rootfs_addr,
-    )?;
-
-    eprintln!("[boot] releasing L2CPU {} from reset", l2cpu_idx);
-    boot::reset_x280(&chip, &[l2cpu_idx]);
-    eprintln!("[boot] configuring L2 prefetchers for L2CPU {}", l2cpu_idx);
-    boot::configure_prefetchers(&chip, l2cpu_idx);
-    eprintln!("[boot] complete");
-    Ok(())
-}
-
 fn main() -> std::process::ExitCode {
     // Ignore SIGPIPE globally — affects all subcommands (network slirp,
     // wget subprocesses, piped stdout, etc.)
@@ -616,11 +492,10 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
         );
     }
 
-    let chip = chip::BootChip::new(card)
+    let chip = shared_chip::SharedChip::new(card)
         .map_err(|e| std::io::Error::other(format!("open /dev/tenstorrent/{}: {}", card, e)))?;
     match action {
         DebugAction::ReadResetReg => {
-            use boot::AxiAccess;
             let reg = 0x80030014u64;
             let val = chip.axi_read32(reg);
             println!("L2CPU_RESET@0x{:x} = {:#010x}", reg, val);
@@ -635,11 +510,11 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
                 return Err(std::io::Error::other("l2cpu must be 0..3"));
             }
             eprintln!(
-                "[debug] invoking boot::reset_x280 on L2CPU {} (PLL step + OR-in bit {})",
+                "[debug] invoking SharedChip::reset_x280 on L2CPU {} (PLL step + OR-in bit {})",
                 l2cpu,
                 l2cpu + 4
             );
-            boot::reset_x280(&chip, &[l2cpu]);
+            chip.reset_x280(&[l2cpu]);
             eprintln!("[debug] reset_x280 returned without panic");
             Ok(())
         }
@@ -648,8 +523,7 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
     }
 }
 
-fn toggle_reset_bit(chip: &chip::BootChip, l2cpu: usize, release: bool) -> std::io::Result<()> {
-    use boot::AxiAccess;
+fn toggle_reset_bit(chip: &shared_chip::SharedChip, l2cpu: usize, release: bool) -> std::io::Result<()> {
     if l2cpu > 3 {
         return Err(std::io::Error::other("l2cpu must be 0..3"));
     }
