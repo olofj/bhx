@@ -311,4 +311,71 @@ mod tests {
         r.read_to_end(&mut buf).unwrap();
         assert_eq!(&buf, b"hello");
     }
+
+    #[test]
+    fn request_roundtrip_remove_disk() {
+        let req = Request::RemoveDisk { l2cpu: 3 };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &req).unwrap();
+        let decoded: Request = read_frame(Cursor::new(&buf)).unwrap();
+        assert!(matches!(decoded, Request::RemoveDisk { l2cpu: 3 }));
+    }
+
+    #[test]
+    fn request_roundtrip_remove_net() {
+        let req = Request::RemoveNet { l2cpu: 0 };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &req).unwrap();
+        let decoded: Request = read_frame(Cursor::new(&buf)).unwrap();
+        assert!(matches!(decoded, Request::RemoveNet { l2cpu: 0 }));
+    }
+
+    #[test]
+    fn boot_force_roundtrips_both_values() {
+        for force in [false, true] {
+            let req = Request::Boot {
+                l2cpu: 1,
+                opensbi: "a".into(),
+                kernel: "b".into(),
+                dtb: "c".into(),
+                initramfs: None,
+                root_device: "vda".into(),
+                force_reset_pcie: false,
+                disk: None,
+                network: false,
+                force,
+            };
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &req).unwrap();
+            let decoded: Request = read_frame(Cursor::new(&buf)).unwrap();
+            match decoded {
+                Request::Boot { force: got, .. } => assert_eq!(got, force),
+                _ => panic!("wrong variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn boot_force_defaults_false_on_old_payload() {
+        // A client compiled against an older protocol (no `force` field) should
+        // be accepted by the daemon; `force` must default to false so old
+        // behavior is preserved (reject duplicate boots).
+        let json = r#"{"op":"boot","l2cpu":0,"opensbi":"a","kernel":"b","dtb":"c","root_device":"vda"}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::Boot { force, .. } => assert!(!force),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn l2cpu_state_wedged_serializes_as_wedged() {
+        // dispatch_status emits this variant when a released core fails the
+        // warm-resume probe. Make sure the wire value matches the client's
+        // printf ("Wedged" via Debug/Display).
+        let s = serde_json::to_string(&L2CpuState::Wedged).unwrap();
+        assert_eq!(s, r#""wedged""#);
+        let parsed: L2CpuState = serde_json::from_str(r#""wedged""#).unwrap();
+        assert_eq!(parsed, L2CpuState::Wedged);
+    }
 }
