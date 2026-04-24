@@ -1,32 +1,55 @@
 # tt-bh-linux-rs — notes for Claude
 
 Rust rewrite of the C++ host tool (`../console/tt-bh-linux`) that runs
-Linux on a Tenstorrent Blackhole card's on-chip SiFive X280 RISC-V
-cores. This crate emulates VirtIO block/network devices and provides
-the OpenSBI virtual-UART console for an L2CPU that has already been
-booted. It does **not** yet do the boot sequence itself — that still
-goes through `../boot.py` (luwen integration is stubbed).
+Linux on a Tenstorrent Blackhole card's on-chip SiFive X280 RISC-V cores
+(the "L2CPUs"). This crate does the full stack end-to-end: boots the
+L2CPU (reset, OpenSBI + kernel + DTB image load, DTB patching, reset
+vectors, prefetchers), then emulates VirtIO block/network devices and
+serves the OpenSBI virtual-UART console.
+
+The tool runs as a **per-card daemon** (`tt-bh-linux daemon start`) that
+owns the card's resources; `boot`, `connect`, `add-disk` etc. are thin
+RPC clients. The old in-process `connect` path has been removed.
 
 ## Layout
 
 ```
 src/
-├── main.rs           # clap CLI, signal handling, thread orchestration
-├── l2cpu.rs          # L2Cpu: owns fd + 8GB VA + two 4GB TLB windows
+├── main.rs           # clap CLI; dispatches to daemon/runner.rs (lifetime) + daemon/client.rs (RPCs)
+├── l2cpu.rs          # L2Cpu: per-L2CPU fd + 8GB VA + two persistent 4GB TLB windows + alloc_lock
 ├── tlb.rs            # TlbHandle (ioctl/mmap RAII) and TlbWindow (volatile r/w)
-├── kmd.rs            # Manual FFI to tt-kmd ioctls (ALLOCATE/FREE/CONFIGURE_TLB)
-├── clock.rs          # PLL stepping for L2CPU frequency changes (200/1750 MHz)
-├── console.rs        # Virtual-UART circular-buffer loop + raw terminal mode
+├── kmd.rs            # Manual FFI to tt-kmd ioctls (ALLOCATE/FREE/CONFIGURE_TLB, RESET_DEVICE, ...)
+├── chip.rs           # BootChip: ephemeral per-op 2 MiB TLBs for AXI tile (8,0) + NOC writes during boot
+├── fdt_ffi.rs        # Manual FFI to libfdt for DTB patching
+├── clock.rs          # PLL stepping (200/1750 MHz) via AXI tile (8,0)
+├── boot.rs           # reset_x280, boot_l2cpu, modify_dtb, configure_prefetchers, l2cpu_is_running
+├── console.rs        # Legacy client-side console helpers (TerminalRawMode) + shared UART constants
 ├── virtio/
-│   ├── mod.rs        # run_device(): 4-phase MMIO handshake + descriptor loop
-│   ├── block.rs      # VirtIO block device (mmaps a .ext4 file)
-│   ├── network.rs    # VirtIO net device (backed by libvdeslirp)
-│   └── interrupt.rs  # PLIC interrupt poke (mutex-protected)
+│   ├── mod.rs        # run_device(): cold-start handshake (Phase 1-3) + warm-restart stash + desc loop
+│   ├── block.rs      # VirtIO block device (mmaps .ext4)
+│   ├── network.rs    # VirtIO net device (libvdeslirp)
+│   └── interrupt.rs  # PLIC interrupt poke (mutex-protected; intentionally overwrites, see gotchas)
+├── daemon/
+│   ├── mod.rs        # DaemonState, L2CpuSlot, WorkerHandle; boot_lock lives here
+│   ├── server.rs     # Accept loop + dispatch_{boot,status,attach_console,add/remove_disk/net,stop,shutdown}
+│   ├── client.rs     # Thin RPC helpers used by main.rs
+│   ├── runner.rs     # daemon start/stop/restart/status/logs — double-fork via `daemonize` crate
+│   ├── lifetime.rs   # pidfile + flock + runtime dir ($XDG_RUNTIME_DIR/tt-bh-linux/<card>)
+│   ├── protocol.rs   # Request/Response, length-prefixed JSON framing, SCM_RIGHTS fd passing
+│   ├── console_hub.rs# 64 KiB scrollback + writer election (Ro/Rw/Takeover)
+│   ├── chip_console.rs # Daemon's chip-side UART pump; probe_warm_resume + pure decode helpers
+│   ├── log.rs        # dlog! macro with O_DSYNC log file (survives host crashes)
+│   └── terminal.rs   # Client-side tty pump for `connect` (Ctrl-A x exit detection)
 ├── slirp_ffi.rs      # FFI to libvdeslirp 0.1.x (only with slirp feature)
-├── image.rs          # download / convert rootfs images (Debian/Ubuntu/Fedora)
-├── kernel.rs         # download kernel+OpenSBI+DTB bundles
-├── ramdisk.rs        # download initramfs images
-└── boot.rs           # SCAFFOLDING — unfinished; needs luwen crate
+├── image.rs          # download / convert rootfs images (Debian/Ubuntu/Fedora) — hardware-free
+├── kernel.rs         # download kernel+OpenSBI+DTB bundles — hardware-free
+└── ramdisk.rs        # download initramfs images — hardware-free
+
+scripts/
+├── README.md
+├── soak_warm_resume.sh  # stop/start daemon, verify warm-resume adoption
+├── soak_add_remove.sh   # repeated add/remove-disk + add/remove-net on one L2CPU
+└── soak_concurrent.sh   # sequential cold boot of all 4 L2CPUs + 4-way concurrent add/remove hammer
 ```
 
 The `slirp` feature is on by default and links `libvdeslirp`+`libslirp`;
@@ -35,11 +58,15 @@ disable with `--no-default-features` if you just need console+disk.
 ## Dependencies (runtime)
 
 - `/dev/tenstorrent/<idx>` — provided by `tt-kmd` (Tenstorrent kernel
-  module). `ls /dev/tenstorrent/` must show at least `0`.
+  module). `ls /dev/tenstorrent/` must show at least `0`. A clone of the
+  driver lives at `../tt-kmd` for reference / audit.
 - `libvdeslirp` / `libslirp` at link time (only with the `slirp`
   feature). See `build.rs` — a `cargo build` compiles a tiny C probe to
   assert `sizeof(SlirpConfig) <= 512`; if that ever fails, bump
   `_data: [u8; 512]` in `slirp_ffi.rs`.
+- `libfdt` at link time (always; see `build.rs`). `modify_dtb` uses it
+  to patch `/memory`, `/reserved-memory`, and the four `virtio,mmio`
+  nodes at boot time.
 - `tt-smi` (Python, installed by tt-installer into
   `~/.tenstorrent-venv/bin/`). Used to reset the card — see below.
 - For `image pull` workflows: `wget`, `xz-utils`, `unzip`, `qemu-utils`,
@@ -47,124 +74,181 @@ disable with `--no-default-features` if you just need console+disk.
 
 ## Typical dev loop
 
-This assumes the chip has already been booted via `../boot.py` (or
-`make boot` in the parent repo) in a **separate terminal**. Then from
-this directory:
-
 ```bash
-cargo run -- connect            # console only (quiet, no-op if no rootfs.ext4)
-cargo run -- connect -d rootfs.ext4     # console + virtio-block
-cargo run -- connect -n                 # console + virtio-net (slirp, port 2222→22)
-cargo run -- connect -d rootfs.ext4 -n  # console + disk + network
-cargo run -- connect --no-console -d rootfs.ext4 -n   # headless
+cargo build
+
+# Start the daemon once per card. Log pinned to project dir with O_DSYNC
+# so every line hits disk before the write() returns.
+./target/debug/tt-bh-linux daemon start -t 0 --log-file ./daemon-card0.log
+
+# Boot one L2CPU with its rootfs + net. Defaults: rootfs.ext4 in cwd,
+# fw_jump.bin / Image / blackhole-card.dtb in cwd.
+./target/debug/tt-bh-linux boot -l 0 -d rootfs.ext4 -n
+
+# Attach an interactive console (Ctrl-A x to detach).
+./target/debug/tt-bh-linux connect -l 0
+
+# Swap the disk or net without rebooting the guest:
+./target/debug/tt-bh-linux remove-disk -l 0
+./target/debug/tt-bh-linux add-disk -l 0 other-rootfs.ext4
+
+# Check state:
+./target/debug/tt-bh-linux daemon status -t 0
+
+# Shut down everything on this card:
+./target/debug/tt-bh-linux daemon stop -t 0
 ```
 
-**Exit**: type `Ctrl-A x`. Hitting `Ctrl-C` also works (goes through
-the SIGINT handler in `main.rs`).
+`connect` is a thin RPC client: the daemon owns the chip-side UART pump
+and a 64 KiB scrollback hub, and the client receives a socketpair fd via
+`SCM_RIGHTS`. Multiple `connect`s fan out through the hub — default is
+`Ro`; `Rw` / `Takeover` available via `daemon/protocol.rs::ConsoleMode`
+(not yet exposed on the CLI).
 
-**When scripting or testing**: wrap with `timeout`:
+**Scripting**: if the agent can't send Ctrl-A x, always wrap `connect`
+with `timeout`:
 
 ```bash
-timeout 5 cargo run -- connect 2>/tmp/stderr.log </dev/null
+timeout 5 ./target/debug/tt-bh-linux connect -l 0 </dev/null 2>/tmp/stderr.log
 ```
 
-Running `cargo run -- connect` without a tty that can send `Ctrl-A x`
-will hang — always use `timeout` in agent loops.
-
-Other subcommands (read-only, no hardware needed):
+Hardware-free subcommands (no daemon, no card needed):
 
 ```bash
-cargo run -- image list         # list downloadable rootfs images
+cargo run -- image list
 cargo run -- image info debian-13
-cargo run -- image pull debian  # downloads, converts, resizes to images/debian-13.ext4
-cargo run -- kernel list        # list firmware bundles
-cargo run -- kernel pull        # downloads fw_jump.bin, Image, blackhole-card.dtb
+cargo run -- image pull debian         # downloads, converts, resizes -> images/debian-13.ext4
+cargo run -- kernel list
+cargo run -- kernel pull               # fw_jump.bin + Image + blackhole-card.dtb into cwd
 cargo run -- ramdisk list
 ```
 
-The `boot` subcommand **does not actually boot** yet — it prints
-"requires luwen crate integration" and exits. To boot from scratch use
-`../boot.py` or `make boot` in the parent repo.
+Low-level diagnostics that bypass the daemon (require the daemon
+stopped — enforced at the client):
+
+```bash
+cargo run -- debug read-reset-reg
+cargo run -- debug reset-x280 -l N     # PLL step + OR-in bit idx+4 (safe on live cores)
+cargo run -- debug assert-reset -l N   # clear bit idx+4 (safe on live cores per empirical test)
+cargo run -- debug deassert-reset -l N
+```
 
 ## Resetting the card
 
-If the chip gets wedged (console garbled, `magic was 0` errors,
-descriptor-chain warnings spinning, ioctl failures), reset it. `tt-smi`
-is installed in the tt-installer venv, so run it in a subshell that
-activates the venv (doesn't pollute the parent shell):
+If the chip wedges (console garbled, `magic was 0` errors,
+descriptor-chain panics spinning, ioctl failures), reset it:
 
 ```bash
 (. ~/.tenstorrent-venv/bin/activate && tt-smi -r)
 ```
 
-If `tt-smi -r` doesn't recover the card, power-cycle the host.
-
-After resetting, you must re-run the boot sequence before reconnecting:
+The daemon's slots are stale after `tt-smi -r` — either stop+start
+(startup probe picks up what survives via warm-resume) or re-image with
+`--force`:
 
 ```bash
-cd ..
-make boot               # resets chip, loads OpenSBI+kernel+DTB, then runs tt-bh-linux
-# or, for a manual split:
-./boot.py               # just boot; exits when chip is running Linux
-cd tt-bh-linux-rs
-cargo run -- connect -d ../rootfs.ext4 -n
+./target/debug/tt-bh-linux daemon stop -t 0
+(. ~/.tenstorrent-venv/bin/activate && tt-smi -r) >/dev/null 2>&1
+./target/debug/tt-bh-linux daemon start -t 0 --log-file ./daemon-card0.log
+./target/debug/tt-bh-linux boot -l 0 -d rootfs.ext4 -n
 ```
+
+If `tt-smi -r` doesn't recover the card, power-cycle the host.
 
 ## Diagnostic signals
 
-- **Console works but dies after 100ms retry spam + "eye catcher
-  mismatch"**: chip was reset or never booted. Re-run `make boot`.
-- **"Magic was 0, not ..."**: OpenSBI virtual UART magic gone — chip
-  state lost; reset and reboot.
-- **`vdeslirp_open returned NULL`** on `cargo run -- connect -n`: the
-  error message from `network.rs` lists likely causes (fd limit,
-  seccomp, ABI mismatch). Check `pkg-config --modversion vdeslirp
-  libslirp` — we expect vdeslirp 0.1.x + libslirp 4.x.
-- **descriptor-chain address-range panics in `virtio::mod::run_device`**:
-  guest driver wrote a bogus descriptor, usually after a chip reset
-  mid-run. Stop the tool, reset, reboot.
+- **"eye catcher mismatch" / "Magic was 0"**: chip-side state lost. Tear
+  down the slot (`daemon stop <...>` or re-boot with `--force`) and
+  re-image.
+- **`daemon status` shows `Wedged`**: startup probe found the core
+  released (bit idx+4=1) but its OpenSBI debug descriptor magic is
+  wrong. Re-boot with `--force`.
+- **`vdeslirp_open returned NULL`**: `network.rs` lists the likely
+  causes (fd limit, seccomp, ABI mismatch). Verify
+  `pkg-config --modversion vdeslirp libslirp` shows 0.1.x + 4.x.
+- **Descriptor-chain panics in `virtio::mod::run_device`**: bogus
+  descriptor from a guest that got torn mid-run. Reset and reboot.
+- **Daemon died / host crashed under load**: check
+  `./daemon-card0.log` — it's `O_DSYNC`, so the last line reflects the
+  last thing that actually hit disk. Known hazard: 4-way concurrent cold
+  boot without the `boot_lock` mitigation (see issue #1).
 
 ## Building & testing
 
 ```bash
-cargo build                     # default features (includes slirp)
-cargo build --no-default-features   # console+disk only, no slirp link
+cargo build                          # default features (slirp)
+cargo build --no-default-features    # no slirp link
 
 cargo clippy --all-targets -- -D warnings   # must stay clean
-cargo test                      # 14 unit tests, all in src/main.rs (CLI parsing)
+cargo test                           # 54 unit tests
 ```
 
-Tests are hardware-free — they only exercise clap and `resolve_disk_path`.
-There is currently no coverage for the clock/tlb/virtio/image modules;
-expanding that is a known gap (see `~/.claude/plans/logical-splashing-gosling.md`
-for the planned cleanup).
+Unit tests cover: CLI parsing + `absolutize`, daemon `protocol`
+round-trips + SCM_RIGHTS, `console_hub` fan-out + writer election,
+`lifetime` pidfile / XDG runtime dir, `DaemonState` initial + wedged
+flag lifecycle, `chip_console::probe_warm_resume` byte decode +
+`DebugDescriptor` layout invariants. All hardware-free.
+
+Hardware-gated soak scripts under `scripts/` (see `scripts/README.md`).
+Remaining coverage gaps: `dispatch_boot --force` state machine,
+`dispatch_add_disk` stuck-slot path, clock/tlb/virtio core handshake,
+image/kernel/ramdisk downloaders, the future `SharedChip` abstraction
+(issue #1).
 
 ## Useful parent-repo artifacts
 
-- `../rootfs.ext4` — default disk image the tool auto-picks up.
-- `../fw_jump.bin`, `../Image`, `../blackhole-card.dtb` — firmware the
-  boot step loads into X280 DRAM.
-- `../boot.py` — the Python boot driver (uses pyluwen); run before
-  `cargo run -- connect`.
-- `../Makefile` — `make boot`, `make ssh` (uses port 2222 forward),
-  `make boot_cloud_init`, etc.
+- `../rootfs.ext4`, `../fw_jump.bin`, `../Image`, `../blackhole-card.dtb`
+  — default artifacts (typically symlinked into this crate's cwd).
+- `../boot.py` — legacy Python boot driver. No longer needed by this
+  crate; retained as reference for the C++ tool at `../console/`.
+- `../Makefile` — predates the Rust daemon; `make boot` there still
+  invokes `boot.py` + the C++ `tt-bh-linux`. Not part of this crate's
+  workflow.
+- `../tt-kmd/` — local clone of the tt-kmd driver source (for concurrency
+  audits and cross-references, e.g. issue #1).
 
 ## Conventions / gotchas
 
 - `L2CPU_STARTING_ADDRESS` / `L2CPU_MEMORY_SIZE` in `l2cpu.rs` encode
   that L2CPUs 0/1 have 4 GB each and 2/3 share 4 GB — don't assume
-  uniform memory sizes.
+  uniform memory sizes. `boot::modify_dtb` patches
+  `/memory@400030000000` per-L2CPU with the actual size so guest
+  kernels on L2CPU 2/3 don't over-allocate.
 - `L2Cpu::drop` order is critical: TLB windows free via ioctl (needs
-  fd), then munmap the 8 GB VA, then close fd. This is enforced by
+  fd), then munmap the 8 GB VA, then close fd. Enforced by
   `ManuallyDrop`.
-- The `InterruptController::set_interrupt` **intentionally overwrites**
-  the PLIC pending register instead of OR-ing — this preserves a
-  (quirky but working) behavior from the C++ implementation. Don't
-  "fix" it without understanding the timing interaction.
-- `process_queue_start`/`_data`/`_complete` in `VirtioDeviceImpl` carry
-  implicit state across calls (e.g. `VirtioBlk::req` is a raw pointer
-  set in `_start` and dereferenced in `_data`). Don't rearrange the
-  call sites in `run_device` without reviewing those invariants.
-- The `connect` path's default disk logic: if `--disk` is not given
-  and `./rootfs.ext4` doesn't exist, no disk thread is spawned (this
-  is what makes `cargo run -- connect` quiet in a dev checkout).
+- `L2Cpu` implements `Sync` via an internal `alloc_lock: Mutex<()>`
+  guarding the ioctl path. Shared across daemon workers as
+  `Arc<L2Cpu>`. Persistent windows are set up at `new()` and never
+  remapped — `write32` / `read32` / `get_persistent_2m_window` lock the
+  mutex only for allocation, not the subsequent volatile ops.
+- **`DaemonState.boot_lock`** (`src/daemon/mod.rs`) serializes the
+  chip-touching phase of `dispatch_boot` (`run_boot_sequence` +
+  `make_slot`). Concurrent 4-way cold boot through independent
+  `BootChip` fds crashes the host: each fd allocates its own TLB id but
+  all four windows alias the **same** physical AXI tile (8,0) registers
+  (PLL, `L2CPU_RESET`), so PLL steps and reset R-M-W race at the
+  hardware. Don't remove or loosen `boot_lock` without the `SharedChip`
+  refactor landing first — see
+  <https://github.com/olofj/tt-bh-rust/issues/1>.
+- `InterruptController::set_interrupt` **intentionally overwrites** the
+  PLIC pending register instead of OR-ing — preserves a quirky but
+  working behavior from the C++ implementation. Don't "fix" without
+  understanding the timing interaction.
+- `process_queue_start` / `_data` / `_complete` in `VirtioDeviceImpl`
+  carry implicit state across calls (e.g. `VirtioBlk::req` is a raw
+  pointer set in `_start` and dereferenced in `_data`). Don't rearrange
+  the call sites in `run_device` without reviewing those invariants.
+- All `sel_generation` bumps in `virtio/mod.rs` use `wrapping_add(1)`.
+  The MMIO counter wraps natively on u32; plain `+ 1` panics in debug
+  builds when the guest reaches `u32::MAX` legitimately *or* when garbage
+  from a concurrent-write race lands in the read.
+- Daemon chdir's to `/` after daemonize, so relative paths in client
+  RPCs won't resolve on the daemon side. The CLI `absolutize`s paths
+  before sending — see `main.rs::absolutize` and its tests. `add-disk`
+  also has a server-side pre-open check so a bad path fails the RPC
+  without leaving a dead worker in the slot.
+- The `boot` subcommand's default disk logic: if `--disk` is not given
+  and `./rootfs.ext4` doesn't exist in the *client's* cwd, no disk is
+  attached. Guest will VFS-mount-panic with `root=/dev/vda`. Pass
+  `--initramfs` or an explicit `--disk` to avoid.
