@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 pub enum Request {
     /// Get daemon + per-L2CPU state.
     Status,
-    /// Boot an L2CPU.
+    /// Boot an L2CPU. If `disk` and/or `network` are provided, the matching
+    /// virtio workers start up in the same RPC so the guest kernel sees
+    /// them before VFS mount (otherwise the guest panics with "Can't open
+    /// blockdev" — add-disk's ~100 ms latency is already too late).
     Boot {
         l2cpu: u8,
         opensbi: String,
@@ -32,6 +35,15 @@ pub enum Request {
         root_device: String,
         #[serde(default)]
         force_reset_pcie: bool,
+        #[serde(default)]
+        disk: Option<String>,
+        #[serde(default)]
+        network: bool,
+        /// If true and a slot already exists for this L2CPU, the daemon
+        /// tears it down (stop workers, drop L2Cpu) before re-imaging.
+        /// Default false → duplicate boots are rejected with an error.
+        #[serde(default)]
+        force: bool,
     },
     /// Attach a console fd. Daemon replies with `ok` and sends the fd via
     /// SCM_RIGHTS; client pumps bytes between its tty and the passed fd.
@@ -202,6 +214,9 @@ mod tests {
             initramfs: None,
             root_device: "vda".into(),
             force_reset_pcie: false,
+            disk: None,
+            network: false,
+            force: false,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).unwrap();
