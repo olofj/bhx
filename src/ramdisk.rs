@@ -177,3 +177,26 @@ pub fn cmd_pull(name: &str, output: Option<&str>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_ramdisk_finds_by_name() {
+        let r = find_ramdisk("debian-13-netboot").expect("known by canonical name");
+        assert_eq!(r.name, "debian-13-netboot");
+    }
+
+    #[test]
+    fn find_ramdisk_finds_by_alias_case_insensitive() {
+        let lower = find_ramdisk("debian-netboot").expect("known by alias");
+        let upper = find_ramdisk("DEBIAN-NETBOOT").expect("aliases lookup is case-insensitive");
+        assert_eq!(lower.name, upper.name);
+    }
+
+    #[test]
+    fn find_ramdisk_returns_none_for_unknown() {
+        assert!(find_ramdisk("nope-9999").is_none());
+    }
+}
