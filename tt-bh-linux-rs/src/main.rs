@@ -127,7 +127,9 @@ enum Commands {
     RemoveDisk,
     /// Attach virtio-net (slirp) to a running L2CPU.
     AddNet {
-        /// SSH port to forward (for informational use; currently fixed in the daemon).
+        /// Override the host-side port forwarded to the guest's :22.
+        /// Default is the formula-derived per-(card, l2cpu_idx) port —
+        /// see `daemon ports` for the mapping.
         #[arg(long)]
         ssh_port: Option<u16>,
     },
@@ -188,6 +190,11 @@ enum DaemonAction {
         #[arg(long)]
         no_follow: bool,
     },
+    /// Print the per-L2CPU SSH-forward host ports for the given card.
+    /// Probes each port to report whether it's currently bindable.
+    /// Useful when `add-net` fails with "ssh-forward port N
+    /// unavailable" — this command shows which ports are clear.
+    Ports,
 }
 
 #[derive(Subcommand)]
@@ -573,7 +580,30 @@ fn run_daemon_cmd(card: u32, action: DaemonAction) -> std::io::Result<()> {
             follow: !no_follow,
             lines,
         }),
+        DaemonAction::Ports => print_ssh_ports(card),
     }
+}
+
+/// Print the SSH-forward host port for each L2CPU on `card`, with a
+/// quick `bind()` probe to flag which ones are already in use. Pure
+/// CLI-side — doesn't talk to the daemon, so it's useful even before
+/// `daemon start`.
+fn print_ssh_ports(card: u32) -> std::io::Result<()> {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+    println!("card {}: per-L2CPU SSH-forward ports", card);
+    for idx in 0..4u8 {
+        let port = regs::slirp::ssh_port(card, idx);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let status = match TcpListener::bind(addr) {
+            Ok(listener) => {
+                drop(listener);
+                "available".to_string()
+            }
+            Err(e) => format!("in use ({})", e),
+        };
+        println!("  l2cpu {}: 127.0.0.1:{} — {}", idx, port, status);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
