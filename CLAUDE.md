@@ -19,9 +19,24 @@ Ambition does not mean scope creep. Stay ruthless about simplicity:
   over creating a new one.
 - Fix root causes, not symptoms.
 
-Only stop when the work is actually done, the user tells you to stop, or
-you genuinely need input to proceed. In that last case, ask a specific
-question rather than waiting passively.
+Stay on the task the user actually asked for. "High-agency" means
+pushing the requested task through to a clean finish — compiling, lint-
+clean, tests passing, no half-done work. It does **not** mean picking up
+adjacent cleanup, refactors, or dead-code removal you happened to
+notice. Those are separate efforts and deserve their own decision from
+the user.
+
+When you spot unrelated rough edges mid-task (dead code, a stale
+comment, a missing test, a refactor that would be nice), do **not**
+silently fold them into the current change. Instead, finish the
+requested task and then surface the observation to the user as a short
+list of "things I noticed, worth a separate issue?" Let the user decide
+whether to act on any of them now, file an issue, or ignore. If the
+user says yes, do it as its own piece of work.
+
+Only stop when the requested work is actually done, the user tells you
+to stop, or you genuinely need input to proceed. In that last case, ask
+a specific question rather than waiting passively.
 
 Rust rewrite of the C++ host tool (`../console/tt-bh-linux`) that runs
 Linux on a Tenstorrent Blackhole card's on-chip SiFive X280 RISC-V cores
