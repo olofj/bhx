@@ -276,11 +276,12 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
     let method = classify_request(&req);
     crate::daemon::metrics::DAEMON_RPC_TOTAL.at(method).inc();
     // Reset the per-thread "did the dispatch fail?" flag so each
-    // RPC starts clean. reply_err flips it on the way out; we read
-    // it post-dispatch to bump the per-method error counter.
+    // RPC starts clean. `reply_err` flips it on the way out (we
+    // call reply_err from the Err arm below); we read it after
+    // dispatch to bump the per-method error counter.
     RPC_FAILED.with(|f| f.set(false));
 
-    match req {
+    let result: crate::Result<()> = match req {
         Request::Status => dispatch_status(&sock, &state),
         Request::Boot {
             l2cpu,
@@ -308,7 +309,7 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             force,
         ),
         Request::AttachConsole { l2cpu, mode } => {
-            dispatch_attach_console(sock, &state, l2cpu, mode)
+            dispatch_attach_console(&sock, &state, l2cpu, mode)
         }
         Request::AddDisk { l2cpu, path } => dispatch_add_disk(&sock, &state, l2cpu, path),
         Request::RemoveDisk { l2cpu } => dispatch_remove_disk(&sock, &state, l2cpu),
@@ -316,6 +317,14 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
         Request::RemoveNet { l2cpu } => dispatch_remove_net(&sock, &state, l2cpu),
         Request::Stop { l2cpu } => dispatch_stop(&sock, &state, l2cpu),
         Request::Shutdown => dispatch_shutdown(&sock, &state),
+    };
+
+    // Route Err results to reply_err, which writes a wire frame
+    // and handles the Internal → "internal daemon error" + dlog
+    // translation. Ok(()) means the dispatch already wrote its
+    // response (Status payload, Attached, or Response::Ok).
+    if let Err(e) = result {
+        reply_err(&sock, e);
     }
 
     if RPC_FAILED.with(|f| f.get()) {
@@ -363,25 +372,35 @@ fn reply_ok(mut sock: &UnixStream) {
     let _ = write_frame(&mut sock, &Response::Ok);
 }
 
-fn reply_err(mut sock: &UnixStream, error: impl Into<String>) {
+/// Translate a `crate::Error` to a wire `Response::Error` and write it.
+/// `Internal` is special-cased: the operator-visible message is the
+/// generic "internal daemon error" while the full context goes to the
+/// daemon log via `dlog!`. All other variants pass their `Display`
+/// through as-is — wire format is identical to the pre-#21 shape.
+///
+/// Also flips the `RPC_FAILED` thread-local so `handle_client` knows
+/// to bump `tt_bh_daemon_rpc_errors_total{method}` on the way out.
+fn reply_err(mut sock: &UnixStream, e: crate::Error) {
     RPC_FAILED.with(|f| f.set(true));
-    let _ = write_frame(
-        &mut sock,
-        &Response::Error {
-            error: error.into(),
-        },
-    );
+    let wire_msg = match &e {
+        crate::Error::Internal(msg) => {
+            dlog!("[dispatch] internal error: {}", msg);
+            "internal daemon error".to_string()
+        }
+        _ => e.to_string(),
+    };
+    let _ = write_frame(&mut sock, &Response::Error { error: wire_msg });
 }
 
 /// Bounds-check the wire-format `l2cpu` index. Every dispatch handler
-/// starts with the same `if idx >= 4 { reply_err … return }` dance —
-/// route it through one place so a future change to the per-card core
-/// count needs to land in exactly one match arm.
-fn validate_l2cpu(idx: u8) -> Result<usize, &'static str> {
+/// starts with the same `if idx >= 4 { return Err(BadRequest) }`
+/// dance — route it through one place so a future change to the
+/// per-card core count needs to land in exactly one match arm.
+fn validate_l2cpu(idx: u8) -> crate::Result<usize> {
     if idx < 4 {
         Ok(idx as usize)
     } else {
-        Err("l2cpu must be 0..3")
+        Err(crate::Error::bad_request("l2cpu must be 0..3"))
     }
 }
 
@@ -446,16 +465,19 @@ fn decide_boot_slot(slot_present: bool, force: bool, l2cpu_idx: u8) -> BootSlotD
 fn validate_add_disk_request(
     disks_empty: bool,
     path: &std::path::Path,
-) -> Result<std::fs::File, String> {
+) -> crate::Result<std::fs::File> {
     if !disks_empty {
         // Phase A: one disk per L2CPU. Phase B+: multi-disk with indexed MMIO.
-        return Err("a disk is already attached".to_string());
+        return Err(crate::Error::slot_state("a disk is already attached"));
     }
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
-        .map_err(|e| format!("cannot open disk image {}: {}", path.display(), e))
+        .map_err(crate::Error::io_ctx(format!(
+            "cannot open disk image {}",
+            path.display()
+        )))
 }
 
 /// Pre-flight check for `dispatch_remove_disk`. The slot-not-booted
@@ -474,7 +496,7 @@ fn validate_remove_disk_request(disks_empty: bool) -> Result<(), &'static str> {
 // Status
 // ---------------------------------------------------------------------------
 
-fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) {
+fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Result<()> {
     let mut l2cpus = Vec::new();
     for (idx, slot_mutex) in state.l2cpus.iter().enumerate() {
         let slot = slot_mutex.lock().unwrap();
@@ -509,6 +531,7 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) {
         l2cpus,
     };
     let _ = write_frame(&mut sock, &Response::Status(payload));
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -529,19 +552,13 @@ fn dispatch_boot(
     disk: Option<String>,
     network: bool,
     force: bool,
-) {
+) -> crate::Result<()> {
     dlog!(
         "[boot l2cpu {}] dispatch_boot entry: opensbi={} kernel={} dtb={} initramfs={:?} root={} force_reset_pcie={} disk={:?} network={} force={}",
         l2cpu_idx, opensbi, kernel, dtb, initramfs, root_device, force_reset_pcie, disk, network, force
     );
-    if let Err(msg) = validate_l2cpu(l2cpu_idx) {
-        reply_err(sock, msg);
-        return;
-    }
-    if let Err(e) = handle_existing_slot(state, l2cpu_idx, force) {
-        reply_err(sock, e);
-        return;
-    }
+    validate_l2cpu(l2cpu_idx)?;
+    handle_existing_slot(state, l2cpu_idx, force).map_err(crate::Error::slot_state)?;
 
     // No daemon-wide serialization of the chip-touching phase here —
     // tile-(8,0) access is mediated by `SharedChip::seq_lock` inside each
@@ -550,7 +567,7 @@ fn dispatch_boot(
     // proceed in parallel; the same-core case is still serialized by the
     // per-slot `Mutex<Option<L2CpuSlot>>` taken in `handle_existing_slot`.
     dlog!("[boot l2cpu {}] starting boot sequence", l2cpu_idx);
-    let l2cpu = match run_boot_sequence(
+    let l2cpu = run_boot_sequence(
         state,
         l2cpu_idx,
         opensbi,
@@ -559,41 +576,42 @@ fn dispatch_boot(
         initramfs,
         root_device,
         force_reset_pcie,
-    ) {
-        Ok(l) => l,
-        Err(e) => {
-            dlog!("[boot l2cpu {}] boot sequence failed: {}", l2cpu_idx, e);
-            reply_err(sock, format!("boot failed: {}", e));
-            return;
+    )
+    .map_err(|e| {
+        dlog!("[boot l2cpu {}] boot sequence failed: {}", l2cpu_idx, e);
+        // Boot failures wrap an io::Error from chip access — preserve
+        // the kind via Io { ctx, source }. The wire shape stays
+        // `"boot failed: <io_error_display>"`.
+        crate::Error::Io {
+            ctx: "boot failed".into(),
+            source: e,
         }
-    };
+    })?;
     dlog!(
         "[boot l2cpu {}] boot sequence returned ok; initializing runtime slot",
         l2cpu_idx
     );
 
-    let mut slot = match make_slot_from_l2cpu(l2cpu, l2cpu_idx) {
-        Ok(s) => s,
-        Err(e) => {
-            dlog!(
-                "[boot l2cpu {}] make_slot_from_l2cpu failed: {}",
-                l2cpu_idx,
-                e
-            );
-            reply_err(sock, format!("post-boot L2Cpu init failed: {}", e));
-            return;
+    let mut slot = make_slot_from_l2cpu(l2cpu, l2cpu_idx).map_err(|e| {
+        dlog!(
+            "[boot l2cpu {}] make_slot_from_l2cpu failed: {}",
+            l2cpu_idx,
+            e
+        );
+        crate::Error::Io {
+            ctx: "post-boot L2Cpu init failed".into(),
+            source: e,
         }
-    };
+    })?;
     dlog!(
         "[boot l2cpu {}] slot ready (console worker spawned)",
         l2cpu_idx
     );
 
-    if let Err(e) = start_initial_workers(&mut slot, state.card, l2cpu_idx, disk, network) {
-        reply_err(sock, e);
-        return;
-    }
+    start_initial_workers(&mut slot, state.card, l2cpu_idx, disk, network)
+        .map_err(crate::Error::slot_state)?;
     install_slot_and_reply_ok(state, l2cpu_idx, slot, sock);
+    Ok(())
 }
 
 /// Reject the boot if a slot is already populated and `--force` wasn't
@@ -921,46 +939,30 @@ fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlo
 // ---------------------------------------------------------------------------
 
 fn dispatch_attach_console(
-    sock: UnixStream,
+    sock: &UnixStream,
     state: &Arc<DaemonState>,
     l2cpu_idx: u8,
     mode: ConsoleMode,
-) {
-    if let Err(msg) = validate_l2cpu(l2cpu_idx) {
-        reply_err(&sock, msg);
-        return;
-    }
+) -> crate::Result<()> {
+    validate_l2cpu(l2cpu_idx)?;
 
-    let (daemon_end, client_end) = match UnixStream::pair() {
-        Ok(p) => p,
-        Err(e) => {
-            reply_err(&sock, format!("socketpair: {}", e));
-            return;
-        }
-    };
+    let (daemon_end, client_end) =
+        UnixStream::pair().map_err(crate::Error::io_ctx("socketpair"))?;
 
     // Hub writes via MSG_DONTWAIT so the socket can stay in blocking mode
     // for the reader thread. Clone the fd for the reader; the hub owns
     // `daemon_end` for fan-out.
-    let daemon_read = match daemon_end.try_clone() {
-        Ok(c) => c,
-        Err(e) => {
-            reply_err(&sock, format!("try_clone: {}", e));
-            return;
-        }
-    };
+    let daemon_read = daemon_end
+        .try_clone()
+        .map_err(crate::Error::io_ctx("try_clone"))?;
 
     // Grab everything we need from the slot under the mutex, then release it
     // before doing any IO so other client handlers don't stall.
     let (hub, input_tx) = {
         let slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
-        let slot = match slot_guard.as_ref() {
-            Some(s) => s,
-            None => {
-                reply_err(&sock, format!("l2cpu {} is not booted", l2cpu_idx));
-                return;
-            }
-        };
+        let slot = slot_guard.as_ref().ok_or_else(|| {
+            crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx))
+        })?;
         (slot.console_hub.clone(), slot.console_input_tx.clone())
     };
 
@@ -976,20 +978,26 @@ fn dispatch_attach_console(
     // Reply with attached + scrollback size, then send the console fd via
     // SCM_RIGHTS. Order matters: the client reads the Attached response,
     // then the fd, then starts pumping bytes on the fd.
+    //
+    // Failures here are post-attach: the hub already accepted the client.
+    // We log + detach + return Ok(()) without surfacing an error to the
+    // wire — the client either disconnected (so a Response::Error would
+    // race with their own EOF) or has a half-written response on the
+    // socket. Keep the wire-state semantics matching the pre-#21 code.
     if let Err(e) = write_frame(
-        &sock,
+        sock,
         &Response::Attached {
             scrollback_bytes: res.scrollback_bytes,
         },
     ) {
         dlog!("[daemon] attach write response: {}", e);
         hub.detach(res.id);
-        return;
+        return Ok(());
     }
-    if let Err(e) = send_fd(&sock, client_end.as_raw_fd()) {
+    if let Err(e) = send_fd(sock, client_end.as_raw_fd()) {
         dlog!("[daemon] send_fd: {}", e);
         hub.detach(res.id);
-        return;
+        return Ok(());
     }
     drop(client_end);
 
@@ -998,10 +1006,11 @@ fn dispatch_attach_console(
     if let Err(e) = write_scrollback(&daemon_read, &scrollback) {
         dlog!("[daemon] scrollback replay failed: {}", e);
         hub.detach(res.id);
-        return;
+        return Ok(());
     }
 
     thread::spawn(move || client_reader_main(daemon_read, res.id, hub, input_tx));
+    Ok(())
 }
 
 /// Blocking write of scrollback bytes. Loops only on EINTR; returns any
@@ -1040,27 +1049,18 @@ fn client_reader_main(sock: UnixStream, id: u64, hub: Arc<ConsoleHub>, input_tx:
 // AddDisk
 // ---------------------------------------------------------------------------
 
-fn dispatch_add_disk(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8, path: String) {
-    if let Err(msg) = validate_l2cpu(l2cpu_idx) {
-        reply_err(sock, msg);
-        return;
-    }
+fn dispatch_add_disk(
+    sock: &UnixStream,
+    state: &Arc<DaemonState>,
+    l2cpu_idx: u8,
+    path: String,
+) -> crate::Result<()> {
+    validate_l2cpu(l2cpu_idx)?;
     let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
-    let slot = match slot_guard.as_mut() {
-        Some(s) => s,
-        None => {
-            reply_err(sock, format!("l2cpu {} is not booted", l2cpu_idx));
-            return;
-        }
-    };
-    let disk_image =
-        match validate_add_disk_request(slot.disks.is_empty(), std::path::Path::new(&path)) {
-            Ok(file) => file,
-            Err(e) => {
-                reply_err(sock, e);
-                return;
-            }
-        };
+    let slot = slot_guard
+        .as_mut()
+        .ok_or_else(|| crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx)))?;
+    let disk_image = validate_add_disk_request(slot.disks.is_empty(), std::path::Path::new(&path))?;
 
     let exit = Arc::new(AtomicBool::new(false));
     let l2cpu = slot.l2cpu.clone();
@@ -1087,31 +1087,26 @@ fn dispatch_add_disk(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8,
         },
     });
     reply_ok(sock);
+    Ok(())
 }
 
-fn dispatch_remove_disk(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) {
+fn dispatch_remove_disk(
+    sock: &UnixStream,
+    state: &Arc<DaemonState>,
+    l2cpu_idx: u8,
+) -> crate::Result<()> {
     dlog!("[remove_disk l2cpu {}] dispatch entry", l2cpu_idx);
-    if let Err(msg) = validate_l2cpu(l2cpu_idx) {
-        reply_err(sock, msg);
-        return;
-    }
+    validate_l2cpu(l2cpu_idx)?;
     // Take the disks out under the lock, then release and join outside.
     // stop_and_join blocks until the worker's poll loop notices the exit
     // flag (~100 ms worst case); holding the state mutex for that long
     // would block every other RPC on other L2CPUs.
     let disks = {
         let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
-        let slot = match slot_guard.as_mut() {
-            Some(s) => s,
-            None => {
-                reply_err(sock, format!("l2cpu {} is not booted", l2cpu_idx));
-                return;
-            }
-        };
-        if let Err(e) = validate_remove_disk_request(slot.disks.is_empty()) {
-            reply_err(sock, e);
-            return;
-        }
+        let slot = slot_guard.as_mut().ok_or_else(|| {
+            crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx))
+        })?;
+        validate_remove_disk_request(slot.disks.is_empty()).map_err(crate::Error::slot_state)?;
         std::mem::take(&mut slot.disks)
     };
     for d in disks {
@@ -1124,6 +1119,7 @@ fn dispatch_remove_disk(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: 
     }
     dlog!("[remove_disk l2cpu {}] done — replying ok", l2cpu_idx);
     reply_ok(sock);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,27 +1132,19 @@ fn dispatch_add_net(
     state: &Arc<DaemonState>,
     l2cpu_idx: u8,
     ssh_port_override: Option<u16>,
-) {
+) -> crate::Result<()> {
     dlog!(
         "[add_net l2cpu {}] dispatch entry (ssh_port_override={:?})",
         l2cpu_idx,
         ssh_port_override
     );
-    if let Err(msg) = validate_l2cpu(l2cpu_idx) {
-        reply_err(sock, msg);
-        return;
-    }
+    validate_l2cpu(l2cpu_idx)?;
     let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
-    let slot = match slot_guard.as_mut() {
-        Some(s) => s,
-        None => {
-            reply_err(sock, format!("l2cpu {} is not booted", l2cpu_idx));
-            return;
-        }
-    };
+    let slot = slot_guard
+        .as_mut()
+        .ok_or_else(|| crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx)))?;
     if slot.net.is_some() {
-        reply_err(sock, "network already attached");
-        return;
+        return Err(crate::Error::slot_state("network already attached"));
     }
 
     // Resolve the host port. CLI override wins over the formula.
@@ -1167,16 +1155,10 @@ fn dispatch_add_net(
     // TOCTOU window between dropping our probe-bind and slirp's bind,
     // but we're catching the operator-error case (port held by another
     // process for a long time), not concurrent-bind races.
-    if let Err(e) = probe_port_available(ssh_port) {
-        reply_err(
-            sock,
-            format!(
-                "ssh-forward port {} unavailable: {}. Pass --ssh-port to pick a different host port, or stop whatever's using it.",
-                ssh_port, e
-            ),
-        );
-        return;
-    }
+    probe_port_available(ssh_port).map_err(crate::Error::io_ctx(format!(
+        "ssh-forward port {} unavailable. Pass --ssh-port to pick a different host port, or stop whatever's using it",
+        ssh_port
+    )))?;
 
     let exit = Arc::new(AtomicBool::new(false));
     let l2cpu = slot.l2cpu.clone();
@@ -1200,59 +1182,53 @@ fn dispatch_add_net(
         l2cpu_idx
     );
     reply_ok(sock);
+    Ok(())
 }
 
 #[cfg(not(feature = "slirp"))]
 fn dispatch_add_net(
-    sock: &UnixStream,
+    _sock: &UnixStream,
     _state: &Arc<DaemonState>,
     _l2cpu_idx: u8,
     _ssh_port: Option<u16>,
-) {
-    reply_err(sock, "daemon built without the slirp feature");
+) -> crate::Result<()> {
+    Err(crate::Error::bad_request(
+        "daemon built without the slirp feature",
+    ))
 }
 
-fn dispatch_remove_net(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) {
+fn dispatch_remove_net(
+    sock: &UnixStream,
+    state: &Arc<DaemonState>,
+    l2cpu_idx: u8,
+) -> crate::Result<()> {
     dlog!("[remove_net l2cpu {}] dispatch entry", l2cpu_idx);
-    if let Err(msg) = validate_l2cpu(l2cpu_idx) {
-        reply_err(sock, msg);
-        return;
-    }
+    validate_l2cpu(l2cpu_idx)?;
     // Take the net handle under the lock, join outside (same reasoning as
     // dispatch_remove_disk).
     let net = {
         let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
-        let slot = match slot_guard.as_mut() {
-            Some(s) => s,
-            None => {
-                reply_err(sock, format!("l2cpu {} is not booted", l2cpu_idx));
-                return;
-            }
-        };
-        match slot.net.take() {
-            Some(n) => n,
-            None => {
-                reply_err(sock, "no net attached");
-                return;
-            }
-        }
+        let slot = slot_guard.as_mut().ok_or_else(|| {
+            crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx))
+        })?;
+        slot.net
+            .take()
+            .ok_or_else(|| crate::Error::slot_state("no net attached"))?
     };
     dlog!("[remove_net l2cpu {}] joining worker", l2cpu_idx);
     net.stop_and_join();
     dlog!("[remove_net l2cpu {}] done — replying ok", l2cpu_idx);
     reply_ok(sock);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Stop / Shutdown
 // ---------------------------------------------------------------------------
 
-fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) {
+fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) -> crate::Result<()> {
     dlog!("[stop l2cpu {}] dispatch_stop entry", l2cpu_idx);
-    if let Err(msg) = validate_l2cpu(l2cpu_idx) {
-        reply_err(sock, msg);
-        return;
-    }
+    validate_l2cpu(l2cpu_idx)?;
     let taken = state.l2cpus[l2cpu_idx as usize].lock().unwrap().take();
     match taken {
         Some(slot) => {
@@ -1260,20 +1236,25 @@ fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) {
             slot.shutdown();
             dlog!("[stop l2cpu {}] workers joined — replying ok", l2cpu_idx);
             reply_ok(sock);
+            Ok(())
         }
         None => {
             dlog!("[stop l2cpu {}] no slot present — replying err", l2cpu_idx);
-            reply_err(sock, format!("l2cpu {} is not booted", l2cpu_idx));
+            Err(crate::Error::slot_state(format!(
+                "l2cpu {} is not booted",
+                l2cpu_idx
+            )))
         }
     }
 }
 
-fn dispatch_shutdown(sock: &UnixStream, state: &Arc<DaemonState>) {
+fn dispatch_shutdown(sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Result<()> {
     dlog!("[shutdown] dispatch_shutdown entry — setting shutdown flag");
     state.shutdown.store(true, Ordering::SeqCst);
     // We don't reach the `serve()` teardown until the accept loop notices the
     // flag, but the accept loop's sleep is 50 ms — client gets Ok promptly.
     reply_ok(sock);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1284,7 +1265,7 @@ mod tests {
     #[test]
     fn validate_l2cpu_accepts_in_range() {
         for i in 0..4u8 {
-            assert_eq!(validate_l2cpu(i), Ok(i as usize));
+            assert_eq!(validate_l2cpu(i).unwrap(), i as usize);
         }
     }
 
@@ -1488,7 +1469,10 @@ mod tests {
     fn add_disk_rejects_when_disk_already_attached() {
         let tf = tempfile::NamedTempFile::new().unwrap();
         let err = validate_add_disk_request(false, tf.path()).unwrap_err();
-        assert!(err.contains("already attached"), "got: {}", err);
+        // SlotState variant for "already attached" — wire shape is bare.
+        assert!(matches!(err, crate::Error::SlotState(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("already attached"), "got: {}", msg);
     }
 
     #[test]
@@ -1496,7 +1480,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bogus = dir.path().join("nonexistent.ext4");
         let err = validate_add_disk_request(true, &bogus).unwrap_err();
-        assert!(err.contains("cannot open disk image"), "got: {}", err);
+        // Io variant for IO failures — wire shape "cannot open disk image <p>: <io>".
+        assert!(matches!(err, crate::Error::Io { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("cannot open disk image"), "got: {}", msg);
     }
 
     #[test]
