@@ -614,16 +614,25 @@ pub fn run_device(
     }
     let queue_header_size = device.queue_header_size();
 
-    // Adaptive sleep with hysteresis: a single empty pass in the middle
-    // of a bursty workload (e.g. disk I/O between descriptor arrivals)
-    // shouldn't knock us back to the slow sleep and then re-ramp when
-    // the next descriptor arrives. Stay fast for FAST_WINDOW after any
-    // observed work; drop to slow only after sustained idle. Same
-    // treatment `chip_console::uart_pass` uses; see that module and
-    // <https://github.com/olofj/tt-bh-rust/issues/2>.
+    // Three-tier adaptive sleep with hysteresis:
+    //   - FAST  (1 µs)   while guest is actively pushing descriptors
+    //   - SLOW  (1 ms)   when no activity for FAST_WINDOW (200 ms)
+    //   - IDLE  (10 ms)  when no activity for IDLE_WINDOW (2 s)
+    // Hysteresis avoids flapping: a single empty pass mid-burst stays
+    // FAST; a sustained quiet stretch falls all the way to IDLE.
+    //
+    // Tier-3 (IDLE) is the difference between ~6% idle CPU (worker
+    // polling at 1 ms = 1000 Hz) and well under 1% (10 ms = 100 Hz).
+    // The cost is at most one IDLE_SLEEP of latency on the first
+    // descriptor after a long idle stretch — fine for guest workloads
+    // whose timeouts are at the seconds level. See `chip_console.rs`
+    // for the matching shape and #27 for the measurement that drove
+    // the tier.
     const FAST_SLEEP_US: libc::c_uint = 1;
     const SLOW_SLEEP_US: libc::c_uint = 1000;
+    const IDLE_SLEEP_US: libc::c_uint = 10_000;
     const FAST_WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
+    const IDLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
     let mut last_active = std::time::Instant::now();
 
     while !exit_flag.load(Ordering::Relaxed) {
@@ -735,18 +744,18 @@ pub fn run_device(
             }
         }
 
-        // Adaptive sleep: fast (1 µs) for low latency while the guest is
-        // actively pushing descriptors, slow (1 ms) when idle to stop
-        // burning CPU. Hysteresis keeps us in fast mode for FAST_WINDOW
-        // after any observed work, so bursty workloads don't flap back
-        // to the slow sleep during sub-ms gaps between descriptors.
+        // Adaptive sleep — see the FAST/SLOW/IDLE constants above for
+        // the tiers and rationale.
         if did_work {
             last_active = std::time::Instant::now();
         }
-        let sleep_us = if last_active.elapsed() < FAST_WINDOW {
+        let elapsed = last_active.elapsed();
+        let sleep_us = if elapsed < FAST_WINDOW {
             FAST_SLEEP_US
-        } else {
+        } else if elapsed < IDLE_WINDOW {
             SLOW_SLEEP_US
+        } else {
+            IDLE_SLEEP_US
         };
         unsafe {
             libc::usleep(sleep_us);

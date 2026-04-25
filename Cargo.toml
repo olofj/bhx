@@ -19,4 +19,14 @@ serde_json = "1"
 [dev-dependencies]
 tempfile = "3"
 
+# Profiling-friendly opt build. Use as:
+#   cargo build --profile profiling
+# Produces target/profiling/tt-bh-linux with full debug info so samply
+# / perf can resolve symbols and frame pointers, while still running
+# release-grade optimized code. See scripts/profile_daemon.sh.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+
 [build-dependencies]

@@ -251,6 +251,15 @@ image/kernel/ramdisk downloaders, the future `SharedChip` abstraction
 
 ## Conventions / gotchas
 
+- Worker poll loops (`virtio::run_device`, `chip_console::uart_pass`)
+  use a three-tier adaptive sleep: FAST (1 µs / 100 µs) while there's
+  observable activity; SLOW (1 ms) after `FAST_WINDOW=200ms` quiet;
+  IDLE (10 ms) after `IDLE_WINDOW=2s` quiet. Tier-3 dropped idle
+  daemon CPU from ~6% to <2%. Don't shrink the IDLE_SLEEP without
+  re-measuring the chip TX ring fill rate (4 KiB; bursty kernel
+  printk fills it in <50 ms — 10 ms IDLE poll keeps a comfortable
+  margin). See `scripts/profile_daemon.sh` for the harness that
+  produced the original numbers.
 - `L2CPU_STARTING_ADDRESS` / `L2CPU_MEMORY_SIZE` in `l2cpu.rs` encode
   that L2CPUs 0/1 have 4 GB each and 2/3 share 4 GB — don't assume
   uniform memory sizes. `boot::modify_dtb` patches
