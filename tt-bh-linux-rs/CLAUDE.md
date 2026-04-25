@@ -72,7 +72,8 @@ src/
 │   ├── mod.rs        # DaemonState, L2CpuSlot, WorkerHandle; holds Arc<SharedChip>
 │   ├── server.rs     # Accept loop + dispatch_{boot,status,attach_console,add/remove_disk/net,stop,shutdown}
 │   ├── client.rs     # Thin RPC helpers used by main.rs
-│   ├── runner.rs     # daemon start/stop/restart/status/logs — double-fork via `daemonize` crate
+│   ├── runner.rs     # daemon start/stop/restart/status/logs — drives daemon::fork
+│   ├── fork.rs       # POSIX double-fork + setsid + stdio redirect (replaces daemonize crate)
 │   ├── lifetime.rs   # pidfile + flock + runtime dir ($XDG_RUNTIME_DIR/tt-bh-linux/<card>)
 │   ├── protocol.rs   # Request/Response, length-prefixed JSON framing, SCM_RIGHTS fd passing
 │   ├── console_hub.rs# 64 KiB scrollback + writer election (Ro/Rw/Takeover)
@@ -286,7 +287,7 @@ image/kernel/ramdisk downloaders, the future `SharedChip` abstraction
   The MMIO counter wraps natively on u32; plain `+ 1` panics in debug
   builds when the guest reaches `u32::MAX` legitimately *or* when garbage
   from a concurrent-write race lands in the read.
-- Daemon chdir's to `/` after daemonize, so relative paths in client
+- Daemon chdir's to `/` in the grand-child of `daemon::fork::double_fork`, so relative paths in client
   RPCs won't resolve on the daemon side. The CLI `absolutize`s paths
   before sending — see `main.rs::absolutize` and its tests. `add-disk`
   also has a server-side pre-open check so a bad path fails the RPC

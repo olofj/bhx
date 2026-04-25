@@ -166,33 +166,25 @@ fn run_daemonized(
     let (_abs, log_out) = open_log(&log_path.to_path_buf())?;
     let log_err = log_out.try_clone()?;
 
-    // Drop pid_guard BEFORE daemonize: the daemonize crate forks, and the
-    // child re-acquires the pidfile flock below. If we held the guard across
-    // the fork, the child would inherit the flock (good), but the parent
-    // would also keep it until process exit (the fork-exit is nearly
-    // instant, but let's not take the risk).
+    // Drop pid_guard BEFORE the fork: the grand-child re-acquires the
+    // pidfile flock below. If we held the guard across the fork, the
+    // child would inherit the flock (good), but the parent would also
+    // keep it until process exit (the fork-exit is nearly instant, but
+    // let's not take the risk).
     drop(pid_guard);
 
-    let daemonize = daemonize::Daemonize::new()
-        .working_directory("/")
-        .umask(0o027)
-        .stdout(log_out)
-        .stderr(log_err);
-
-    match daemonize.execute() {
-        daemonize::Outcome::Parent(p) => match p {
-            Ok(_) => {
-                eprintln!(
-                    "[daemon] started for card {} (pid will be in {})",
-                    card,
-                    pid_path.display()
-                );
-                return Ok(());
-            }
-            Err(e) => return Err(io::Error::other(format!("daemonize failed: {}", e))),
-        },
-        daemonize::Outcome::Child(c) => {
-            c.map_err(|e| io::Error::other(format!("daemonize child failed: {}", e)))?;
+    use crate::daemon::fork::{double_fork, Outcome};
+    match double_fork(Path::new("/"), 0o027, log_out, log_err)? {
+        Outcome::Parent => {
+            eprintln!(
+                "[daemon] started for card {} (pid will be in {})",
+                card,
+                pid_path.display()
+            );
+            return Ok(());
+        }
+        Outcome::Child => {
+            // Fall through to grand-child setup below.
         }
     }
 
