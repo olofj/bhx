@@ -48,6 +48,8 @@ pub struct VirtioNet {
     buffer: [u8; PACKET_SIZE],
     header_processed: bool,
     queue_header_size: u64,
+    /// L2CPU index this device serves. Stored only for metric labels.
+    l2cpu_idx: u8,
 }
 
 unsafe impl Send for VirtioNet {}
@@ -76,7 +78,7 @@ impl VirtioNet {
     /// `crate::regs::slirp::ssh_port`. This type doesn't know about
     /// chip topology; the only piece of "where does this device live"
     /// information that affects its behavior is the SSH-forward port.
-    pub fn new(ssh_port: u16) -> std::io::Result<Self> {
+    pub fn new(ssh_port: u16, l2cpu_idx: u8) -> std::io::Result<Self> {
         let mut cfg: SlirpConfig = unsafe { std::mem::zeroed() };
         unsafe { vdeslirp_init(&mut cfg, VDE_INIT_DEFAULT) };
         let slirp = unsafe { vdeslirp_open(&mut cfg) };
@@ -106,6 +108,7 @@ impl VirtioNet {
             buffer: [0u8; PACKET_SIZE],
             header_processed: false,
             queue_header_size: std::mem::size_of::<VirtioNetHdrMrgRxbuf>() as u64,
+            l2cpu_idx,
         })
     }
 }
@@ -163,6 +166,12 @@ impl VirtioDeviceImpl for VirtioNet {
                 unsafe {
                     ptr::copy_nonoverlapping(self.buffer.as_ptr(), data_addr, copy_len);
                 }
+                crate::daemon::metrics::NET_PACKETS_TOTAL
+                    .rx(self.l2cpu_idx)
+                    .inc();
+                crate::daemon::metrics::NET_BYTES_TOTAL
+                    .rx(self.l2cpu_idx)
+                    .add(copy_len as u64);
             }
         } else if queue_idx == 1 {
             // TX: send packet to slirp
@@ -174,6 +183,12 @@ impl VirtioDeviceImpl for VirtioNet {
                     eprintln!("vdeslirp_send failed: {}", ret);
                 }
             }
+            crate::daemon::metrics::NET_PACKETS_TOTAL
+                .tx(self.l2cpu_idx)
+                .inc();
+            crate::daemon::metrics::NET_BYTES_TOTAL
+                .tx(self.l2cpu_idx)
+                .add(copy_len as u64);
         }
         self.header_processed = false;
     }
@@ -227,7 +242,7 @@ pub fn network_main(
         ssh_port
     );
     while !exit_flag.load(Ordering::Relaxed) {
-        let mut net = match VirtioNet::new(ssh_port) {
+        let mut net = match VirtioNet::new(ssh_port, l2cpu_idx as u8) {
             Ok(n) => n,
             Err(e) => {
                 eprintln!(

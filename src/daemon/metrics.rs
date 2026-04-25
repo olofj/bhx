@@ -232,6 +232,86 @@ impl Default for PerL2cpuDirCounter {
     }
 }
 
+/// Per-L2CPU virtio-block counter, partitioned by op. `read` =
+/// `VIRTIO_BLK_T_IN`, `write` = `VIRTIO_BLK_T_OUT`. UNSUPP request
+/// types don't bump either — they go through `PerL2cpuBlkErrors`.
+pub struct PerL2cpuBlkOpCounter {
+    read: [Counter; 4],
+    write: [Counter; 4],
+}
+impl PerL2cpuBlkOpCounter {
+    pub const fn new() -> Self {
+        Self {
+            read: [const { Counter::new() }; 4],
+            write: [const { Counter::new() }; 4],
+        }
+    }
+    pub fn read(&self, idx: u8) -> &Counter {
+        &self.read[idx as usize]
+    }
+    pub fn write(&self, idx: u8) -> &Counter {
+        &self.write[idx as usize]
+    }
+}
+impl Default for PerL2cpuBlkOpCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-L2CPU virtio-block error counter. `ioerr` = request overflowed
+/// the disk image's size (`VIRTIO_BLK_S_IOERR`); `unsupp` = guest sent
+/// an unrecognized request type (`VIRTIO_BLK_S_UNSUPP`).
+pub struct PerL2cpuBlkErrors {
+    ioerr: [Counter; 4],
+    unsupp: [Counter; 4],
+}
+impl PerL2cpuBlkErrors {
+    pub const fn new() -> Self {
+        Self {
+            ioerr: [const { Counter::new() }; 4],
+            unsupp: [const { Counter::new() }; 4],
+        }
+    }
+    pub fn ioerr(&self, idx: u8) -> &Counter {
+        &self.ioerr[idx as usize]
+    }
+    pub fn unsupp(&self, idx: u8) -> &Counter {
+        &self.unsupp[idx as usize]
+    }
+}
+impl Default for PerL2cpuBlkErrors {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-L2CPU virtio-net counter, partitioned by direction. `rx` =
+/// inbound (slirp → guest), `tx` = outbound (guest → slirp).
+pub struct PerL2cpuNetDirCounter {
+    rx: [Counter; 4],
+    tx: [Counter; 4],
+}
+impl PerL2cpuNetDirCounter {
+    pub const fn new() -> Self {
+        Self {
+            rx: [const { Counter::new() }; 4],
+            tx: [const { Counter::new() }; 4],
+        }
+    }
+    pub fn rx(&self, idx: u8) -> &Counter {
+        &self.rx[idx as usize]
+    }
+    pub fn tx(&self, idx: u8) -> &Counter {
+        &self.tx[idx as usize]
+    }
+}
+impl Default for PerL2cpuNetDirCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// One counter per RPC method. Drives `tt_bh_daemon_rpc_total{method}`
 /// and `_errors_total{method}`. Adding a new method = one field +
 /// matching arm in `RpcMethod::name`.
@@ -360,6 +440,34 @@ pub static L2CPU_CONSOLE_CLIENTS: PerL2cpuGauge = PerL2cpuGauge::new();
 /// Chip-console bytes per L2CPU per direction.
 pub static L2CPU_CONSOLE_BYTES_TOTAL: PerL2cpuDirCounter = PerL2cpuDirCounter::new();
 
+// --- Per virtio-block worker ---
+//
+// Today there's exactly one disk per L2CPU (Phase A in dispatch_add_disk),
+// so the rendered metric pins `disk_id="0"`. When Phase B (multi-disk)
+// lands, the `disk_id` dimension expands without changing the metric
+// name — dashboards keyed off `disk_id` keep working.
+
+/// Block requests completed per L2CPU per op (read|write).
+pub static BLK_REQUESTS_TOTAL: PerL2cpuBlkOpCounter = PerL2cpuBlkOpCounter::new();
+
+/// Block bytes transferred per L2CPU per op. Sum of the per-request
+/// `data_offset` (total bytes attempted, including overflow chunks
+/// counted by IOERR).
+pub static BLK_BYTES_TOTAL: PerL2cpuBlkOpCounter = PerL2cpuBlkOpCounter::new();
+
+/// Block error counter per L2CPU. `ioerr` = request crossed the disk
+/// image's size; `unsupp` = guest sent an unknown request type.
+pub static BLK_ERRORS_TOTAL: PerL2cpuBlkErrors = PerL2cpuBlkErrors::new();
+
+// --- Per virtio-net worker ---
+
+/// Net packets per L2CPU per direction.
+pub static NET_PACKETS_TOTAL: PerL2cpuNetDirCounter = PerL2cpuNetDirCounter::new();
+
+/// Net bytes per L2CPU per direction. Counts the actual bytes copied
+/// to/from the slirp buffer (after `min(data_len, PACKET_SIZE)`).
+pub static NET_BYTES_TOTAL: PerL2cpuNetDirCounter = PerL2cpuNetDirCounter::new();
+
 // ============================================================================
 // Prometheus text formatter
 // ============================================================================
@@ -486,6 +594,115 @@ pub fn render_prometheus(state: &DaemonState) -> String {
             "tt_bh_l2cpu_console_bytes_total{{idx=\"{}\",direction=\"h2g\"}} {}",
             idx,
             L2CPU_CONSOLE_BYTES_TOTAL.h2g(idx).get()
+        );
+    }
+
+    // ----- Per virtio-block -----
+    //
+    // disk_id="0" pinned today (one disk per L2CPU). Phase B will
+    // expand the dimension without changing the metric name.
+
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_blk_requests_total Block requests completed per L2CPU per op."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_blk_requests_total counter");
+    for idx in 0..4u8 {
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_blk_requests_total{{idx=\"{}\",disk_id=\"0\",op=\"read\"}} {}",
+            idx,
+            BLK_REQUESTS_TOTAL.read(idx).get()
+        );
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_blk_requests_total{{idx=\"{}\",disk_id=\"0\",op=\"write\"}} {}",
+            idx,
+            BLK_REQUESTS_TOTAL.write(idx).get()
+        );
+    }
+
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_blk_bytes_total Block bytes transferred per L2CPU per op."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_blk_bytes_total counter");
+    for idx in 0..4u8 {
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_blk_bytes_total{{idx=\"{}\",disk_id=\"0\",op=\"read\"}} {}",
+            idx,
+            BLK_BYTES_TOTAL.read(idx).get()
+        );
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_blk_bytes_total{{idx=\"{}\",disk_id=\"0\",op=\"write\"}} {}",
+            idx,
+            BLK_BYTES_TOTAL.write(idx).get()
+        );
+    }
+
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_blk_errors_total Block-request errors per L2CPU per reason \
+         (ioerr=overflowed image size, unsupp=unknown request type)."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_blk_errors_total counter");
+    for idx in 0..4u8 {
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_blk_errors_total{{idx=\"{}\",disk_id=\"0\",reason=\"ioerr\"}} {}",
+            idx,
+            BLK_ERRORS_TOTAL.ioerr(idx).get()
+        );
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_blk_errors_total{{idx=\"{}\",disk_id=\"0\",reason=\"unsupp\"}} {}",
+            idx,
+            BLK_ERRORS_TOTAL.unsupp(idx).get()
+        );
+    }
+
+    // ----- Per virtio-net -----
+
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_net_packets_total Net packets per L2CPU per direction \
+         (rx=slirp-to-guest, tx=guest-to-slirp)."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_net_packets_total counter");
+    for idx in 0..4u8 {
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_net_packets_total{{idx=\"{}\",direction=\"rx\"}} {}",
+            idx,
+            NET_PACKETS_TOTAL.rx(idx).get()
+        );
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_net_packets_total{{idx=\"{}\",direction=\"tx\"}} {}",
+            idx,
+            NET_PACKETS_TOTAL.tx(idx).get()
+        );
+    }
+
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_net_bytes_total Net bytes per L2CPU per direction."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_net_bytes_total counter");
+    for idx in 0..4u8 {
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_net_bytes_total{{idx=\"{}\",direction=\"rx\"}} {}",
+            idx,
+            NET_BYTES_TOTAL.rx(idx).get()
+        );
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_net_bytes_total{{idx=\"{}\",direction=\"tx\"}} {}",
+            idx,
+            NET_BYTES_TOTAL.tx(idx).get()
         );
     }
 
@@ -725,6 +942,16 @@ mod tests {
             "tt_bh_l2cpu_console_bytes_total{idx=\"3\",direction=\"h2g\"} ",
             "tt_bh_l2cpu_disks{idx=\"0\"} ",
             "tt_bh_l2cpu_net{idx=\"3\"} ",
+            // Per virtio-block (disk_id pinned at 0 in Phase A).
+            "tt_bh_blk_requests_total{idx=\"0\",disk_id=\"0\",op=\"read\"} ",
+            "tt_bh_blk_requests_total{idx=\"2\",disk_id=\"0\",op=\"write\"} ",
+            "tt_bh_blk_bytes_total{idx=\"3\",disk_id=\"0\",op=\"read\"} ",
+            "tt_bh_blk_errors_total{idx=\"0\",disk_id=\"0\",reason=\"ioerr\"} ",
+            "tt_bh_blk_errors_total{idx=\"1\",disk_id=\"0\",reason=\"unsupp\"} ",
+            // Per virtio-net.
+            "tt_bh_net_packets_total{idx=\"0\",direction=\"rx\"} ",
+            "tt_bh_net_packets_total{idx=\"3\",direction=\"tx\"} ",
+            "tt_bh_net_bytes_total{idx=\"2\",direction=\"rx\"} ",
         ] {
             assert!(
                 out.contains(needle),
@@ -810,6 +1037,42 @@ mod tests {
         assert_eq!(m.at(RpcMethod::Boot).get(), 3);
         assert_eq!(m.at(RpcMethod::AddDisk).get(), 2);
         assert_eq!(m.at(RpcMethod::Status).get(), 0);
+    }
+
+    #[test]
+    fn per_l2cpu_blk_op_separates_read_and_write() {
+        let m = PerL2cpuBlkOpCounter::new();
+        m.read(0).add(100);
+        m.write(0).add(200);
+        m.read(3).add(50);
+        assert_eq!(m.read(0).get(), 100);
+        assert_eq!(m.write(0).get(), 200);
+        assert_eq!(m.read(3).get(), 50);
+        assert_eq!(m.write(3).get(), 0);
+    }
+
+    #[test]
+    fn per_l2cpu_blk_errors_separates_ioerr_and_unsupp() {
+        let m = PerL2cpuBlkErrors::new();
+        m.ioerr(1).inc();
+        m.ioerr(1).inc();
+        m.unsupp(2).inc();
+        assert_eq!(m.ioerr(0).get(), 0);
+        assert_eq!(m.ioerr(1).get(), 2);
+        assert_eq!(m.unsupp(2).get(), 1);
+        assert_eq!(m.unsupp(1).get(), 0);
+    }
+
+    #[test]
+    fn per_l2cpu_net_dir_separates_rx_and_tx() {
+        let m = PerL2cpuNetDirCounter::new();
+        m.rx(0).add(1500);
+        m.tx(0).add(64);
+        m.rx(2).add(1500);
+        assert_eq!(m.rx(0).get(), 1500);
+        assert_eq!(m.tx(0).get(), 64);
+        assert_eq!(m.rx(2).get(), 1500);
+        assert_eq!(m.tx(2).get(), 0);
     }
 
     #[test]
