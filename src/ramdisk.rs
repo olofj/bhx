@@ -108,20 +108,7 @@ pub fn pull_ramdisk(name: &str, output: Option<&Path>) -> Result<PathBuf, String
         }
     };
 
-    // Download
-    eprintln!("  Downloading...");
-    let status = Command::new("wget")
-        .arg("-O")
-        .arg(&download_path)
-        .arg("--progress=bar:force:noscroll")
-        .arg(ramdisk.url)
-        .status()
-        .map_err(|e| format!("Failed to run wget: {}", e))?;
-
-    if !status.success() {
-        let _ = fs::remove_file(&download_path);
-        return Err("Download failed".to_string());
-    }
+    crate::fetch::download_to(ramdisk.url, &download_path)?;
 
     // Decompress if needed
     match ramdisk.compression {
