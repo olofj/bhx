@@ -61,7 +61,13 @@ impl Drop for VirtioNet {
 }
 
 impl VirtioNet {
-    pub fn new(ttdevice: u32, l2cpu_idx: usize) -> std::io::Result<Self> {
+    /// Construct a virtio-net device backed by slirp. `ssh_port` is the
+    /// host-side TCP port that gets forwarded to the guest's `:22` —
+    /// the daemon picks one based on (card, l2cpu_idx) via
+    /// `crate::regs::slirp::ssh_port`. This type doesn't know about
+    /// chip topology; the only piece of "where does this device live"
+    /// information that affects its behavior is the SSH-forward port.
+    pub fn new(ssh_port: u16) -> std::io::Result<Self> {
         let mut cfg: SlirpConfig = unsafe { std::mem::zeroed() };
         unsafe { vdeslirp_init(&mut cfg, VDE_INIT_DEFAULT) };
         let slirp = unsafe { vdeslirp_open(&mut cfg) };
@@ -79,9 +85,8 @@ impl VirtioNet {
 
         let host = InAddr::from_str("127.0.0.1");
         let guest = InAddr::from_str("10.0.2.15");
-        let port = crate::regs::slirp::ssh_port(ttdevice, l2cpu_idx as u8) as i32;
         unsafe {
-            vdeslirp_add_fwd(slirp, 0, host, port, guest, 22);
+            vdeslirp_add_fwd(slirp, 0, host, ssh_port as i32, guest, 22);
         }
 
         let slirp_fd = unsafe { vdeslirp_fd(slirp) };
@@ -189,9 +194,13 @@ impl VirtioDeviceImpl for VirtioNet {
     }
 }
 
-/// Network device thread main function.
+/// Network device thread main function. `ssh_port` is the host TCP port
+/// to forward to the guest's `:22` — chosen by the caller via
+/// `crate::regs::slirp::ssh_port`. Keeping the chip-topology logic at
+/// the call site lets this thread know nothing about cards or L2CPU
+/// indices beyond the log prefix.
 pub fn network_main(
-    ttdevice: u32,
+    ssh_port: u16,
     l2cpu: Arc<L2Cpu>,
     interrupt_ctl: Arc<InterruptController>,
     interrupt_number: u32,
@@ -200,13 +209,14 @@ pub fn network_main(
 ) {
     let l2cpu_idx = l2cpu.idx();
     crate::dlog!(
-        "[net l2cpu {}] worker thread entered (mmio_offset=0x{:x}, irq={})",
+        "[net l2cpu {}] worker thread entered (mmio_offset=0x{:x}, irq={}, ssh_port={})",
         l2cpu_idx,
         mmio_region_offset,
-        interrupt_number
+        interrupt_number,
+        ssh_port
     );
     while !exit_flag.load(Ordering::Relaxed) {
-        let mut net = match VirtioNet::new(ttdevice, l2cpu_idx) {
+        let mut net = match VirtioNet::new(ssh_port) {
             Ok(n) => n,
             Err(e) => {
                 eprintln!("network: failed to initialize slirp user-mode networking: {}", e);
