@@ -620,4 +620,26 @@ mod tests {
         let (start, size) = parse_largest_partition(json).unwrap();
         assert_eq!((start, size), (2048, 42));
     }
+
+    #[test]
+    fn get_known_image_finds_exact_name() {
+        let img = get_known_image("debian-13").expect("debian-13 should be known");
+        assert_eq!(img.name, "debian-13");
+    }
+
+    #[test]
+    fn get_known_image_finds_alias() {
+        let img = get_known_image("debian").expect("`debian` alias should resolve");
+        assert_eq!(img.name, "debian-13");
+    }
+
+    #[test]
+    fn get_known_image_returns_none_for_unknown() {
+        assert!(get_known_image("fedora-40").is_none());
+    }
+
+    #[test]
+    fn get_known_image_treats_empty_string_as_unknown() {
+        assert!(get_known_image("").is_none());
+    }
 }

@@ -49,11 +49,17 @@ pub const KNOWN_KERNELS: &[KnownKernel] = &[
 ];
 
 /// Look up a kernel release by version, or return the default.
+///
+/// Accepts both `0.10` and `v0.10` / `V0.10` — the `v`/`V` prefix is
+/// optional and case-insensitive so "v0.10" from a release tag and
+/// "0.10" from a humans-typed CLI argument both work.
 pub fn get_known_kernel(version: Option<&str>) -> Option<&'static KnownKernel> {
     match version {
         Some(v) => {
-            // Try exact match, then with "v" prefix stripped
-            let v_stripped = v.strip_prefix('v').unwrap_or(v);
+            let v_stripped = v
+                .strip_prefix('v')
+                .or_else(|| v.strip_prefix('V'))
+                .unwrap_or(v);
             KNOWN_KERNELS
                 .iter()
                 .find(|k| k.version == v_stripped || k.version == v)
@@ -170,5 +176,34 @@ pub fn cmd_pull(version: Option<&str>, output_dir: Option<&str>) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_known_kernel_returns_default_when_none_passed() {
+        let k = get_known_kernel(None).expect("a default kernel must be set");
+        assert!(k.is_default);
+    }
+
+    #[test]
+    fn get_known_kernel_strips_v_prefix() {
+        let with_v = get_known_kernel(Some("v0.10")).expect("v0.10 should resolve");
+        let bare = get_known_kernel(Some("0.10")).expect("0.10 should resolve");
+        assert_eq!(with_v.version, bare.version);
+    }
+
+    #[test]
+    fn get_known_kernel_uppercase_v_prefix_resolves() {
+        let with_v = get_known_kernel(Some("V0.10")).expect("V0.10 should resolve");
+        assert_eq!(with_v.version, "0.10");
+    }
+
+    #[test]
+    fn get_known_kernel_returns_none_for_unknown_version() {
+        assert!(get_known_kernel(Some("9999")).is_none());
     }
 }

@@ -317,3 +317,131 @@ fn modify_dtb_inner(
     eprintln!("[modify_dtb] packed DTB {} bytes", packed.len());
     Ok(packed)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Pinned copy of `blackhole-card.dtb` for hardware-free tests.
+    /// Updating the on-card DTB requires re-copying this fixture.
+    const FIXTURE_DTB: &[u8] = include_bytes!("../tests/fixtures/blackhole-card.dtb");
+
+    #[test]
+    fn read_bin_file_pads_to_4byte_alignment() {
+        let mut tf = tempfile::NamedTempFile::new().unwrap();
+        tf.write_all(&[1, 2, 3]).unwrap();
+        let out = read_bin_file(tf.path()).unwrap();
+        assert_eq!(out, vec![1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn read_bin_file_leaves_aligned_files_alone() {
+        for size in [0usize, 4, 8, 16] {
+            let mut tf = tempfile::NamedTempFile::new().unwrap();
+            tf.write_all(&vec![0xa5u8; size]).unwrap();
+            let out = read_bin_file(tf.path()).unwrap();
+            assert_eq!(out.len(), size, "size {} should be unchanged", size);
+        }
+    }
+
+    /// Locate `/memory@400030000000` and parse its `reg` property as
+    /// (start, size) — the layout `boot::modify_dtb` writes is two
+    /// big-endian u64s.
+    fn read_memory_reg(dtb: &[u8]) -> (u64, u64) {
+        let fdt = Fdt::open_into(dtb, 0).unwrap();
+        let node = fdt.path_offset("/memory@400030000000").unwrap();
+        let reg = fdt.getprop(node, "reg").unwrap();
+        assert_eq!(reg.len(), 16);
+        let start = u64::from_be_bytes(reg[0..8].try_into().unwrap());
+        let size = u64::from_be_bytes(reg[8..16].try_into().unwrap());
+        (start, size)
+    }
+
+    #[test]
+    fn modify_dtb_patches_memory_node_for_l2cpu_with_2gib() {
+        // L2CPU 2/3 each see 2 GiB. Verify modify_dtb writes (start, 2 GiB)
+        // into /memory's reg.
+        let mem_start = 0x4000_3000_0000u64;
+        let mem_size = 0x8000_0000u64; // 2 GiB
+        let dev = BootDevice::Vda("vda".to_string());
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size).unwrap();
+        assert_eq!(read_memory_reg(&out), (mem_start, mem_size));
+    }
+
+    #[test]
+    fn modify_dtb_bootargs_for_vda_root() {
+        let dev = BootDevice::Vda("vda".to_string());
+        let out = modify_dtb(FIXTURE_DTB, &dev, 0x4000_3000_0000, 0x1_0000_0000).unwrap();
+        let fdt = Fdt::open_into(&out, 0).unwrap();
+        let chosen = fdt.path_offset("/chosen").unwrap();
+        let args = fdt.getprop(chosen, "bootargs").unwrap();
+        // Trailing NUL — the fdt setprop wrote a C string.
+        let s = std::str::from_utf8(&args[..args.len() - 1]).unwrap();
+        assert!(s.contains("root=/dev/vda"), "bootargs missing root=/dev/vda: {:?}", s);
+        assert!(s.contains("console=hvc0"), "bootargs missing hvc0: {:?}", s);
+    }
+
+    #[test]
+    fn modify_dtb_bootargs_for_initramfs() {
+        let dev = BootDevice::Initramfs { addr: 0x4000_3210_0000, len: 4096 };
+        let out = modify_dtb(FIXTURE_DTB, &dev, 0x4000_3000_0000, 0x1_0000_0000).unwrap();
+        let fdt = Fdt::open_into(&out, 0).unwrap();
+        let chosen = fdt.path_offset("/chosen").unwrap();
+        let args = fdt.getprop(chosen, "bootargs").unwrap();
+        let s = std::str::from_utf8(&args[..args.len() - 1]).unwrap();
+        assert!(s.contains("initrd=0x4000321"), "bootargs missing initrd addr: {:?}", s);
+        assert!(s.contains(",4096"), "bootargs missing initrd len: {:?}", s);
+    }
+
+    #[test]
+    fn modify_dtb_creates_reserved_memory_subnode_at_top_of_dram() {
+        let mem_start = 0x4000_3000_0000u64;
+        let mem_size = 0x1_0000_0000u64; // 4 GiB
+        let mem_end = mem_start + mem_size;
+        let expected_base = mem_end - crate::regs::virtio_mmio::RESERVED_SIZE;
+
+        let dev = BootDevice::Vda("vda".to_string());
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size).unwrap();
+        let fdt = Fdt::open_into(&out, 0).unwrap();
+        let res = fdt
+            .path_offset("/reserved-memory/memory@4000afa00000")
+            .expect("modify_dtb must create the virtio reserved-memory node");
+        assert!(fdt.getprop(res, "no-map").is_some(), "reserved region must be no-map");
+        let reg = fdt.getprop(res, "reg").unwrap();
+        let base = u64::from_be_bytes(reg[0..8].try_into().unwrap());
+        let size = u64::from_be_bytes(reg[8..16].try_into().unwrap());
+        assert_eq!(base, expected_base);
+        assert_eq!(size, crate::regs::virtio_mmio::RESERVED_SIZE);
+    }
+
+    #[test]
+    fn modify_dtb_creates_4_virtio_mmio_nodes_with_descending_irqs() {
+        // /soc gets four virtio@<addr> children: addresses descend from
+        // mem_end - MMIO_SLOT_SIZE downwards, IRQs descend from DISK_IRQ.
+        // The node walks i=0..4 -> 4 nodes total.
+        let mem_start = 0x4000_3000_0000u64;
+        let mem_size = 0x1_0000_0000u64;
+        let mem_end = mem_start + mem_size;
+        let dev = BootDevice::Vda("vda".to_string());
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size).unwrap();
+        let fdt = Fdt::open_into(&out, 0).unwrap();
+
+        for i in 0..4u64 {
+            let addr = mem_end - crate::regs::virtio_mmio::MMIO_SLOT_SIZE * (i + 1);
+            let path = format!("/soc/virtio@{:x}", addr);
+            let node = fdt
+                .path_offset(&path)
+                .unwrap_or_else(|| panic!("missing {}", path));
+            // compatible = "virtio,mmio\0"
+            let compat = fdt.getprop(node, "compatible").unwrap();
+            assert!(compat.starts_with(b"virtio,mmio"), "{} compatible={:?}", path, compat);
+            // interrupts is one big-endian u32; verify it descends.
+            let irq = fdt.getprop(node, "interrupts").unwrap();
+            assert_eq!(irq.len(), 4);
+            let irq_val = u32::from_be_bytes(irq.try_into().unwrap());
+            let expected_irq = crate::regs::virtio_mmio::DISK_IRQ - i as u32;
+            assert_eq!(irq_val, expected_irq, "{} irq", path);
+        }
+    }
+}
