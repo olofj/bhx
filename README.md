@@ -38,6 +38,10 @@ cd tt-bh-linux-rs
 cargo build --release       # or plain `cargo build` for a dev build
 ```
 
+CI runs the full build/clippy/test gauntlet on every push that touches
+`tt-bh-linux-rs/`; see `.github/workflows/rust-ci.yml` (default and
+`--no-default-features` builds, plus `cargo fmt --check`).
+
 ## Fetching the firmware + a rootfs
 
 You need three firmware files plus a disk image, all in the current
