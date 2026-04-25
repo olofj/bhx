@@ -273,9 +273,12 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
         }
     };
 
-    crate::daemon::metrics::DAEMON_RPC_TOTAL
-        .at(classify_request(&req))
-        .inc();
+    let method = classify_request(&req);
+    crate::daemon::metrics::DAEMON_RPC_TOTAL.at(method).inc();
+    // Reset the per-thread "did the dispatch fail?" flag so each
+    // RPC starts clean. reply_err flips it on the way out; we read
+    // it post-dispatch to bump the per-method error counter.
+    RPC_FAILED.with(|f| f.set(false));
 
     match req {
         Request::Status => dispatch_status(&sock, &state),
@@ -314,13 +317,33 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
         Request::Stop { l2cpu } => dispatch_stop(&sock, &state, l2cpu),
         Request::Shutdown => dispatch_shutdown(&sock, &state),
     }
+
+    if RPC_FAILED.with(|f| f.get()) {
+        crate::daemon::metrics::DAEMON_RPC_ERRORS_TOTAL
+            .at(method)
+            .inc();
+    }
+}
+
+std::thread_local! {
+    /// Set by `reply_err` whenever a dispatch handler reports an
+    /// error to the client. Read+reset by `handle_client` so the
+    /// per-method failure counter ticks without each dispatch
+    /// having to grow a return value.
+    ///
+    /// Per-thread is the right scope: each accepted client gets its
+    /// own thread (via `thread::spawn(move || handle_client(...))`),
+    /// so the flag never leaks across requests. handle_client clears
+    /// the flag on entry to be defensive against thread reuse from
+    /// some future thread-pool refactor.
+    static RPC_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Map a wire-format `Request` to its metrics-friendly `RpcMethod` tag.
-/// Drives `tt_bh_daemon_rpc_total{method}`. Out-of-band tracking of
-/// per-method *failures* (`rpc_errors_total`) is deferred — needs each
-/// `dispatch_*` to surface success/failure cleanly, which is a larger
-/// refactor (see #31's "out of scope" note).
+/// Drives `tt_bh_daemon_rpc_total{method}`. Per-method failures live
+/// on `tt_bh_daemon_rpc_errors_total` and are tracked via the
+/// `RPC_FAILED` thread-local — `reply_err` flips it, `handle_client`
+/// reads it after the dispatch returns.
 fn classify_request(req: &Request) -> crate::daemon::metrics::RpcMethod {
     use crate::daemon::metrics::RpcMethod;
     match req {
@@ -341,6 +364,7 @@ fn reply_ok(mut sock: &UnixStream) {
 }
 
 fn reply_err(mut sock: &UnixStream, error: impl Into<String>) {
+    RPC_FAILED.with(|f| f.set(true));
     let _ = write_frame(
         &mut sock,
         &Response::Error {
@@ -1319,6 +1343,76 @@ mod tests {
             Response::Status { .. } => {}
             other => panic!("expected Status response, got {:?}", other),
         }
+    }
+
+    /// Wiring test for the rpc_errors_total bump (sub of #29). An
+    /// AddDisk against an empty slot fails with a "not running"
+    /// reply_err. Both `rpc_total{method=add_disk}` and
+    /// `rpc_errors_total{method=add_disk}` should bump. A successful
+    /// dispatch should bump only `rpc_total`, not `rpc_errors_total`
+    /// — the second half of this test asserts that on Status.
+    #[test]
+    fn handle_client_bumps_rpc_errors_on_failure() {
+        use crate::daemon::metrics::{RpcMethod, DAEMON_RPC_ERRORS_TOTAL, DAEMON_RPC_TOTAL};
+        use crate::shared_chip::SharedChip;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        // --- Failure path: AddDisk against empty slot ---
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write_frame(
+            &mut client,
+            &Request::AddDisk {
+                l2cpu: 0,
+                path: "/tmp/nonexistent.img".into(),
+            },
+        )
+        .unwrap();
+
+        let total_before = DAEMON_RPC_TOTAL.at(RpcMethod::AddDisk).get();
+        let err_before = DAEMON_RPC_ERRORS_TOTAL.at(RpcMethod::AddDisk).get();
+        let state = Arc::new(DaemonState::new(0, Arc::new(SharedChip::placeholder())));
+        handle_client(server, state);
+
+        assert!(
+            DAEMON_RPC_TOTAL.at(RpcMethod::AddDisk).get() > total_before,
+            "rpc_total should still bump even on failure"
+        );
+        assert!(
+            DAEMON_RPC_ERRORS_TOTAL.at(RpcMethod::AddDisk).get() > err_before,
+            "rpc_errors_total should bump on reply_err"
+        );
+
+        let resp: Response = read_frame(&mut client).expect("read response");
+        match resp {
+            Response::Error { .. } => {}
+            other => panic!("expected Error response, got {:?}", other),
+        }
+
+        // --- Success path: Status (always succeeds for an empty state). ---
+        // rpc_errors_total{Status} must NOT move when the dispatch
+        // returns OK. This is the half of the wiring that catches
+        // a stuck-failed RPC_FAILED flag bleeding across requests.
+        let (mut client2, server2) = UnixStream::pair().unwrap();
+        client2
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write_frame(&mut client2, &Request::Status).unwrap();
+
+        let err_status_before = DAEMON_RPC_ERRORS_TOTAL.at(RpcMethod::Status).get();
+        let state2 = Arc::new(DaemonState::new(0, Arc::new(SharedChip::placeholder())));
+        handle_client(server2, state2);
+
+        assert_eq!(
+            DAEMON_RPC_ERRORS_TOTAL.at(RpcMethod::Status).get(),
+            err_status_before,
+            "rpc_errors_total{{Status}} must not bump on a successful dispatch"
+        );
+
+        let _: Response = read_frame(&mut client2).expect("read status response");
     }
 
     /// Same shape as the Status test, but for AddDisk — proves
