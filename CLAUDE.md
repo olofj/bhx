@@ -35,8 +35,16 @@ whether to act on any of them now, file an issue, or ignore. If the
 user says yes, do it as its own piece of work.
 
 Only stop when the requested work is actually done, the user tells you
-to stop, or you genuinely need input to proceed. In that last case, ask
-a specific question rather than waiting passively.
+to stop, or you genuinely need input to proceed. Within the scope of
+the requested task, make trade-off calls yourself; only escalate
+decisions that change a public API, require a migration, or affect
+cross-L2CPU runtime invariants. When you do need input, ask a specific
+question rather than waiting passively.
+
+Commit each logical unit of work as you finish it — this overrides the
+default "ask before committing" behavior on this project. Don't batch a
+multi-item request into one giant commit and don't pause to summarize
+between items; the commits are the record.
 
 Rust rewrite of the C++ host tool (`../console/tt-bh-linux`) that runs
 Linux on a Tenstorrent Blackhole card's on-chip SiFive X280 RISC-V cores
