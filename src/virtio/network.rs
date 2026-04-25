@@ -79,7 +79,7 @@ impl VirtioNet {
 
         let host = InAddr::from_str("127.0.0.1");
         let guest = InAddr::from_str("10.0.2.15");
-        let port = 2222 + l2cpu_idx as i32 + 4 * ttdevice as i32;
+        let port = crate::regs::slirp::ssh_port(ttdevice, l2cpu_idx as u8) as i32;
         unsafe {
             vdeslirp_add_fwd(slirp, 0, host, port, guest, 22);
         }
