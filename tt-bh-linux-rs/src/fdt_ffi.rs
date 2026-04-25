@@ -52,30 +52,64 @@ fn check(err: c_int, op: &str) -> Result<(), String> {
 /// Owned, resizable DTB buffer.
 ///
 /// Provides the libfdt operations used by the boot sequence. The backing
-/// `Vec<u8>` is sized once at construction (original + slack) and must be
-/// large enough for all additions; libfdt will return NOSPACE otherwise.
+/// storage is `Vec<u64>` rather than `Vec<u8>` so the pointer libfdt sees
+/// is guaranteed 8-byte aligned — the FDT spec requires the buffer to be
+/// 8-byte aligned in memory, and a plain `Vec<u8>` only promises align 1.
+/// Production hits this whenever the heap allocator hands back an
+/// unaligned block; tests hit it more often because allocator state
+/// shifts test-to-test.
+///
+/// `byte_len` tracks the externally-visible byte length, which can
+/// shrink below `storage.len() * 8` after `pack`.
 pub struct Fdt {
-    buf: Vec<u8>,
+    storage: Vec<u64>,
+    byte_len: usize,
 }
 
 impl Fdt {
     /// Open a DTB for modification, growing the buffer by `extra_bytes`.
+    ///
+    /// libfdt requires *both* the input pointer and the output buffer to
+    /// be 8-byte aligned. `src` is typically a `Vec<u8>` from `fs::read`
+    /// or a `&'static [u8; N]` from `include_bytes!`, neither of which
+    /// promise alignment > 1. We stage through one aligned `Vec<u64>`:
+    /// the input is copied into the output buffer first, then libfdt
+    /// validates and resizes in place. This avoids two separate aligned
+    /// allocations.
     pub fn open_into(src: &[u8], extra_bytes: usize) -> Result<Self, String> {
         let total = src.len() + extra_bytes;
-        let mut buf = vec![0u8; total];
+        let words = total.div_ceil(8);
+        let mut storage: Vec<u64> = vec![0u64; words];
+        // Stage the input into the aligned buffer so the libfdt call
+        // sees an aligned source pointer. We then call fdt_open_into
+        // with the same buffer for both src and dst — that's a valid
+        // libfdt usage (it does a memmove internally if src == dst,
+        // and our case is "moves into self" which is a noop).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                storage.as_mut_ptr() as *mut u8,
+                src.len(),
+            );
+        }
         let ret = unsafe {
             fdt_open_into(
-                src.as_ptr() as *const c_void,
-                buf.as_mut_ptr() as *mut c_void,
+                storage.as_ptr() as *const c_void,
+                storage.as_mut_ptr() as *mut c_void,
                 total as c_int,
             )
         };
         check(ret, "fdt_open_into")?;
-        Ok(Fdt { buf })
+        Ok(Fdt { storage, byte_len: total })
     }
 
-    fn ptr(&self) -> *const c_void { self.buf.as_ptr() as *const c_void }
-    fn ptr_mut(&mut self) -> *mut c_void { self.buf.as_mut_ptr() as *mut c_void }
+    fn ptr(&self) -> *const c_void { self.storage.as_ptr() as *const c_void }
+    fn ptr_mut(&mut self) -> *mut c_void { self.storage.as_mut_ptr() as *mut c_void }
+    fn buf_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(self.storage.as_ptr() as *const u8, self.byte_len)
+        }
+    }
 
     /// Find a node by path. Returns None if not found.
     pub fn path_offset(&self, path: &str) -> Option<c_int> {
@@ -153,8 +187,11 @@ impl Fdt {
     pub fn pack(mut self) -> Result<Vec<u8>, String> {
         let ret = unsafe { fdt_pack(self.ptr_mut()) };
         check(ret, "fdt_pack")?;
-        let size = u32::from_be_bytes(self.buf[4..8].try_into().unwrap()) as usize;
-        self.buf.truncate(size);
-        Ok(self.buf)
+        let size = u32::from_be_bytes(self.buf_bytes()[4..8].try_into().unwrap()) as usize;
+        // Copy out as Vec<u8> truncated to the packed size. We could
+        // hand back the storage's bytes via Vec::from_raw_parts but that
+        // breaks Vec's allocator invariant (allocated as u64, freed as
+        // u8); a copy is fine for a packed-DTB size that's a few KiB.
+        Ok(self.buf_bytes()[..size].to_vec())
     }
 }
