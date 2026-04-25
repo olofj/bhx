@@ -225,13 +225,27 @@ fn uart_pass(
             last_active = std::time::Instant::now();
         }
         let elapsed = last_active.elapsed();
-        let sleep = if elapsed < FAST_WINDOW {
-            FAST_SLEEP
-        } else if elapsed < IDLE_WINDOW {
-            SLOW_SLEEP
-        } else {
-            IDLE_SLEEP
+        let tier = crate::daemon::metrics::classify_tier(elapsed, FAST_WINDOW, IDLE_WINDOW);
+        let sleep = match tier {
+            crate::daemon::metrics::Tier::Fast => FAST_SLEEP,
+            crate::daemon::metrics::Tier::Slow => SLOW_SLEEP,
+            crate::daemon::metrics::Tier::Idle => IDLE_SLEEP,
         };
+        let idx_u8 = l2cpu.idx() as u8;
+        crate::daemon::metrics::WORKER_POLL_ITERATIONS_TOTAL
+            .at(
+                crate::daemon::metrics::WorkerKind::ChipConsole,
+                idx_u8,
+                tier,
+            )
+            .inc();
+        crate::daemon::metrics::WORKER_TIER_NANOS_TOTAL
+            .at(
+                crate::daemon::metrics::WorkerKind::ChipConsole,
+                idx_u8,
+                tier,
+            )
+            .add(sleep.as_nanos() as u64);
         std::thread::sleep(sleep);
     }
 }

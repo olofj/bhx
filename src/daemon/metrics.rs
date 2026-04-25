@@ -286,6 +286,99 @@ impl Default for PerL2cpuBlkErrors {
     }
 }
 
+/// Worker poll-tier discriminator. Each adaptive-sleep iteration in
+/// `virtio::run_device` and `chip_console::uart_pass` falls into one
+/// of these tiers based on how long the loop has been quiet —
+/// Fast (microseconds) when there's recent activity, Slow (~ms)
+/// after the FAST_WINDOW expires, Idle (~10 ms) after IDLE_WINDOW
+/// expires. See #27 for the rationale.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Tier {
+    Fast,
+    Slow,
+    Idle,
+}
+impl Tier {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Tier::Fast => "fast",
+            Tier::Slow => "slow",
+            Tier::Idle => "idle",
+        }
+    }
+    pub const fn all() -> &'static [Tier] {
+        &[Tier::Fast, Tier::Slow, Tier::Idle]
+    }
+}
+
+/// Worker discriminator. One variant per long-running poll loop in
+/// the daemon.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WorkerKind {
+    VirtioBlk,
+    VirtioNet,
+    ChipConsole,
+}
+impl WorkerKind {
+    pub const fn name(self) -> &'static str {
+        match self {
+            WorkerKind::VirtioBlk => "virtio_blk",
+            WorkerKind::VirtioNet => "virtio_net",
+            WorkerKind::ChipConsole => "chip_console",
+        }
+    }
+    pub const fn all() -> &'static [WorkerKind] {
+        &[
+            WorkerKind::VirtioBlk,
+            WorkerKind::VirtioNet,
+            WorkerKind::ChipConsole,
+        ]
+    }
+    fn idx(self) -> usize {
+        match self {
+            WorkerKind::VirtioBlk => 0,
+            WorkerKind::VirtioNet => 1,
+            WorkerKind::ChipConsole => 2,
+        }
+    }
+}
+
+/// Classify an "elapsed since last activity" duration into one of the
+/// three poll tiers. Pure function — extracted from `run_device` /
+/// `uart_pass` so it's unit-testable. Each loop has its own
+/// `fast_window` / `idle_window` (see #27).
+pub fn classify_tier(elapsed: Duration, fast_window: Duration, idle_window: Duration) -> Tier {
+    if elapsed < fast_window {
+        Tier::Fast
+    } else if elapsed < idle_window {
+        Tier::Slow
+    } else {
+        Tier::Idle
+    }
+}
+
+/// 3D counter: `[worker][idx][tier]`. 3 × 4 × 3 = 36 cells per metric.
+/// Indexed by `at(WorkerKind, idx: u8, Tier)`. Both keying enums have
+/// stable `name()` strings the renderer uses verbatim.
+pub struct WorkerTierCounter {
+    values: [[[Counter; 3]; 4]; 3],
+}
+impl WorkerTierCounter {
+    pub const fn new() -> Self {
+        Self {
+            values: [const { [const { [const { Counter::new() }; 3] }; 4] }; 3],
+        }
+    }
+    pub fn at(&self, worker: WorkerKind, idx: u8, tier: Tier) -> &Counter {
+        &self.values[worker.idx()][idx as usize][tier as usize]
+    }
+}
+impl Default for WorkerTierCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-L2CPU virtio-net counter, partitioned by direction. `rx` =
 /// inbound (slirp → guest), `tx` = outbound (guest → slirp).
 pub struct PerL2cpuNetDirCounter {
@@ -478,6 +571,21 @@ pub static BLK_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
 /// Net-device interrupt count per L2CPU. Same shape as
 /// `BLK_INTERRUPTS_TOTAL`.
 pub static NET_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
+
+// --- Worker poll loop ---
+
+/// Iterations per worker per L2CPU per tier. A high count in
+/// `tier="fast"` means the worker is busy; a high count in
+/// `tier="idle"` means it's quiet. Together these tell the operator
+/// where the daemon is spending its CPU. See #27.
+pub static WORKER_POLL_ITERATIONS_TOTAL: WorkerTierCounter = WorkerTierCounter::new();
+
+/// Cumulative wall time slept per tier, in nanoseconds. Internal
+/// representation is u64 nanos so the increments are integer
+/// `fetch_add` — the renderer divides by 1e9 to emit
+/// `tt_bh_worker_tier_seconds_total` as floating-point seconds (the
+/// canonical Prometheus shape for time).
+pub static WORKER_TIER_NANOS_TOTAL: WorkerTierCounter = WorkerTierCounter::new();
 
 // ============================================================================
 // Prometheus text formatter
@@ -745,6 +853,57 @@ pub fn render_prometheus(state: &DaemonState) -> String {
         );
     }
 
+    // ----- Worker poll-loop tiers -----
+
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_worker_poll_iterations_total Adaptive-sleep loop iterations \
+         per worker per L2CPU per tier (fast=µs, slow=ms, idle=10ms — see #27)."
+    );
+    let _ = writeln!(
+        &mut out,
+        "# TYPE tt_bh_worker_poll_iterations_total counter"
+    );
+    for &w in WorkerKind::all() {
+        for idx in 0..4u8 {
+            for &t in Tier::all() {
+                let _ = writeln!(
+                    &mut out,
+                    "tt_bh_worker_poll_iterations_total{{worker=\"{}\",idx=\"{}\",tier=\"{}\"}} {}",
+                    w.name(),
+                    idx,
+                    t.name(),
+                    WORKER_POLL_ITERATIONS_TOTAL.at(w, idx, t).get()
+                );
+            }
+        }
+    }
+
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_worker_tier_seconds_total Cumulative seconds spent sleeping \
+         in each tier per worker per L2CPU."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_worker_tier_seconds_total counter");
+    for &w in WorkerKind::all() {
+        for idx in 0..4u8 {
+            for &t in Tier::all() {
+                // Internal counter holds nanoseconds for cheap atomic
+                // adds; convert to seconds for the rendered metric.
+                let nanos = WORKER_TIER_NANOS_TOTAL.at(w, idx, t).get();
+                let secs = nanos as f64 / 1_000_000_000.0;
+                let _ = writeln!(
+                    &mut out,
+                    "tt_bh_worker_tier_seconds_total{{worker=\"{}\",idx=\"{}\",tier=\"{}\"}} {}",
+                    w.name(),
+                    idx,
+                    t.name(),
+                    secs
+                );
+            }
+        }
+    }
+
     // Slot-derived gauges: uptime, disks, net, state. Walk the
     // mutexes once to read every slot's snapshot.
     let _ = writeln!(
@@ -996,6 +1155,11 @@ mod tests {
             "tt_bh_net_bytes_total{idx=\"2\",direction=\"rx\"} ",
             "tt_bh_blk_interrupts_total{idx=\"0\",disk_id=\"0\"} ",
             "tt_bh_net_interrupts_total{idx=\"3\"} ",
+            // Worker poll-tier (every (worker, idx, tier) combination
+            // gets a line; spot-check a representative subset).
+            "tt_bh_worker_poll_iterations_total{worker=\"virtio_blk\",idx=\"0\",tier=\"fast\"} ",
+            "tt_bh_worker_poll_iterations_total{worker=\"chip_console\",idx=\"3\",tier=\"idle\"} ",
+            "tt_bh_worker_tier_seconds_total{worker=\"virtio_net\",idx=\"2\",tier=\"slow\"} ",
         ] {
             assert!(
                 out.contains(needle),
@@ -1081,6 +1245,76 @@ mod tests {
         assert_eq!(m.at(RpcMethod::Boot).get(), 3);
         assert_eq!(m.at(RpcMethod::AddDisk).get(), 2);
         assert_eq!(m.at(RpcMethod::Status).get(), 0);
+    }
+
+    #[test]
+    fn classify_tier_picks_correct_bucket() {
+        let fast = Duration::from_millis(200);
+        let idle = Duration::from_secs(2);
+
+        // Below fast_window → Fast.
+        assert_eq!(
+            classify_tier(Duration::from_millis(0), fast, idle),
+            Tier::Fast
+        );
+        assert_eq!(
+            classify_tier(Duration::from_millis(199), fast, idle),
+            Tier::Fast
+        );
+        // At/above fast_window but below idle_window → Slow.
+        assert_eq!(
+            classify_tier(Duration::from_millis(200), fast, idle),
+            Tier::Slow
+        );
+        assert_eq!(
+            classify_tier(Duration::from_millis(1999), fast, idle),
+            Tier::Slow
+        );
+        // At/above idle_window → Idle.
+        assert_eq!(
+            classify_tier(Duration::from_secs(2), fast, idle),
+            Tier::Idle
+        );
+        assert_eq!(
+            classify_tier(Duration::from_secs(60), fast, idle),
+            Tier::Idle
+        );
+    }
+
+    #[test]
+    fn worker_tier_counter_indexes_independently() {
+        let m = WorkerTierCounter::new();
+        m.at(WorkerKind::VirtioBlk, 0, Tier::Fast).add(10);
+        m.at(WorkerKind::VirtioNet, 1, Tier::Slow).add(5);
+        m.at(WorkerKind::ChipConsole, 3, Tier::Idle).inc();
+
+        assert_eq!(m.at(WorkerKind::VirtioBlk, 0, Tier::Fast).get(), 10);
+        assert_eq!(m.at(WorkerKind::VirtioNet, 1, Tier::Slow).get(), 5);
+        assert_eq!(m.at(WorkerKind::ChipConsole, 3, Tier::Idle).get(), 1);
+        // No bleed across (worker, idx, tier) axes.
+        assert_eq!(m.at(WorkerKind::VirtioBlk, 0, Tier::Slow).get(), 0);
+        assert_eq!(m.at(WorkerKind::VirtioNet, 0, Tier::Slow).get(), 0);
+        assert_eq!(m.at(WorkerKind::ChipConsole, 3, Tier::Fast).get(), 0);
+    }
+
+    #[test]
+    fn worker_kind_and_tier_names_are_stable() {
+        // Wire labels are consumed by external dashboards; a typo
+        // here would break alerts at deploy time.
+        for &(w, expected) in &[
+            (WorkerKind::VirtioBlk, "virtio_blk"),
+            (WorkerKind::VirtioNet, "virtio_net"),
+            (WorkerKind::ChipConsole, "chip_console"),
+        ] {
+            assert_eq!(w.name(), expected);
+        }
+        for &(t, expected) in &[
+            (Tier::Fast, "fast"),
+            (Tier::Slow, "slow"),
+            (Tier::Idle, "idle"),
+        ] {
+            assert_eq!(t.name(), expected);
+        }
     }
 
     #[test]

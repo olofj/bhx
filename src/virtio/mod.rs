@@ -772,13 +772,23 @@ pub fn run_device(
             last_active = std::time::Instant::now();
         }
         let elapsed = last_active.elapsed();
-        let sleep_us = if elapsed < FAST_WINDOW {
-            FAST_SLEEP_US
-        } else if elapsed < IDLE_WINDOW {
-            SLOW_SLEEP_US
-        } else {
-            IDLE_SLEEP_US
+        let tier = crate::daemon::metrics::classify_tier(elapsed, FAST_WINDOW, IDLE_WINDOW);
+        let sleep_us = match tier {
+            crate::daemon::metrics::Tier::Fast => FAST_SLEEP_US,
+            crate::daemon::metrics::Tier::Slow => SLOW_SLEEP_US,
+            crate::daemon::metrics::Tier::Idle => IDLE_SLEEP_US,
         };
+        let worker = match interrupt_kind {
+            InterruptKind::Block => crate::daemon::metrics::WorkerKind::VirtioBlk,
+            InterruptKind::Net => crate::daemon::metrics::WorkerKind::VirtioNet,
+        };
+        let idx_u8 = l2cpu.idx() as u8;
+        crate::daemon::metrics::WORKER_POLL_ITERATIONS_TOTAL
+            .at(worker, idx_u8, tier)
+            .inc();
+        crate::daemon::metrics::WORKER_TIER_NANOS_TOTAL
+            .at(worker, idx_u8, tier)
+            .add(sleep_us as u64 * 1_000);
         unsafe {
             libc::usleep(sleep_us);
         }
