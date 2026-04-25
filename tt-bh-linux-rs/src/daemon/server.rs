@@ -56,7 +56,7 @@ use crate::regs::virtio_mmio::{NET_IRQ as NET_INT, NET_OFFSET as NET_MMIO};
 // `cargo run -- debug …` subcommands where eprintln-to-terminal is the
 // right default; daemon callers see those lines via the stderr → log
 // redirect, just without the timestamp prefix.
-pub fn serve(card: u32, listener: UnixListener) -> io::Result<()> {
+pub fn serve(card: u32, listener: UnixListener, sandbox: bool, log_path: &Path) -> io::Result<()> {
     // Open the one-and-only persistent TLB window to tile (8,0) before
     // anything else touches chip state, so the daemon has a single
     // serialization point for PLL / reset register access. Fallible because
@@ -74,6 +74,23 @@ pub fn serve(card: u32, listener: UnixListener) -> io::Result<()> {
     if !released.is_empty() {
         warm_resume_released(&state, &released);
     }
+
+    // Install seccomp + landlock AFTER chip probe + warm-resume have
+    // opened /dev/tenstorrent/<card> and done their initial ioctls,
+    // BEFORE the accept loop spawns dispatch threads. The sandbox
+    // module uses TSYNC so chip-console workers spawned by warm-
+    // resume inherit too. Filter is opt-in via `daemon start
+    // --sandbox` until soak coverage builds confidence. See
+    // `docs/sandbox-syscalls.md` for the policy.
+    if sandbox {
+        if let Err(e) = crate::daemon::sandbox::apply(card, log_path) {
+            // A sandbox installation failure is fatal — better to
+            // refuse to start than silently run without the
+            // protection the operator asked for.
+            return Err(io::Error::other(format!("sandbox install failed: {}", e)));
+        }
+    }
+
     while !state.shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((sock, _addr)) => {

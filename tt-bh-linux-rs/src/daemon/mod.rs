@@ -22,6 +22,7 @@ pub mod lifetime;
 pub mod log;
 pub mod protocol;
 pub mod runner;
+pub mod sandbox;
 pub mod server;
 pub mod terminal;
 
