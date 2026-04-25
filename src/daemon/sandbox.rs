@@ -95,21 +95,32 @@ mod imp {
                 ));
             }
         }
-        // Operator's cwd at daemon start time — read-only, captures
-        // rootfs.ext4 + Image + fw_jump.bin + blackhole-card.dtb +
-        // any path the operator might pass to add-disk.
+        // Operator's cwd at daemon start time — read+write at the cwd
+        // level. Captures rootfs.ext4 + Image + fw_jump.bin +
+        // blackhole-card.dtb + any path the operator might pass to
+        // add-disk. WriteFile is needed for the disk image, which the
+        // virtio-blk worker opens O_RDWR. Landlock checks the symlink
+        // path (not the resolved target), so a cwd-rooted symlink
+        // pointing to a sibling project (the typical
+        // ../tt-bh-linux/rootfs.ext4 layout) traverses fine.
         if let Ok(cwd) = std::env::current_dir() {
-            allow.push((cwd, AccessFs::ReadFile | AccessFs::ReadDir));
+            allow.push((
+                cwd,
+                AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir,
+            ));
         }
-        // The boot artifacts often live under ../tt-bh-linux/ (sibling
-        // to this checkout). Also allow the parent of cwd, read-only,
-        // so symlink traversal there resolves.
+        // Parent of cwd: read-only — covers a sibling-of-cwd checkout
+        // pattern (e.g. tests/rootfs/rootfs.ext4 referencing a
+        // buildroot output dir).
         if let Ok(cwd) = std::env::current_dir() {
             if let Some(parent) = cwd.parent() {
                 allow.push((parent.to_path_buf(), AccessFs::ReadFile | AccessFs::ReadDir));
             }
         }
-        // System read-only paths slirp + libc + dynamic-linker need.
+        // System read-only paths slirp + libc + dynamic-linker need,
+        // plus the PCIe sysfs paths chip::reset_board reads to poll
+        // the config-space reset bit during `boot --force` after a
+        // warm-resume.
         for (p, access) in [
             ("/etc", AccessFs::ReadFile | AccessFs::ReadDir),
             ("/usr", AccessFs::ReadFile | AccessFs::ReadDir),
@@ -120,6 +131,13 @@ mod imp {
             // (resolvconf, locale archives) and the daemon never has
             // a reason to NOT read tmp.
             ("/tmp", AccessFs::ReadFile | AccessFs::ReadDir),
+            // PCIe sysfs: /sys/bus/pci/devices/<BDF> is a symlink into
+            // /sys/devices/pci.../<BDF>; allow both so reset_board's
+            // open + read of the config file traverses cleanly. Read
+            // only — the actual board-reset write goes through the
+            // kmd ioctl, not through this file.
+            ("/sys/bus/pci", AccessFs::ReadFile | AccessFs::ReadDir),
+            ("/sys/devices", AccessFs::ReadFile | AccessFs::ReadDir),
         ] {
             if Path::new(p).exists() {
                 allow.push((PathBuf::from(p), access));
