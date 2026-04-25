@@ -13,6 +13,7 @@ mod chip;
 mod clock;
 mod console;
 mod daemon;
+mod error;
 mod fdt_ffi;
 mod fetch;
 mod image;
@@ -26,6 +27,10 @@ mod shared_chip;
 mod slirp_ffi;
 mod tlb;
 mod virtio;
+
+// Re-export the structured error type at the crate root so call sites
+// can write `crate::Result<T>` rather than `crate::error::Result<T>`.
+pub use error::{Error, Result};
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
