@@ -97,8 +97,13 @@ impl Drop for PidfileGuard {
     }
 }
 
-/// Attempt to acquire the per-card pidfile. Fails with AlreadyExists if
-/// another process holds the flock; writes our pid to the file on success.
+/// Attempt to acquire the per-card pidfile.
+///
+/// On contention, returns `io::Error::new(ErrorKind::AlreadyExists, …)` —
+/// the kind carries semantic meaning here: `runner::start` matches on
+/// `AlreadyExists` to attach the running pid to its user-facing error
+/// message. This is the *only* place in the crate that uses a non-`Other`
+/// `ErrorKind` deliberately; everywhere else uses `io::Error::other`.
 pub fn acquire_pidfile(card: u32) -> io::Result<PidfileGuard> {
     ensure_runtime_dir(card)?;
     let path = pidfile_path(card);

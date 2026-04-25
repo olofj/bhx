@@ -192,6 +192,20 @@ pub fn modify_dtb(
     boot_device: &BootDevice,
     mem_start: u64,
     mem_size: u64,
+) -> std::io::Result<Vec<u8>> {
+    modify_dtb_inner(dtb_bytes, boot_device, mem_start, mem_size)
+        .map_err(std::io::Error::other)
+}
+
+// libfdt's wrappers in `fdt_ffi` return `Result<_, String>`; keep that
+// inside this helper so the body uses `?` cleanly, and convert at the
+// public boundary above. There's no value in exposing the raw String to
+// callers — they all immediately do `io::Error::other`.
+fn modify_dtb_inner(
+    dtb_bytes: &[u8],
+    boot_device: &BootDevice,
+    mem_start: u64,
+    mem_size: u64,
 ) -> Result<Vec<u8>, String> {
     let mem_end = mem_start + mem_size;
     eprintln!(

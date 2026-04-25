@@ -43,6 +43,19 @@ use crate::regs::virtio_mmio::{NET_IRQ as NET_INT, NET_OFFSET as NET_MMIO};
 /// Run the daemon accept loop foreground-style. Returns on SIGTERM / SIGINT
 /// once the shutdown flag has been tripped. Caller is responsible for
 /// daemonization (double-fork) before calling this.
+// Logging convention inside this module: use `dlog!` for every line we
+// emit, so the log file has consistent `[timestamp pid=… tid=…]`
+// prefixes that grep/triage tooling can rely on. Failures inside a
+// `dispatch_*` handler get *both* a `dlog!` (so the daemon log records
+// what happened) *and* a `reply_err` (so the client sees an error).
+// Plain `eprintln!` is reserved for `runner.rs` (pre-daemonize messages
+// to the user's terminal) and `main.rs` (CLI-side errors).
+//
+// Lower-level modules (`chip.rs`, `shared_chip.rs`, `virtio/*`,
+// `chip_console.rs`) still use `eprintln!` because they're shared with
+// `cargo run -- debug …` subcommands where eprintln-to-terminal is the
+// right default; daemon callers see those lines via the stderr → log
+// redirect, just without the timestamp prefix.
 pub fn serve(card: u32, listener: UnixListener) -> io::Result<()> {
     // Open the one-and-only persistent TLB window to tile (8,0) before
     // anything else touches chip state, so the daemon has a single
@@ -56,7 +69,7 @@ pub fn serve(card: u32, listener: UnixListener) -> io::Result<()> {
 
     listener.set_nonblocking(true)?;
 
-    eprintln!("[daemon] accepting connections on card {}", card);
+    dlog!("[daemon] accepting connections on card {}", card);
     let released = probe_initial_chip_state(&state.shared_chip, card);
     if !released.is_empty() {
         warm_resume_released(&state, &released);
@@ -71,13 +84,13 @@ pub fn serve(card: u32, listener: UnixListener) -> io::Result<()> {
                 thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                eprintln!("[daemon] accept error: {}", e);
+                dlog!("[daemon] accept error: {}", e);
                 thread::sleep(Duration::from_millis(200));
             }
         }
     }
 
-    eprintln!("[daemon] shutdown flag set — tearing down L2CPU slots");
+    dlog!("[daemon] shutdown flag set — tearing down L2CPU slots");
     for slot_mutex in state.l2cpus.iter() {
         if let Some(slot) = slot_mutex.lock().unwrap().take() {
             slot.shutdown();
@@ -86,7 +99,7 @@ pub fn serve(card: u32, listener: UnixListener) -> io::Result<()> {
     // Clean up socket file; pidfile flock is released when our guard drops in
     // the caller (`run_foreground`).
     let _ = std::fs::remove_file(lifetime::socket_path(card));
-    eprintln!("[daemon] bye");
+    dlog!("[daemon] bye");
     Ok(())
 }
 
@@ -101,7 +114,7 @@ fn probe_initial_chip_state(
     card: u32,
 ) -> Vec<u8> {
     let val = shared.read_l2cpu_reset();
-    eprintln!(
+    dlog!(
         "[probe] L2CPU_RESET={:#010x} (card {})",
         val, card
     );
@@ -113,7 +126,7 @@ fn probe_initial_chip_state(
         } else {
             "held in reset (cold-bootable)"
         };
-        eprintln!("[probe]   L2CPU {} bit {} = {} -> {}", idx, idx + 4, bit, state);
+        dlog!("[probe]   L2CPU {} bit {} = {} -> {}", idx, idx + 4, bit, state);
         if bit == 1 {
             released.push(idx);
         }
@@ -197,7 +210,7 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
     let req: Request = match read_frame(&mut sock) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[daemon] read request failed: {}", e);
+            dlog!("[daemon] read request failed: {}", e);
             let _ = write_frame(
                 &mut sock,
                 &Response::Error {
@@ -574,8 +587,7 @@ fn run_boot_sequence(
         starting_address,
         memory_size
     );
-    let dtb_patched = boot::modify_dtb(&dtb_raw, &boot_device, starting_address, memory_size)
-        .map_err(io::Error::other)?;
+    let dtb_patched = boot::modify_dtb(&dtb_raw, &boot_device, starting_address, memory_size)?;
 
     let initramfs_pb = initramfs.map(std::path::PathBuf::from);
     dlog!(
@@ -696,7 +708,7 @@ fn dispatch_attach_console(
 
     let (res, scrollback) = hub.attach(daemon_end, mode);
     if !res.demoted.is_empty() {
-        eprintln!(
+        dlog!(
             "[daemon] l2cpu {} console takeover demoted {:?}",
             l2cpu_idx, res.demoted
         );
@@ -711,12 +723,12 @@ fn dispatch_attach_console(
             scrollback_bytes: res.scrollback_bytes,
         },
     ) {
-        eprintln!("[daemon] attach write response: {}", e);
+        dlog!("[daemon] attach write response: {}", e);
         hub.detach(res.id);
         return;
     }
     if let Err(e) = send_fd(&sock, client_end.as_raw_fd()) {
-        eprintln!("[daemon] send_fd: {}", e);
+        dlog!("[daemon] send_fd: {}", e);
         hub.detach(res.id);
         return;
     }
@@ -725,7 +737,7 @@ fn dispatch_attach_console(
     // Replay scrollback over `daemon_read` (blocking writes — 64 KiB fits
     // under SO_SNDBUF so this returns quickly without stalling the chip).
     if let Err(e) = write_scrollback(&daemon_read, &scrollback) {
-        eprintln!("[daemon] scrollback replay failed: {}", e);
+        dlog!("[daemon] scrollback replay failed: {}", e);
         hub.detach(res.id);
         return;
     }
