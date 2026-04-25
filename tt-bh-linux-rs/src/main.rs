@@ -179,6 +179,12 @@ enum DaemonAction {
         /// no-op everywhere else. See docs/sandbox-syscalls.md.
         #[arg(long)]
         no_sandbox: bool,
+        /// Bind a Prometheus-style HTTP exporter on
+        /// `127.0.0.1:<port>` and serve `GET /metrics`. Loopback only.
+        /// Off by default; pass an explicit port to enable. See
+        /// `daemon::metrics`.
+        #[arg(long)]
+        metrics_port: Option<u16>,
     },
     /// Stop the daemon: SIGTERM, 5s grace, SIGKILL; idempotent.
     Stop,
@@ -192,6 +198,9 @@ enum DaemonAction {
         /// See `daemon start --no-sandbox`.
         #[arg(long)]
         no_sandbox: bool,
+        /// See `daemon start --metrics-port`.
+        #[arg(long)]
+        metrics_port: Option<u16>,
     },
     /// Show daemon + per-L2CPU status.
     Status,
@@ -601,22 +610,26 @@ fn run_daemon_cmd(card: u32, action: DaemonAction) -> std::io::Result<()> {
             foreground,
             log_file,
             no_sandbox,
+            metrics_port,
         } => daemon::runner::start(daemon::runner::StartOpts {
             card,
             foreground,
             log_file: log_file.map(std::path::PathBuf::from),
             sandbox: !no_sandbox,
+            metrics_port,
         }),
         DaemonAction::Stop => daemon::runner::stop(card),
         DaemonAction::Restart {
             foreground,
             log_file,
             no_sandbox,
+            metrics_port,
         } => daemon::runner::restart(
             card,
             foreground,
             log_file.map(std::path::PathBuf::from),
             !no_sandbox,
+            metrics_port,
         ),
         DaemonAction::Status => daemon::runner::status(card),
         DaemonAction::Logs { lines, no_follow } => daemon::runner::logs(daemon::runner::LogsOpts {

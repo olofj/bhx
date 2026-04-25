@@ -20,6 +20,7 @@ pub mod console_hub;
 pub mod fork;
 pub mod lifetime;
 pub mod log;
+pub mod metrics;
 pub mod protocol;
 pub mod runner;
 pub mod sandbox;

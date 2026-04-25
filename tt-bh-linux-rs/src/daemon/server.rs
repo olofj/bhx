@@ -56,7 +56,13 @@ use crate::regs::virtio_mmio::{NET_IRQ as NET_INT, NET_OFFSET as NET_MMIO};
 // `cargo run -- debug …` subcommands where eprintln-to-terminal is the
 // right default; daemon callers see those lines via the stderr → log
 // redirect, just without the timestamp prefix.
-pub fn serve(card: u32, listener: UnixListener, sandbox: bool, log_path: &Path) -> io::Result<()> {
+pub fn serve(
+    card: u32,
+    listener: UnixListener,
+    sandbox: bool,
+    log_path: &Path,
+    metrics_port: Option<u16>,
+) -> io::Result<()> {
     // Open the one-and-only persistent TLB window to tile (8,0) before
     // anything else touches chip state, so the daemon has a single
     // serialization point for PLL / reset register access. Fallible because
@@ -73,6 +79,20 @@ pub fn serve(card: u32, listener: UnixListener, sandbox: bool, log_path: &Path) 
     let released = probe_initial_chip_state(&state.shared_chip, card);
     if !released.is_empty() {
         warm_resume_released(&state, &released);
+    }
+
+    // Spawn the metrics exporter BEFORE the sandbox so a `bind()`
+    // failure (e.g. port in use) is fatal at start time, mirroring how
+    // sandbox-install failures abort the daemon. Once the listener is
+    // up, the accept thread runs under whatever sandbox we install
+    // next (the seccomp filter already allows TCP listen+accept).
+    if let Some(port) = metrics_port {
+        if let Err(e) = crate::daemon::metrics::spawn_exporter(port, state.clone()) {
+            return Err(io::Error::other(format!(
+                "metrics exporter bind on 127.0.0.1:{} failed: {}",
+                port, e
+            )));
+        }
     }
 
     // Install seccomp + landlock AFTER chip probe + warm-resume have
@@ -223,6 +243,18 @@ fn install_signal_handlers(flag: Arc<AtomicBool>) {
 }
 
 fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
+    crate::daemon::metrics::DAEMON_CLIENTS_TOTAL.inc();
+    crate::daemon::metrics::DAEMON_CLIENTS_ACTIVE.inc();
+    // RAII so the active gauge decrements on every return path
+    // (read failure, dispatch panic, etc.) without sprinkling decs.
+    struct ActiveGuard;
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            crate::daemon::metrics::DAEMON_CLIENTS_ACTIVE.dec();
+        }
+    }
+    let _active_guard = ActiveGuard;
+
     let req: Request = match read_frame(&mut sock) {
         Ok(r) => r,
         Err(e) => {
