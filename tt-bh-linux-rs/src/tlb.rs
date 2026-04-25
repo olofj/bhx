@@ -6,9 +6,7 @@
 use std::os::unix::io::RawFd;
 use std::ptr;
 
-use crate::kmd::{
-    self, AllocateTlb, ConfigureTlb, FreeTlb, FreeTlbIn, NocTlbConfig,
-};
+use crate::kmd::{self, AllocateTlb, ConfigureTlb, FreeTlb, FreeTlbIn, NocTlbConfig};
 
 // This code requires 64-bit pointers for 4GB TLB windows and NOC addresses.
 #[cfg(not(target_pointer_width = "64"))]
@@ -59,8 +57,13 @@ impl TlbHandle {
         configure.input.config = *config;
         if let Err(e) = unsafe { kmd::ioctl_configure_tlb(fd, &mut configure) } {
             // Cleanup on failure
-            let mut free = FreeTlb { input: FreeTlbIn { id: tlb_id }, output: Default::default() };
-            unsafe { let _ = kmd::ioctl_free_tlb(fd, &mut free); }
+            let mut free = FreeTlb {
+                input: FreeTlbIn { id: tlb_id },
+                output: Default::default(),
+            };
+            unsafe {
+                let _ = kmd::ioctl_free_tlb(fd, &mut free);
+            }
             return Err(std::io::Error::from_raw_os_error(e as i32));
         }
 
@@ -95,8 +98,13 @@ impl TlbHandle {
         };
 
         if mem == libc::MAP_FAILED {
-            let mut free = FreeTlb { input: FreeTlbIn { id: tlb_id }, output: Default::default() };
-            unsafe { let _ = kmd::ioctl_free_tlb(fd, &mut free); }
+            let mut free = FreeTlb {
+                input: FreeTlbIn { id: tlb_id },
+                output: Default::default(),
+            };
+            unsafe {
+                let _ = kmd::ioctl_free_tlb(fd, &mut free);
+            }
             return Err(std::io::Error::last_os_error());
         }
 
@@ -191,7 +199,9 @@ impl TlbWindow {
 
     /// Write a 32-bit value at the given offset within the window. Uses volatile write.
     pub fn write32(&self, addr: u64, value: u32) {
-        let off = self.offset.checked_add(addr as usize)
+        let off = self
+            .offset
+            .checked_add(addr as usize)
             .expect("TLB window offset overflow");
         assert!(off + 4 <= self.window_size, "TLB write32 out of bounds");
         assert!(off.is_multiple_of(4), "TLB write32 unaligned");
@@ -202,7 +212,9 @@ impl TlbWindow {
 
     /// Read a 32-bit value at the given offset within the window. Uses volatile read.
     pub fn read32(&self, addr: u64) -> u32 {
-        let off = self.offset.checked_add(addr as usize)
+        let off = self
+            .offset
+            .checked_add(addr as usize)
             .expect("TLB window offset overflow");
         assert!(off + 4 <= self.window_size, "TLB read32 out of bounds");
         assert!(off.is_multiple_of(4), "TLB read32 unaligned");

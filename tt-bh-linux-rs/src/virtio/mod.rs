@@ -238,9 +238,7 @@ fn is_warm_restart_candidate(
     expected_dev_id: u32,
     stash_all_valid: bool,
 ) -> bool {
-    existing_magic == expected_magic
-        && existing_dev_id == expected_dev_id
-        && stash_all_valid
+    existing_magic == expected_magic && existing_dev_id == expected_dev_id && stash_all_valid
 }
 
 /// Run a VirtIO device: setup MMIO, negotiate features, process descriptors.
@@ -278,8 +276,10 @@ pub fn run_device(
     // signal — stash is only written at the end of a successful Phase 3, so
     // an all-in-range stash means a prior server got clean queue addresses.
     let (descriptor_table_address, available_ring_address, used_ring_address, warm_restarted) = unsafe {
-        let existing_magic = ptr::read_volatile(mmio_base.add(VIRTIO_MMIO_MAGIC_VALUE) as *const u32);
-        let existing_dev_id = ptr::read_volatile(mmio_base.add(VIRTIO_MMIO_DEVICE_ID) as *const u32);
+        let existing_magic =
+            ptr::read_volatile(mmio_base.add(VIRTIO_MMIO_MAGIC_VALUE) as *const u32);
+        let existing_dev_id =
+            ptr::read_volatile(mmio_base.add(VIRTIO_MMIO_DEVICE_ID) as *const u32);
         let existing_status = ptr::read_volatile(mmio_base.add(VIRTIO_MMIO_STATUS) as *const u32);
 
         let mut desc = vec![0u64; num_queues as usize];
@@ -300,8 +300,7 @@ pub fn run_device(
             }
         }
 
-        let magic_matches = existing_magic == VIRTIO_MAGIC
-            && existing_dev_id == device.device_id();
+        let magic_matches = existing_magic == VIRTIO_MAGIC && existing_dev_id == device.device_id();
 
         if is_warm_restart_candidate(
             existing_magic,
@@ -347,7 +346,11 @@ pub fn run_device(
     let regs = MmioRegs::new(mmio_base);
 
     let (descriptor_table_address, available_ring_address, used_ring_address) = if warm_restarted {
-        (descriptor_table_address, available_ring_address, used_ring_address)
+        (
+            descriptor_table_address,
+            available_ring_address,
+            used_ring_address,
+        )
     } else {
         // Cold start: zero the standard register window (preserving stash at
         // 0x200+) and drive the guest through the init handshake.
@@ -358,7 +361,10 @@ pub fn run_device(
         unsafe {
             ptr::write_volatile(regs.magic_value, VIRTIO_MAGIC);
             ptr::write_volatile(mmio_base.add(VIRTIO_MMIO_VERSION) as *mut u32, 2);
-            ptr::write_volatile(mmio_base.add(VIRTIO_MMIO_DEVICE_ID) as *mut u32, device.device_id());
+            ptr::write_volatile(
+                mmio_base.add(VIRTIO_MMIO_DEVICE_ID) as *mut u32,
+                device.device_id(),
+            );
             ptr::write_volatile(regs.queue_num_max, QUEUE_SIZE as u32);
             ptr::write_volatile(mmio_base.add(0x018) as *mut u32, 1); // sw_impl
             ptr::write_volatile(regs.sel_generation, 0);
@@ -389,7 +395,9 @@ pub fn run_device(
                 );
                 next_hint += std::time::Duration::from_secs(15);
             }
-            unsafe { libc::usleep(1000); }
+            unsafe {
+                libc::usleep(1000);
+            }
         }
 
         // Phase 2: Feature negotiation via sel_generation.
@@ -438,16 +446,22 @@ pub fn run_device(
         let mut queues_seen = vec![false; num_queues as usize];
         while !exit_flag.load(Ordering::Relaxed) {
             let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
-            unsafe { ptr::write_volatile(regs.queue_ready, 0); }
+            unsafe {
+                ptr::write_volatile(regs.queue_ready, 0);
+            }
             let q = unsafe { ptr::read_volatile(regs.queue_select) } as usize;
             match phase3_decide(curr_gen, prev_gen, q, num_queues as usize) {
-                Phase3Action::Wait => {
-                    unsafe { libc::usleep(1); }
-                }
+                Phase3Action::Wait => unsafe {
+                    libc::usleep(1);
+                },
                 Phase3Action::Skip { next_gen } => {
-                    unsafe { ptr::write_volatile(regs.sel_generation, next_gen); }
+                    unsafe {
+                        ptr::write_volatile(regs.sel_generation, next_gen);
+                    }
                     prev_gen = next_gen;
-                    unsafe { libc::usleep(1); }
+                    unsafe {
+                        libc::usleep(1);
+                    }
                 }
                 Phase3Action::Configure { q, next_gen } => {
                     desc[q] = unsafe {
@@ -463,7 +477,9 @@ pub fn run_device(
                             | (ptr::read_volatile(regs.queue_used_low) as u64)
                     };
                     queues_seen[q] = true;
-                    unsafe { ptr::write_volatile(regs.sel_generation, next_gen); }
+                    unsafe {
+                        ptr::write_volatile(regs.sel_generation, next_gen);
+                    }
                     prev_gen = next_gen;
                     if queues_seen.iter().all(|&b| b) {
                         break;
@@ -588,20 +604,23 @@ pub fn run_device(
                 loop {
                     // Cycle detection: a valid chain can visit at most QUEUE_SIZE descriptors
                     if steps >= QUEUE_SIZE {
-                        eprintln!("virtio: descriptor chain exceeded {} steps, breaking", QUEUE_SIZE);
+                        eprintln!(
+                            "virtio: descriptor chain exceeded {} steps, breaking",
+                            QUEUE_SIZE
+                        );
                         chain_valid = false;
                         break;
                     }
                     steps += 1;
 
-                    let d = unsafe {
-                        ptr::read_volatile(desc_q.add((desc_idx % QUEUE_SIZE) as usize))
-                    };
+                    let d =
+                        unsafe { ptr::read_volatile(desc_q.add((desc_idx % QUEUE_SIZE) as usize)) };
 
                     // Validate descriptor address is within L2CPU memory.
                     // Use checked arithmetic to prevent overflow bypassing the check.
                     let addr_end = (d.addr).checked_add(d.len as u64);
-                    if d.addr < starting_address || d.addr >= mem_end
+                    if d.addr < starting_address
+                        || d.addr >= mem_end
                         || addr_end.is_none()
                         || addr_end.unwrap() > mem_end
                     {
@@ -612,9 +631,7 @@ pub fn run_device(
                         chain_valid = false;
                         break;
                     }
-                    let addr = unsafe {
-                        memory.add((d.addr - starting_address) as usize)
-                    };
+                    let addr = unsafe { memory.add((d.addr - starting_address) as usize) };
 
                     if d.flags & VRING_DESC_F_NEXT != 0 {
                         if num_bytes_written < queue_header_size {
@@ -671,7 +688,9 @@ pub fn run_device(
         } else {
             SLOW_SLEEP_US
         };
-        unsafe { libc::usleep(sleep_us); }
+        unsafe {
+            libc::usleep(sleep_us);
+        }
     }
 }
 
@@ -685,14 +704,8 @@ mod tests {
     fn phase2_done_when_initial_status_has_features_ok() {
         // Initial status already says FEATURES_OK — the recheck and
         // generation values shouldn't matter.
-        assert_eq!(
-            phase2_decide(FEATURES_OK, 0, 5, 5),
-            Phase2Action::Done
-        );
-        assert_eq!(
-            phase2_decide(FEATURES_OK, 0, 7, 5),
-            Phase2Action::Done
-        );
+        assert_eq!(phase2_decide(FEATURES_OK, 0, 5, 5), Phase2Action::Done);
+        assert_eq!(phase2_decide(FEATURES_OK, 0, 7, 5), Phase2Action::Done);
     }
 
     #[test]
@@ -706,10 +719,7 @@ mod tests {
         // Initial status was 0 but the guest flipped FEATURES_OK between
         // our two reads. Don't treat the bump as feature-negotiation — it
         // belongs to Phase 3.
-        assert_eq!(
-            phase2_decide(0, FEATURES_OK, 6, 5),
-            Phase2Action::Done
-        );
+        assert_eq!(phase2_decide(0, FEATURES_OK, 6, 5), Phase2Action::Done);
     }
 
     #[test]
@@ -765,14 +775,26 @@ mod tests {
     #[test]
     fn warm_restart_requires_magic_match() {
         // Wrong magic → not a candidate, regardless of stash.
-        assert!(!is_warm_restart_candidate(0xdead_beef, 1, VIRTIO_MAGIC, 1, true));
+        assert!(!is_warm_restart_candidate(
+            0xdead_beef,
+            1,
+            VIRTIO_MAGIC,
+            1,
+            true
+        ));
     }
 
     #[test]
     fn warm_restart_requires_dev_id_match() {
         // Right magic but wrong device id → not a candidate. Catches the
         // case where two devices share an MMIO region after a layout bug.
-        assert!(!is_warm_restart_candidate(VIRTIO_MAGIC, 7, VIRTIO_MAGIC, 1, true));
+        assert!(!is_warm_restart_candidate(
+            VIRTIO_MAGIC,
+            7,
+            VIRTIO_MAGIC,
+            1,
+            true
+        ));
     }
 
     #[test]
@@ -780,11 +802,23 @@ mod tests {
         // Magic + dev id match but stash is partial (out-of-range
         // address) — fall back to cold-start. Partial state is worse
         // than starting fresh.
-        assert!(!is_warm_restart_candidate(VIRTIO_MAGIC, 1, VIRTIO_MAGIC, 1, false));
+        assert!(!is_warm_restart_candidate(
+            VIRTIO_MAGIC,
+            1,
+            VIRTIO_MAGIC,
+            1,
+            false
+        ));
     }
 
     #[test]
     fn warm_restart_accepted_when_all_three_align() {
-        assert!(is_warm_restart_candidate(VIRTIO_MAGIC, 1, VIRTIO_MAGIC, 1, true));
+        assert!(is_warm_restart_candidate(
+            VIRTIO_MAGIC,
+            1,
+            VIRTIO_MAGIC,
+            1,
+            true
+        ));
     }
 }

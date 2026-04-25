@@ -108,7 +108,11 @@ impl ConsoleHub {
         };
 
         let scrollback: Vec<u8> = s.scrollback.iter().copied().collect();
-        s.clients.push(Client { id, sock, is_writer });
+        s.clients.push(Client {
+            id,
+            sock,
+            is_writer,
+        });
         (
             AttachResult {
                 id,
@@ -161,13 +165,14 @@ impl ConsoleHub {
         // rather than tracking partial writes, because scrollback already
         // covers short disconnects and we don't want to pay the bookkeeping.
         let mut dropped = Vec::new();
-        s.clients.retain_mut(|c| match send_all_dontwait(&c.sock, bytes) {
-            Ok(()) => true,
-            Err(_) => {
-                dropped.push(c.id);
-                false
-            }
-        });
+        s.clients
+            .retain_mut(|c| match send_all_dontwait(&c.sock, bytes) {
+                Ok(()) => true,
+                Err(_) => {
+                    dropped.push(c.id);
+                    false
+                }
+            });
         dropped
     }
 

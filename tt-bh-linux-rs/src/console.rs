@@ -27,14 +27,12 @@ impl TerminalRawMode {
             eprintln!("[console] stdin is not a tty; skipping raw-mode setup");
             return Ok(TerminalRawMode { orig: None });
         }
-        let orig = tcgetattr(std::io::stdin())
-            .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+        let orig =
+            tcgetattr(std::io::stdin()).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
         let mut raw = orig.clone();
 
-        raw.local_flags &= !(LocalFlags::ECHO
-            | LocalFlags::ICANON
-            | LocalFlags::ISIG
-            | LocalFlags::IEXTEN);
+        raw.local_flags &=
+            !(LocalFlags::ECHO | LocalFlags::ICANON | LocalFlags::ISIG | LocalFlags::IEXTEN);
         raw.input_flags &= !(InputFlags::BRKINT
             | InputFlags::INPCK
             | InputFlags::ISTRIP

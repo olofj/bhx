@@ -108,8 +108,7 @@ fn uart_pass(
 
     let debug_ptr = l2cpu.read32(starting_address + OPENSBI_DEBUG_PTR);
     let uart_base = {
-        let desc_window =
-            l2cpu.get_persistent_2m_window(starting_address + debug_ptr as u64)?;
+        let desc_window = l2cpu.get_persistent_2m_window(starting_address + debug_ptr as u64)?;
         let desc = desc_window.get_window() as *const DebugDescriptor;
         for (i, &expected) in EYE_CATCHER.iter().enumerate() {
             let byte = unsafe { ptr::read_volatile(&(*desc).eye_catcher[i]) };
@@ -255,18 +254,17 @@ pub fn probe_warm_resume(l2cpu: &L2Cpu) -> bool {
     let starting_address = l2cpu.starting_address();
     let debug_ptr = l2cpu.read32(starting_address + OPENSBI_DEBUG_PTR);
 
-    let desc_window =
-        match l2cpu.get_persistent_2m_window(starting_address + debug_ptr as u64) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!(
-                    "[probe l2cpu {}] descriptor window failed: {}",
-                    l2cpu.idx(),
-                    e
-                );
-                return false;
-            }
-        };
+    let desc_window = match l2cpu.get_persistent_2m_window(starting_address + debug_ptr as u64) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!(
+                "[probe l2cpu {}] descriptor window failed: {}",
+                l2cpu.idx(),
+                e
+            );
+            return false;
+        }
+    };
     let desc_ptr = desc_window.get_window() as *const DebugDescriptor;
 
     // Pull the descriptor bytes into a stack buffer with volatile reads so
@@ -306,11 +304,7 @@ pub fn probe_warm_resume(l2cpu: &L2Cpu) -> bool {
     let queue_window = match l2cpu.get_persistent_2m_window(uart_base) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!(
-                "[probe l2cpu {}] queue window failed: {}",
-                l2cpu.idx(),
-                e
-            );
+            eprintln!("[probe l2cpu {}] queue window failed: {}", l2cpu.idx(), e);
             return false;
         }
     };
@@ -405,11 +399,7 @@ pub fn chip_console_main(
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) => {
-                eprintln!(
-                    "[console l2cpu {}] error: {} — retrying",
-                    l2cpu.idx(),
-                    e
-                );
+                eprintln!("[console l2cpu {}] error: {} — retrying", l2cpu.idx(), e);
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
@@ -449,10 +439,7 @@ mod tests {
     #[test]
     fn decode_descriptor_accepts_valid_bytes() {
         let buf = valid_descriptor(0x4000_1234_5678_abc0);
-        assert_eq!(
-            decode_descriptor(&buf),
-            Ok(0x4000_1234_5678_abc0)
-        );
+        assert_eq!(decode_descriptor(&buf), Ok(0x4000_1234_5678_abc0));
     }
 
     #[test]

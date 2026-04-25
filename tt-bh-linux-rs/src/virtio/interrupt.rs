@@ -31,11 +31,7 @@ impl InterruptController {
 
     /// Set interrupt: write bit to PLIC, fence, then clear.
     /// BUG PRESERVED: overwrites entire register instead of OR-ing (matches C++).
-    pub fn set_interrupt(
-        &self,
-        interrupt_status: *mut u32,
-        interrupt_number: u32,
-    ) {
+    pub fn set_interrupt(&self, interrupt_status: *mut u32, interrupt_number: u32) {
         assert!(
             interrupt_number >= 5,
             "interrupt_number ({}) must be >= 5 to avoid underflow in PLIC bit shift",

@@ -525,7 +525,11 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
     }
 }
 
-fn toggle_reset_bit(chip: &shared_chip::SharedChip, l2cpu: usize, release: bool) -> std::io::Result<()> {
+fn toggle_reset_bit(
+    chip: &shared_chip::SharedChip,
+    l2cpu: usize,
+    release: bool,
+) -> std::io::Result<()> {
     if l2cpu > 3 {
         return Err(std::io::Error::other("l2cpu must be 0..3"));
     }
@@ -593,7 +597,11 @@ mod tests {
         // And the error message must name the offending path, so a cold-
         // booted user can see which argument went wrong.
         let msg = format!("{}", res.err().unwrap());
-        assert!(msg.contains("xyzzy.ext4"), "error should name path: {}", msg);
+        assert!(
+            msg.contains("xyzzy.ext4"),
+            "error should name path: {}",
+            msg
+        );
     }
 
     #[test]
