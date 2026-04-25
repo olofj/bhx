@@ -66,15 +66,26 @@ impl Drop for VirtioBlk {
 
 impl VirtioBlk {
     pub fn new(image_path: &Path) -> std::io::Result<Self> {
+        use std::os::fd::IntoRawFd;
+        // nix 0.31 returns OwnedFd; convert to RawFd so the rest of the
+        // function (mmap, manual close in Drop) keeps the same fd-lifecycle
+        // it had in the nix-0.29 era.
         let fd = nix::fcntl::open(
             image_path,
             nix::fcntl::OFlag::O_RDWR,
             nix::sys::stat::Mode::empty(),
         )
-        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?
+        .into_raw_fd();
 
-        let stat =
-            nix::sys::stat::fstat(fd).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+        // nix 0.31's fstat takes an AsFd; wrap our RawFd in a BorrowedFd
+        // for the duration of the call (the fd is still owned by us).
+        let stat = {
+            use std::os::fd::BorrowedFd;
+            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+            nix::sys::stat::fstat(borrowed)
+                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?
+        };
         let file_size = stat.st_size as usize;
 
         let mapped_data = unsafe {

@@ -10,7 +10,7 @@ slirp = [] # Links libvdeslirp/libslirp for network device support
 
 [dependencies]
 libc = "0.2"
-nix = { version = "0.29", features = ["ioctl", "mman", "fs", "term", "signal", "uio", "socket"] }
+nix = { version = "0.31", features = ["ioctl", "mman", "fs", "term", "signal", "uio", "socket"] }
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
 daemonize = "0.5"

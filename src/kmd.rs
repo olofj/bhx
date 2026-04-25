@@ -164,13 +164,18 @@ nix::ioctl_readwrite_bad!(ioctl_configure_tlb, IOCTL_CONFIGURE_TLB, ConfigureTlb
 
 /// Open the tenstorrent character device for the given card index.
 pub fn open_device(card: u32) -> std::io::Result<RawFd> {
+    use std::os::fd::IntoRawFd;
     let path = format!("/dev/tenstorrent/{}", card);
+    // nix 0.31 returns OwnedFd; convert to RawFd to keep the existing
+    // manual-close lifecycle (callers store the RawFd alongside other
+    // resources and close in their own Drop ordering).
     let fd = nix::fcntl::open(
         path.as_str(),
         nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_CLOEXEC,
         nix::sys::stat::Mode::empty(),
     )
-    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?
+    .into_raw_fd();
     Ok(fd)
 }
 
