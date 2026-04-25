@@ -18,6 +18,13 @@ use crate::virtio::{self, VirtioDeviceImpl};
 const VIRTIO_BLK_T_IN: u32 = 0; // read from disk
 const VIRTIO_BLK_T_OUT: u32 = 1; // write to disk
 
+// VirtIO block status bytes (virtio 1.2 §5.2.6). Written into the last
+// descriptor of the chain to tell the guest whether its request
+// succeeded.
+const VIRTIO_BLK_S_OK: u8 = 0;
+const VIRTIO_BLK_S_IOERR: u8 = 1;
+const VIRTIO_BLK_S_UNSUPP: u8 = 2;
+
 // VirtIO IDs
 const VIRTIO_ID_BLOCK: u32 = 2;
 // VIRTIO_F_VERSION_1 is bit 32 in the combined feature space; in features[1]
@@ -52,6 +59,14 @@ pub struct VirtioBlk {
     req: *const VirtioBlkOuthdr,
     /// Accumulated byte offset within the current I/O request (across data descriptors).
     data_offset: u64,
+    /// Pending status byte for the in-flight request. Starts at S_OK
+    /// in `process_queue_start`; gets set to S_IOERR on out-of-bounds
+    /// or to S_UNSUPP on an unrecognized request type. Written into
+    /// the final descriptor by `process_queue_complete`. Without this
+    /// field, an overflow request silently returned S_OK and the
+    /// guest's blockdev layer never saw EIO — the request just hung
+    /// (virtio 1.2 §5.2.6).
+    req_status: u8,
 }
 
 unsafe impl Send for VirtioBlk {}
@@ -113,6 +128,7 @@ impl VirtioBlk {
             file: Some(file),
             req: ptr::null(),
             data_offset: 0,
+            req_status: VIRTIO_BLK_S_OK,
         })
     }
 
@@ -138,18 +154,26 @@ impl VirtioDeviceImpl for VirtioBlk {
     fn process_queue_start(&mut self, _queue_idx: u32, addr: *mut u8, _len: u64) {
         self.req = addr as *const VirtioBlkOuthdr;
         self.data_offset = 0;
+        // Reset the per-request status — `process_queue_data` may set
+        // it to IOERR/UNSUPP; `process_queue_complete` writes whatever
+        // we end with into the final descriptor.
+        self.req_status = VIRTIO_BLK_S_OK;
     }
 
     fn process_queue_data(&mut self, _queue_idx: u32, addr: *mut u8, len: u64) {
         let req = unsafe { &*self.req };
         let disk_offset = self.sector_size as u64 * req.sector + self.data_offset;
-        let end = disk_offset + len;
+        let end = disk_offset.saturating_add(len);
 
         if end > self.file_size as u64 {
             eprintln!(
-                "block: I/O at offset {:#x} len {} exceeds disk size {:#x}, ignoring",
+                "block: I/O at offset {:#x} len {} exceeds disk size {:#x}, returning IOERR",
                 disk_offset, len, self.file_size
             );
+            // Signal a device I/O error to the guest. Without this the
+            // request looked successful from the guest's POV and its
+            // blockdev layer hung waiting for data that never arrived.
+            self.req_status = VIRTIO_BLK_S_IOERR;
             self.data_offset += len;
             return;
         }
@@ -177,16 +201,22 @@ impl VirtioDeviceImpl for VirtioBlk {
             }
             t => {
                 eprintln!("Unimplemented block request type: {} len: {}", t, len);
+                // Tell the guest "we don't know what this is" so its
+                // block layer surfaces an error instead of hanging.
+                self.req_status = VIRTIO_BLK_S_UNSUPP;
             }
         }
         self.data_offset += len;
     }
 
     fn process_queue_complete(&mut self, _queue_idx: u32, addr: *mut u8, _len: u64) {
-        // Write status byte 0 = success
+        // Emit the status byte set by `process_queue_data`. S_OK if no
+        // overflow / unsupported-type was observed; S_IOERR on
+        // overflow; S_UNSUPP on an unknown request type.
         unsafe {
-            ptr::write_volatile(addr, 0u8);
+            ptr::write_volatile(addr, self.req_status);
         }
+        self.req_status = VIRTIO_BLK_S_OK;
     }
 
     fn queue_has_data(&self, _queue_idx: u32) -> bool {

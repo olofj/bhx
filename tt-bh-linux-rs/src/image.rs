@@ -6,6 +6,19 @@
 //!
 //! Inspired by the image management in ~/exe, adapted for riscv64 and the
 //! Blackhole's requirement for raw ext4 filesystem images.
+//!
+//! # Threat model for `Command::new` invocations
+//!
+//! This module shells out to `wget`, `xz`, `unzip`, `qemu-img`, `sfdisk`,
+//! `dd`, `e2fsck`, `resize2fs` by basename — `Command::new("wget")`
+//! resolves via `$PATH`. A malicious `$PATH` (or a shell function
+//! shadowing one of these names) could substitute a different binary.
+//! That's accepted: these helpers run as the operator's own user from
+//! the CLI, never inside the daemon. An attacker who can already
+//! corrupt the operator's `$PATH` already has equivalent access to do
+//! anything else the operator can. Resolving via `which` once at
+//! startup wouldn't change the threat model — it'd be the same
+//! `which` lookup against the same `$PATH`, just done earlier.
 
 use std::fs;
 use std::path::{Path, PathBuf};

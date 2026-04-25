@@ -6,6 +6,12 @@
 //! Some distributions provide standalone initramfs/initrd images for riscv64.
 //! These can be loaded directly into L2CPU DRAM alongside the kernel, useful
 //! for network-boot or installer scenarios where no block device is needed.
+//!
+//! # PATH-based binary resolution
+//!
+//! `Command::new("gunzip")` / `Command::new("xz")` resolve via `$PATH`.
+//! CLI-only path; see `image.rs`'s module doc-comment for the
+//! threat-model rationale.
 
 use std::fs;
 use std::path::{Path, PathBuf};

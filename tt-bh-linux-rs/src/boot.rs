@@ -245,7 +245,7 @@ fn modify_dtb_inner(
     // end of its DRAM window, which our server then rejects as out-of-range.
     // boot.py has the same bug — it reads but never writes /memory.
     let memory_node = fdt
-        .path_offset("/memory@400030000000")
+        .path_offset("/memory@400030000000")?
         .ok_or_else(|| "memory@400030000000 node not found in DT".to_string())?;
     let mut reg = Vec::with_capacity(16);
     reg.extend_from_slice(&mem_start.to_be_bytes());
@@ -256,7 +256,7 @@ fn modify_dtb_inner(
         mem_start, mem_size
     );
 
-    let chosen = match fdt.path_offset("/chosen") {
+    let chosen = match fdt.path_offset("/chosen")? {
         Some(o) => o,
         None => fdt.add_subnode(0, "chosen")?,
     };
@@ -272,7 +272,7 @@ fn modify_dtb_inner(
     fdt.setprop(chosen, "bootargs", &bootargs_bytes)?;
 
     // /reserved-memory (create if missing, mirroring boot.py)
-    let reserved = match fdt.path_offset("/reserved-memory") {
+    let reserved = match fdt.path_offset("/reserved-memory")? {
         Some(o) => o,
         None => {
             let r = fdt.add_subnode(0, "reserved-memory")?;
@@ -295,10 +295,10 @@ fn modify_dtb_inner(
 
     // /soc and PLIC phandle
     let soc = fdt
-        .path_offset("/soc")
+        .path_offset("/soc")?
         .ok_or_else(|| "soc node not found in DT".to_string())?;
     let plic = fdt
-        .path_offset("/soc/interrupt-controller@c000000")
+        .path_offset("/soc/interrupt-controller@c000000")?
         .ok_or_else(|| "plic node not found in DT".to_string())?;
     let mut plic_phandle = fdt.get_phandle(plic);
     if plic_phandle == 0 {
@@ -372,7 +372,7 @@ mod tests {
     /// big-endian u64s.
     fn read_memory_reg(dtb: &[u8]) -> (u64, u64) {
         let fdt = Fdt::open_into(dtb, 0).unwrap();
-        let node = fdt.path_offset("/memory@400030000000").unwrap();
+        let node = fdt.path_offset("/memory@400030000000").unwrap().unwrap();
         let reg = fdt.getprop(node, "reg").unwrap();
         assert_eq!(reg.len(), 16);
         let start = u64::from_be_bytes(reg[0..8].try_into().unwrap());
@@ -396,7 +396,7 @@ mod tests {
         let dev = BootDevice::Vda("vda".to_string());
         let out = modify_dtb(FIXTURE_DTB, &dev, 0x4000_3000_0000, 0x1_0000_0000).unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
-        let chosen = fdt.path_offset("/chosen").unwrap();
+        let chosen = fdt.path_offset("/chosen").unwrap().unwrap();
         let args = fdt.getprop(chosen, "bootargs").unwrap();
         // Trailing NUL — the fdt setprop wrote a C string.
         let s = std::str::from_utf8(&args[..args.len() - 1]).unwrap();
@@ -416,7 +416,7 @@ mod tests {
         };
         let out = modify_dtb(FIXTURE_DTB, &dev, 0x4000_3000_0000, 0x1_0000_0000).unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
-        let chosen = fdt.path_offset("/chosen").unwrap();
+        let chosen = fdt.path_offset("/chosen").unwrap().unwrap();
         let args = fdt.getprop(chosen, "bootargs").unwrap();
         let s = std::str::from_utf8(&args[..args.len() - 1]).unwrap();
         assert!(
@@ -439,6 +439,7 @@ mod tests {
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let res = fdt
             .path_offset("/reserved-memory/memory@4000afa00000")
+            .expect("path_offset shouldn't fail")
             .expect("modify_dtb must create the virtio reserved-memory node");
         assert!(
             fdt.getprop(res, "no-map").is_some(),
@@ -468,6 +469,7 @@ mod tests {
             let path = format!("/soc/virtio@{:x}", addr);
             let node = fdt
                 .path_offset(&path)
+                .expect("path_offset shouldn't fail")
                 .unwrap_or_else(|| panic!("missing {}", path));
             // compatible = "virtio,mmio\0"
             let compat = fdt.getprop(node, "compatible").unwrap();
