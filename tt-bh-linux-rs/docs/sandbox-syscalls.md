@@ -134,6 +134,8 @@ The issue's `pipe2` is right — we use it for ctrlc's signal-handling pipe.
 
 `socket` / `bind` / `listen` weren't on the issue's whitelist but are required for slirp's TCP forwarder. Add them. `connect` stays blocked.
 
-## Next step
+## Implementation
 
-Translate the inventory above into a `seccompiler` filter + a `landlock` ruleset, gated behind a `--sandbox` flag on `daemon start` per the issue's "Feature gate" section. Filter installs after `probe_initial_chip_state` + `warm_resume_released` have finished (those open `/dev/tenstorrent/<card>` and need full path access) but before the accept loop starts.
+The inventory above is translated into a `seccompiler` filter + a `landlock` ruleset in `src/daemon/sandbox.rs`. Both install after `probe_initial_chip_state` + `warm_resume_released` have finished (those open `/dev/tenstorrent/<card>` and need full path access) but before the accept loop starts.
+
+The sandbox is on by default. Operators pass `daemon start --no-sandbox` to opt out (debugging the filter itself, e.g. tracking down a missing syscall). Failure to install the sandbox is fatal — the daemon refuses to start rather than silently run unsandboxed.

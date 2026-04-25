@@ -79,14 +79,13 @@ pub fn serve(card: u32, listener: UnixListener, sandbox: bool, log_path: &Path) 
     // opened /dev/tenstorrent/<card> and done their initial ioctls,
     // BEFORE the accept loop spawns dispatch threads. The sandbox
     // module uses TSYNC so chip-console workers spawned by warm-
-    // resume inherit too. Filter is opt-in via `daemon start
-    // --sandbox` until soak coverage builds confidence. See
+    // resume inherit too. On by default; operators pass
+    // `daemon start --no-sandbox` to opt out (debugging only). See
     // `docs/sandbox-syscalls.md` for the policy.
     if sandbox {
         if let Err(e) = crate::daemon::sandbox::apply(card, log_path) {
-            // A sandbox installation failure is fatal — better to
-            // refuse to start than silently run without the
-            // protection the operator asked for.
+            // Failure to install is fatal — refuse to start rather
+            // than silently run unsandboxed.
             return Err(io::Error::other(format!("sandbox install failed: {}", e)));
         }
     }
