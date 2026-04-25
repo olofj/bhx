@@ -170,13 +170,15 @@ enum DaemonAction {
         /// directory when you need post-mortem logs.
         #[arg(long)]
         log_file: Option<String>,
-        /// Install seccomp + landlock sandbox before the accept loop.
-        /// Defense-in-depth so a daemon-side bug can't pivot to read
-        /// arbitrary host files or open outbound connections. Linux
-        /// only; no-op everywhere else. See docs/sandbox-syscalls.md
-        /// for the policy.
+        /// Disable the seccomp + landlock sandbox. The sandbox is on
+        /// by default — defense-in-depth so a daemon-side bug can't
+        /// pivot to read arbitrary host files or open outbound
+        /// connections. Pass this only when debugging the filter
+        /// itself (e.g. tracking down which syscall is missing from
+        /// the whitelist). Linux only; the flag is accepted but a
+        /// no-op everywhere else. See docs/sandbox-syscalls.md.
         #[arg(long)]
-        sandbox: bool,
+        no_sandbox: bool,
     },
     /// Stop the daemon: SIGTERM, 5s grace, SIGKILL; idempotent.
     Stop,
@@ -187,9 +189,9 @@ enum DaemonAction {
         /// See `daemon start --log-file`.
         #[arg(long)]
         log_file: Option<String>,
-        /// See `daemon start --sandbox`.
+        /// See `daemon start --no-sandbox`.
         #[arg(long)]
-        sandbox: bool,
+        no_sandbox: bool,
     },
     /// Show daemon + per-L2CPU status.
     Status,
@@ -598,23 +600,23 @@ fn run_daemon_cmd(card: u32, action: DaemonAction) -> std::io::Result<()> {
         DaemonAction::Start {
             foreground,
             log_file,
-            sandbox,
+            no_sandbox,
         } => daemon::runner::start(daemon::runner::StartOpts {
             card,
             foreground,
             log_file: log_file.map(std::path::PathBuf::from),
-            sandbox,
+            sandbox: !no_sandbox,
         }),
         DaemonAction::Stop => daemon::runner::stop(card),
         DaemonAction::Restart {
             foreground,
             log_file,
-            sandbox,
+            no_sandbox,
         } => daemon::runner::restart(
             card,
             foreground,
             log_file.map(std::path::PathBuf::from),
-            sandbox,
+            !no_sandbox,
         ),
         DaemonAction::Status => daemon::runner::status(card),
         DaemonAction::Logs { lines, no_follow } => daemon::runner::logs(daemon::runner::LogsOpts {
