@@ -285,6 +285,66 @@ fn validate_l2cpu(idx: u8) -> Result<usize, &'static str> {
     }
 }
 
+/// What `dispatch_boot` should do given the current per-slot state and
+/// the client's `force` flag. Pulled out as a pure function so the
+/// reject-vs-teardown decision is unit-testable without a real slot
+/// (which carries hardware-bound `Arc<L2Cpu>` and `Arc<InterruptController>`).
+#[derive(Debug, PartialEq, Eq)]
+enum BootSlotDecision {
+    /// Slot is occupied and `force` wasn't set — return the message
+    /// verbatim to the client.
+    Reject(String),
+    /// Slot is empty (or already torn down on a prior `force`); just
+    /// proceed to the boot sequence.
+    Proceed,
+    /// Slot is occupied and `force` was set — caller must take the
+    /// existing slot out of `DaemonState`, drop the lock, and call
+    /// `slot.shutdown()` *before* the new NOC writes start.
+    TearDownAndProceed,
+}
+
+fn decide_boot_slot(slot_present: bool, force: bool, l2cpu_idx: u8) -> BootSlotDecision {
+    match (slot_present, force) {
+        (false, _) => BootSlotDecision::Proceed,
+        (true, true) => BootSlotDecision::TearDownAndProceed,
+        (true, false) => BootSlotDecision::Reject(format!(
+            "l2cpu {} is already booted; stop it first, or re-run with --force",
+            l2cpu_idx
+        )),
+    }
+}
+
+/// Pre-flight check for `dispatch_add_disk`. Catching the bad path
+/// here (instead of letting the worker spawn and crash) avoids a
+/// stuck-slot state where `slot.disks` is non-empty with a dead worker
+/// handle and subsequent `add-disk` calls fail with "a disk is already
+/// attached". The `disks_empty` argument is the
+/// `slot.disks.is_empty()` reading taken under the slot mutex.
+fn validate_add_disk_request(disks_empty: bool, path: &std::path::Path) -> Result<(), String> {
+    if !disks_empty {
+        // Phase A: one disk per L2CPU. Phase B+: multi-disk with indexed MMIO.
+        return Err("a disk is already attached".to_string());
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("cannot open disk image {}: {}", path.display(), e))?;
+    Ok(())
+}
+
+/// Pre-flight check for `dispatch_remove_disk`. The slot-not-booted
+/// rejection is handled by the dispatch I/O wrapper because it needs
+/// to inspect `Option<L2CpuSlot>`; this helper is just for the
+/// "no disk attached" case so we have something testable.
+fn validate_remove_disk_request(disks_empty: bool) -> Result<(), &'static str> {
+    if disks_empty {
+        Err("no disk attached")
+    } else {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------------
@@ -410,8 +470,9 @@ fn dispatch_boot(
 /// Reject the boot if a slot is already populated and `--force` wasn't
 /// given. With `--force`, take the prior slot out and shut it down so
 /// the boot can proceed without races between the new NOC writes and
-/// the prior workers' TLB mmaps. Holds the per-slot mutex for the
-/// is_some() check + the take(); other cores stay unblocked.
+/// the prior workers' TLB mmaps. The reject-vs-teardown policy lives
+/// in `decide_boot_slot`; this function is the I/O wrapper that grabs
+/// the lock, invokes the policy, and threads the slot through.
 fn handle_existing_slot(
     state: &Arc<DaemonState>,
     l2cpu_idx: u8,
@@ -419,13 +480,11 @@ fn handle_existing_slot(
 ) -> Result<(), String> {
     let prior = {
         let mut guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
-        if guard.is_some() && !force {
-            return Err(format!(
-                "l2cpu {} is already booted; stop it first, or re-run with --force",
-                l2cpu_idx
-            ));
+        match decide_boot_slot(guard.is_some(), force, l2cpu_idx) {
+            BootSlotDecision::Reject(msg) => return Err(msg),
+            BootSlotDecision::Proceed => None,
+            BootSlotDecision::TearDownAndProceed => guard.take(),
         }
-        if force { guard.take() } else { None }
     };
     if let Some(prior) = prior {
         dlog!(
@@ -826,24 +885,8 @@ fn dispatch_add_disk(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8,
             return;
         }
     };
-    if !slot.disks.is_empty() {
-        // Phase A: one disk per L2CPU. Phase B+: multi-disk with indexed MMIO.
-        reply_err(sock, "a disk is already attached");
-        return;
-    }
-
-    // Pre-check the image is openable before spawning the worker. Without
-    // this, a bad path (e.g. relative path against daemon's cwd=/) spawns
-    // a worker that immediately exits, but `slot.disks` is already populated
-    // with the dead handle — and subsequent `add-disk` calls then hit
-    // "a disk is already attached". Failing fast here keeps the slot clean
-    // and returns the real error (ENOENT etc.) to the client.
-    if let Err(e) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-    {
-        reply_err(sock, format!("cannot open disk image {}: {}", path, e));
+    if let Err(e) = validate_add_disk_request(slot.disks.is_empty(), std::path::Path::new(&path)) {
+        reply_err(sock, e);
         return;
     }
 
@@ -885,8 +928,8 @@ fn dispatch_remove_disk(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: 
                 return;
             }
         };
-        if slot.disks.is_empty() {
-            reply_err(sock, "no disk attached");
+        if let Err(e) = validate_remove_disk_request(slot.disks.is_empty()) {
+            reply_err(sock, e);
             return;
         }
         std::mem::take(&mut slot.disks)
@@ -1029,5 +1072,97 @@ fn dispatch_shutdown(sock: &UnixStream, state: &Arc<DaemonState>) {
     // We don't reach the `serve()` teardown until the accept loop notices the
     // flag, but the accept loop's sleep is 50 ms — client gets Ok promptly.
     reply_ok(sock);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn validate_l2cpu_accepts_in_range() {
+        for i in 0..4u8 {
+            assert_eq!(validate_l2cpu(i), Ok(i as usize));
+        }
+    }
+
+    #[test]
+    fn validate_l2cpu_rejects_out_of_range() {
+        for i in [4u8, 5, 99, u8::MAX] {
+            assert!(validate_l2cpu(i).is_err());
+        }
+    }
+
+    // ---- decide_boot_slot ----
+
+    #[test]
+    fn boot_decides_proceed_when_slot_empty_no_force() {
+        assert_eq!(decide_boot_slot(false, false, 0), BootSlotDecision::Proceed);
+    }
+
+    #[test]
+    fn boot_decides_proceed_when_slot_empty_with_force() {
+        // --force on an empty slot is a noop, not an error.
+        assert_eq!(decide_boot_slot(false, true, 0), BootSlotDecision::Proceed);
+    }
+
+    #[test]
+    fn boot_decides_reject_when_slot_full_no_force() {
+        match decide_boot_slot(true, false, 2) {
+            BootSlotDecision::Reject(msg) => {
+                assert!(msg.contains("l2cpu 2"), "got: {}", msg);
+                assert!(msg.contains("--force"), "got: {}", msg);
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn boot_decides_teardown_when_slot_full_with_force() {
+        assert_eq!(
+            decide_boot_slot(true, true, 1),
+            BootSlotDecision::TearDownAndProceed
+        );
+    }
+
+    // ---- validate_add_disk_request ----
+
+    #[test]
+    fn add_disk_rejects_when_disk_already_attached() {
+        let tf = tempfile::NamedTempFile::new().unwrap();
+        let err = validate_add_disk_request(false, tf.path()).unwrap_err();
+        assert!(err.contains("already attached"), "got: {}", err);
+    }
+
+    #[test]
+    fn add_disk_rejects_when_image_path_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir.path().join("nonexistent.ext4");
+        let err = validate_add_disk_request(true, &bogus).unwrap_err();
+        assert!(err.contains("cannot open disk image"), "got: {}", err);
+    }
+
+    #[test]
+    fn add_disk_accepts_valid_open_image_on_empty_slot() {
+        let mut tf = tempfile::NamedTempFile::new().unwrap();
+        // Disk image needs to be writable too (worker opens with read+write).
+        tf.write_all(&[0u8; 4096]).unwrap();
+        validate_add_disk_request(true, tf.path()).expect("valid path on empty slot must accept");
+    }
+
+    // ---- validate_remove_disk_request ----
+
+    #[test]
+    fn remove_disk_rejects_when_no_disk_attached() {
+        assert_eq!(
+            validate_remove_disk_request(true),
+            Err("no disk attached")
+        );
+    }
+
+    #[test]
+    fn remove_disk_accepts_when_disk_attached() {
+        assert_eq!(validate_remove_disk_request(false), Ok(()));
+    }
 }
 
