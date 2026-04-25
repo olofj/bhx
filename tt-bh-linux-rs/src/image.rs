@@ -165,8 +165,17 @@ pub fn image_dir() -> PathBuf {
 
 /// Pull (download and convert) an image by name.
 ///
-/// Returns the path to the ready-to-use ext4 image.
-pub fn pull_image(name: &str, output: Option<&Path>) -> Result<PathBuf, String> {
+/// Returns the path to the ready-to-use ext4 image. With `force_refetch`,
+/// the HTTP-conditional cache is bypassed and the body is re-downloaded
+/// even if the upstream's ETag/Last-Modified hasn't changed; the
+/// already-converted `.ext4` short-circuit at the top still applies
+/// because that's a separate "I already have the final artifact"
+/// signal and re-converting is far slower than the conditional GET.
+pub fn pull_image(
+    name: &str,
+    output: Option<&Path>,
+    force_refetch: bool,
+) -> Result<PathBuf, String> {
     let image = get_known_image(name).ok_or_else(|| {
         format!(
             "Unknown image '{}'. Use 'image list' to see available images.",
@@ -179,9 +188,9 @@ pub fn pull_image(name: &str, output: Option<&Path>) -> Result<PathBuf, String> 
         .map(PathBuf::from)
         .unwrap_or_else(|| dir.join(format!("{}.ext4", image.name)));
 
-    if final_path.exists() {
+    if final_path.exists() && !force_refetch {
         eprintln!("Image already exists at {}", final_path.display());
-        eprintln!("Delete it first if you want to re-download.");
+        eprintln!("Delete it first or pass --refetch if you want to re-download.");
         return Ok(final_path);
     }
 
@@ -190,7 +199,7 @@ pub fn pull_image(name: &str, output: Option<&Path>) -> Result<PathBuf, String> 
     eprintln!("  URL: {}", image.url);
 
     // Step 1: Download
-    let download_path = download_file(image.url, &dir, image.compression)?;
+    let download_path = download_file(image.url, &dir, image.compression, force_refetch)?;
 
     // Step 2: Convert to ext4 if needed
     let ext4_path = convert_to_ext4(&download_path, image.format, &final_path)?;
@@ -226,11 +235,16 @@ pub fn pull_image(name: &str, output: Option<&Path>) -> Result<PathBuf, String> 
 /// `xz -d` on the downloaded file, which consumes it and leaves
 /// `<filename without .xz>`. For Zip, we unzip into `dir` and locate
 /// the extracted image. For None, the downloaded file is the result.
-fn download_file(url: &str, dir: &Path, compression: Compression) -> Result<PathBuf, String> {
+fn download_file(
+    url: &str,
+    dir: &Path,
+    compression: Compression,
+    force_refetch: bool,
+) -> Result<PathBuf, String> {
     let filename = url.rsplit('/').next().unwrap_or("download");
     let download_path = dir.join(filename);
 
-    crate::fetch::download_to(url, &download_path)?;
+    crate::fetch::download_to_cached(url, &download_path, force_refetch)?;
 
     match compression {
         Compression::None => Ok(download_path),
@@ -578,8 +592,8 @@ pub fn cmd_image_info(name: &str) {
 }
 
 /// Pull an image by name.
-pub fn cmd_pull(name: &str, output: Option<&str>) {
-    match pull_image(name, output.map(Path::new)) {
+pub fn cmd_pull(name: &str, output: Option<&str>, force_refetch: bool) {
+    match pull_image(name, output.map(Path::new), force_refetch) {
         Ok(path) => {
             println!("{}", path.display());
         }
