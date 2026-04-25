@@ -273,6 +273,18 @@ fn reply_err(mut sock: &UnixStream, error: impl Into<String>) {
     );
 }
 
+/// Bounds-check the wire-format `l2cpu` index. Every dispatch handler
+/// starts with the same `if idx >= 4 { reply_err … return }` dance —
+/// route it through one place so a future change to the per-card core
+/// count needs to land in exactly one match arm.
+fn validate_l2cpu(idx: u8) -> Result<usize, &'static str> {
+    if idx < 4 {
+        Ok(idx as usize)
+    } else {
+        Err("l2cpu must be 0..3")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------------
@@ -337,43 +349,13 @@ fn dispatch_boot(
         "[boot l2cpu {}] dispatch_boot entry: opensbi={} kernel={} dtb={} initramfs={:?} root={} force_reset_pcie={} disk={:?} network={} force={}",
         l2cpu_idx, opensbi, kernel, dtb, initramfs, root_device, force_reset_pcie, disk, network, force
     );
-    if l2cpu_idx >= 4 {
-        reply_err(sock, "l2cpu must be 0..3");
+    if let Err(msg) = validate_l2cpu(l2cpu_idx) {
+        reply_err(sock, msg);
         return;
     }
-
-    // Slot-already-exists handling. Re-imaging on top of a live slot —
-    // even if the core itself is currently held in reset — leaves the
-    // prior workers' TLB mmaps live; the new boot's NOC tile writes then
-    // race the stale mappings and can panic the host (observed
-    // 2026-04-24: mid-OpenSBI write hard-crashed the box). So we either
-    // reject or explicitly tear the slot down first, gated by `force`.
-    {
-        let slot_exists = state.l2cpus[l2cpu_idx as usize]
-            .lock()
-            .unwrap()
-            .is_some();
-        if slot_exists && !force {
-            reply_err(
-                sock,
-                format!(
-                    "l2cpu {} is already booted; stop it first, or re-run with --force",
-                    l2cpu_idx
-                ),
-            );
-            return;
-        }
-    }
-    if force {
-        let existing = state.l2cpus[l2cpu_idx as usize].lock().unwrap().take();
-        if let Some(prior) = existing {
-            dlog!(
-                "[boot l2cpu {}] --force: tearing down existing slot before re-imaging",
-                l2cpu_idx
-            );
-            prior.shutdown();
-            dlog!("[boot l2cpu {}] prior slot torn down", l2cpu_idx);
-        }
+    if let Err(e) = handle_existing_slot(state, l2cpu_idx, force) {
+        reply_err(sock, e);
+        return;
     }
 
     // No daemon-wide serialization of the chip-touching phase here —
@@ -381,7 +363,7 @@ fn dispatch_boot(
     // of its typed methods, and per-L2CPU NOC traffic goes through each
     // L2CPU's own fd + TLB windows. Concurrent boots on different cores
     // proceed in parallel; the same-core case is still serialized by the
-    // per-slot `Mutex<Option<L2CpuSlot>>` higher up this function.
+    // per-slot `Mutex<Option<L2CpuSlot>>` taken in `handle_existing_slot`.
     dlog!("[boot l2cpu {}] starting boot sequence", l2cpu_idx);
     let l2cpu = match run_boot_sequence(
         state,
@@ -418,38 +400,83 @@ fn dispatch_boot(
         l2cpu_idx
     );
 
-    // Spawn the virtio workers *before* replying Ok — kernel hits VFS mount
-    // at ~0.137s and has no retry. Three sequential RPCs (boot + add-disk +
-    // add-net) lose that race; bundling them keeps the worker threads up
-    // within a few ms of L2CPU reset release.
-    if let Some(path) = disk {
-        dlog!(
-            "[boot l2cpu {}] spawning disk worker for {}",
-            l2cpu_idx,
-            path
-        );
-        if let Err(e) = start_disk_worker(&mut slot, &path) {
-            dlog!(
-                "[boot l2cpu {}] start_disk_worker failed: {}",
-                l2cpu_idx,
-                e
-            );
-            reply_err(sock, format!("start disk worker failed: {}", e));
-            return;
+    if let Err(e) = start_initial_workers(&mut slot, state.card, l2cpu_idx, disk, network) {
+        reply_err(sock, e);
+        return;
+    }
+    install_slot_and_reply_ok(state, l2cpu_idx, slot, sock);
+}
+
+/// Reject the boot if a slot is already populated and `--force` wasn't
+/// given. With `--force`, take the prior slot out and shut it down so
+/// the boot can proceed without races between the new NOC writes and
+/// the prior workers' TLB mmaps. Holds the per-slot mutex for the
+/// is_some() check + the take(); other cores stay unblocked.
+fn handle_existing_slot(
+    state: &Arc<DaemonState>,
+    l2cpu_idx: u8,
+    force: bool,
+) -> Result<(), String> {
+    let prior = {
+        let mut guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
+        if guard.is_some() && !force {
+            return Err(format!(
+                "l2cpu {} is already booted; stop it first, or re-run with --force",
+                l2cpu_idx
+            ));
         }
+        if force { guard.take() } else { None }
+    };
+    if let Some(prior) = prior {
+        dlog!(
+            "[boot l2cpu {}] --force: tearing down existing slot before re-imaging",
+            l2cpu_idx
+        );
+        prior.shutdown();
+        dlog!("[boot l2cpu {}] prior slot torn down", l2cpu_idx);
+    }
+    Ok(())
+}
+
+/// Spawn the requested virtio workers *before* replying Ok — kernel hits
+/// VFS mount at ~0.137s and has no retry. Three sequential RPCs
+/// (boot + add-disk + add-net) lose that race; bundling them keeps the
+/// worker threads up within a few ms of L2CPU reset release.
+fn start_initial_workers(
+    slot: &mut L2CpuSlot,
+    card: u32,
+    l2cpu_idx: u8,
+    disk: Option<String>,
+    network: bool,
+) -> Result<(), String> {
+    if let Some(path) = disk {
+        dlog!("[boot l2cpu {}] spawning disk worker for {}", l2cpu_idx, path);
+        start_disk_worker(slot, &path).map_err(|e| {
+            dlog!("[boot l2cpu {}] start_disk_worker failed: {}", l2cpu_idx, e);
+            format!("start disk worker failed: {}", e)
+        })?;
     }
     if network {
         dlog!("[boot l2cpu {}] spawning net worker", l2cpu_idx);
-        if let Err(e) = start_net_worker(state.card, &mut slot) {
+        start_net_worker(card, slot).map_err(|e| {
             dlog!("[boot l2cpu {}] start_net_worker failed: {}", l2cpu_idx, e);
-            reply_err(sock, format!("start net worker failed: {}", e));
-            return;
-        }
+            format!("start net worker failed: {}", e)
+        })?;
     }
+    Ok(())
+}
 
+/// Park the slot in `DaemonState`, clear any stale `wedged` mark left
+/// over from a prior startup probe (since the cold boot just succeeded
+/// and the core is running with valid magic), and reply Ok to the
+/// client.
+fn install_slot_and_reply_ok(
+    state: &Arc<DaemonState>,
+    l2cpu_idx: u8,
+    slot: L2CpuSlot,
+    sock: &UnixStream,
+) {
     *state.l2cpus[l2cpu_idx as usize].lock().unwrap() = Some(slot);
-    // Successful cold boot — core is freshly running with valid magic,
-    // so any stale "wedged" mark from a prior startup probe is obsolete.
     state.wedged[l2cpu_idx as usize].store(false, Ordering::Relaxed);
     dlog!(
         "[boot l2cpu {}] dispatch_boot complete — replying ok",
@@ -668,8 +695,8 @@ fn dispatch_attach_console(
     l2cpu_idx: u8,
     mode: ConsoleMode,
 ) {
-    if l2cpu_idx >= 4 {
-        reply_err(&sock, "l2cpu must be 0..3");
+    if let Err(msg) = validate_l2cpu(l2cpu_idx) {
+        reply_err(&sock, msg);
         return;
     }
 
@@ -787,8 +814,8 @@ fn client_reader_main(
 // ---------------------------------------------------------------------------
 
 fn dispatch_add_disk(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8, path: String) {
-    if l2cpu_idx >= 4 {
-        reply_err(sock, "l2cpu must be 0..3");
+    if let Err(msg) = validate_l2cpu(l2cpu_idx) {
+        reply_err(sock, msg);
         return;
     }
     let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
@@ -841,8 +868,8 @@ fn dispatch_add_disk(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8,
 
 fn dispatch_remove_disk(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) {
     dlog!("[remove_disk l2cpu {}] dispatch entry", l2cpu_idx);
-    if l2cpu_idx >= 4 {
-        reply_err(sock, "l2cpu must be 0..3");
+    if let Err(msg) = validate_l2cpu(l2cpu_idx) {
+        reply_err(sock, msg);
         return;
     }
     // Take the disks out under the lock, then release and join outside.
@@ -888,8 +915,8 @@ fn dispatch_add_net(
     _ssh_port: Option<u16>,
 ) {
     dlog!("[add_net l2cpu {}] dispatch entry", l2cpu_idx);
-    if l2cpu_idx >= 4 {
-        reply_err(sock, "l2cpu must be 0..3");
+    if let Err(msg) = validate_l2cpu(l2cpu_idx) {
+        reply_err(sock, msg);
         return;
     }
     let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
@@ -939,8 +966,8 @@ fn dispatch_add_net(
 
 fn dispatch_remove_net(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) {
     dlog!("[remove_net l2cpu {}] dispatch entry", l2cpu_idx);
-    if l2cpu_idx >= 4 {
-        reply_err(sock, "l2cpu must be 0..3");
+    if let Err(msg) = validate_l2cpu(l2cpu_idx) {
+        reply_err(sock, msg);
         return;
     }
     // Take the net handle under the lock, join outside (same reasoning as
@@ -974,8 +1001,8 @@ fn dispatch_remove_net(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u
 
 fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) {
     dlog!("[stop l2cpu {}] dispatch_stop entry", l2cpu_idx);
-    if l2cpu_idx >= 4 {
-        reply_err(sock, "l2cpu must be 0..3");
+    if let Err(msg) = validate_l2cpu(l2cpu_idx) {
+        reply_err(sock, msg);
         return;
     }
     let taken = state.l2cpus[l2cpu_idx as usize].lock().unwrap().take();
