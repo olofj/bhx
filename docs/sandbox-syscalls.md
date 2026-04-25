@@ -40,7 +40,7 @@ Grouped by purpose, with seccomp policy intent.
 | `tgkill`, `exit_group`, `exit` | thread teardown / panic handling |
 | `clock_gettime`, `clock_nanosleep`, `nanosleep` | adaptive sleep tiers + log timestamps |
 | `pselect6`, `poll`, `ppoll` | listener accept loop + slirp internal |
-| `accept4`, `getsockname`, `getsockopt`, `setsockopt` | unix socket + slirp listener |
+| `accept`, `accept4`, `getsockname`, `getsockopt`, `setsockopt` | unix socket + slirp listener. **Both** `accept` and `accept4` are needed: Rust code uses `accept4(SOCK_CLOEXEC)`, but libvdeslirp's worker thread calls the legacy `accept(2)` on the SSH-forward listener — without it slirp busy-loops on EPERM, see #32. |
 | `recvfrom`, `sendto`, `sendmsg` | wire-format JSON + SCM\_RIGHTS console fd |
 | `socket(AF_UNIX,…)`, `socket(AF_INET,SOCK_STREAM,…)` | control sock + slirp's TCP forward listener |
 | `bind`, `listen` | same — slirp listens on `127.0.0.1:<ssh_port>` |

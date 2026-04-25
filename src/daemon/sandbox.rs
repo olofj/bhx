@@ -252,6 +252,13 @@ mod imp {
             libc::SYS_socket,
             libc::SYS_bind,
             libc::SYS_listen,
+            // Both accept variants. Most internal Rust code uses
+            // accept4(SOCK_CLOEXEC), but libvdeslirp's worker thread
+            // calls the legacy accept(2) on the slirp port-forward
+            // listener — without this the slirp thread busy-loops on
+            // EPERM and the host can't connect to the SSH-forward port
+            // (#32).
+            libc::SYS_accept,
             libc::SYS_accept4,
             libc::SYS_getsockname,
             libc::SYS_getsockopt,
