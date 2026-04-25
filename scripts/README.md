@@ -16,6 +16,9 @@ Run them from `tt-bh-linux-rs/` after `cargo build`.
 | `soak_warm_resume.sh` | N cycles of `daemon stop` + `daemon start`; asserts each restart re-adopts L2CPU 0 via warm-resume (probe passes, slot adopted). |
 | `soak_add_remove.sh`  | N cycles of `add-disk` / `remove-disk` / `add-net` / `remove-net`; asserts `daemon status` after each step. Also verifies double-remove errors cleanly without mutating the slot. |
 | `soak_concurrent.sh`  | Boots all 4 L2CPUs in parallel (each with its own `rootfs-N.ext4`), then runs N iterations of **4-way concurrent** `remove-disk`/`add-disk`/`remove-net`/`add-net` hammering sibling slots in parallel, with a background `daemon status` poller alongside. Chip-wide AXI ops go through `SharedChip::seq_lock`; per-L2CPU NOC traffic goes through each core's own fd. See [issue #1](https://github.com/olofj/tt-bh-rust/issues/1). |
+| `soak_kill_recovery.sh` | N SIGKILL-the-daemon cycles. After each kill, asserts the next `daemon start` cleans up stale runtime files, the warm-resume probe adopts the still-live L2CPU, and add-disk + add-net re-attach successfully. Targets the dirty-shutdown path that graceful `daemon stop` doesn't exercise. |
+| `soak_disk_io_pressure.sh` | N `remove-disk` calls while the guest is in steady-state I/O (kernel journal + systemd housekeeping). Asserts each remove-disk returns within `TIMEOUT` seconds (default 5; healthy runs are ~300 ms), the daemon survives, and the slot becomes addressable for re-add. |
+| `soak_net_teardown.sh` | N `remove-net` calls while a host-side TCP session is held open against the slirp-forwarded SSH port. Asserts the held connection drops cleanly (no host hang), the daemon survives, and add-net brings the listener back up. Doesn't depend on guest SSH credentials — just exercises the TCP-listener teardown. |
 | `console_roundtrip.py` | End-to-end console I/O stress — logs into the guest via `connect`, puts the tty in raw mode, then roundtrips 64 KiB of base64 text in each direction (guest→host and host→guest) and compares sha256. Validates `chip_console`'s `push_char` / `pop_char` + `ConsoleHub` fan-out under sustained transfers. Caller is responsible for having the daemon up with at least one L2CPU booted + at a login prompt. See "Concurrent console roundtrip" below for the 4-way stress form. |
 
 ## Env overrides
@@ -28,6 +31,8 @@ All scripts honour:
 - `CARD`           — tt device index (default 0).
 - `L2CPU`          — core index to exercise (default 0, ignored by `soak_concurrent.sh` which always uses all 4).
 - `STATUS_POLL_HZ` — background status poll frequency in `soak_concurrent.sh` (default 20).
+- `TIMEOUT`        — per-step timeout for `soak_disk_io_pressure.sh` and `soak_net_teardown.sh` (default 5 s).
+- `PORT_WAIT`      — max wait for guest sshd to come up in `soak_net_teardown.sh` (default 60 s; bump for slow boots).
 
 ## Typical use
 
@@ -78,9 +83,10 @@ served by this repo's pipeline.
 
 ## What isn't covered here
 
-These only hammer the happy paths with expected values. Things left for
-a separate coverage pass:
+These hammer the most common stressors but a few things still aren't:
 
-- crash injection (SIGKILL the daemon mid-RPC)
-- long-running guest with I/O pressure during `remove-disk`
-- libvdeslirp TCP session loss on `remove-net`
+- multi-card concurrency (we only have one Blackhole on this host)
+- long-running endurance soaks (>1 h cycles) — the existing scripts
+  are short-cycle stress, not stability runs
+- application-level guest I/O patterns (real workloads, not just
+  kernel journal) during disk teardown
