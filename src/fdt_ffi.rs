@@ -7,6 +7,8 @@
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 
+use crate::Error;
+
 extern "C" {
     pub fn fdt_open_into(fdt: *const c_void, buf: *mut c_void, bufsize: c_int) -> c_int;
     pub fn fdt_pack(fdt: *mut c_void) -> c_int;
@@ -41,9 +43,9 @@ fn err_str(err: c_int) -> String {
     }
 }
 
-fn check(err: c_int, op: &str) -> Result<(), String> {
+fn check(err: c_int, op: &str) -> crate::Result<()> {
     if err < 0 {
-        Err(format!("{}: {}", op, err_str(err)))
+        Err(Error::fdt(op, err_str(err)))
     } else {
         Ok(())
     }
@@ -76,7 +78,7 @@ impl Fdt {
     /// the input is copied into the output buffer first, then libfdt
     /// validates and resizes in place. This avoids two separate aligned
     /// allocations.
-    pub fn open_into(src: &[u8], extra_bytes: usize) -> Result<Self, String> {
+    pub fn open_into(src: &[u8], extra_bytes: usize) -> crate::Result<Self> {
         let total = src.len() + extra_bytes;
         let words = total.div_ceil(8);
         let mut storage: Vec<u64> = vec![0u64; words];
@@ -121,8 +123,9 @@ impl Fdt {
     ///   passes a static string so the NUL case isn't reachable, but
     ///   surfacing it lets a future caller forward guest-supplied
     ///   paths safely (security finding from #17).
-    pub fn path_offset(&self, path: &str) -> Result<Option<c_int>, String> {
-        let c_path = CString::new(path).map_err(|e| format!("path_offset({}): {}", path, e))?;
+    pub fn path_offset(&self, path: &str) -> crate::Result<Option<c_int>> {
+        let c_path = CString::new(path)
+            .map_err(|e| Error::fdt(format!("path_offset({})", path), e.to_string()))?;
         let ret = unsafe { fdt_path_offset(self.ptr(), c_path.as_ptr()) };
         // libfdt returns -FDT_ERR_NOTFOUND (-1) for missing nodes; any
         // other negative is a real error worth surfacing.
@@ -130,26 +133,30 @@ impl Fdt {
         if ret == NEG_NOTFOUND {
             Ok(None)
         } else if ret < 0 {
-            Err(format!("path_offset({}): {}", path, err_str(ret)))
+            Err(Error::fdt(format!("path_offset({})", path), err_str(ret)))
         } else {
             Ok(Some(ret))
         }
     }
 
     /// Add a subnode under `parent`, return the new node offset.
-    pub fn add_subnode(&mut self, parent: c_int, name: &str) -> Result<c_int, String> {
-        let c_name = CString::new(name).map_err(|e| e.to_string())?;
+    pub fn add_subnode(&mut self, parent: c_int, name: &str) -> crate::Result<c_int> {
+        let c_name =
+            CString::new(name).map_err(|e| Error::fdt("fdt_add_subnode", e.to_string()))?;
         let ret = unsafe { fdt_add_subnode(self.ptr_mut(), parent, c_name.as_ptr()) };
         if ret < 0 {
-            Err(format!("fdt_add_subnode({}): {}", name, err_str(ret)))
+            Err(Error::fdt(
+                format!("fdt_add_subnode({})", name),
+                err_str(ret),
+            ))
         } else {
             Ok(ret)
         }
     }
 
     /// Set property `name` on `node` to raw `value` bytes.
-    pub fn setprop(&mut self, node: c_int, name: &str, value: &[u8]) -> Result<(), String> {
-        let c_name = CString::new(name).map_err(|e| e.to_string())?;
+    pub fn setprop(&mut self, node: c_int, name: &str, value: &[u8]) -> crate::Result<()> {
+        let c_name = CString::new(name).map_err(|e| Error::fdt("fdt_setprop", e.to_string()))?;
         let ret = unsafe {
             fdt_setprop(
                 self.ptr_mut(),
@@ -162,11 +169,11 @@ impl Fdt {
         check(ret, &format!("fdt_setprop({})", name))
     }
 
-    pub fn setprop_u32(&mut self, node: c_int, name: &str, value: u32) -> Result<(), String> {
+    pub fn setprop_u32(&mut self, node: c_int, name: &str, value: u32) -> crate::Result<()> {
         self.setprop(node, name, &value.to_be_bytes())
     }
 
-    pub fn setprop_string(&mut self, node: c_int, name: &str, value: &str) -> Result<(), String> {
+    pub fn setprop_string(&mut self, node: c_int, name: &str, value: &str) -> crate::Result<()> {
         let mut v = value.as_bytes().to_vec();
         v.push(0);
         self.setprop(node, name, &v)
@@ -188,7 +195,7 @@ impl Fdt {
         unsafe { fdt_get_phandle(self.ptr(), node) }
     }
 
-    pub fn find_max_phandle(&self) -> Result<u32, String> {
+    pub fn find_max_phandle(&self) -> crate::Result<u32> {
         let mut ph: u32 = 0;
         let ret = unsafe { fdt_find_max_phandle(self.ptr(), &mut ph) };
         check(ret, "fdt_find_max_phandle")?;
@@ -198,7 +205,7 @@ impl Fdt {
     /// Compact the DTB and return the packed bytes. `fdt_totalsize` in the
     /// header is a macro, not a function, so we read the totalsize field
     /// directly (offset 4, big-endian u32).
-    pub fn pack(mut self) -> Result<Vec<u8>, String> {
+    pub fn pack(mut self) -> crate::Result<Vec<u8>> {
         let ret = unsafe { fdt_pack(self.ptr_mut()) };
         check(ret, "fdt_pack")?;
         let size = u32::from_be_bytes(self.buf_bytes()[4..8].try_into().unwrap()) as usize;
@@ -238,11 +245,15 @@ mod tests {
         let fdt = Fdt::open_into(FIXTURE_DTB, 0).unwrap();
         let result = fdt.path_offset("/memory\0/embedded-nul");
         match result {
-            Err(msg) => assert!(
-                msg.contains("nul") || msg.contains("NUL") || msg.contains("interior"),
-                "expected NUL-related error message, got: {}",
-                msg
-            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("nul") || msg.contains("NUL") || msg.contains("interior"),
+                    "expected NUL-related error message, got: {}",
+                    msg
+                );
+                assert!(matches!(e, Error::Fdt { .. }), "expected Fdt variant");
+            }
             other => panic!("expected Err for NUL-bearing path, got {:?}", other),
         }
     }

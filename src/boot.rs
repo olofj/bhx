@@ -212,20 +212,7 @@ pub fn modify_dtb(
     boot_device: &BootDevice,
     mem_start: u64,
     mem_size: u64,
-) -> std::io::Result<Vec<u8>> {
-    modify_dtb_inner(dtb_bytes, boot_device, mem_start, mem_size).map_err(std::io::Error::other)
-}
-
-// libfdt's wrappers in `fdt_ffi` return `Result<_, String>`; keep that
-// inside this helper so the body uses `?` cleanly, and convert at the
-// public boundary above. There's no value in exposing the raw String to
-// callers — they all immediately do `io::Error::other`.
-fn modify_dtb_inner(
-    dtb_bytes: &[u8],
-    boot_device: &BootDevice,
-    mem_start: u64,
-    mem_size: u64,
-) -> Result<Vec<u8>, String> {
+) -> crate::Result<Vec<u8>> {
     let mem_end = mem_start + mem_size;
     eprintln!(
         "[modify_dtb] input DTB {} bytes, mem=[0x{:x}..0x{:x}) ({} MB), boot_device={:?}",
@@ -244,9 +231,9 @@ fn modify_dtb_inner(
     // kernel thinking it has 4 GiB and allocating virtio buffers past the
     // end of its DRAM window, which our server then rejects as out-of-range.
     // boot.py has the same bug — it reads but never writes /memory.
-    let memory_node = fdt
-        .path_offset("/memory@400030000000")?
-        .ok_or_else(|| "memory@400030000000 node not found in DT".to_string())?;
+    let memory_node = fdt.path_offset("/memory@400030000000")?.ok_or_else(|| {
+        crate::Error::fdt("path_offset", "memory@400030000000 node not found in DT")
+    })?;
     let mut reg = Vec::with_capacity(16);
     reg.extend_from_slice(&mem_start.to_be_bytes());
     reg.extend_from_slice(&mem_size.to_be_bytes());
@@ -296,10 +283,10 @@ fn modify_dtb_inner(
     // /soc and PLIC phandle
     let soc = fdt
         .path_offset("/soc")?
-        .ok_or_else(|| "soc node not found in DT".to_string())?;
+        .ok_or_else(|| crate::Error::fdt("path_offset", "soc node not found in DT"))?;
     let plic = fdt
         .path_offset("/soc/interrupt-controller@c000000")?
-        .ok_or_else(|| "plic node not found in DT".to_string())?;
+        .ok_or_else(|| crate::Error::fdt("path_offset", "plic node not found in DT"))?;
     let mut plic_phandle = fdt.get_phandle(plic);
     if plic_phandle == 0 {
         plic_phandle = fdt.find_max_phandle()? + 1;
