@@ -17,9 +17,10 @@ Run them from `tt-bh-linux-rs/` after `cargo build`.
 | `soak_add_remove.sh`  | N cycles of `add-disk` / `remove-disk` / `add-net` / `remove-net`; asserts `daemon status` after each step. Also verifies double-remove errors cleanly without mutating the slot. |
 | `soak_concurrent.sh`  | Boots all 4 L2CPUs in parallel (each with its own `rootfs-N.ext4`), then runs N iterations of **4-way concurrent** `remove-disk`/`add-disk`/`remove-net`/`add-net` hammering sibling slots in parallel, with a background `daemon status` poller alongside. Chip-wide AXI ops go through `SharedChip::seq_lock`; per-L2CPU NOC traffic goes through each core's own fd. See [issue #1](https://github.com/olofj/tt-bh-rust/issues/1). |
 | `soak_kill_recovery.sh` | N SIGKILL-the-daemon cycles. After each kill, asserts the next `daemon start` cleans up stale runtime files, the warm-resume probe adopts the still-live L2CPU, and add-disk + add-net re-attach successfully. Targets the dirty-shutdown path that graceful `daemon stop` doesn't exercise. |
-| `soak_disk_io_pressure.sh` | N `remove-disk` calls while the guest is in steady-state I/O (kernel journal + systemd housekeeping). Asserts each remove-disk returns within `TIMEOUT` seconds (default 5; healthy runs are ~300 ms), the daemon survives, and the slot becomes addressable for re-add. |
+| `soak_disk_io_pressure.sh` | N `remove-disk` calls while the guest is in steady-state I/O (kernel journal + systemd housekeeping). Asserts each remove-disk returns within `TIMEOUT` seconds (default 5; healthy runs are ~300 ms), the daemon survives, and the slot becomes addressable for re-add. Light pressure — the buildroot-only [`soak_fio_remove_disk.py`](#soak_fio_remove_diskpy) drives real fio writes for a stronger version of the same test. |
+| `soak_fio_remove_disk.py` | Like `soak_disk_io_pressure.sh` but drives a real `fio` job inside the guest writing 64 MiB to the rootfs at the moment we yank the disk. Requires the [tests/rootfs](../tests/rootfs/) buildroot rootfs (auto-login + `fio` in target/bin). Drives the virtio-blk descriptor path much harder than the kernel-journal-only version. |
 | `soak_net_teardown.sh` | N `remove-net` calls while a host-side TCP session is held open against the slirp-forwarded SSH port. Asserts the held connection drops cleanly (no host hang), the daemon survives, and add-net brings the listener back up. Doesn't depend on guest SSH credentials — just exercises the TCP-listener teardown. |
-| `console_roundtrip.py` | End-to-end console I/O stress — logs into the guest via `connect`, puts the tty in raw mode, then roundtrips 64 KiB of base64 text in each direction (guest→host and host→guest) and compares sha256. Validates `chip_console`'s `push_char` / `pop_char` + `ConsoleHub` fan-out under sustained transfers. Caller is responsible for having the daemon up with at least one L2CPU booted + at a login prompt. See "Concurrent console roundtrip" below for the 4-way stress form. |
+| `console_roundtrip.py` | End-to-end console I/O stress — logs into the guest via `connect`, puts the tty in raw mode, then roundtrips 64 KiB of base64 text in each direction (guest→host and host→guest) and compares sha256. Validates `chip_console`'s `push_char` / `pop_char` + `ConsoleHub` fan-out under sustained transfers. Auto-detects buildroot (auto-login on `# `) vs Debian (`login:` → `debian\r` → `$ `); silences kernel printk to the console before the test so async kernel messages don't pollute the captured stream. See "Concurrent console roundtrip" below for the 4-way stress form. |
 
 ## Env overrides
 
@@ -78,9 +79,12 @@ wait
 # Each /tmp/rt_$i.log should end with "ALL PASS".
 ```
 
-The guest needs a `debian` user with a passwordless console login for
-the scripted login to work — that's the default in the rootfs image
-served by this repo's pipeline.
+Two rootfs flavors are supported, auto-detected from the prompt that
+appears first:
+- **Buildroot** (`tests/rootfs/rootfs.ext4`, recommended for soaks):
+  drops to `# ` immediately, no login. See [tests/rootfs/](../tests/rootfs/).
+- **Debian** (legacy `image pull debian` flow): needs a `debian` user
+  with a passwordless console login.
 
 ## What isn't covered here
 
