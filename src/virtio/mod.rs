@@ -159,6 +159,90 @@ const QUEUE_SIZE: u16 = 16384;
 const STASH_OFFSET: usize = 0x200;
 const STASH_PER_QUEUE: usize = 24; // desc_addr + avail_addr + used_addr, each u64
 
+// ---------------------------------------------------------------------------
+// Pure-decode handshake helpers
+//
+// These are the decisions `run_device` makes after each MMIO read. Pulling
+// them out lets unit tests pin behavior (notably the `wrapping_add(1)` fix
+// for sel_generation overflow at u32::MAX — a regression that hardware
+// observation alone wouldn't catch quickly) without poking real registers.
+// ---------------------------------------------------------------------------
+
+/// Phase 2 decision: feature negotiation via `sel_generation`.
+///
+/// Inputs:
+/// - `initial_status`: status read at the *top* of the loop iteration.
+/// - `recheck_status`: status re-read *after* observing curr_gen != prev_gen,
+///   to close the window where the guest flipped FEATURES_OK and bumped
+///   the generation for queue setup between our two reads. Ignored when
+///   `curr_gen == prev_gen`.
+/// - `curr_gen` / `prev_gen`: latest and last-acked sel_generation values.
+#[derive(Debug, PartialEq, Eq)]
+enum Phase2Action {
+    Done,
+    Wait,
+    BumpFeatures { next_gen: u32 },
+}
+
+fn phase2_decide(
+    initial_status: u32,
+    recheck_status: u32,
+    curr_gen: u32,
+    prev_gen: u32,
+) -> Phase2Action {
+    if initial_status & VIRTIO_CONFIG_S_FEATURES_OK != 0 {
+        return Phase2Action::Done;
+    }
+    if curr_gen == prev_gen {
+        return Phase2Action::Wait;
+    }
+    if recheck_status & VIRTIO_CONFIG_S_FEATURES_OK != 0 {
+        return Phase2Action::Done;
+    }
+    Phase2Action::BumpFeatures {
+        next_gen: curr_gen.wrapping_add(1),
+    }
+}
+
+/// Phase 3 decision: queue address exchange. Decoupled from MMIO reads
+/// so tests can pin the wrap-around for invalid queue indices and the
+/// "configure → bump" sequencing.
+#[derive(Debug, PartialEq, Eq)]
+enum Phase3Action {
+    Wait,
+    Skip { next_gen: u32 },
+    Configure { q: usize, next_gen: u32 },
+}
+
+fn phase3_decide(curr_gen: u32, prev_gen: u32, q: usize, num_queues: usize) -> Phase3Action {
+    if curr_gen == prev_gen {
+        return Phase3Action::Wait;
+    }
+    let next_gen = curr_gen.wrapping_add(1);
+    if q >= num_queues {
+        Phase3Action::Skip { next_gen }
+    } else {
+        Phase3Action::Configure { q, next_gen }
+    }
+}
+
+/// A fresh server is willing to skip the cold-start handshake when the
+/// MMIO region looks like a previous successful Phase-3 left it: matching
+/// magic + dev id, plus a stash of in-range queue addresses. Without
+/// `stash_all_valid` we fall back to cold-start because partial state is
+/// worse than starting from scratch.
+fn is_warm_restart_candidate(
+    existing_magic: u32,
+    existing_dev_id: u32,
+    expected_magic: u32,
+    expected_dev_id: u32,
+    stash_all_valid: bool,
+) -> bool {
+    existing_magic == expected_magic
+        && existing_dev_id == expected_dev_id
+        && stash_all_valid
+}
+
 /// Run a VirtIO device: setup MMIO, negotiate features, process descriptors.
 pub fn run_device(
     device: &mut dyn VirtioDeviceImpl,
@@ -219,7 +303,13 @@ pub fn run_device(
         let magic_matches = existing_magic == VIRTIO_MAGIC
             && existing_dev_id == device.device_id();
 
-        if magic_matches && stash_all_valid {
+        if is_warm_restart_candidate(
+            existing_magic,
+            existing_dev_id,
+            VIRTIO_MAGIC,
+            device.device_id(),
+            stash_all_valid,
+        ) {
             eprintln!(
                 "virtio: device {} warm restart — resuming from stashed queue state (status={:#x})",
                 existing_dev_id, existing_status
@@ -311,29 +401,28 @@ pub fn run_device(
         // Phase 3 and we leave it for that loop to handle.
         let mut prev_gen: u32 = 0;
         while !exit_flag.load(Ordering::Relaxed) {
-            if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_FEATURES_OK != 0 {
-                break;
-            }
+            let initial_status = unsafe { ptr::read_volatile(regs.status) };
             let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
-            if curr_gen != prev_gen {
-                // Re-check status *after* reading sel_generation to close the
-                // window where the guest flipped FEATURES_OK and bumped the
-                // generation for queue setup between our two reads.
-                if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_FEATURES_OK != 0 {
-                    break;
+            // Re-check status only when the gen changed; phase2_decide
+            // ignores the recheck input otherwise. Reading early would
+            // cost an extra MMIO load per spin while the guest hasn't
+            // moved.
+            let recheck_status = if curr_gen != prev_gen {
+                unsafe { ptr::read_volatile(regs.status) }
+            } else {
+                initial_status
+            };
+            match phase2_decide(initial_status, recheck_status, curr_gen, prev_gen) {
+                Phase2Action::Done => break,
+                Phase2Action::Wait => {}
+                Phase2Action::BumpFeatures { next_gen } => {
+                    let sel = unsafe { ptr::read_volatile(regs.device_features_sel) };
+                    unsafe {
+                        ptr::write_volatile(regs.device_features, features[sel as usize & 1]);
+                        ptr::write_volatile(regs.sel_generation, next_gen);
+                    }
+                    prev_gen = next_gen;
                 }
-                let sel = unsafe { ptr::read_volatile(regs.device_features_sel) };
-                unsafe {
-                    ptr::write_volatile(regs.device_features, features[sel as usize & 1]);
-                }
-                // wrapping_add: sel_generation is a u32 MMIO counter whose
-                // native semantics are unsigned wrap. Plain `+ 1` panics in
-                // debug builds once the guest's counter reaches u32::MAX.
-                let next_gen = curr_gen.wrapping_add(1);
-                unsafe {
-                    ptr::write_volatile(regs.sel_generation, next_gen);
-                }
-                prev_gen = next_gen;
             }
         }
 
@@ -350,40 +439,37 @@ pub fn run_device(
         while !exit_flag.load(Ordering::Relaxed) {
             let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
             unsafe { ptr::write_volatile(regs.queue_ready, 0); }
-            if curr_gen != prev_gen {
-                let q = unsafe { ptr::read_volatile(regs.queue_select) } as usize;
-                if q >= num_queues as usize {
-                    // Invalid queue index from guest — skip this generation
-                    let next_gen = curr_gen.wrapping_add(1);
+            let q = unsafe { ptr::read_volatile(regs.queue_select) } as usize;
+            match phase3_decide(curr_gen, prev_gen, q, num_queues as usize) {
+                Phase3Action::Wait => {
+                    unsafe { libc::usleep(1); }
+                }
+                Phase3Action::Skip { next_gen } => {
                     unsafe { ptr::write_volatile(regs.sel_generation, next_gen); }
                     prev_gen = next_gen;
                     unsafe { libc::usleep(1); }
-                    continue;
                 }
-
-                desc[q] = unsafe {
-                    ((ptr::read_volatile(regs.queue_desc_high) as u64) << 32)
-                        | (ptr::read_volatile(regs.queue_desc_low) as u64)
-                };
-                avail[q] = unsafe {
-                    ((ptr::read_volatile(regs.queue_avail_high) as u64) << 32)
-                        | (ptr::read_volatile(regs.queue_avail_low) as u64)
-                };
-                used[q] = unsafe {
-                    ((ptr::read_volatile(regs.queue_used_high) as u64) << 32)
-                        | (ptr::read_volatile(regs.queue_used_low) as u64)
-                };
-                queues_seen[q] = true;
-
-                let next_gen = curr_gen.wrapping_add(1);
-                unsafe { ptr::write_volatile(regs.sel_generation, next_gen); }
-                prev_gen = next_gen;
-
-                if queues_seen.iter().all(|&b| b) {
-                    break;
+                Phase3Action::Configure { q, next_gen } => {
+                    desc[q] = unsafe {
+                        ((ptr::read_volatile(regs.queue_desc_high) as u64) << 32)
+                            | (ptr::read_volatile(regs.queue_desc_low) as u64)
+                    };
+                    avail[q] = unsafe {
+                        ((ptr::read_volatile(regs.queue_avail_high) as u64) << 32)
+                            | (ptr::read_volatile(regs.queue_avail_low) as u64)
+                    };
+                    used[q] = unsafe {
+                        ((ptr::read_volatile(regs.queue_used_high) as u64) << 32)
+                            | (ptr::read_volatile(regs.queue_used_low) as u64)
+                    };
+                    queues_seen[q] = true;
+                    unsafe { ptr::write_volatile(regs.sel_generation, next_gen); }
+                    prev_gen = next_gen;
+                    if queues_seen.iter().all(|&b| b) {
+                        break;
+                    }
                 }
             }
-            unsafe { libc::usleep(1); }
         }
 
         // Persist the queue addresses so a future server instance can resume.
@@ -586,5 +672,119 @@ pub fn run_device(
             SLOW_SLEEP_US
         };
         unsafe { libc::usleep(sleep_us); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FEATURES_OK: u32 = VIRTIO_CONFIG_S_FEATURES_OK;
+
+    #[test]
+    fn phase2_done_when_initial_status_has_features_ok() {
+        // Initial status already says FEATURES_OK — the recheck and
+        // generation values shouldn't matter.
+        assert_eq!(
+            phase2_decide(FEATURES_OK, 0, 5, 5),
+            Phase2Action::Done
+        );
+        assert_eq!(
+            phase2_decide(FEATURES_OK, 0, 7, 5),
+            Phase2Action::Done
+        );
+    }
+
+    #[test]
+    fn phase2_waits_when_gen_unchanged() {
+        // Status not yet FEATURES_OK and gen hasn't moved — keep spinning.
+        assert_eq!(phase2_decide(0, 0, 5, 5), Phase2Action::Wait);
+    }
+
+    #[test]
+    fn phase2_done_when_recheck_status_has_features_ok() {
+        // Initial status was 0 but the guest flipped FEATURES_OK between
+        // our two reads. Don't treat the bump as feature-negotiation — it
+        // belongs to Phase 3.
+        assert_eq!(
+            phase2_decide(0, FEATURES_OK, 6, 5),
+            Phase2Action::Done
+        );
+    }
+
+    #[test]
+    fn phase2_bumps_with_wrap_at_u32_max() {
+        // Regression guard: sel_generation is a u32 MMIO counter; plain
+        // `+ 1` panics in debug builds when it reaches u32::MAX. The
+        // wrapping_add is the contract.
+        assert_eq!(
+            phase2_decide(0, 0, u32::MAX, 0),
+            Phase2Action::BumpFeatures { next_gen: 0 }
+        );
+    }
+
+    #[test]
+    fn phase2_bumps_normally_for_low_gen_values() {
+        assert_eq!(
+            phase2_decide(0, 0, 6, 5),
+            Phase2Action::BumpFeatures { next_gen: 7 }
+        );
+    }
+
+    #[test]
+    fn phase3_waits_when_gen_unchanged() {
+        assert_eq!(phase3_decide(5, 5, 0, 2), Phase3Action::Wait);
+    }
+
+    #[test]
+    fn phase3_skips_invalid_queue_idx_with_wrap() {
+        // q out of range: skip this gen, bump regardless. The wrap matters
+        // here too — same u32 counter.
+        assert_eq!(
+            phase3_decide(u32::MAX, 0, 99, 2),
+            Phase3Action::Skip { next_gen: 0 }
+        );
+        assert_eq!(
+            phase3_decide(6, 5, 5, 2),
+            Phase3Action::Skip { next_gen: 7 }
+        );
+    }
+
+    #[test]
+    fn phase3_configures_valid_queue_idx_with_wrap() {
+        assert_eq!(
+            phase3_decide(u32::MAX, 0, 1, 2),
+            Phase3Action::Configure { q: 1, next_gen: 0 }
+        );
+        assert_eq!(
+            phase3_decide(6, 5, 0, 2),
+            Phase3Action::Configure { q: 0, next_gen: 7 }
+        );
+    }
+
+    #[test]
+    fn warm_restart_requires_magic_match() {
+        // Wrong magic → not a candidate, regardless of stash.
+        assert!(!is_warm_restart_candidate(0xdead_beef, 1, VIRTIO_MAGIC, 1, true));
+    }
+
+    #[test]
+    fn warm_restart_requires_dev_id_match() {
+        // Right magic but wrong device id → not a candidate. Catches the
+        // case where two devices share an MMIO region after a layout bug.
+        assert!(!is_warm_restart_candidate(VIRTIO_MAGIC, 7, VIRTIO_MAGIC, 1, true));
+    }
+
+    #[test]
+    fn warm_restart_requires_stash_valid() {
+        // Magic + dev id match but stash is partial (out-of-range
+        // address) — fall back to cold-start. Partial state is worse
+        // than starting fresh.
+        assert!(!is_warm_restart_candidate(VIRTIO_MAGIC, 1, VIRTIO_MAGIC, 1, false));
+    }
+
+    #[test]
+    fn warm_restart_accepted_when_all_three_align() {
+        assert!(is_warm_restart_candidate(VIRTIO_MAGIC, 1, VIRTIO_MAGIC, 1, true));
     }
 }
