@@ -72,21 +72,28 @@ $(DL_DIR)/$(BUILDROOT_TARBALL):
 # via env so the source tree itself doesn't get polluted.
 BR_MAKE_ENV := \
 	BR2_DEFCONFIG=$(DEFCONFIG) \
-	BR2_DL_DIR=$(DL_DIR) \
-	BR2_ROOTFS_OVERLAY=$(OVERLAY)
+	BR2_DL_DIR=$(DL_DIR)
 
-# Configure step: generates output/.config from our defconfig. The
-# stamp file is `output/.config-stamp` so re-running `make` doesn't
-# re-run defconfig if the source defconfig is unchanged.
-$(OUTPUT_DIR)/.config: $(DEFCONFIG) $(BR_SRCDIR)/Makefile
+# Configure step: generates buildroot's in-tree .config from our
+# defconfig. The defconfig encodes BR2_ROOTFS_OVERLAY as a relative
+# path (`../overlay`) which buildroot resolves against its own working
+# directory (BR_SRCDIR). That avoids hard-coding any contributor-
+# specific absolute path here.
+BR_DOTCONFIG := $(BR_SRCDIR)/.config
+
+$(BR_DOTCONFIG): $(DEFCONFIG) $(BR_SRCDIR)/Makefile
 	$(BR_MAKE_ENV) $(MAKE) -C $(BR_SRCDIR) defconfig
 
-$(ROOTFS_EXT4): $(OUTPUT_DIR)/.config $(shell find $(OVERLAY) -type f 2>/dev/null)
+$(ROOTFS_EXT4): $(BR_DOTCONFIG) $(shell find $(OVERLAY) -type f 2>/dev/null)
 	$(BR_MAKE_ENV) $(MAKE) -C $(BR_SRCDIR)
+	# Stable convenience symlink — soak scripts look for this path
+	# without needing to know the buildroot version directory name.
+	ln -sfr $(ROOTFS_EXT4) $(ROOTFS_LINK)
 
 rebuild:
 	rm -rf $(OUTPUT_DIR)/images
 	$(BR_MAKE_ENV) $(MAKE) -C $(BR_SRCDIR)
+	ln -sfr $(ROOTFS_EXT4) $(ROOTFS_LINK)
 
 clean:
 	rm -rf $(BR_SRCDIR)

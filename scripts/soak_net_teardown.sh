@@ -99,7 +99,8 @@ sleep 0.3
 note "cold boot L2CPU $L2CPU with disk+net (rootfs=$ROOTFS, ssh fwd port $SSH_PORT)"
 timeout 90 "$BINARY" boot -t "$CARD" -l "$L2CPU" -d "$ROOTFS" --no-console -n >/dev/null
 
-rootfs_basename=$(basename "$ROOTFS")
+# Daemon stores the canonicalized path; match its basename.
+rootfs_basename=$(basename "$(readlink -f "$ROOTFS")")
 status=$("$BINARY" daemon status -t "$CARD")
 echo "$status" | grep -qE "l2cpu $L2CPU: Running disk=.*$rootfs_basename net=y" \
     || fail "post-boot status mismatch:\n$status"

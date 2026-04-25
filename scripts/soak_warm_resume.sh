@@ -70,7 +70,12 @@ sleep 0.3
 note "cold boot L2CPU $L2CPU with disk+net (rootfs=$ROOTFS)"
 timeout 60 "$BINARY" boot -t "$CARD" -l "$L2CPU" -d "$ROOTFS" --no-console -n >/dev/null
 
-rootfs_basename=$(basename "$ROOTFS")
+# The CLI absolutizes via canonicalize (follows symlinks) before
+# sending to the daemon, so the basename in `daemon status` is the
+# basename of the resolved file, not of $ROOTFS. Compute that here so
+# soaks work with both regular files (./rootfs.ext4) and the buildroot
+# symlink (tests/rootfs/rootfs.ext4 -> ...rootfs.ext2).
+rootfs_basename=$(basename "$(readlink -f "$ROOTFS")")
 status=$("$BINARY" daemon status -t "$CARD")
 echo "$status" | grep -qE "l2cpu $L2CPU: Running disk=.*$rootfs_basename net=y" \
     || fail "post-boot status mismatch:\n$status"
