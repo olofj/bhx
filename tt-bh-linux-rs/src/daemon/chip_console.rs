@@ -145,15 +145,20 @@ fn uart_pass(
     // down; the hub's fan-out is one syscall per client per push.
     let mut out_buf = [0u8; 256];
 
-    // Hysteresis for the poll-rate choice at the bottom of the loop: a
-    // single dry iteration shouldn't drop us back to the slow (idle)
-    // sleep, because bursty guest output has many small gaps. Track the
-    // time of the last observed activity and stay in fast mode until
-    // the console has been quiet for `FAST_WINDOW`. After that, switch
-    // to the slow sleep to save CPU.
+    // Three-tier adaptive sleep with hysteresis:
+    //   - FAST  (100 µs) while console is actively producing/consuming
+    //   - SLOW  (1 ms)   after FAST_WINDOW (200 ms) with no activity
+    //   - IDLE  (10 ms)  after IDLE_WINDOW (2 s) with no activity
+    // The IDLE tier dominates idle-daemon CPU: at SLOW we polled
+    // 1000×/s burning ~2% per worker, IDLE drops that to 100×/s. Cap
+    // at 10 ms so bursty guest output (kernel printk to the 4 KiB TX
+    // ring) can't fill the ring before we drain it — the chip's ring
+    // size sets the cap, not the kernel's tolerable latency. See #27.
     const FAST_SLEEP: Duration = Duration::from_micros(100);
     const SLOW_SLEEP: Duration = Duration::from_millis(1);
+    const IDLE_SLEEP: Duration = Duration::from_millis(10);
     const FAST_WINDOW: Duration = Duration::from_millis(200);
+    const IDLE_WINDOW: Duration = Duration::from_secs(2);
     let mut last_active = std::time::Instant::now();
 
     loop {
@@ -208,23 +213,18 @@ fn uart_pass(
             }
         }
 
-        // Pick the sleep length based on how long it's been since we last
-        // did real work. Anything touched in the last FAST_WINDOW keeps
-        // us at FAST_SLEEP (100 µs — responsive, still yields the CPU);
-        // after that we drop to SLOW_SLEEP (1 ms) to avoid burning CPU on
-        // an idle guest. The window gives hysteresis so a single empty
-        // iteration in the middle of a bursty output stream doesn't flap
-        // us back to the slow sleep and then back again the next time
-        // bytes show up. See
-        // <https://github.com/olofj/tt-bh-rust/issues/2> for the proper
-        // adaptive backoff follow-up.
+        // Pick the sleep tier based on how long it's been since we last
+        // did real work — see the FAST/SLOW/IDLE constants above.
         if got_output || got_input {
             last_active = std::time::Instant::now();
         }
-        let sleep = if last_active.elapsed() < FAST_WINDOW {
+        let elapsed = last_active.elapsed();
+        let sleep = if elapsed < FAST_WINDOW {
             FAST_SLEEP
-        } else {
+        } else if elapsed < IDLE_WINDOW {
             SLOW_SLEEP
+        } else {
+            IDLE_SLEEP
         };
         std::thread::sleep(sleep);
     }
