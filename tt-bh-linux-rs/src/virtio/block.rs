@@ -67,6 +67,9 @@ pub struct VirtioBlk {
     /// guest's blockdev layer never saw EIO — the request just hung
     /// (virtio 1.2 §5.2.6).
     req_status: u8,
+    /// L2CPU index this device serves. Stored only for metric labels;
+    /// not used in the I/O path itself.
+    l2cpu_idx: u8,
 }
 
 unsafe impl Send for VirtioBlk {}
@@ -90,19 +93,19 @@ impl VirtioBlk {
     /// The daemon's add-disk path uses `from_file` with a pre-vetted
     /// File handle to avoid the path-resolved-twice TOCTOU.
     #[allow(dead_code)]
-    pub fn new(image_path: &Path) -> std::io::Result<Self> {
+    pub fn new(image_path: &Path, l2cpu_idx: u8) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(image_path)?;
-        Self::from_file(file)
+        Self::from_file(file, l2cpu_idx)
     }
 
     /// Construct a VirtioBlk from an already-opened File. The File is
     /// owned by the resulting VirtioBlk for its full lifetime; the
     /// caller is freed from any close responsibility. `mmap` derives
     /// the file size via `fstat` on the file's fd.
-    pub fn from_file(file: File) -> std::io::Result<Self> {
+    pub fn from_file(file: File, l2cpu_idx: u8) -> std::io::Result<Self> {
         let stat = nix::sys::stat::fstat(&file)
             .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
         let file_size = stat.st_size as usize;
@@ -129,6 +132,7 @@ impl VirtioBlk {
             req: ptr::null(),
             data_offset: 0,
             req_status: VIRTIO_BLK_S_OK,
+            l2cpu_idx,
         })
     }
 
@@ -216,6 +220,37 @@ impl VirtioDeviceImpl for VirtioBlk {
         unsafe {
             ptr::write_volatile(addr, self.req_status);
         }
+
+        // One bump per request, regardless of how many data
+        // descriptors made it up. `data_offset` was accumulated by
+        // `process_queue_data` across each chunk.
+        let req = unsafe { &*self.req };
+        let idx = self.l2cpu_idx;
+        match req.type_ {
+            VIRTIO_BLK_T_IN => {
+                crate::daemon::metrics::BLK_REQUESTS_TOTAL.read(idx).inc();
+                crate::daemon::metrics::BLK_BYTES_TOTAL
+                    .read(idx)
+                    .add(self.data_offset);
+            }
+            VIRTIO_BLK_T_OUT => {
+                crate::daemon::metrics::BLK_REQUESTS_TOTAL.write(idx).inc();
+                crate::daemon::metrics::BLK_BYTES_TOTAL
+                    .write(idx)
+                    .add(self.data_offset);
+            }
+            _ => {
+                // Unknown type — already flagged in req_status; the
+                // error counter below picks it up. Don't pollute
+                // read/write totals with it.
+            }
+        }
+        match self.req_status {
+            VIRTIO_BLK_S_IOERR => crate::daemon::metrics::BLK_ERRORS_TOTAL.ioerr(idx).inc(),
+            VIRTIO_BLK_S_UNSUPP => crate::daemon::metrics::BLK_ERRORS_TOTAL.unsupp(idx).inc(),
+            _ => {}
+        }
+
         self.req_status = VIRTIO_BLK_S_OK;
     }
 
@@ -269,7 +304,7 @@ pub fn disk_main(
                 return;
             }
         };
-        let mut blk = match VirtioBlk::from_file(cloned) {
+        let mut blk = match VirtioBlk::from_file(cloned, l2cpu.idx() as u8) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("disk: failed to open image {}: {}", disk_image_path, e);
