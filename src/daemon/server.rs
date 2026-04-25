@@ -285,6 +285,24 @@ fn validate_l2cpu(idx: u8) -> Result<usize, &'static str> {
     }
 }
 
+/// Probe whether a TCP port on 127.0.0.1 is available to bind. Used by
+/// `dispatch_add_net` before handing the port to slirp so an
+/// already-occupied port produces a useful error instead of a slirp
+/// `vdeslirp_open` returning NULL with no context.
+///
+/// There is a small TOCTOU window between the probe-bind dropping and
+/// slirp's subsequent bind. The intent is to catch operator-error
+/// cases (port held by another process for a long time), not to
+/// prevent concurrent-bind races.
+#[cfg(feature = "slirp")]
+fn probe_port_available(port: u16) -> std::io::Result<()> {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let listener = TcpListener::bind(addr)?;
+    drop(listener); // release immediately so slirp can rebind
+    Ok(())
+}
+
 /// What `dispatch_boot` should do given the current per-slot state and
 /// the client's `force` flag. Pulled out as a pure function so the
 /// reject-vs-teardown decision is unit-testable without a real slot
@@ -976,9 +994,13 @@ fn dispatch_add_net(
     sock: &UnixStream,
     state: &Arc<DaemonState>,
     l2cpu_idx: u8,
-    _ssh_port: Option<u16>,
+    ssh_port_override: Option<u16>,
 ) {
-    dlog!("[add_net l2cpu {}] dispatch entry", l2cpu_idx);
+    dlog!(
+        "[add_net l2cpu {}] dispatch entry (ssh_port_override={:?})",
+        l2cpu_idx,
+        ssh_port_override
+    );
     if let Err(msg) = validate_l2cpu(l2cpu_idx) {
         reply_err(sock, msg);
         return;
@@ -996,11 +1018,29 @@ fn dispatch_add_net(
         return;
     }
 
+    // Resolve the host port. CLI override wins over the formula.
+    let ssh_port =
+        ssh_port_override.unwrap_or_else(|| crate::regs::slirp::ssh_port(state.card, l2cpu_idx));
+
+    // Pre-check: confirm nothing else holds the port. There's a small
+    // TOCTOU window between dropping our probe-bind and slirp's bind,
+    // but we're catching the operator-error case (port held by another
+    // process for a long time), not concurrent-bind races.
+    if let Err(e) = probe_port_available(ssh_port) {
+        reply_err(
+            sock,
+            format!(
+                "ssh-forward port {} unavailable: {}. Pass --ssh-port to pick a different host port, or stop whatever's using it.",
+                ssh_port, e
+            ),
+        );
+        return;
+    }
+
     let exit = Arc::new(AtomicBool::new(false));
     let l2cpu = slot.l2cpu.clone();
     let interrupt = slot.interrupt.clone();
     let exit_thread = exit.clone();
-    let ssh_port = crate::regs::slirp::ssh_port(state.card, l2cpu_idx);
     dlog!(
         "[add_net l2cpu {}] spawning network worker thread (ssh_port={})",
         l2cpu_idx,
@@ -1181,5 +1221,38 @@ mod tests {
     #[test]
     fn remove_disk_accepts_when_disk_attached() {
         assert_eq!(validate_remove_disk_request(false), Ok(()));
+    }
+
+    // ---- probe_port_available ----
+
+    #[cfg(feature = "slirp")]
+    #[test]
+    fn probe_port_available_succeeds_for_clear_port() {
+        // Bind a transient listener to grab a free port, then drop it
+        // so the port is provably bindable. Probe should succeed.
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+        let probe_listener =
+            TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let port = probe_listener.local_addr().unwrap().port();
+        drop(probe_listener);
+        // Best-effort — a flaky kernel could re-assign the port between
+        // drop and probe, but in practice this is reliable.
+        probe_port_available(port).expect("just-released port should be bindable");
+    }
+
+    #[cfg(feature = "slirp")]
+    #[test]
+    fn probe_port_available_errors_when_port_in_use() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+        let occupant =
+            TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let port = occupant.local_addr().unwrap().port();
+        let err = probe_port_available(port).unwrap_err();
+        // Linux returns EADDRINUSE; portable check: we just want some Err.
+        assert!(
+            err.kind() == std::io::ErrorKind::AddrInUse
+                || err.raw_os_error() == Some(libc::EADDRINUSE)
+        );
+        drop(occupant);
     }
 }
