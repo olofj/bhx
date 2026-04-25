@@ -179,6 +179,9 @@ fn uart_pass(
         }
         let got_output = n > 0;
         if got_output {
+            crate::daemon::metrics::L2CPU_CONSOLE_BYTES_TOTAL
+                .g2h(l2cpu.idx() as u8)
+                .add(n as u64);
             let _ = hub.push_chip_output(&out_buf[..n]);
         }
 
@@ -188,6 +191,9 @@ fn uart_pass(
             match input_rx.try_recv() {
                 Ok(b) => {
                     got_input = true;
+                    crate::daemon::metrics::L2CPU_CONSOLE_BYTES_TOTAL
+                        .h2g(l2cpu.idx() as u8)
+                        .inc();
                     // Wait for the guest's SBI layer to drain the 4 KiB RX
                     // ring. Unbounded with a short sleep per iteration —
                     // upstream (mpsc channel + socket buffer) naturally

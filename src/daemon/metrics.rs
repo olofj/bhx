@@ -159,19 +159,206 @@ impl<const N: usize> Default for GaugeVec<N> {
 }
 
 // ============================================================================
-// Global metrics
+// Labeled metric shapes
 // ============================================================================
 //
-// At this stage (#30) the inventory is intentionally tiny — just enough
-// to exercise the registry plumbing and prove the format. The full
-// instrumentation lands in #31, where these statics expand to cover
-// virtio block/net, chip_console, RPC dispatch, and slot lifecycle.
+// Each shape is its own type so call sites and the renderer share a
+// schema. Verbose at definition; explicit at use site (`CONSOLE_BYTES.g2h(idx).add(n)`).
+
+/// Per-L2CPU counter array (idx 0..3).
+pub struct PerL2cpuCounter {
+    values: [Counter; 4],
+}
+impl PerL2cpuCounter {
+    pub const fn new() -> Self {
+        Self {
+            values: [const { Counter::new() }; 4],
+        }
+    }
+    pub fn at(&self, idx: u8) -> &Counter {
+        &self.values[idx as usize]
+    }
+}
+impl Default for PerL2cpuCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-L2CPU gauge array (idx 0..3).
+pub struct PerL2cpuGauge {
+    values: [Gauge; 4],
+}
+impl PerL2cpuGauge {
+    pub const fn new() -> Self {
+        Self {
+            values: [const { Gauge::new() }; 4],
+        }
+    }
+    pub fn at(&self, idx: u8) -> &Gauge {
+        &self.values[idx as usize]
+    }
+}
+impl Default for PerL2cpuGauge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-L2CPU + per-direction counter (chip-console bytes). `g2h` =
+/// guest → host (chip TX ring drained into the hub); `h2g` = host →
+/// guest (input pushed into the chip RX ring).
+pub struct PerL2cpuDirCounter {
+    g2h: [Counter; 4],
+    h2g: [Counter; 4],
+}
+impl PerL2cpuDirCounter {
+    pub const fn new() -> Self {
+        Self {
+            g2h: [const { Counter::new() }; 4],
+            h2g: [const { Counter::new() }; 4],
+        }
+    }
+    pub fn g2h(&self, idx: u8) -> &Counter {
+        &self.g2h[idx as usize]
+    }
+    pub fn h2g(&self, idx: u8) -> &Counter {
+        &self.h2g[idx as usize]
+    }
+}
+impl Default for PerL2cpuDirCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One counter per RPC method. Drives `tt_bh_daemon_rpc_total{method}`
+/// and `_errors_total{method}`. Adding a new method = one field +
+/// matching arm in `RpcMethod::name`.
+pub struct RpcMethodCounter {
+    pub status: Counter,
+    pub boot: Counter,
+    pub attach_console: Counter,
+    pub add_disk: Counter,
+    pub remove_disk: Counter,
+    pub add_net: Counter,
+    pub remove_net: Counter,
+    pub stop: Counter,
+    pub shutdown: Counter,
+}
+impl RpcMethodCounter {
+    pub const fn new() -> Self {
+        Self {
+            status: Counter::new(),
+            boot: Counter::new(),
+            attach_console: Counter::new(),
+            add_disk: Counter::new(),
+            remove_disk: Counter::new(),
+            add_net: Counter::new(),
+            remove_net: Counter::new(),
+            stop: Counter::new(),
+            shutdown: Counter::new(),
+        }
+    }
+    pub fn at(&self, m: RpcMethod) -> &Counter {
+        match m {
+            RpcMethod::Status => &self.status,
+            RpcMethod::Boot => &self.boot,
+            RpcMethod::AttachConsole => &self.attach_console,
+            RpcMethod::AddDisk => &self.add_disk,
+            RpcMethod::RemoveDisk => &self.remove_disk,
+            RpcMethod::AddNet => &self.add_net,
+            RpcMethod::RemoveNet => &self.remove_net,
+            RpcMethod::Stop => &self.stop,
+            RpcMethod::Shutdown => &self.shutdown,
+        }
+    }
+}
+impl Default for RpcMethodCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Discriminator for the RPC method label. One variant per
+/// `protocol::Request` arm we want to bucket separately.
+#[derive(Copy, Clone, Debug)]
+pub enum RpcMethod {
+    Status,
+    Boot,
+    AttachConsole,
+    AddDisk,
+    RemoveDisk,
+    AddNet,
+    RemoveNet,
+    Stop,
+    Shutdown,
+}
+impl RpcMethod {
+    pub const fn name(self) -> &'static str {
+        match self {
+            RpcMethod::Status => "status",
+            RpcMethod::Boot => "boot",
+            RpcMethod::AttachConsole => "attach_console",
+            RpcMethod::AddDisk => "add_disk",
+            RpcMethod::RemoveDisk => "remove_disk",
+            RpcMethod::AddNet => "add_net",
+            RpcMethod::RemoveNet => "remove_net",
+            RpcMethod::Stop => "stop",
+            RpcMethod::Shutdown => "shutdown",
+        }
+    }
+    pub const fn all() -> &'static [RpcMethod] {
+        &[
+            RpcMethod::Status,
+            RpcMethod::Boot,
+            RpcMethod::AttachConsole,
+            RpcMethod::AddDisk,
+            RpcMethod::RemoveDisk,
+            RpcMethod::AddNet,
+            RpcMethod::RemoveNet,
+            RpcMethod::Stop,
+            RpcMethod::Shutdown,
+        ]
+    }
+}
+
+// ============================================================================
+// Global metrics
+// ============================================================================
+
+// --- Daemon-global ---
 
 /// Cumulative count of accepted RPC client connections.
 pub static DAEMON_CLIENTS_TOTAL: Counter = Counter::new();
 
 /// Currently-connected RPC clients (active count, decremented on close).
 pub static DAEMON_CLIENTS_ACTIVE: Gauge = Gauge::new();
+
+/// Sandbox enforcement state. 0 = disabled, 1 = partially enforced,
+/// 2 = fully enforced. Set by `sandbox::apply` (no-op on non-Linux).
+pub static DAEMON_SANDBOX_STATUS: Gauge = Gauge::new();
+
+/// Per-method RPC counters.
+pub static DAEMON_RPC_TOTAL: RpcMethodCounter = RpcMethodCounter::new();
+
+/// Per-method RPC failure counters (response was an `Error` variant
+/// or framed response failed to write).
+pub static DAEMON_RPC_ERRORS_TOTAL: RpcMethodCounter = RpcMethodCounter::new();
+
+// --- Per-L2CPU ---
+
+/// Cold-boot count per L2CPU (`dispatch_boot` install path).
+pub static L2CPU_BOOT_COLD_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
+
+/// Warm-resume count per L2CPU (`warm_resume_released` adoption path).
+pub static L2CPU_BOOT_WARM_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
+
+/// Currently-attached console clients per L2CPU (`ConsoleHub` writer registry).
+pub static L2CPU_CONSOLE_CLIENTS: PerL2cpuGauge = PerL2cpuGauge::new();
+
+/// Chip-console bytes per L2CPU per direction.
+pub static L2CPU_CONSOLE_BYTES_TOTAL: PerL2cpuDirCounter = PerL2cpuDirCounter::new();
 
 // ============================================================================
 // Prometheus text formatter
@@ -180,11 +367,16 @@ pub static DAEMON_CLIENTS_ACTIVE: Gauge = Gauge::new();
 /// Render the current metric set in Prometheus text format (version
 /// 0.0.4). Returns the full response body, suitable for the HTTP
 /// listener to write back verbatim.
+///
+/// Walks the per-L2CPU slot mutexes for derived gauges (uptime, disks,
+/// net, slot-state). Holds each slot lock briefly — same contention
+/// model `dispatch_status` uses, which is well-tested under the
+/// concurrent-soak.
 pub fn render_prometheus(state: &DaemonState) -> String {
-    let mut out = String::with_capacity(2048);
+    let mut out = String::with_capacity(4096);
 
-    // Daemon-global metrics. Order doesn't matter to scrapers, but
-    // keeping uptime first makes manual `curl` output readable.
+    // ----- Daemon-global -----
+
     write_gauge(
         &mut out,
         "tt_bh_daemon_uptime_seconds",
@@ -203,6 +395,148 @@ pub fn render_prometheus(state: &DaemonState) -> String {
         "Currently-connected RPC clients.",
         DAEMON_CLIENTS_ACTIVE.get(),
     );
+    write_gauge(
+        &mut out,
+        "tt_bh_daemon_sandbox_status",
+        "Sandbox enforcement: 0=disabled, 1=partial, 2=fully-enforced.",
+        DAEMON_SANDBOX_STATUS.get(),
+    );
+
+    // Per-method RPC totals. One emit pass per metric so HELP/TYPE
+    // appear once at the top per Prometheus convention.
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_daemon_rpc_total Cumulative RPC count per method."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_daemon_rpc_total counter");
+    for &m in RpcMethod::all() {
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_daemon_rpc_total{{method=\"{}\"}} {}",
+            m.name(),
+            DAEMON_RPC_TOTAL.at(m).get()
+        );
+    }
+
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_daemon_rpc_errors_total RPC failures per method."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_daemon_rpc_errors_total counter");
+    for &m in RpcMethod::all() {
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_daemon_rpc_errors_total{{method=\"{}\"}} {}",
+            m.name(),
+            DAEMON_RPC_ERRORS_TOTAL.at(m).get()
+        );
+    }
+
+    // ----- Per-L2CPU -----
+
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_l2cpu_boot_total Boot count per L2CPU, by kind (cold|warm)."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_l2cpu_boot_total counter");
+    for idx in 0..4u8 {
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_l2cpu_boot_total{{idx=\"{}\",kind=\"cold\"}} {}",
+            idx,
+            L2CPU_BOOT_COLD_TOTAL.at(idx).get()
+        );
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_l2cpu_boot_total{{idx=\"{}\",kind=\"warm\"}} {}",
+            idx,
+            L2CPU_BOOT_WARM_TOTAL.at(idx).get()
+        );
+    }
+
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_l2cpu_console_clients Currently-attached console clients per L2CPU."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_l2cpu_console_clients gauge");
+    for idx in 0..4u8 {
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_l2cpu_console_clients{{idx=\"{}\"}} {}",
+            idx,
+            L2CPU_CONSOLE_CLIENTS.at(idx).get()
+        );
+    }
+
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_l2cpu_console_bytes_total Chip-console byte transfers per L2CPU \
+         per direction (g2h = guest-to-host, h2g = host-to-guest)."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_l2cpu_console_bytes_total counter");
+    for idx in 0..4u8 {
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_l2cpu_console_bytes_total{{idx=\"{}\",direction=\"g2h\"}} {}",
+            idx,
+            L2CPU_CONSOLE_BYTES_TOTAL.g2h(idx).get()
+        );
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_l2cpu_console_bytes_total{{idx=\"{}\",direction=\"h2g\"}} {}",
+            idx,
+            L2CPU_CONSOLE_BYTES_TOTAL.h2g(idx).get()
+        );
+    }
+
+    // Slot-derived gauges: uptime, disks, net, state. Walk the
+    // mutexes once to read every slot's snapshot.
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_l2cpu_uptime_seconds Seconds since slot installation. \
+         Absent for L2CPUs without an installed slot."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_l2cpu_uptime_seconds gauge");
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_l2cpu_disks Attached disk-worker count per L2CPU."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_l2cpu_disks gauge");
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_l2cpu_net Net-worker presence per L2CPU (0 or 1)."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_l2cpu_net gauge");
+    for idx in 0..4u8 {
+        let g = state.l2cpus[idx as usize].lock().unwrap();
+        if let Some(slot) = g.as_ref() {
+            let uptime = slot.started.elapsed().as_secs() as i64;
+            let _ = writeln!(
+                &mut out,
+                "tt_bh_l2cpu_uptime_seconds{{idx=\"{}\"}} {}",
+                idx, uptime
+            );
+            let _ = writeln!(
+                &mut out,
+                "tt_bh_l2cpu_disks{{idx=\"{}\"}} {}",
+                idx,
+                slot.disks.len()
+            );
+            let _ = writeln!(
+                &mut out,
+                "tt_bh_l2cpu_net{{idx=\"{}\"}} {}",
+                idx,
+                slot.net.is_some() as u8
+            );
+        } else {
+            // Emit explicit zero for disks/net so absence is visible
+            // without an "is the slot installed?" lookup. Skip uptime
+            // — emitting 0 would alias to "just-installed" which is
+            // misleading in a tail of recently-stopped slots.
+            let _ = writeln!(&mut out, "tt_bh_l2cpu_disks{{idx=\"{}\"}} 0", idx);
+            let _ = writeln!(&mut out, "tt_bh_l2cpu_net{{idx=\"{}\"}} 0", idx);
+        }
+    }
 
     out
 }
@@ -360,42 +694,56 @@ mod tests {
     }
 
     #[test]
-    fn render_prometheus_emits_expected_lines() {
+    fn render_prometheus_emits_expected_metric_names() {
+        // Don't assert exact counter values against shared statics —
+        // other tests in this module touch the same globals and run in
+        // parallel. Just confirm the labelled inventory is present.
         let state = DaemonState::new(0, Arc::new(SharedChip::placeholder()));
-        // Bump the globals so the rendered output reflects something
-        // non-zero — that way we catch a regression where the format
-        // helpers fall back to a default.
-        DAEMON_CLIENTS_TOTAL.add(3);
-        DAEMON_CLIENTS_ACTIVE.set(1);
-
         let out = render_prometheus(&state);
 
-        // Each metric should have HELP + TYPE + value lines, in that
-        // canonical order. Don't lock the exact uptime value since the
-        // clock advances during the test, but assert the line shape.
-        assert!(out.contains("# HELP tt_bh_daemon_uptime_seconds"));
-        assert!(out.contains("# TYPE tt_bh_daemon_uptime_seconds gauge"));
-        assert!(out.contains("\ntt_bh_daemon_uptime_seconds "));
-
-        assert!(out.contains("# HELP tt_bh_daemon_clients_total"));
-        assert!(out.contains("# TYPE tt_bh_daemon_clients_total counter"));
-        assert!(out.contains("tt_bh_daemon_clients_total 3\n"));
-
-        assert!(out.contains("# HELP tt_bh_daemon_clients_active"));
-        assert!(out.contains("# TYPE tt_bh_daemon_clients_active gauge"));
-        assert!(out.contains("tt_bh_daemon_clients_active 1\n"));
-
-        // Reset for any later tests to start from a known state.
-        DAEMON_CLIENTS_TOTAL.add(0);
-        DAEMON_CLIENTS_ACTIVE.set(0);
+        // Daemon-global.
+        for needle in [
+            "# HELP tt_bh_daemon_uptime_seconds",
+            "# TYPE tt_bh_daemon_uptime_seconds gauge",
+            "\ntt_bh_daemon_uptime_seconds ",
+            "# HELP tt_bh_daemon_clients_total",
+            "# TYPE tt_bh_daemon_clients_total counter",
+            "# HELP tt_bh_daemon_clients_active",
+            "# TYPE tt_bh_daemon_clients_active gauge",
+            "# HELP tt_bh_daemon_sandbox_status",
+            "# TYPE tt_bh_daemon_sandbox_status gauge",
+            "# HELP tt_bh_daemon_rpc_total",
+            "# TYPE tt_bh_daemon_rpc_total counter",
+            "tt_bh_daemon_rpc_total{method=\"boot\"} ",
+            "tt_bh_daemon_rpc_total{method=\"add_disk\"} ",
+            "tt_bh_daemon_rpc_errors_total{method=\"boot\"} ",
+            // Per-L2CPU (every idx 0..3 should appear).
+            "tt_bh_l2cpu_boot_total{idx=\"0\",kind=\"cold\"} ",
+            "tt_bh_l2cpu_boot_total{idx=\"3\",kind=\"warm\"} ",
+            "tt_bh_l2cpu_console_clients{idx=\"2\"} ",
+            "tt_bh_l2cpu_console_bytes_total{idx=\"0\",direction=\"g2h\"} ",
+            "tt_bh_l2cpu_console_bytes_total{idx=\"3\",direction=\"h2g\"} ",
+            "tt_bh_l2cpu_disks{idx=\"0\"} ",
+            "tt_bh_l2cpu_net{idx=\"3\"} ",
+        ] {
+            assert!(
+                out.contains(needle),
+                "rendered output missing {:?}; first 200 chars:\n{}",
+                needle,
+                &out.chars().take(200).collect::<String>()
+            );
+        }
     }
 
     #[test]
     fn render_prometheus_format_is_well_formed() {
-        // Sanity-check the structural invariants the Prometheus text
-        // format demands: each metric is a triple (HELP, TYPE, value)
-        // with no blank gaps inside the triple, and every non-comment
-        // line has exactly one space between name and value.
+        // Sanity-check the structural invariants Prometheus demands:
+        // every value line has `name [labels] value` (2 whitespace
+        // tokens), and HELP appears at most once per metric name. With
+        // labelled metrics, multiple value lines share one HELP/TYPE
+        // pair, so the simple equality count we used pre-#31 no
+        // longer holds — instead require value_count >= help_count
+        // and HELP/TYPE balance.
         let state = DaemonState::new(0, Arc::new(SharedChip::placeholder()));
         let out = render_prometheus(&state);
 
@@ -417,11 +765,76 @@ mod tests {
                 );
             }
         }
-        assert_eq!(help_count, type_count);
-        assert_eq!(help_count, value_count);
+        assert_eq!(help_count, type_count, "every HELP needs a matching TYPE");
         assert!(
-            help_count >= 3,
-            "expected at least 3 metrics, got {help_count}"
+            value_count >= help_count,
+            "expected ≥ help_count value lines (got {} value, {} help)",
+            value_count,
+            help_count
         );
+        assert!(
+            help_count >= 8,
+            "expected at least 8 metric names, got {help_count}"
+        );
+    }
+
+    #[test]
+    fn per_l2cpu_counter_indexed() {
+        let m = PerL2cpuCounter::new();
+        m.at(0).add(10);
+        m.at(2).add(7);
+        assert_eq!(m.at(0).get(), 10);
+        assert_eq!(m.at(1).get(), 0);
+        assert_eq!(m.at(2).get(), 7);
+    }
+
+    #[test]
+    fn per_l2cpu_dir_counter_separates_directions() {
+        let m = PerL2cpuDirCounter::new();
+        m.g2h(0).add(100);
+        m.h2g(0).add(200);
+        m.g2h(1).add(50);
+        assert_eq!(m.g2h(0).get(), 100);
+        assert_eq!(m.h2g(0).get(), 200);
+        assert_eq!(m.g2h(1).get(), 50);
+        assert_eq!(m.h2g(1).get(), 0);
+        assert_eq!(m.g2h(2).get(), 0);
+    }
+
+    #[test]
+    fn rpc_method_counter_dispatches_per_method() {
+        let m = RpcMethodCounter::new();
+        m.at(RpcMethod::Boot).add(3);
+        m.at(RpcMethod::AddDisk).inc();
+        m.at(RpcMethod::AddDisk).inc();
+        assert_eq!(m.at(RpcMethod::Boot).get(), 3);
+        assert_eq!(m.at(RpcMethod::AddDisk).get(), 2);
+        assert_eq!(m.at(RpcMethod::Status).get(), 0);
+    }
+
+    #[test]
+    fn rpc_method_names_cover_every_variant() {
+        // Names are stable wire labels — operators build dashboards
+        // off them. A typo here would silently break a dashboard at
+        // some point in the future.
+        let names: Vec<_> = RpcMethod::all().iter().map(|m| m.name()).collect();
+        for expected in [
+            "status",
+            "boot",
+            "attach_console",
+            "add_disk",
+            "remove_disk",
+            "add_net",
+            "remove_net",
+            "stop",
+            "shutdown",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "expected method name {:?} in {:?}",
+                expected,
+                names
+            );
+        }
     }
 }
