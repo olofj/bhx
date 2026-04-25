@@ -3,7 +3,8 @@
 
 //! VirtIO block device implementation.
 
-use std::os::unix::io::RawFd;
+use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,7 +42,13 @@ pub struct VirtioBlk {
     sector_size: usize,
     mapped_data: *mut u8,
     file_size: usize,
-    fd: RawFd,
+    /// Owned file handle for the disk image. Dropped after `mapped_data`
+    /// is unmapped (Drop runs munmap first explicitly, then this field
+    /// drops at the end of `Drop::drop`, which closes the fd). mmap
+    /// holds its own kernel-level reference to the inode so the order
+    /// doesn't actually matter, but we mirror the historical
+    /// munmap-then-close shape for clarity.
+    file: Option<File>,
     req: *const VirtioBlkOuthdr,
     /// Accumulated byte offset within the current I/O request (across data descriptors).
     data_offset: u64,
@@ -56,36 +63,33 @@ impl Drop for VirtioBlk {
                 libc::munmap(self.mapped_data as *mut libc::c_void, self.file_size);
             }
         }
-        if self.fd >= 0 {
-            unsafe {
-                libc::close(self.fd);
-            }
-        }
+        // Explicitly drop the File so the close happens here in the
+        // Drop body (after munmap), not at some unspecified point.
+        self.file.take();
     }
 }
 
 impl VirtioBlk {
+    /// Open `image_path` and construct a VirtioBlk against it. Used by
+    /// CLI / debug paths that don't go through `dispatch_add_disk`.
+    /// The daemon's add-disk path uses `from_file` with a pre-vetted
+    /// File handle to avoid the path-resolved-twice TOCTOU.
+    #[allow(dead_code)]
     pub fn new(image_path: &Path) -> std::io::Result<Self> {
-        use std::os::fd::IntoRawFd;
-        // nix 0.31 returns OwnedFd; convert to RawFd so the rest of the
-        // function (mmap, manual close in Drop) keeps the same fd-lifecycle
-        // it had in the nix-0.29 era.
-        let fd = nix::fcntl::open(
-            image_path,
-            nix::fcntl::OFlag::O_RDWR,
-            nix::sys::stat::Mode::empty(),
-        )
-        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?
-        .into_raw_fd();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(image_path)?;
+        Self::from_file(file)
+    }
 
-        // nix 0.31's fstat takes an AsFd; wrap our RawFd in a BorrowedFd
-        // for the duration of the call (the fd is still owned by us).
-        let stat = {
-            use std::os::fd::BorrowedFd;
-            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-            nix::sys::stat::fstat(borrowed)
-                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?
-        };
+    /// Construct a VirtioBlk from an already-opened File. The File is
+    /// owned by the resulting VirtioBlk for its full lifetime; the
+    /// caller is freed from any close responsibility. `mmap` derives
+    /// the file size via `fstat` on the file's fd.
+    pub fn from_file(file: File) -> std::io::Result<Self> {
+        let stat = nix::sys::stat::fstat(&file)
+            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
         let file_size = stat.st_size as usize;
 
         let mapped_data = unsafe {
@@ -94,14 +98,11 @@ impl VirtioBlk {
                 file_size,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
-                fd,
+                file.as_raw_fd(),
                 0,
             )
         };
         if mapped_data == libc::MAP_FAILED {
-            unsafe {
-                libc::close(fd);
-            }
             return Err(std::io::Error::last_os_error());
         }
 
@@ -109,7 +110,7 @@ impl VirtioBlk {
             sector_size: 512,
             mapped_data: mapped_data as *mut u8,
             file_size,
-            fd,
+            file: Some(file),
             req: ptr::null(),
             data_offset: 0,
         })
@@ -201,12 +202,20 @@ impl VirtioDeviceImpl for VirtioBlk {
 }
 
 /// Block device thread main function.
+///
+/// `disk_image` is the operator-vetted File handle (opened during
+/// `dispatch_add_disk`). Holding it for the whole worker lifetime
+/// closes the path-resolved-twice TOCTOU window: the inner loop
+/// re-creates VirtioBlk on each iteration via `try_clone`, so a
+/// symlink swap between iterations can't redirect the daemon at a
+/// different inode. `disk_image_path` is kept for log lines only.
 pub fn disk_main(
     l2cpu: Arc<L2Cpu>,
     interrupt_ctl: Arc<InterruptController>,
     interrupt_number: u32,
     mmio_region_offset: u64,
     disk_image_path: String,
+    disk_image: File,
     exit_flag: Arc<AtomicBool>,
 ) {
     crate::dlog!(
@@ -217,7 +226,20 @@ pub fn disk_main(
         interrupt_number
     );
     while !exit_flag.load(Ordering::Relaxed) {
-        let mut blk = match VirtioBlk::new(Path::new(&disk_image_path)) {
+        // Hand a fresh fd-clone to each VirtioBlk so its Drop's munmap
+        // + close is independent of the master `disk_image` File. The
+        // dup is cheap (no actual open() syscall, no path resolution).
+        let cloned = match disk_image.try_clone() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "disk: failed to dup fd for image {}: {}",
+                    disk_image_path, e
+                );
+                return;
+            }
+        };
+        let mut blk = match VirtioBlk::from_file(cloned) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("disk: failed to open image {}: {}", disk_image_path, e);
