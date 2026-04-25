@@ -215,63 +215,43 @@ pub fn pull_image(name: &str, output: Option<&Path>) -> Result<PathBuf, String> 
     Ok(ext4_path)
 }
 
-/// Download a file using wget.
+/// Download a file via wget and run any requested decompression.
+///
+/// Layout: wget downloads to `<dir>/<filename>` (the URL's basename),
+/// using `fetch::download_to` for temp+cleanup. For Xz, we then run
+/// `xz -d` on the downloaded file, which consumes it and leaves
+/// `<filename without .xz>`. For Zip, we unzip into `dir` and locate
+/// the extracted image. For None, the downloaded file is the result.
 fn download_file(url: &str, dir: &Path, compression: Compression) -> Result<PathBuf, String> {
     let filename = url.rsplit('/').next().unwrap_or("download");
     let download_path = dir.join(filename);
-    let temp_path = dir.join(format!("{}.downloading", filename));
 
-    eprintln!("  Downloading...");
+    crate::fetch::download_to(url, &download_path)?;
 
-    let status = Command::new("wget")
-        .arg("-O")
-        .arg(&temp_path)
-        .arg("--progress=bar:force:noscroll")
-        .arg(url)
-        .status()
-        .map_err(|e| format!("Failed to run wget: {}. Install with: apt install wget", e))?;
-
-    if !status.success() {
-        let _ = fs::remove_file(&temp_path);
-        return Err("Download failed".to_string());
-    }
-
-    // Decompress if needed
     match compression {
-        Compression::None => {
-            fs::rename(&temp_path, &download_path)
-                .map_err(|e| format!("Failed to rename download: {}", e))?;
-            Ok(download_path)
-        }
+        Compression::None => Ok(download_path),
         Compression::Xz => {
             eprintln!("  Decompressing (xz)...");
-            let decompressed = dir.join(filename.trim_end_matches(".xz"));
             let status = Command::new("xz")
-                .args(["-d", "-k", "-f"])
-                .arg(&temp_path)
+                .args(["-d", "-f"])
+                .arg(&download_path)
                 .status()
                 .map_err(|e| format!("Failed to run xz: {}. Install with: apt install xz-utils", e))?;
-            let _ = fs::remove_file(&temp_path);
             if !status.success() {
                 return Err("xz decompression failed".to_string());
             }
-            // xz -d removes the .xz suffix from the file
-            let decompressed_from_xz = temp_path.with_extension("");
-            if decompressed_from_xz.exists() && decompressed_from_xz != decompressed {
-                fs::rename(&decompressed_from_xz, &decompressed)
-                    .map_err(|e| format!("Failed to rename decompressed file: {}", e))?;
-            }
-            Ok(decompressed)
+            // `xz -d` strips `.xz` from the input filename.
+            Ok(dir.join(filename.trim_end_matches(".xz")))
         }
         Compression::Zip => {
             eprintln!("  Extracting (zip)...");
             let status = Command::new("unzip")
                 .args(["-o", "-j", "-d"])
                 .arg(dir)
-                .arg(&temp_path)
+                .arg(&download_path)
                 .status()
                 .map_err(|e| format!("Failed to run unzip: {}. Install with: apt install unzip", e))?;
-            let _ = fs::remove_file(&temp_path);
+            let _ = fs::remove_file(&download_path);
             if !status.success() {
                 return Err("unzip failed".to_string());
             }

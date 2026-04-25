@@ -14,6 +14,7 @@ mod clock;
 mod console;
 mod daemon;
 mod fdt_ffi;
+mod fetch;
 mod image;
 mod kernel;
 mod kmd;

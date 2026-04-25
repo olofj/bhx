@@ -106,24 +106,7 @@ pub fn pull_kernel(version: Option<&str>, output_dir: Option<&Path>) -> Result<P
 
     // Download zip
     let zip_path = dir.join("tt-bh-linux.zip");
-    let temp_path = dir.join("tt-bh-linux.zip.downloading");
-
-    eprintln!("  Downloading...");
-    let status = Command::new("wget")
-        .arg("-O")
-        .arg(&temp_path)
-        .arg("--progress=bar:force:noscroll")
-        .arg(kernel.url)
-        .status()
-        .map_err(|e| format!("Failed to run wget: {}", e))?;
-
-    if !status.success() {
-        let _ = fs::remove_file(&temp_path);
-        return Err("Download failed".to_string());
-    }
-
-    fs::rename(&temp_path, &zip_path)
-        .map_err(|e| format!("Failed to rename download: {}", e))?;
+    crate::fetch::download_to(kernel.url, &zip_path)?;
 
     // Extract
     eprintln!("  Extracting...");
