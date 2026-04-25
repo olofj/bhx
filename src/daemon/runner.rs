@@ -25,6 +25,9 @@ pub struct StartOpts {
     /// knows where to tail. Opened with `O_DSYNC` so lines survive a host
     /// crash (trading throughput for durability — see `runner::open_log`).
     pub log_file: Option<PathBuf>,
+    /// Install seccomp + landlock filters before the accept loop. See
+    /// `daemon::sandbox`.
+    pub sandbox: bool,
 }
 
 /// Resolve the caller-supplied log path against the current working dir and
@@ -75,9 +78,24 @@ pub fn start(opts: StartOpts) -> io::Result<()> {
     );
 
     if opts.foreground {
-        run_foreground(card, listener, pid_guard, &pid_path)
+        run_foreground(
+            card,
+            listener,
+            pid_guard,
+            &pid_path,
+            opts.sandbox,
+            &log_path,
+        )
     } else {
-        run_daemonized(card, listener, &sock_path, &pid_path, &log_path, pid_guard)
+        run_daemonized(
+            card,
+            listener,
+            &sock_path,
+            &pid_path,
+            &log_path,
+            pid_guard,
+            opts.sandbox,
+        )
     }
 }
 
@@ -136,8 +154,10 @@ fn run_foreground(
     listener: UnixListener,
     pid_guard: lifetime::PidfileGuard,
     pid_path: &Path,
+    sandbox: bool,
+    log_path: &Path,
 ) -> io::Result<()> {
-    server::serve(card, listener)?;
+    server::serve(card, listener, sandbox, log_path)?;
     drop(pid_guard);
     let _ = std::fs::remove_file(pid_path);
     Ok(())
@@ -162,6 +182,7 @@ fn run_daemonized(
     pid_path: &Path,
     log_path: &Path,
     pid_guard: lifetime::PidfileGuard,
+    sandbox: bool,
 ) -> io::Result<()> {
     let (_abs, log_out) = open_log(&log_path.to_path_buf())?;
     let log_err = log_out.try_clone()?;
@@ -190,7 +211,7 @@ fn run_daemonized(
 
     // Grand-child: re-acquire pidfile and run the server loop.
     let _pid_guard = lifetime::acquire_pidfile(card)?;
-    if let Err(e) = server::serve(card, listener) {
+    if let Err(e) = server::serve(card, listener, sandbox, log_path) {
         eprintln!("[daemon] fatal: {}", e);
     }
     let _ = std::fs::remove_file(sock_path);
@@ -202,12 +223,18 @@ pub fn stop(card: u32) -> io::Result<()> {
     lifetime::stop(card)
 }
 
-pub fn restart(card: u32, foreground: bool, log_file: Option<PathBuf>) -> io::Result<()> {
+pub fn restart(
+    card: u32,
+    foreground: bool,
+    log_file: Option<PathBuf>,
+    sandbox: bool,
+) -> io::Result<()> {
     stop(card)?;
     start(StartOpts {
         card,
         foreground,
         log_file,
+        sandbox,
     })
 }
 

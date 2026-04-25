@@ -16,6 +16,14 @@ ctrlc = { version = "3", features = ["termination"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Sandbox crates (Linux-only). seccompiler builds + installs BPF
+# syscall filters; landlock restricts filesystem reach. Both are
+# small, no transitive deps that pull in C++. See docs/sandbox-
+# syscalls.md and src/daemon/sandbox.rs.
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+landlock = "0.4"
+
 [dev-dependencies]
 tempfile = "3"
 
