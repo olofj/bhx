@@ -118,7 +118,10 @@ pub fn pull_ramdisk(
         }
     };
 
-    crate::fetch::download_to_cached(ramdisk.url, &download_path, force_refetch)?;
+    // Anchor the sidecar at `output_path` (the final decompressed
+    // initrd) so the cache check survives gunzip/xz consuming the
+    // download intermediate. See #26.
+    crate::fetch::download_to_cached(ramdisk.url, &download_path, &output_path, force_refetch)?;
 
     // Decompress if needed
     match ramdisk.compression {

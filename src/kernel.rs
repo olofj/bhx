@@ -119,9 +119,12 @@ pub fn pull_kernel(
     eprintln!("  {}", kernel.description);
     eprintln!("  URL: {}", kernel.url);
 
-    // Download zip
+    // Download zip. Anchor the cache sidecar at the surviving
+    // `Image` artifact (the zip itself is removed after extraction;
+    // see #26). On the next pull with `Image` still present, the
+    // sidecar lives next to it and the HEAD check skips the download.
     let zip_path = dir.join("tt-bh-linux.zip");
-    crate::fetch::download_to_cached(kernel.url, &zip_path, force_refetch)?;
+    crate::fetch::download_to_cached(kernel.url, &zip_path, &image_path, force_refetch)?;
 
     // Extract
     eprintln!("  Extracting...");

@@ -72,19 +72,34 @@ pub fn download_to(url: &str, dest_path: &Path) -> Result<PathBuf, String> {
 /// Variant of `download_to` that consults a sidecar metadata file to
 /// skip the wget when the upstream hasn't changed.
 ///
+/// `sidecar_anchor` is the path of the *final* artifact that survives
+/// the caller's pipeline — the sidecar lives at
+/// `<sidecar_anchor>.fetch.json`. For pipelines that do nothing post-
+/// download (raw initrd), `sidecar_anchor == dest_path`. For
+/// pipelines that decompress / unzip / convert (image .ext4, kernel
+/// `Image`, ramdisk .gz/.xz), pass the path the surviving artifact
+/// will end up at — the cache check on the next call looks at that
+/// file's existence + the sidecar, not the long-gone download
+/// intermediate. See #26.
+///
 /// Behavior:
 /// - If `force` is true, the cache check is bypassed and we always
 ///   download.
-/// - Else, if the destination file is missing OR the sidecar is
+/// - Else, if the anchor file is missing OR its sidecar is
 ///   missing/invalid, we download.
 /// - Else, run `wget --spider` to fetch the upstream's ETag /
 ///   Last-Modified. If either field matches the sidecar, skip the
-///   download and return the existing path.
-/// - After any successful download, refresh the sidecar with the
-///   current upstream metadata so the next call has something to
-///   compare against.
-pub fn download_to_cached(url: &str, dest_path: &Path, force: bool) -> Result<PathBuf, String> {
-    if !force && cache_hit(url, dest_path) {
+///   download and return the existing `dest_path`.
+/// - After any successful download, refresh the sidecar (anchored at
+///   `sidecar_anchor`) with the current upstream metadata so the
+///   next call has something to compare against.
+pub fn download_to_cached(
+    url: &str,
+    dest_path: &Path,
+    sidecar_anchor: &Path,
+    force: bool,
+) -> Result<PathBuf, String> {
+    if !force && cache_hit(url, sidecar_anchor) {
         eprintln!("  Skipping download — upstream unchanged ({})", url);
         return Ok(dest_path.to_path_buf());
     }
@@ -93,23 +108,23 @@ pub fn download_to_cached(url: &str, dest_path: &Path, force: bool) -> Result<Pa
     // download since we already have the file. Worst case: next call
     // sees a stale sidecar and re-downloads.
     if let Ok(meta) = head_metadata(url) {
-        let _ = write_sidecar(dest_path, &meta);
+        let _ = write_sidecar(sidecar_anchor, &meta);
     } else {
         // If HEAD failed but the body succeeded, drop any pre-existing
         // sidecar so we don't keep a stale match around.
-        let _ = fs::remove_file(sidecar_path(dest_path));
+        let _ = fs::remove_file(sidecar_path(sidecar_anchor));
     }
     Ok(dest_path.to_path_buf())
 }
 
-/// True iff the dest file exists, the sidecar exists with valid
-/// metadata, and a HEAD against `url` shows a matching ETag or
-/// Last-Modified.
-fn cache_hit(url: &str, dest_path: &Path) -> bool {
-    if !dest_path.exists() {
+/// True iff the anchor file exists, the sidecar at
+/// `<anchor>.fetch.json` exists and parses, and a HEAD against `url`
+/// shows a matching ETag or Last-Modified.
+fn cache_hit(url: &str, anchor: &Path) -> bool {
+    if !anchor.exists() {
         return false;
     }
-    let sidecar = match read_sidecar(dest_path) {
+    let sidecar = match read_sidecar(anchor) {
         Some(m) => m,
         None => return false,
     };
@@ -435,5 +450,56 @@ HTTP request sent, awaiting response...
         write_sidecar(&dest, &original).unwrap();
         let parsed = read_sidecar(&dest).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    // ---- cache_hit (anchor semantics, #26) ----
+
+    #[test]
+    fn cache_hit_false_when_anchor_does_not_exist() {
+        // The download intermediate's existence shouldn't matter —
+        // cache_hit checks the anchor file. With no anchor file
+        // present, cache is a miss regardless of what's in the
+        // sidecar. (We can't actually run the network HEAD here,
+        // but the function short-circuits on the anchor.exists()
+        // check before any wget, so this exercises that path.)
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("rootfs.ext4");
+        // Sidecar exists but anchor doesn't. (Simulates the bug
+        // pre-#26 would have hit if we were anchoring on the
+        // intermediate.)
+        let meta = FetchMetadata {
+            etag: Some("\"abc123\"".to_string()),
+            last_modified: None,
+        };
+        write_sidecar(&anchor, &meta).unwrap();
+        // Sanity: sidecar IS present.
+        assert!(read_sidecar(&anchor).is_some());
+        // But anchor file is missing.
+        assert!(!anchor.exists());
+        // cache_hit must be false: nothing for the operator to use.
+        assert!(!cache_hit("http://nowhere.invalid/x", &anchor));
+    }
+
+    #[test]
+    fn sidecar_lives_at_anchor_not_at_dest() {
+        // When dest_path and sidecar_anchor differ, the sidecar must
+        // be written next to the anchor — so a pipeline that consumes
+        // dest (gunzip, unzip, xz -d) leaves the sidecar adjacent to
+        // the *surviving* artifact. Rebuilds of pre-#26 behavior
+        // would write the sidecar next to dest and orphan it.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("rootfs.ext4.xz");
+        let anchor = dir.path().join("rootfs.ext4");
+        let meta = FetchMetadata {
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+        };
+        write_sidecar(&anchor, &meta).unwrap();
+        // Sidecar exists at <anchor>.fetch.json, not <dest>.fetch.json.
+        assert!(sidecar_path(&anchor).exists());
+        assert!(!sidecar_path(&dest).exists());
+        // And it round-trips back via the anchor.
+        assert_eq!(read_sidecar(&anchor).unwrap(), meta);
+        assert!(read_sidecar(&dest).is_none());
     }
 }

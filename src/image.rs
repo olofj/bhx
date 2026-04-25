@@ -211,8 +211,17 @@ pub fn pull_image(
     eprintln!("  {}", image.description);
     eprintln!("  URL: {}", image.url);
 
-    // Step 1: Download
-    let download_path = download_file(image.url, &dir, image.compression, force_refetch)?;
+    // Step 1: Download. Anchor the sidecar at `final_path` (the
+    // .ext4 that survives the convert step) so the cache check
+    // works on a re-pull when the download intermediate is gone.
+    // See #26.
+    let download_path = download_file(
+        image.url,
+        &dir,
+        image.compression,
+        &final_path,
+        force_refetch,
+    )?;
 
     // Step 2: Convert to ext4 if needed
     let ext4_path = convert_to_ext4(&download_path, image.format, &final_path)?;
@@ -252,12 +261,13 @@ fn download_file(
     url: &str,
     dir: &Path,
     compression: Compression,
+    sidecar_anchor: &Path,
     force_refetch: bool,
 ) -> Result<PathBuf, String> {
     let filename = url.rsplit('/').next().unwrap_or("download");
     let download_path = dir.join(filename);
 
-    crate::fetch::download_to_cached(url, &download_path, force_refetch)?;
+    crate::fetch::download_to_cached(url, &download_path, sidecar_anchor, force_refetch)?;
 
     match compression {
         Compression::None => Ok(download_path),
