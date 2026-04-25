@@ -7,9 +7,6 @@
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 
-#[allow(dead_code)]
-pub const FDT_ERR_NOTFOUND: c_int = 1;
-
 extern "C" {
     pub fn fdt_open_into(fdt: *const c_void, buf: *mut c_void, bufsize: c_int) -> c_int;
     pub fn fdt_pack(fdt: *mut c_void) -> c_int;
