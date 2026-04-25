@@ -76,18 +76,22 @@ pub fn boot_l2cpu(
     rootfs_path: Option<&Path>,
     rootfs_addr: u64,
 ) -> std::io::Result<()> {
+    use crate::regs::l2cpu as regs_l2cpu;
+
     let l2cpu_idx = l2cpu.idx();
     let tile = L2CPU_TILES[l2cpu_idx];
-    let l2cpu_base: u64 = 0xfffff7fefff10000;
     eprintln!(
-        "[boot_l2cpu] L2CPU {} -> tile ({}, {}), l2cpu_base=0x{:x}",
-        l2cpu_idx, tile.x, tile.y, l2cpu_base
+        "[boot_l2cpu] L2CPU {} -> tile ({}, {}), control_base=0x{:x}",
+        l2cpu_idx, tile.x, tile.y, regs_l2cpu::CONTROL_BASE
     );
 
-    let l3_reg_base: u64 = 0x02010000;
-    eprintln!("[boot_l2cpu] enabling L3 cache at 0x{:x}+8", l3_reg_base);
-    l2cpu.write32(l3_reg_base + 8, 0x0f);
-    let l3_readback = l2cpu.read32(l3_reg_base + 8);
+    eprintln!(
+        "[boot_l2cpu] enabling L3 cache at 0x{:x}+{}",
+        regs_l2cpu::L3_CTRL_BASE, regs_l2cpu::L3_ENABLE_OFFSET
+    );
+    let l3_enable_addr = regs_l2cpu::L3_CTRL_BASE + regs_l2cpu::L3_ENABLE_OFFSET;
+    l2cpu.write32(l3_enable_addr, regs_l2cpu::L3_ENABLE_VALUE);
+    let l3_readback = l2cpu.read32(l3_enable_addr);
     eprintln!("[boot_l2cpu]   L3 readback: {:#x}", l3_readback);
 
     let opensbi_bytes = read_bin_file(opensbi_path)?;
@@ -134,15 +138,15 @@ pub fn boot_l2cpu(
         l2cpu_noc_write_bulk(l2cpu, rootfs_addr, &rootfs_bytes)?;
     }
 
-    let reset_vector_0 = (opensbi_addr & 0xffffffff) as u32;
+    let reset_vector_0 = (opensbi_addr & 0xffff_ffff) as u32;
     let reset_vector_1 = (opensbi_addr >> 32) as u32;
     eprintln!(
         "[boot_l2cpu] Setting reset vectors for 4 cores: lo={:#x}, hi={:#x}",
         reset_vector_0, reset_vector_1
     );
     for core in 0..4u64 {
-        l2cpu.write32(l2cpu_base + core * 8, reset_vector_0);
-        l2cpu.write32(l2cpu_base + core * 8 + 4, reset_vector_1);
+        l2cpu.write32(regs_l2cpu::CONTROL_BASE + core * 8, reset_vector_0);
+        l2cpu.write32(regs_l2cpu::CONTROL_BASE + core * 8 + 4, reset_vector_1);
     }
     eprintln!("[boot_l2cpu] L2CPU {} image + vectors loaded", l2cpu_idx);
 
@@ -151,16 +155,18 @@ pub fn boot_l2cpu(
 
 /// Configure L2 prefetchers for a booted L2CPU.
 pub fn configure_prefetchers(l2cpu: &L2Cpu) {
+    use crate::regs::l2cpu as regs_l2cpu;
+
     let l2cpu_idx = l2cpu.idx();
     let tile = L2CPU_TILES[l2cpu_idx];
-    let l2_prefetch_base: u64 = 0x02030000;
     eprintln!(
         "[configure_prefetchers] L2CPU {} tile ({}, {}) base=0x{:x}",
-        l2cpu_idx, tile.x, tile.y, l2_prefetch_base
+        l2cpu_idx, tile.x, tile.y, regs_l2cpu::L2_PREFETCH_BASE
     );
-    for offset in &[0x0000u64, 0x2000, 0x4000, 0x6000] {
-        l2cpu.write32(l2_prefetch_base + offset, 0x15811);
-        l2cpu.write32(l2_prefetch_base + offset + 4, 0x38c84e);
+    for i in 0..regs_l2cpu::L2_PREFETCH_NUM {
+        let base = regs_l2cpu::L2_PREFETCH_BASE + i * regs_l2cpu::L2_PREFETCH_STRIDE;
+        l2cpu.write32(base, regs_l2cpu::L2_PREFETCH_CFG_LO);
+        l2cpu.write32(base + 4, regs_l2cpu::L2_PREFETCH_CFG_HI);
     }
     eprintln!("[configure_prefetchers] done");
 }
@@ -245,9 +251,10 @@ pub fn modify_dtb(
     };
     let virtio_reserved = fdt.add_subnode(reserved, "memory@4000afa00000")?;
     let reserved_reg = {
+        use crate::regs::virtio_mmio::RESERVED_SIZE;
         let mut buf = Vec::with_capacity(16);
-        buf.extend_from_slice(&(mem_end - 0x600000).to_be_bytes());
-        buf.extend_from_slice(&0x600000u64.to_be_bytes());
+        buf.extend_from_slice(&(mem_end - RESERVED_SIZE).to_be_bytes());
+        buf.extend_from_slice(&RESERVED_SIZE.to_be_bytes());
         buf
     };
     fdt.setprop(virtio_reserved, "reg", &reserved_reg)?;
@@ -269,22 +276,27 @@ pub fn modify_dtb(
         eprintln!("[modify_dtb]   PLIC phandle = {}", plic_phandle);
     }
 
-    for i in (0..4u64).rev() {
-        let virtio_addr = mem_end - 0x200000 * (i + 1);
-        let virtio_irq = 33 - i as u32;
-        let name = format!("virtio@{:x}", virtio_addr);
-        eprintln!(
-            "[modify_dtb]   adding {} irq={} parent={}",
-            name, virtio_irq, plic_phandle
-        );
-        let node = fdt.add_subnode(soc, &name)?;
-        fdt.setprop_string(node, "compatible", "virtio,mmio")?;
-        let mut reg = Vec::with_capacity(16);
-        reg.extend_from_slice(&virtio_addr.to_be_bytes());
-        reg.extend_from_slice(&0x200000u64.to_be_bytes());
-        fdt.setprop(node, "reg", &reg)?;
-        fdt.setprop_u32(node, "interrupts", virtio_irq)?;
-        fdt.setprop_u32(node, "interrupt-parent", plic_phandle)?;
+    {
+        use crate::regs::virtio_mmio::{DISK_IRQ, MMIO_SLOT_SIZE};
+        for i in (0..4u64).rev() {
+            let virtio_addr = mem_end - MMIO_SLOT_SIZE * (i + 1);
+            // Slot 0 (lowest in the reservation) has the largest IRQ
+            // (DISK_IRQ); the four slots descend by IRQ number.
+            let virtio_irq = DISK_IRQ - i as u32;
+            let name = format!("virtio@{:x}", virtio_addr);
+            eprintln!(
+                "[modify_dtb]   adding {} irq={} parent={}",
+                name, virtio_irq, plic_phandle
+            );
+            let node = fdt.add_subnode(soc, &name)?;
+            fdt.setprop_string(node, "compatible", "virtio,mmio")?;
+            let mut reg = Vec::with_capacity(16);
+            reg.extend_from_slice(&virtio_addr.to_be_bytes());
+            reg.extend_from_slice(&MMIO_SLOT_SIZE.to_be_bytes());
+            fdt.setprop(node, "reg", &reg)?;
+            fdt.setprop_u32(node, "interrupts", virtio_irq)?;
+            fdt.setprop_u32(node, "interrupt-parent", plic_phandle)?;
+        }
     }
 
     let packed = fdt.pack()?;

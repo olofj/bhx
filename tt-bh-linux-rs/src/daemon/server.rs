@@ -34,11 +34,11 @@ use crate::virtio::interrupt::InterruptController;
 #[cfg(feature = "slirp")]
 use crate::virtio::network;
 
-/// Virtio MMIO offsets and interrupt numbers (match `run_connect`).
-const DISK_INT: u32 = 33;
-const DISK_MMIO: u64 = 2 * 1024 * 1024;
-const NET_INT: u32 = 32;
-const NET_MMIO: u64 = 4 * 1024 * 1024;
+// VirtIO MMIO offsets and interrupt numbers come from `crate::regs::virtio_mmio`;
+// re-export under the legacy short names so the dispatch code reads cleanly.
+use crate::regs::virtio_mmio::{DISK_IRQ as DISK_INT, DISK_OFFSET as DISK_MMIO};
+#[cfg(feature = "slirp")]
+use crate::regs::virtio_mmio::{NET_IRQ as NET_INT, NET_OFFSET as NET_MMIO};
 
 /// Run the daemon accept loop foreground-style. Returns on SIGTERM / SIGINT
 /// once the shutdown flag has been tripped. Caller is responsible for
@@ -499,19 +499,16 @@ fn run_boot_sequence(
     root_device: &str,
     force_reset_pcie: bool,
 ) -> io::Result<Arc<L2Cpu>> {
+    use crate::regs::boot_image;
+
     let card = state.card;
     let starting_address = crate::l2cpu::L2CPU_STARTING_ADDRESS[l2cpu_idx as usize];
     let memory_size = crate::l2cpu::L2CPU_MEMORY_SIZE[l2cpu_idx as usize];
 
-    let opensbi_offset: u64 = 0x0;
-    let kernel_offset: u64 = 0x200000;
-    let dtb_offset: u64 = 0x100000;
-    let initramfs_offset: u64 = 0xb5000000;
-
-    let opensbi_addr = starting_address + opensbi_offset;
-    let kernel_addr = starting_address + kernel_offset;
-    let dtb_addr = starting_address + dtb_offset;
-    let rootfs_addr = starting_address + initramfs_offset;
+    let opensbi_addr = starting_address + boot_image::OPENSBI_OFFSET;
+    let kernel_addr = starting_address + boot_image::KERNEL_OFFSET;
+    let dtb_addr = starting_address + boot_image::DTB_OFFSET;
+    let rootfs_addr = starting_address + boot_image::INITRAMFS_OFFSET;
 
     // Pre-reset state check goes through the daemon's SharedChip — one
     // persistent TLB to tile (8,0) for all L2CPUs, so this read can't race
@@ -616,7 +613,7 @@ fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlo
         l2cpu_idx
     );
     let interrupt = {
-        let window = l2cpu.get_persistent_2m_window(0x2FF10000 + 0x404)?;
+        let window = l2cpu.get_persistent_2m_window(crate::regs::plic::PENDING_ADDR)?;
         Arc::new(InterruptController::new(window))
     };
     let hub = Arc::new(ConsoleHub::new());

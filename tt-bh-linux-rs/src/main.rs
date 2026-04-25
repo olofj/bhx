@@ -19,6 +19,7 @@ mod kernel;
 mod kmd;
 mod l2cpu;
 mod ramdisk;
+mod regs;
 mod shared_chip;
 #[cfg(feature = "slirp")]
 mod slirp_ffi;
