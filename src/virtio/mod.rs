@@ -120,7 +120,18 @@ struct MmioRegs {
     sel_generation: *mut u32,
 }
 
-// MmioRegs contains raw pointers to device-mapped memory regions
+// SAFETY: `MmioRegs` is a bag of `*mut u32` pointers into the persistent
+// 2 MiB MMIO TLB window owned by the calling worker's `Arc<L2Cpu>`. The
+// pointers are valid for the lifetime of `run_device` because:
+//   1. `run_device` keeps the originating window alive via the `L2Cpu`
+//      it borrows from the worker thread.
+//   2. Each worker thread owns its own `MmioRegs` (constructed inside
+//      `run_device`); we only need `Send` so the struct can move into
+//      the spawned thread, not `Sync` for cross-thread sharing.
+// We do NOT mark `Sync` — concurrent access from multiple threads
+// would race on the volatile MMIO without our handshake's
+// `sel_generation` discipline; keeping `Send`-only enforces that
+// assumption at the type level.
 unsafe impl Send for MmioRegs {}
 
 impl MmioRegs {
@@ -262,7 +273,19 @@ pub fn run_device(
 
     let num_queues = device.num_queues();
     let mem_end = starting_address + l2cpu.memory_size();
-    let in_range = |addr: u64| addr >= starting_address && addr < mem_end;
+    // Range check used by both warm-restart probing (below) and the
+    // queue-pointer validation later. Takes a `size` so a stash address
+    // near `mem_end` doesn't pass for a ring whose extent runs off the
+    // end of mapped DRAM.
+    let in_range_size = |addr: u64, size: u64| -> bool {
+        if addr < starting_address {
+            return false;
+        }
+        match addr.checked_add(size) {
+            Some(end) => end <= mem_end,
+            None => false,
+        }
+    };
 
     // Warm-restart detection: if the MMIO region already has our magic and a
     // full set of stashed queue addresses from a prior successful handshake,
@@ -287,6 +310,11 @@ pub fn run_device(
         let mut used = vec![0u64; num_queues as usize];
         let mut stash_all_valid = true;
         let mut stash_all_zero = true;
+        // Match the sizes in the queue-pointer validation below.
+        let queue_size = QUEUE_SIZE as u64;
+        let desc_bytes = queue_size * std::mem::size_of::<VringDesc>() as u64;
+        let avail_bytes = 4 + queue_size * std::mem::size_of::<u16>() as u64;
+        let used_bytes = 4 + queue_size * std::mem::size_of::<VringUsedElem>() as u64;
         for i in 0..num_queues as usize {
             let base = mmio_base.add(STASH_OFFSET + i * STASH_PER_QUEUE);
             desc[i] = ptr::read_volatile(base as *const u64);
@@ -295,7 +323,10 @@ pub fn run_device(
             if desc[i] != 0 || avail[i] != 0 || used[i] != 0 {
                 stash_all_zero = false;
             }
-            if !in_range(desc[i]) || !in_range(avail[i]) || !in_range(used[i]) {
+            if !in_range_size(desc[i], desc_bytes)
+                || !in_range_size(avail[i], avail_bytes)
+                || !in_range_size(used[i], used_bytes)
+            {
                 stash_all_valid = false;
             }
         }
@@ -520,26 +551,55 @@ pub fn run_device(
     let mut used_ptrs: Vec<*mut VringUsed> = Vec::new();
 
     // Validate and compute pointers to virtqueue structures in L2CPU memory.
-    // Addresses must fall within the L2CPU's memory region.
-    let validate_addr = |addr: u64, label: &str, qi: usize| -> usize {
-        if addr < starting_address || addr >= mem_end {
+    // Both the start address AND the full ring extent must lie inside the
+    // mapped DRAM window. Without the size check, a guest could place a
+    // ring at `mem_end - 8` and the daemon would walk descriptor entries
+    // past the end of valid memory (security finding from #17).
+    let validate_addr = |addr: u64, size: u64, label: &str, qi: usize| -> usize {
+        if addr < starting_address {
             panic!(
-                "virtqueue {} address {:#x} for queue {} is outside L2CPU memory [{:#x}, {:#x})",
-                label, addr, qi, starting_address, mem_end
+                "virtqueue {} address {:#x} for queue {} below L2CPU memory start {:#x}",
+                label, addr, qi, starting_address
+            );
+        }
+        let end = addr.saturating_add(size);
+        if end > mem_end {
+            panic!(
+                "virtqueue {} for queue {} extends past L2CPU memory: addr={:#x} size={:#x} mem_end={:#x}",
+                label, qi, addr, size, mem_end
             );
         }
         (addr - starting_address) as usize
     };
 
+    // Per the virtio spec (no EVENT_IDX negotiated):
+    //   desc table: QUEUE_SIZE × 16-byte VringDesc
+    //   avail ring: 2-byte flags + 2-byte idx + QUEUE_SIZE × 2-byte ring entry
+    //   used ring : 2-byte flags + 2-byte idx + QUEUE_SIZE × 8-byte VringUsedElem
+    let queue_size = QUEUE_SIZE as u64;
+    let desc_bytes = queue_size * std::mem::size_of::<VringDesc>() as u64;
+    let avail_bytes = 4 + queue_size * std::mem::size_of::<u16>() as u64;
+    let used_bytes = 4 + queue_size * std::mem::size_of::<VringUsedElem>() as u64;
+
     for i in 0..num_queues as usize {
         desc_ptrs.push(unsafe {
-            memory.add(validate_addr(descriptor_table_address[i], "desc", i)) as *mut VringDesc
+            memory.add(validate_addr(
+                descriptor_table_address[i],
+                desc_bytes,
+                "desc",
+                i,
+            )) as *mut VringDesc
         });
         avail_ptrs.push(unsafe {
-            memory.add(validate_addr(available_ring_address[i], "avail", i)) as *mut VringAvail
+            memory.add(validate_addr(
+                available_ring_address[i],
+                avail_bytes,
+                "avail",
+                i,
+            )) as *mut VringAvail
         });
         used_ptrs.push(unsafe {
-            memory.add(validate_addr(used_ring_address[i], "used", i)) as *mut VringUsed
+            memory.add(validate_addr(used_ring_address[i], used_bytes, "used", i)) as *mut VringUsed
         });
     }
 

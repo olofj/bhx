@@ -55,8 +55,15 @@ unsafe impl Send for VirtioNet {}
 impl Drop for VirtioNet {
     fn drop(&mut self) {
         if !self.slirp.is_null() {
-            unsafe {
-                vdeslirp_close(self.slirp);
+            // libvdeslirp returns non-zero on internal teardown errors
+            // (e.g., a NAT-table free that hits an unexpected state).
+            // The instance is gone either way, but a non-zero return
+            // can foreshadow EADDRINUSE on the next add-net for the
+            // same forward port — log it so the operator has a paper
+            // trail when add-net later fails.
+            let rc = unsafe { vdeslirp_close(self.slirp) };
+            if rc != 0 {
+                eprintln!("vdeslirp_close returned {}", rc);
             }
         }
     }

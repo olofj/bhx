@@ -332,13 +332,21 @@ fn decide_boot_slot(slot_present: bool, force: bool, l2cpu_idx: u8) -> BootSlotD
     }
 }
 
-/// Pre-flight check for `dispatch_add_disk`. Catching the bad path
-/// here (instead of letting the worker spawn and crash) avoids a
-/// stuck-slot state where `slot.disks` is non-empty with a dead worker
-/// handle and subsequent `add-disk` calls fail with "a disk is already
-/// attached". The `disks_empty` argument is the
-/// `slot.disks.is_empty()` reading taken under the slot mutex.
-fn validate_add_disk_request(disks_empty: bool, path: &std::path::Path) -> Result<(), String> {
+/// Pre-flight check for `dispatch_add_disk`. Returns the opened File on
+/// success so the caller can hand the *same* fd to the worker — a bare
+/// path-then-reopen would leave a TOCTOU window where a symlink swap
+/// between dispatch and the worker's first VirtioBlk::new could redirect
+/// the daemon at a different inode (security finding from #17).
+///
+/// Catching the bad path here also avoids a stuck-slot state where
+/// `slot.disks` is non-empty with a dead worker handle and subsequent
+/// `add-disk` calls fail with "a disk is already attached". The
+/// `disks_empty` argument is the `slot.disks.is_empty()` reading taken
+/// under the slot mutex.
+fn validate_add_disk_request(
+    disks_empty: bool,
+    path: &std::path::Path,
+) -> Result<std::fs::File, String> {
     if !disks_empty {
         // Phase A: one disk per L2CPU. Phase B+: multi-disk with indexed MMIO.
         return Err("a disk is already attached".to_string());
@@ -347,8 +355,7 @@ fn validate_add_disk_request(disks_empty: bool, path: &std::path::Path) -> Resul
         .read(true)
         .write(true)
         .open(path)
-        .map_err(|e| format!("cannot open disk image {}: {}", path.display(), e))?;
-    Ok(())
+        .map_err(|e| format!("cannot open disk image {}: {}", path.display(), e))
 }
 
 /// Pre-flight check for `dispatch_remove_disk`. The slot-not-booted
@@ -536,7 +543,23 @@ fn start_initial_workers(
             l2cpu_idx,
             path
         );
-        start_disk_worker(slot, &path).map_err(|e| {
+        // Open the disk image at the trust boundary so the worker
+        // operates on the exact inode we vetted, immune to symlink
+        // swaps between dispatch and the worker's mmap call.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| {
+                dlog!(
+                    "[boot l2cpu {}] open disk image {} failed: {}",
+                    l2cpu_idx,
+                    path,
+                    e
+                );
+                format!("cannot open disk image {}: {}", path, e)
+            })?;
+        start_disk_worker(slot, &path, file).map_err(|e| {
             dlog!("[boot l2cpu {}] start_disk_worker failed: {}", l2cpu_idx, e);
             format!("start disk worker failed: {}", e)
         })?;
@@ -570,7 +593,15 @@ fn install_slot_and_reply_ok(
     reply_ok(sock);
 }
 
-fn start_disk_worker(slot: &mut L2CpuSlot, path: &str) -> io::Result<()> {
+/// Spawn the disk worker. `disk_image` is an already-open File for the
+/// image — caller (typically `validate_add_disk_request`) opened it
+/// once at the trust boundary and we hand the same handle to the
+/// worker, defending against a path-resolved-twice TOCTOU.
+fn start_disk_worker(
+    slot: &mut L2CpuSlot,
+    path: &str,
+    disk_image: std::fs::File,
+) -> io::Result<()> {
     let exit = Arc::new(AtomicBool::new(false));
     let l2cpu = slot.l2cpu.clone();
     let interrupt = slot.interrupt.clone();
@@ -583,6 +614,7 @@ fn start_disk_worker(slot: &mut L2CpuSlot, path: &str) -> io::Result<()> {
             DISK_INT,
             DISK_MMIO,
             path_thread,
+            disk_image,
             exit_thread,
         );
     });
@@ -917,10 +949,14 @@ fn dispatch_add_disk(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8,
             return;
         }
     };
-    if let Err(e) = validate_add_disk_request(slot.disks.is_empty(), std::path::Path::new(&path)) {
-        reply_err(sock, e);
-        return;
-    }
+    let disk_image =
+        match validate_add_disk_request(slot.disks.is_empty(), std::path::Path::new(&path)) {
+            Ok(file) => file,
+            Err(e) => {
+                reply_err(sock, e);
+                return;
+            }
+        };
 
     let exit = Arc::new(AtomicBool::new(false));
     let l2cpu = slot.l2cpu.clone();
@@ -934,6 +970,7 @@ fn dispatch_add_disk(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8,
             DISK_INT,
             DISK_MMIO,
             path_thread,
+            disk_image,
             exit_thread,
         );
     });
@@ -1208,7 +1245,11 @@ mod tests {
         let mut tf = tempfile::NamedTempFile::new().unwrap();
         // Disk image needs to be writable too (worker opens with read+write).
         tf.write_all(&[0u8; 4096]).unwrap();
-        validate_add_disk_request(true, tf.path()).expect("valid path on empty slot must accept");
+        // Returns the open File on success — the caller hands the same
+        // fd to the worker so a path-resolved-twice TOCTOU can't redirect
+        // the daemon at a different inode after this point.
+        let _file = validate_add_disk_request(true, tf.path())
+            .expect("valid path on empty slot must accept");
     }
 
     // ---- validate_remove_disk_request ----

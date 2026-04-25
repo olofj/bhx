@@ -75,6 +75,17 @@ pub fn boot_l2cpu(
     use crate::regs::l2cpu as regs_l2cpu;
 
     let l2cpu_idx = l2cpu.idx();
+    // Defensive: every caller today is the daemon, which has already
+    // gone through `validate_l2cpu`. If a future debug subcommand
+    // routes around the daemon and passes a stale/garbage idx, the
+    // raw array index panic message would be cryptic. Catch it here
+    // with a useful one.
+    assert!(
+        l2cpu_idx < L2CPU_TILES.len(),
+        "boot_l2cpu: l2cpu_idx {} out of range (have {} tiles)",
+        l2cpu_idx,
+        L2CPU_TILES.len()
+    );
     let tile = L2CPU_TILES[l2cpu_idx];
     eprintln!(
         "[boot_l2cpu] L2CPU {} -> tile ({}, {}), control_base=0x{:x}",
@@ -158,6 +169,12 @@ pub fn configure_prefetchers(l2cpu: &L2Cpu) {
     use crate::regs::l2cpu as regs_l2cpu;
 
     let l2cpu_idx = l2cpu.idx();
+    assert!(
+        l2cpu_idx < L2CPU_TILES.len(),
+        "configure_prefetchers: l2cpu_idx {} out of range (have {} tiles)",
+        l2cpu_idx,
+        L2CPU_TILES.len()
+    );
     let tile = L2CPU_TILES[l2cpu_idx];
     eprintln!(
         "[configure_prefetchers] L2CPU {} tile ({}, {}) base=0x{:x}",
