@@ -472,8 +472,9 @@ fn start_net_worker(card: u32, slot: &mut L2CpuSlot) -> io::Result<()> {
     let interrupt = slot.interrupt.clone();
     let exit_thread = exit.clone();
     let idx = slot.idx;
+    let ssh_port = crate::regs::slirp::ssh_port(card, idx);
     let t = thread::spawn(move || {
-        network::network_main(card, l2cpu, interrupt, NET_INT, NET_MMIO, exit_thread);
+        network::network_main(ssh_port, l2cpu, interrupt, NET_INT, NET_MMIO, exit_thread);
     });
     slot.net = Some(WorkerHandle {
         exit,
@@ -896,13 +897,14 @@ fn dispatch_add_net(
     let l2cpu = slot.l2cpu.clone();
     let interrupt = slot.interrupt.clone();
     let exit_thread = exit.clone();
-    let card = state.card;
+    let ssh_port = crate::regs::slirp::ssh_port(state.card, l2cpu_idx);
     dlog!(
-        "[add_net l2cpu {}] spawning network worker thread",
-        l2cpu_idx
+        "[add_net l2cpu {}] spawning network worker thread (ssh_port={})",
+        l2cpu_idx,
+        ssh_port
     );
     let t = thread::spawn(move || {
-        network::network_main(card, l2cpu, interrupt, NET_INT, NET_MMIO, exit_thread);
+        network::network_main(ssh_port, l2cpu, interrupt, NET_INT, NET_MMIO, exit_thread);
     });
     slot.net = Some(WorkerHandle {
         exit,
