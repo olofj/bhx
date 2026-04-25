@@ -33,6 +33,7 @@ All scripts honour:
 - `STATUS_POLL_HZ` — background status poll frequency in `soak_concurrent.sh` (default 20).
 - `TIMEOUT`        — per-step timeout for `soak_disk_io_pressure.sh` and `soak_net_teardown.sh` (default 5 s).
 - `PORT_WAIT`      — max wait for guest sshd to come up in `soak_net_teardown.sh` (default 60 s; bump for slow boots).
+- `ROOTFS`         — disk image to attach. Auto-detected: `tests/rootfs/rootfs.ext4` (the buildroot test image — preferred) → `./rootfs.ext4` (legacy `image pull debian` location). Set explicitly to override.
 
 ## Typical use
 

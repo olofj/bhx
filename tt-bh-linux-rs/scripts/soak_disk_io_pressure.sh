@@ -44,6 +44,15 @@ PIDFILE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/tt-bh-linux/${CARD}/pid"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 note() { echo "[soak] $*"; }
 
+# Resolve rootfs (ROOTFS env > buildroot > legacy ./rootfs.ext4).
+if [ -z "${ROOTFS:-}" ]; then
+    if [ -e tests/rootfs/rootfs.ext4 ]; then
+        ROOTFS=tests/rootfs/rootfs.ext4
+    elif [ -e rootfs.ext4 ]; then
+        ROOTFS=rootfs.ext4
+    fi
+fi
+
 cleanup() {
     "$BINARY" daemon stop -t "$CARD" >/dev/null 2>&1 || true
 }
@@ -51,7 +60,8 @@ trap cleanup EXIT
 
 # Sanity checks -------------------------------------------------------------
 [ -x "$BINARY" ] || fail "binary $BINARY not executable (run cargo build first)"
-[ -e rootfs.ext4 ] || fail "rootfs.ext4 not present in cwd"
+[ -n "${ROOTFS:-}" ] && [ -e "$ROOTFS" ] \
+    || fail "no rootfs available; build tests/rootfs or set ROOTFS=<path>"
 [ -e fw_jump.bin ] || fail "fw_jump.bin missing"
 [ -e Image ] || fail "Image missing"
 [ -e blackhole-card.dtb ] || fail "blackhole-card.dtb missing"
@@ -65,8 +75,8 @@ note "daemon start"
 "$BINARY" daemon start -t "$CARD" --log-file "$LOG_FILE" >/dev/null
 sleep 0.3
 
-note "cold boot L2CPU $L2CPU with disk"
-timeout 60 "$BINARY" boot -t "$CARD" -l "$L2CPU" --no-console >/dev/null
+note "cold boot L2CPU $L2CPU with disk (rootfs=$ROOTFS)"
+timeout 60 "$BINARY" boot -t "$CARD" -l "$L2CPU" -d "$ROOTFS" --no-console >/dev/null
 
 # Give the guest a moment to actually mount the rootfs and start working it.
 # Without this, "I/O pressure" is just the boot-time loader, which doesn't
@@ -74,8 +84,9 @@ timeout 60 "$BINARY" boot -t "$CARD" -l "$L2CPU" --no-console >/dev/null
 note "letting guest reach steady-state I/O (10 s warm-up)"
 sleep 10
 
+rootfs_basename=$(basename "$ROOTFS")
 status=$("$BINARY" daemon status -t "$CARD")
-echo "$status" | grep -qE "l2cpu $L2CPU: Running disk=.*rootfs.ext4" \
+echo "$status" | grep -qE "l2cpu $L2CPU: Running disk=.*$rootfs_basename" \
     || fail "post-boot status mismatch:\n$status"
 note "post-boot status OK; daemon pid $(cat "$PIDFILE")"
 
@@ -104,10 +115,10 @@ for i in $(seq 1 "$ITERATIONS"); do
         || fail "iter $i: post-remove status not 'disk=-':\n$status"
 
     # Re-attach the disk for the next iteration.
-    "$BINARY" add-disk -t "$CARD" -l "$L2CPU" rootfs.ext4 >/dev/null \
+    "$BINARY" add-disk -t "$CARD" -l "$L2CPU" "$ROOTFS" >/dev/null \
         || fail "iter $i: add-disk failed"
     status=$("$BINARY" daemon status -t "$CARD")
-    echo "$status" | grep -qE "l2cpu $L2CPU: Running disk=.*rootfs.ext4" \
+    echo "$status" | grep -qE "l2cpu $L2CPU: Running disk=.*$rootfs_basename" \
         || fail "iter $i: post-readd status mismatch:\n$status"
 
     # A short settle before the next yank. Without this, the guest hasn't

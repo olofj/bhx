@@ -56,7 +56,17 @@ cleanup() {
 trap cleanup EXIT
 
 [ -x "$BINARY" ] || fail "binary $BINARY not executable (run cargo build first)"
-[ -e rootfs.ext4 ] || fail "rootfs.ext4 not present in cwd"
+
+# Resolve rootfs (ROOTFS env > buildroot > legacy ./rootfs.ext4).
+if [ -z "${ROOTFS:-}" ]; then
+    if [ -e tests/rootfs/rootfs.ext4 ]; then
+        ROOTFS=tests/rootfs/rootfs.ext4
+    elif [ -e rootfs.ext4 ]; then
+        ROOTFS=rootfs.ext4
+    fi
+fi
+[ -n "${ROOTFS:-}" ] && [ -e "$ROOTFS" ] \
+    || fail "no rootfs available; build tests/rootfs or set ROOTFS=<path>"
 [ -e fw_jump.bin ] || fail "fw_jump.bin missing"
 [ -e Image ] || fail "Image missing"
 [ -e blackhole-card.dtb ] || fail "blackhole-card.dtb missing"
@@ -65,8 +75,8 @@ trap cleanup EXIT
 # backing file (ext4 would corrupt). Only copy missing ones.
 for i in "${CORES[@]}"; do
     if [ ! -e "rootfs-${i}.ext4" ]; then
-        note "copying rootfs.ext4 -> rootfs-${i}.ext4"
-        cp --reflink=auto rootfs.ext4 "rootfs-${i}.ext4"
+        note "copying $ROOTFS -> rootfs-${i}.ext4"
+        cp --reflink=auto "$ROOTFS" "rootfs-${i}.ext4"
     fi
 done
 
