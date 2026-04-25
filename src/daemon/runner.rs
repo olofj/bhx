@@ -28,6 +28,10 @@ pub struct StartOpts {
     /// Install seccomp + landlock filters before the accept loop. See
     /// `daemon::sandbox`.
     pub sandbox: bool,
+    /// If set, bind a Prometheus-style HTTP exporter on
+    /// `127.0.0.1:<port>` and serve `GET /metrics`. None = no exporter.
+    /// See `daemon::metrics`.
+    pub metrics_port: Option<u16>,
 }
 
 /// Resolve the caller-supplied log path against the current working dir and
@@ -78,24 +82,9 @@ pub fn start(opts: StartOpts) -> io::Result<()> {
     );
 
     if opts.foreground {
-        run_foreground(
-            card,
-            listener,
-            pid_guard,
-            &pid_path,
-            opts.sandbox,
-            &log_path,
-        )
+        run_foreground(listener, pid_guard, &pid_path, &log_path, &opts)
     } else {
-        run_daemonized(
-            card,
-            listener,
-            &sock_path,
-            &pid_path,
-            &log_path,
-            pid_guard,
-            opts.sandbox,
-        )
+        run_daemonized(listener, &sock_path, &pid_path, &log_path, pid_guard, &opts)
     }
 }
 
@@ -150,14 +139,19 @@ fn acquire_pidfile_or_already_running(
 /// is held across the serve loop and dropped on the way out so the
 /// pidfile + flock are released cleanly even on Ctrl-C.
 fn run_foreground(
-    card: u32,
     listener: UnixListener,
     pid_guard: lifetime::PidfileGuard,
     pid_path: &Path,
-    sandbox: bool,
     log_path: &Path,
+    opts: &StartOpts,
 ) -> io::Result<()> {
-    server::serve(card, listener, sandbox, log_path)?;
+    server::serve(
+        opts.card,
+        listener,
+        opts.sandbox,
+        log_path,
+        opts.metrics_port,
+    )?;
     drop(pid_guard);
     let _ = std::fs::remove_file(pid_path);
     Ok(())
@@ -176,13 +170,12 @@ fn run_foreground(
 /// scenarios we most want logs from are host machine-check crashes
 /// where tmpfs and pending page-cache writes are gone.
 fn run_daemonized(
-    card: u32,
     listener: UnixListener,
     sock_path: &Path,
     pid_path: &Path,
     log_path: &Path,
     pid_guard: lifetime::PidfileGuard,
-    sandbox: bool,
+    opts: &StartOpts,
 ) -> io::Result<()> {
     let (_abs, log_out) = open_log(&log_path.to_path_buf())?;
     let log_err = log_out.try_clone()?;
@@ -199,7 +192,7 @@ fn run_daemonized(
         Outcome::Parent => {
             eprintln!(
                 "[daemon] started for card {} (pid will be in {})",
-                card,
+                opts.card,
                 pid_path.display()
             );
             return Ok(());
@@ -210,8 +203,14 @@ fn run_daemonized(
     }
 
     // Grand-child: re-acquire pidfile and run the server loop.
-    let _pid_guard = lifetime::acquire_pidfile(card)?;
-    if let Err(e) = server::serve(card, listener, sandbox, log_path) {
+    let _pid_guard = lifetime::acquire_pidfile(opts.card)?;
+    if let Err(e) = server::serve(
+        opts.card,
+        listener,
+        opts.sandbox,
+        log_path,
+        opts.metrics_port,
+    ) {
         eprintln!("[daemon] fatal: {}", e);
     }
     let _ = std::fs::remove_file(sock_path);
@@ -228,6 +227,7 @@ pub fn restart(
     foreground: bool,
     log_file: Option<PathBuf>,
     sandbox: bool,
+    metrics_port: Option<u16>,
 ) -> io::Result<()> {
     stop(card)?;
     start(StartOpts {
@@ -235,6 +235,7 @@ pub fn restart(
         foreground,
         log_file,
         sandbox,
+        metrics_port,
     })
 }
 
