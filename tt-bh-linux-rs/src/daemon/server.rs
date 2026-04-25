@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::boot;
 use crate::daemon::chip_console;
@@ -213,6 +213,7 @@ fn warm_resume_released(state: &Arc<DaemonState>, released: &[u8]) {
             Ok(slot) => {
                 *state.l2cpus[idx as usize].lock().unwrap() = Some(slot);
                 state.wedged[idx as usize].store(false, Ordering::Relaxed);
+                crate::daemon::metrics::L2CPU_BOOT_WARM_TOTAL.at(idx).inc();
                 dlog!("[warm-resume l2cpu {}] slot adopted", idx);
             }
             Err(e) => {
@@ -269,6 +270,10 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
         }
     };
 
+    crate::daemon::metrics::DAEMON_RPC_TOTAL
+        .at(classify_request(&req))
+        .inc();
+
     match req {
         Request::Status => dispatch_status(&sock, &state),
         Request::Boot {
@@ -305,6 +310,26 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
         Request::RemoveNet { l2cpu } => dispatch_remove_net(&sock, &state, l2cpu),
         Request::Stop { l2cpu } => dispatch_stop(&sock, &state, l2cpu),
         Request::Shutdown => dispatch_shutdown(&sock, &state),
+    }
+}
+
+/// Map a wire-format `Request` to its metrics-friendly `RpcMethod` tag.
+/// Drives `tt_bh_daemon_rpc_total{method}`. Out-of-band tracking of
+/// per-method *failures* (`rpc_errors_total`) is deferred — needs each
+/// `dispatch_*` to surface success/failure cleanly, which is a larger
+/// refactor (see #31's "out of scope" note).
+fn classify_request(req: &Request) -> crate::daemon::metrics::RpcMethod {
+    use crate::daemon::metrics::RpcMethod;
+    match req {
+        Request::Status => RpcMethod::Status,
+        Request::Boot { .. } => RpcMethod::Boot,
+        Request::AttachConsole { .. } => RpcMethod::AttachConsole,
+        Request::AddDisk { .. } => RpcMethod::AddDisk,
+        Request::RemoveDisk { .. } => RpcMethod::RemoveDisk,
+        Request::AddNet { .. } => RpcMethod::AddNet,
+        Request::RemoveNet { .. } => RpcMethod::RemoveNet,
+        Request::Stop { .. } => RpcMethod::Stop,
+        Request::Shutdown => RpcMethod::Shutdown,
     }
 }
 
@@ -634,6 +659,9 @@ fn install_slot_and_reply_ok(
 ) {
     *state.l2cpus[l2cpu_idx as usize].lock().unwrap() = Some(slot);
     state.wedged[l2cpu_idx as usize].store(false, Ordering::Relaxed);
+    crate::daemon::metrics::L2CPU_BOOT_COLD_TOTAL
+        .at(l2cpu_idx)
+        .inc();
     dlog!(
         "[boot l2cpu {}] dispatch_boot complete — replying ok",
         l2cpu_idx
@@ -828,7 +856,7 @@ fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlo
         let window = l2cpu.get_persistent_2m_window(crate::regs::plic::PENDING_ADDR)?;
         Arc::new(InterruptController::new(window))
     };
-    let hub = Arc::new(ConsoleHub::new());
+    let hub = Arc::new(ConsoleHub::new(l2cpu_idx));
 
     let (input_tx, input_rx) = mpsc::channel::<u8>();
     let exit = Arc::new(AtomicBool::new(false));
@@ -857,6 +885,7 @@ fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlo
         },
         disks: Vec::new(),
         net: None,
+        started: Instant::now(),
     })
 }
 

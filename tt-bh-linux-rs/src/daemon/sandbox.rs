@@ -167,10 +167,12 @@ mod imp {
             .map_err(|e| format!("landlock restrict_self: {}", e))?;
         match status.ruleset {
             RulesetStatus::FullyEnforced => {
+                crate::daemon::metrics::DAEMON_SANDBOX_STATUS.set(2);
                 crate::dlog!("[sandbox] landlock: fully enforced");
                 Ok(())
             }
             RulesetStatus::PartiallyEnforced => {
+                crate::daemon::metrics::DAEMON_SANDBOX_STATUS.set(1);
                 crate::dlog!(
                     "[sandbox] landlock: partially enforced (kernel ABI < V3); \
                      some access types not restricted"

@@ -47,6 +47,9 @@ struct HubState {
 }
 
 pub struct ConsoleHub {
+    /// L2CPU index. Used as a label on the per-hub metric updates;
+    /// not otherwise referenced internally.
+    idx: u8,
     state: Mutex<HubState>,
 }
 
@@ -63,13 +66,14 @@ pub struct AttachResult {
 
 impl Default for ConsoleHub {
     fn default() -> Self {
-        Self::new()
+        Self::new(0)
     }
 }
 
 impl ConsoleHub {
-    pub fn new() -> Self {
+    pub fn new(idx: u8) -> Self {
         ConsoleHub {
+            idx,
             state: Mutex::new(HubState {
                 scrollback: VecDeque::with_capacity(SCROLLBACK_BYTES),
                 clients: Vec::new(),
@@ -113,6 +117,9 @@ impl ConsoleHub {
             sock,
             is_writer,
         });
+        crate::daemon::metrics::L2CPU_CONSOLE_CLIENTS
+            .at(self.idx)
+            .set(s.clients.len() as i64);
         (
             AttachResult {
                 id,
@@ -127,6 +134,9 @@ impl ConsoleHub {
     pub fn detach(&self, id: u64) {
         let mut s = self.state.lock().unwrap();
         s.clients.retain(|c| c.id != id);
+        crate::daemon::metrics::L2CPU_CONSOLE_CLIENTS
+            .at(self.idx)
+            .set(s.clients.len() as i64);
     }
 
     /// Id of the current writer, if any.
@@ -173,6 +183,11 @@ impl ConsoleHub {
                     false
                 }
             });
+        if !dropped.is_empty() {
+            crate::daemon::metrics::L2CPU_CONSOLE_CLIENTS
+                .at(self.idx)
+                .set(s.clients.len() as i64);
+        }
         dropped
     }
 
@@ -227,7 +242,7 @@ mod tests {
 
     #[test]
     fn push_fans_out_to_all_clients() {
-        let hub = ConsoleHub::new();
+        let hub = ConsoleHub::new(0);
         let (a_daemon, a_client) = pair_nonblocking();
         let (b_daemon, b_client) = pair_nonblocking();
 
@@ -248,7 +263,7 @@ mod tests {
 
     #[test]
     fn scrollback_is_bounded() {
-        let hub = ConsoleHub::new();
+        let hub = ConsoleHub::new(0);
         let chunk = vec![b'x'; SCROLLBACK_BYTES];
         hub.push_chip_output(&chunk);
         hub.push_chip_output(b"tail");
@@ -266,7 +281,7 @@ mod tests {
 
     #[test]
     fn first_rw_becomes_writer_later_rw_is_ro() {
-        let hub = ConsoleHub::new();
+        let hub = ConsoleHub::new(0);
         let (d1, _c1) = pair_nonblocking();
         let (d2, _c2) = pair_nonblocking();
 
@@ -279,7 +294,7 @@ mod tests {
 
     #[test]
     fn takeover_demotes_previous_writer() {
-        let hub = ConsoleHub::new();
+        let hub = ConsoleHub::new(0);
         let (d1, _c1) = pair_nonblocking();
         let (d2, _c2) = pair_nonblocking();
 
@@ -295,7 +310,7 @@ mod tests {
 
     #[test]
     fn detach_removes_client() {
-        let hub = ConsoleHub::new();
+        let hub = ConsoleHub::new(0);
         let (d1, _c1) = pair_nonblocking();
         let (r1, _) = hub.attach(d1, ConsoleMode::Rw);
         assert_eq!(hub.client_count(), 1);
@@ -305,7 +320,7 @@ mod tests {
 
     #[test]
     fn attach_returns_scrollback() {
-        let hub = ConsoleHub::new();
+        let hub = ConsoleHub::new(0);
         hub.push_chip_output(b"already-there");
         let (d1, _c1) = pair_nonblocking();
         let (res, replay) = hub.attach(d1, ConsoleMode::Ro);
@@ -317,7 +332,7 @@ mod tests {
     fn non_draining_client_is_dropped() {
         // Fill the socket buffer of a non-draining client until write_all
         // returns WouldBlock; hub should report it dropped and remove it.
-        let hub = ConsoleHub::new();
+        let hub = ConsoleHub::new(0);
         let (d1, _c1_never_drains) = pair_nonblocking();
         let (r1, _) = hub.attach(d1, ConsoleMode::Ro);
 

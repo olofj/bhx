@@ -68,6 +68,10 @@ pub struct L2CpuSlot {
     pub console_worker: WorkerHandle,
     pub disks: Vec<DiskWorker>,
     pub net: Option<WorkerHandle>,
+    /// Wall-clock instant the slot was installed. Drives
+    /// `tt_bh_l2cpu_uptime_seconds`. Set once at construction; never
+    /// updated.
+    pub started: Instant,
 }
 
 pub struct DiskWorker {
