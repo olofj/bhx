@@ -1,0 +1,4 @@
+# Buildroot source extract + build dir + download cache. Regenerable.
+buildroot-*/
+output/
+dl/

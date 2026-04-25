@@ -28,10 +28,21 @@ BINARY=${BINARY:-./target/debug/tt-bh-linux}
 LOG_FILE=${LOG_FILE:-./daemon-card0.log}
 CARD=${CARD:-0}
 L2CPU=${L2CPU:-0}
-DISK_PATH=${DISK_PATH:-rootfs.ext4}
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 note() { echo "[soak] $*"; }
+
+# Resolve the disk to attach. DISK_PATH explicit override > ROOTFS env >
+# buildroot test rootfs > legacy ./rootfs.ext4.
+if [ -z "${DISK_PATH:-}" ]; then
+    if [ -n "${ROOTFS:-}" ]; then
+        DISK_PATH="$ROOTFS"
+    elif [ -e tests/rootfs/rootfs.ext4 ]; then
+        DISK_PATH=tests/rootfs/rootfs.ext4
+    else
+        DISK_PATH=rootfs.ext4
+    fi
+fi
 
 cleanup() {
     "$BINARY" daemon stop -t "$CARD" >/dev/null 2>&1 || true

@@ -34,6 +34,16 @@ L2CPU=${L2CPU:-0}
 fail() { echo "FAIL: $*" >&2; exit 1; }
 note() { echo "[soak] $*"; }
 
+# Resolve the rootfs path. Priority: ROOTFS env > buildroot test rootfs >
+# ./rootfs.ext4 (the legacy `image pull debian` location).
+if [ -z "${ROOTFS:-}" ]; then
+    if [ -e tests/rootfs/rootfs.ext4 ]; then
+        ROOTFS=tests/rootfs/rootfs.ext4
+    elif [ -e rootfs.ext4 ]; then
+        ROOTFS=rootfs.ext4
+    fi
+fi
+
 cleanup() {
     "$BINARY" daemon stop -t "$CARD" >/dev/null 2>&1 || true
 }
@@ -41,7 +51,8 @@ trap cleanup EXIT
 
 # Sanity checks -------------------------------------------------------------
 [ -x "$BINARY" ] || fail "binary $BINARY not executable (run cargo build first)"
-[ -e rootfs.ext4 ] || fail "rootfs.ext4 not present in cwd (kernel pull + image pull first)"
+[ -n "${ROOTFS:-}" ] && [ -e "$ROOTFS" ] \
+    || fail "no rootfs available; build tests/rootfs or set ROOTFS=<path>"
 [ -e fw_jump.bin ] || fail "fw_jump.bin missing"
 [ -e Image ] || fail "Image missing"
 [ -e blackhole-card.dtb ] || fail "blackhole-card.dtb missing"
@@ -56,11 +67,12 @@ note "daemon start"
 "$BINARY" daemon start -t "$CARD" --log-file "$LOG_FILE" >/dev/null
 sleep 0.3
 
-note "cold boot L2CPU $L2CPU with disk+net"
-timeout 60 "$BINARY" boot -t "$CARD" -l "$L2CPU" --no-console -n >/dev/null
+note "cold boot L2CPU $L2CPU with disk+net (rootfs=$ROOTFS)"
+timeout 60 "$BINARY" boot -t "$CARD" -l "$L2CPU" -d "$ROOTFS" --no-console -n >/dev/null
 
+rootfs_basename=$(basename "$ROOTFS")
 status=$("$BINARY" daemon status -t "$CARD")
-echo "$status" | grep -qE "l2cpu $L2CPU: Running disk=.*rootfs.ext4 net=y" \
+echo "$status" | grep -qE "l2cpu $L2CPU: Running disk=.*$rootfs_basename net=y" \
     || fail "post-boot status mismatch:\n$status"
 note "post-boot status OK"
 
