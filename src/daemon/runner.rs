@@ -12,7 +12,7 @@
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::daemon::lifetime;
 use crate::daemon::server;
@@ -56,36 +56,65 @@ pub fn start(opts: StartOpts) -> io::Result<()> {
     lifetime::ensure_runtime_dir(card)?;
     let sock_path = lifetime::socket_path(card);
     let pid_path = lifetime::pidfile_path(card);
-    let default_log_path = lifetime::log_path(card);
-    // Resolve the actual log file path up front so the pre-fork "listening
-    // on …" message can report it. For explicit paths we also persist the
-    // absolute location to a sidecar so `daemon logs` can find it.
-    let (log_path, log_is_override) = match opts.log_file.as_ref() {
-        Some(p) => {
-            let (abs, _f) = open_log(p)?;
-            // Drop the test open; real open happens below for the daemonize
-            // handoff (we can't hand the daemonize crate a cloned fd without
-            // owning a fresh File, and we want to fail fast on bad paths).
-            (abs, true)
-        }
-        None => (default_log_path, false),
-    };
-    if log_is_override {
-        let sidecar = lifetime::runtime_dir(card).join("logpath");
-        let _ = std::fs::write(&sidecar, format!("{}\n", log_path.display()));
-    } else {
-        // Clear any stale sidecar from a previous override-based start.
-        let _ = std::fs::remove_file(lifetime::runtime_dir(card).join("logpath"));
-    }
 
-    // If a stale socket file exists (daemon crashed without cleanup), remove
-    // it so the bind succeeds.
+    let log_path = resolve_log_path_with_override(card, opts.log_file.as_deref())?;
+
+    // Stale socket cleanup: if the daemon crashed without removing its
+    // socket file, the new bind would fail with EADDRINUSE.
     if !lifetime::is_running(card) {
         let _ = std::fs::remove_file(&sock_path);
     }
 
-    // Acquiring the flock here also catches the "already running" case early.
-    let pid_guard = lifetime::acquire_pidfile(card).map_err(|e| {
+    let pid_guard = acquire_pidfile_or_already_running(card, &sock_path)?;
+    let listener = UnixListener::bind(&sock_path)?;
+    eprintln!(
+        "[daemon] card {} listening on {} (log: {})",
+        card,
+        sock_path.display(),
+        log_path.display()
+    );
+
+    if opts.foreground {
+        run_foreground(card, listener, pid_guard, &pid_path)
+    } else {
+        run_daemonized(card, listener, &sock_path, &pid_path, &log_path, pid_guard)
+    }
+}
+
+/// Pick the log path: either the operator's explicit `--log-file`, or
+/// the per-card default under the runtime directory. For an explicit
+/// path, persist the absolute location to a sidecar so `daemon logs`
+/// can locate it without re-parsing the original CLI args.
+fn resolve_log_path_with_override(
+    card: u32,
+    override_path: Option<&Path>,
+) -> io::Result<PathBuf> {
+    let runtime_dir = lifetime::runtime_dir(card);
+    let sidecar = runtime_dir.join("logpath");
+    match override_path {
+        Some(p) => {
+            // Test-open up front so we fail fast on bad paths before
+            // anything else touches the runtime dir; the real open for
+            // the daemonize handoff happens later via `open_log` again.
+            let (abs, _f) = open_log(&p.to_path_buf())?;
+            let _ = std::fs::write(&sidecar, format!("{}\n", abs.display()));
+            Ok(abs)
+        }
+        None => {
+            // Clear any stale sidecar from a previous override-based start.
+            let _ = std::fs::remove_file(&sidecar);
+            Ok(lifetime::log_path(card))
+        }
+    }
+}
+
+/// Acquire the pidfile flock, converting the `AlreadyExists` outcome into
+/// a user-friendly "daemon already running for card N (pid …)" message.
+fn acquire_pidfile_or_already_running(
+    card: u32,
+    sock_path: &Path,
+) -> io::Result<lifetime::PidfileGuard> {
+    lifetime::acquire_pidfile(card).map_err(|e| {
         if e.kind() == io::ErrorKind::AlreadyExists {
             let existing = lifetime::read_pid(card).ok().flatten();
             io::Error::other(format!(
@@ -97,35 +126,45 @@ pub fn start(opts: StartOpts) -> io::Result<()> {
         } else {
             e
         }
-    })?;
+    })
+}
 
-    let listener = UnixListener::bind(&sock_path)?;
-    eprintln!(
-        "[daemon] card {} listening on {} (log: {})",
-        card,
-        sock_path.display(),
-        log_path.display()
-    );
+/// Foreground mode: serve directly in this process. The pidfile guard
+/// is held across the serve loop and dropped on the way out so the
+/// pidfile + flock are released cleanly even on Ctrl-C.
+fn run_foreground(
+    card: u32,
+    listener: UnixListener,
+    pid_guard: lifetime::PidfileGuard,
+    pid_path: &Path,
+) -> io::Result<()> {
+    server::serve(card, listener)?;
+    drop(pid_guard);
+    let _ = std::fs::remove_file(pid_path);
+    Ok(())
+}
 
-    if opts.foreground {
-        server::serve(card, listener)?;
-        drop(pid_guard);
-        let _ = std::fs::remove_file(&pid_path);
-        return Ok(());
-    }
-
-    // Background mode: daemonize, then serve. We close our side of the
-    // listener inherit path by dropping `pid_guard` and `listener` after the
-    // fork — the child inherits both fds through the double-fork.
-    // The `daemonize` crate does fork + setsid + fork + chdir + umask + stdio
-    // redirect. We skip its pid_file machinery so our own pidfile semantics
-    // (flock + stale-recovery) stay authoritative.
-    //
-    // Opened with O_DSYNC via `open_log` so each stderr line is durably on
-    // disk before the write() returns. Matters because the scenarios we
-    // most want logs from are host machine-check crashes where tmpfs and
-    // pending page-cache writes are gone.
-    let (_abs, log_out) = open_log(&log_path)?;
+/// Background mode: double-fork via the `daemonize` crate, then serve
+/// in the grand-child. Parent returns after the fork; the grand-child
+/// re-acquires the pidfile flock and runs `serve` to completion.
+///
+/// We use `daemonize` for the fork + setsid + fork + chdir + umask +
+/// stdio redirect, but skip its pid_file machinery so our own pidfile
+/// semantics (flock + stale-recovery) stay authoritative.
+///
+/// The log fd is opened with O_DSYNC via `open_log` so each stderr line
+/// is durably on disk before the write() returns. Matters because the
+/// scenarios we most want logs from are host machine-check crashes
+/// where tmpfs and pending page-cache writes are gone.
+fn run_daemonized(
+    card: u32,
+    listener: UnixListener,
+    sock_path: &Path,
+    pid_path: &Path,
+    log_path: &Path,
+    pid_guard: lifetime::PidfileGuard,
+) -> io::Result<()> {
+    let (_abs, log_out) = open_log(&log_path.to_path_buf())?;
     let log_err = log_out.try_clone()?;
 
     // Drop pid_guard BEFORE daemonize: the daemonize crate forks, and the
@@ -158,14 +197,13 @@ pub fn start(opts: StartOpts) -> io::Result<()> {
         }
     }
 
-    // We are now the grand-child; parent has returned from this function.
-    // Re-acquire pidfile and run the server loop.
+    // Grand-child: re-acquire pidfile and run the server loop.
     let _pid_guard = lifetime::acquire_pidfile(card)?;
     if let Err(e) = server::serve(card, listener) {
         eprintln!("[daemon] fatal: {}", e);
     }
-    let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_file(&pid_path);
+    let _ = std::fs::remove_file(sock_path);
+    let _ = std::fs::remove_file(pid_path);
     std::process::exit(0);
 }
 
