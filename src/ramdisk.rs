@@ -66,7 +66,11 @@ fn ramdisk_dir() -> PathBuf {
 }
 
 /// Pull a ramdisk/initramfs.
-pub fn pull_ramdisk(name: &str, output: Option<&Path>) -> Result<PathBuf, String> {
+pub fn pull_ramdisk(
+    name: &str,
+    output: Option<&Path>,
+    force_refetch: bool,
+) -> Result<PathBuf, String> {
     let ramdisk = find_ramdisk(name).ok_or_else(|| {
         let available: Vec<_> = KNOWN_RAMDISKS.iter().map(|r| r.name).collect();
         format!(
@@ -83,9 +87,9 @@ pub fn pull_ramdisk(name: &str, output: Option<&Path>) -> Result<PathBuf, String
         .map(PathBuf::from)
         .unwrap_or_else(|| dir.join(format!("{}.initrd", ramdisk.name)));
 
-    if output_path.exists() {
+    if output_path.exists() && !force_refetch {
         eprintln!("Ramdisk already exists: {}", output_path.display());
-        eprintln!("Delete it first if you want to re-download.");
+        eprintln!("Delete it first or pass --refetch if you want to re-download.");
         return Ok(output_path);
     }
 
@@ -108,7 +112,7 @@ pub fn pull_ramdisk(name: &str, output: Option<&Path>) -> Result<PathBuf, String
         }
     };
 
-    crate::fetch::download_to(ramdisk.url, &download_path)?;
+    crate::fetch::download_to_cached(ramdisk.url, &download_path, force_refetch)?;
 
     // Decompress if needed
     match ramdisk.compression {
@@ -164,8 +168,8 @@ pub fn cmd_list() {
 }
 
 /// Pull a ramdisk.
-pub fn cmd_pull(name: &str, output: Option<&str>) {
-    match pull_ramdisk(name, output.map(Path::new)) {
+pub fn cmd_pull(name: &str, output: Option<&str>, force_refetch: bool) {
+    match pull_ramdisk(name, output.map(Path::new), force_refetch) {
         Ok(path) => {
             println!("{}", path.display());
         }

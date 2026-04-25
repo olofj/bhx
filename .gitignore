@@ -9,6 +9,11 @@
 # Disk images (rootfs.ext4, images/*.ext4).
 *.ext4
 /images/
+/ramdisks/
+
+# fetch::download_to_cached sidecars next to downloaded artifacts.
+*.fetch.json
+*.fetch.json.tmp
 
 # Daemon runtime output when --log-file points into the repo.
 /daemon-card*.log

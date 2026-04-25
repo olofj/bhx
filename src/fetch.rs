@@ -3,17 +3,37 @@
 
 //! Shared download helpers used by `image`, `kernel`, and `ramdisk`.
 //!
-//! The three downloader modules all do the same dance: run `wget` to a
-//! `<filename>.downloading` temp path, on success rename to the final
-//! name, on failure clean up the temp. The decompression / unpacking
-//! steps that follow differ enough per caller (xz keep-input vs not,
-//! gunzip in-place, unzip-into-directory) that they stay in the
-//! call-site modules. This module owns just the wget piece plus stale-
-//! temp cleanup.
+//! Two layers:
+//!
+//! * [`download_to`] is the basic wget-with-temp wrapper. Used directly
+//!   by callers that don't want caching (or that already wrap us with
+//!   their own cache).
+//! * [`download_to_cached`] consults a `<dest>.fetch.json` sidecar and
+//!   skips the body download if a `wget --spider` HEAD against the URL
+//!   shows the upstream's `ETag` / `Last-Modified` matches what the
+//!   sidecar recorded last time.
+//!
+//! Decompression / unpacking stays in the call-site modules
+//! (`image.rs`, `kernel.rs`, `ramdisk.rs`); the semantics genuinely
+//! differ per caller (xz keep-input vs not, gunzip in-place, unzip-
+//! into-directory).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use serde::{Deserialize, Serialize};
+
+/// Cached HTTP-conditional metadata for a downloaded file. Persisted
+/// next to the destination as `<dest>.fetch.json`. Either field may be
+/// absent if the upstream doesn't emit it.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FetchMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<String>,
+}
 
 /// Download `url` into `dest_path` via `wget`.
 ///
@@ -49,6 +69,171 @@ pub fn download_to(url: &str, dest_path: &Path) -> Result<PathBuf, String> {
     Ok(dest_path.to_path_buf())
 }
 
+/// Variant of `download_to` that consults a sidecar metadata file to
+/// skip the wget when the upstream hasn't changed.
+///
+/// Behavior:
+/// - If `force` is true, the cache check is bypassed and we always
+///   download.
+/// - Else, if the destination file is missing OR the sidecar is
+///   missing/invalid, we download.
+/// - Else, run `wget --spider` to fetch the upstream's ETag /
+///   Last-Modified. If either field matches the sidecar, skip the
+///   download and return the existing path.
+/// - After any successful download, refresh the sidecar with the
+///   current upstream metadata so the next call has something to
+///   compare against.
+pub fn download_to_cached(url: &str, dest_path: &Path, force: bool) -> Result<PathBuf, String> {
+    if !force && cache_hit(url, dest_path) {
+        eprintln!("  Skipping download — upstream unchanged ({})", url);
+        return Ok(dest_path.to_path_buf());
+    }
+    download_to(url, dest_path)?;
+    // Best-effort sidecar refresh; HEAD failure shouldn't fail the
+    // download since we already have the file. Worst case: next call
+    // sees a stale sidecar and re-downloads.
+    if let Ok(meta) = head_metadata(url) {
+        let _ = write_sidecar(dest_path, &meta);
+    } else {
+        // If HEAD failed but the body succeeded, drop any pre-existing
+        // sidecar so we don't keep a stale match around.
+        let _ = fs::remove_file(sidecar_path(dest_path));
+    }
+    Ok(dest_path.to_path_buf())
+}
+
+/// True iff the dest file exists, the sidecar exists with valid
+/// metadata, and a HEAD against `url` shows a matching ETag or
+/// Last-Modified.
+fn cache_hit(url: &str, dest_path: &Path) -> bool {
+    if !dest_path.exists() {
+        return false;
+    }
+    let sidecar = match read_sidecar(dest_path) {
+        Some(m) => m,
+        None => return false,
+    };
+    let upstream = match head_metadata(url) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    upstream_matches(&sidecar, &upstream)
+}
+
+/// Two metadata records match if at least one of (etag, last_modified)
+/// agrees and is non-empty on both sides. If both fields are absent
+/// from upstream, we conservatively treat that as "no match" so we
+/// re-download on the next pull.
+pub(crate) fn upstream_matches(cached: &FetchMetadata, upstream: &FetchMetadata) -> bool {
+    let etag_match = match (&cached.etag, &upstream.etag) {
+        (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => a == b,
+        _ => false,
+    };
+    if etag_match {
+        return true;
+    }
+    match (&cached.last_modified, &upstream.last_modified) {
+        (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => a == b,
+        _ => false,
+    }
+}
+
+/// Run `wget --spider --server-response <url>` and parse ETag /
+/// Last-Modified out of the response headers. Follows redirects (the
+/// last block of HTTP/1.1 lines is the one whose ETag we care about).
+fn head_metadata(url: &str) -> Result<FetchMetadata, String> {
+    let output = Command::new("wget")
+        .arg("--spider")
+        .arg("--server-response")
+        .arg("--tries=1")
+        .arg("--timeout=10")
+        .arg(url)
+        .output()
+        .map_err(|e| format!("Failed to run wget --spider: {}", e))?;
+    // wget --spider prints headers to stderr regardless of HTTP status.
+    // We don't care if it returned non-zero (some servers 405 a HEAD);
+    // we only want whatever headers it managed to capture.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(parse_wget_headers(&stderr))
+}
+
+/// Parse wget --server-response stderr for the ETag and Last-Modified
+/// of the *last* HTTP response block. wget prefixes each header line
+/// with two spaces; redirect chains print one block per hop.
+pub(crate) fn parse_wget_headers(stderr: &str) -> FetchMetadata {
+    let mut last_etag: Option<String> = None;
+    let mut last_lm: Option<String> = None;
+    let mut block_etag: Option<String> = None;
+    let mut block_lm: Option<String> = None;
+    for raw in stderr.lines() {
+        let line = raw.trim_start();
+        // A new HTTP response block resets the per-block accumulators
+        // — but commit the previous block's findings to "last_*" so
+        // a subsequent block without ETag doesn't lose a redirect's
+        // ETag entirely.
+        if line.starts_with("HTTP/") {
+            if block_etag.is_some() {
+                last_etag = block_etag.take();
+            }
+            if block_lm.is_some() {
+                last_lm = block_lm.take();
+            }
+            continue;
+        }
+        if let Some(rest) = line
+            .strip_prefix("ETag: ")
+            .or_else(|| line.strip_prefix("etag: "))
+        {
+            block_etag = Some(rest.trim().to_string());
+        } else if let Some(rest) = line
+            .strip_prefix("Last-Modified: ")
+            .or_else(|| line.strip_prefix("last-modified: "))
+        {
+            block_lm = Some(rest.trim().to_string());
+        }
+    }
+    // Final block's findings.
+    if let Some(e) = block_etag {
+        last_etag = Some(e);
+    }
+    if let Some(lm) = block_lm {
+        last_lm = Some(lm);
+    }
+    FetchMetadata {
+        etag: last_etag,
+        last_modified: last_lm,
+    }
+}
+
+/// Sidecar path: `<dest>.fetch.json` next to the file.
+fn sidecar_path(dest_path: &Path) -> PathBuf {
+    let mut s = dest_path.as_os_str().to_owned();
+    s.push(".fetch.json");
+    PathBuf::from(s)
+}
+
+/// Read and parse the sidecar. Returns None on any error (missing
+/// file, malformed JSON, missing fields) so the caller falls through
+/// to a re-download — partial cache state is worse than no cache.
+pub(crate) fn read_sidecar(dest_path: &Path) -> Option<FetchMetadata> {
+    let sc = sidecar_path(dest_path);
+    let bytes = fs::read(&sc).ok()?;
+    serde_json::from_slice::<FetchMetadata>(&bytes).ok()
+}
+
+/// Write the sidecar atomically (write to temp, rename). On any error,
+/// returns Err but the caller treats this as best-effort.
+fn write_sidecar(dest_path: &Path, meta: &FetchMetadata) -> Result<(), String> {
+    let sc = sidecar_path(dest_path);
+    let mut tmp = sc.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let json = serde_json::to_vec_pretty(meta).map_err(|e| e.to_string())?;
+    fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &sc).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn downloading_path(dest_path: &Path) -> PathBuf {
     let mut s = dest_path.as_os_str().to_owned();
     s.push(".downloading");
@@ -72,5 +257,183 @@ mod tests {
     fn downloading_path_appends_to_extensionless_path() {
         let p = Path::new("/tmp/Image");
         assert_eq!(downloading_path(p), PathBuf::from("/tmp/Image.downloading"));
+    }
+
+    #[test]
+    fn sidecar_path_appends_fetch_json() {
+        assert_eq!(
+            sidecar_path(Path::new("/tmp/foo.bin")),
+            PathBuf::from("/tmp/foo.bin.fetch.json")
+        );
+    }
+
+    // ---- header parsing ----
+
+    #[test]
+    fn parse_wget_headers_extracts_etag_and_last_modified() {
+        let stderr = "
+--2026-04-25 10:00:00--  https://example.com/foo.bin
+Resolving example.com (example.com)... 1.2.3.4
+Connecting to example.com|1.2.3.4|:443... connected.
+HTTP request sent, awaiting response...
+  HTTP/1.1 200 OK
+  Last-Modified: Tue, 09 Apr 2024 10:21:54 GMT
+  ETag: \"abc123\"
+  Content-Length: 12345
+";
+        let m = parse_wget_headers(stderr);
+        assert_eq!(m.etag.as_deref(), Some("\"abc123\""));
+        assert_eq!(
+            m.last_modified.as_deref(),
+            Some("Tue, 09 Apr 2024 10:21:54 GMT")
+        );
+    }
+
+    #[test]
+    fn parse_wget_headers_takes_last_block_after_redirect() {
+        // Redirect chain: 301 → 200. The 200 block's ETag is what we
+        // want; the 301 block usually has no ETag but might.
+        let stderr = "
+  HTTP/1.1 301 Moved Permanently
+  Location: https://cdn.example.com/foo.bin
+  ETag: \"redirect-etag\"
+  HTTP/1.1 200 OK
+  ETag: \"final-etag\"
+  Content-Length: 12345
+";
+        let m = parse_wget_headers(stderr);
+        assert_eq!(m.etag.as_deref(), Some("\"final-etag\""));
+    }
+
+    #[test]
+    fn parse_wget_headers_handles_lowercased_header_names() {
+        // RFC 7230 says HTTP header names are case-insensitive; some
+        // CDNs lower-case them.
+        let stderr = "
+  HTTP/1.1 200 OK
+  etag: \"lower\"
+  last-modified: Mon, 01 Jan 2024 00:00:00 GMT
+";
+        let m = parse_wget_headers(stderr);
+        assert_eq!(m.etag.as_deref(), Some("\"lower\""));
+        assert_eq!(
+            m.last_modified.as_deref(),
+            Some("Mon, 01 Jan 2024 00:00:00 GMT")
+        );
+    }
+
+    #[test]
+    fn parse_wget_headers_returns_empty_when_no_headers() {
+        let m = parse_wget_headers("");
+        assert!(m.etag.is_none());
+        assert!(m.last_modified.is_none());
+    }
+
+    // ---- upstream_matches ----
+
+    #[test]
+    fn upstream_matches_on_etag_alone() {
+        let cached = FetchMetadata {
+            etag: Some("\"x\"".to_string()),
+            last_modified: None,
+        };
+        let upstream = FetchMetadata {
+            etag: Some("\"x\"".to_string()),
+            last_modified: Some("ignored".to_string()),
+        };
+        assert!(upstream_matches(&cached, &upstream));
+    }
+
+    #[test]
+    fn upstream_matches_on_last_modified_when_etag_missing() {
+        let cached = FetchMetadata {
+            etag: None,
+            last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
+        };
+        let upstream = FetchMetadata {
+            etag: None,
+            last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
+        };
+        assert!(upstream_matches(&cached, &upstream));
+    }
+
+    #[test]
+    fn upstream_does_not_match_when_etag_changes() {
+        let cached = FetchMetadata {
+            etag: Some("\"old\"".to_string()),
+            last_modified: Some("same".to_string()),
+        };
+        let upstream = FetchMetadata {
+            etag: Some("\"new\"".to_string()),
+            last_modified: None,
+        };
+        // ETag mismatch + no last-modified comparison possible → miss.
+        assert!(!upstream_matches(&cached, &upstream));
+    }
+
+    #[test]
+    fn upstream_does_not_match_when_both_missing() {
+        let cached = FetchMetadata::default();
+        let upstream = FetchMetadata::default();
+        // No fields to compare → conservatively a miss; we'd rather
+        // re-download than skip on suspect "match".
+        assert!(!upstream_matches(&cached, &upstream));
+    }
+
+    #[test]
+    fn upstream_does_not_match_empty_strings() {
+        let cached = FetchMetadata {
+            etag: Some(String::new()),
+            last_modified: None,
+        };
+        let upstream = FetchMetadata {
+            etag: Some(String::new()),
+            last_modified: None,
+        };
+        assert!(!upstream_matches(&cached, &upstream));
+    }
+
+    // ---- read_sidecar ----
+
+    #[test]
+    fn read_sidecar_returns_none_for_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("foo.bin");
+        assert!(read_sidecar(&dest).is_none());
+    }
+
+    #[test]
+    fn read_sidecar_returns_none_for_corrupt_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("foo.bin");
+        let sc = sidecar_path(&dest);
+        fs::write(&sc, b"not valid json {{{").unwrap();
+        assert!(read_sidecar(&dest).is_none());
+    }
+
+    #[test]
+    fn read_sidecar_round_trips_full_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("foo.bin");
+        let original = FetchMetadata {
+            etag: Some("\"abc123\"".to_string()),
+            last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
+        };
+        write_sidecar(&dest, &original).unwrap();
+        let parsed = read_sidecar(&dest).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn read_sidecar_round_trips_etag_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("foo.bin");
+        let original = FetchMetadata {
+            etag: Some("\"abc123\"".to_string()),
+            last_modified: None,
+        };
+        write_sidecar(&dest, &original).unwrap();
+        let parsed = read_sidecar(&dest).unwrap();
+        assert_eq!(parsed, original);
     }
 }

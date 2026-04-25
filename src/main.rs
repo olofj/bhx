@@ -214,6 +214,12 @@ enum ImageAction {
         /// Output path (default: images/<name>.ext4)
         #[arg(short, long)]
         output: Option<String>,
+        /// Bypass the HTTP-conditional cache and always re-download.
+        /// (The "image already exists" short-circuit on the converted
+        /// .ext4 still applies — delete that file too if you want a
+        /// truly clean fetch.)
+        #[arg(long)]
+        refetch: bool,
     },
 }
 
@@ -229,6 +235,9 @@ enum KernelAction {
         /// Output directory (default: current directory)
         #[arg(short, long)]
         output: Option<String>,
+        /// Bypass the HTTP-conditional cache and always re-download.
+        #[arg(long)]
+        refetch: bool,
     },
 }
 
@@ -260,6 +269,9 @@ enum RamdiskAction {
         /// Output path
         #[arg(short, long)]
         output: Option<String>,
+        /// Bypass the HTTP-conditional cache and always re-download.
+        #[arg(long)]
+        refetch: bool,
     },
 }
 
@@ -354,8 +366,12 @@ fn main() -> std::process::ExitCode {
             match action {
                 ImageAction::List => image::cmd_list_available(),
                 ImageAction::Info { name } => image::cmd_image_info(&name),
-                ImageAction::Pull { name, output } => {
-                    image::cmd_pull(&name, output.as_deref());
+                ImageAction::Pull {
+                    name,
+                    output,
+                    refetch,
+                } => {
+                    image::cmd_pull(&name, output.as_deref(), refetch);
                 }
             }
             Ok(())
@@ -363,8 +379,12 @@ fn main() -> std::process::ExitCode {
         Some(Commands::Kernel { action }) => {
             match action {
                 KernelAction::List => kernel::cmd_list(),
-                KernelAction::Pull { version, output } => {
-                    kernel::cmd_pull(version.as_deref(), output.as_deref());
+                KernelAction::Pull {
+                    version,
+                    output,
+                    refetch,
+                } => {
+                    kernel::cmd_pull(version.as_deref(), output.as_deref(), refetch);
                 }
             }
             Ok(())
@@ -372,8 +392,12 @@ fn main() -> std::process::ExitCode {
         Some(Commands::Ramdisk { action }) => {
             match action {
                 RamdiskAction::List => ramdisk::cmd_list(),
-                RamdiskAction::Pull { name, output } => {
-                    ramdisk::cmd_pull(&name, output.as_deref());
+                RamdiskAction::Pull {
+                    name,
+                    output,
+                    refetch,
+                } => {
+                    ramdisk::cmd_pull(&name, output.as_deref(), refetch);
                 }
             }
             Ok(())

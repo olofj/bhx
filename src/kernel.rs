@@ -79,7 +79,11 @@ fn firmware_dir() -> PathBuf {
 ///
 /// Downloads and extracts fw_jump.bin, Image, and blackhole-card.dtb to the
 /// output directory.
-pub fn pull_kernel(version: Option<&str>, output_dir: Option<&Path>) -> Result<PathBuf, String> {
+pub fn pull_kernel(
+    version: Option<&str>,
+    output_dir: Option<&Path>,
+    force_refetch: bool,
+) -> Result<PathBuf, String> {
     let kernel = get_known_kernel(version).ok_or_else(|| {
         let available: Vec<_> = KNOWN_KERNELS.iter().map(|k| k.version).collect();
         format!(
@@ -96,12 +100,12 @@ pub fn pull_kernel(version: Option<&str>, output_dir: Option<&Path>) -> Result<P
     let fw_path = dir.join("fw_jump.bin");
     let image_path = dir.join("Image");
     let dtb_path = dir.join("blackhole-card.dtb");
-    if fw_path.exists() && image_path.exists() && dtb_path.exists() {
+    if fw_path.exists() && image_path.exists() && dtb_path.exists() && !force_refetch {
         eprintln!("Firmware files already exist:");
         eprintln!("  {}", fw_path.display());
         eprintln!("  {}", image_path.display());
         eprintln!("  {}", dtb_path.display());
-        eprintln!("Delete them first if you want to re-download.");
+        eprintln!("Delete them first or pass --refetch if you want to re-download.");
         return Ok(dir);
     }
 
@@ -111,7 +115,7 @@ pub fn pull_kernel(version: Option<&str>, output_dir: Option<&Path>) -> Result<P
 
     // Download zip
     let zip_path = dir.join("tt-bh-linux.zip");
-    crate::fetch::download_to(kernel.url, &zip_path)?;
+    crate::fetch::download_to_cached(kernel.url, &zip_path, force_refetch)?;
 
     // Extract
     eprintln!("  Extracting...");
@@ -166,8 +170,8 @@ pub fn cmd_list() {
 }
 
 /// Pull the kernel firmware bundle.
-pub fn cmd_pull(version: Option<&str>, output_dir: Option<&str>) {
-    match pull_kernel(version, output_dir.map(Path::new)) {
+pub fn cmd_pull(version: Option<&str>, output_dir: Option<&str>, force_refetch: bool) {
+    match pull_kernel(version, output_dir.map(Path::new), force_refetch) {
         Ok(dir) => {
             println!("{}", dir.display());
         }
