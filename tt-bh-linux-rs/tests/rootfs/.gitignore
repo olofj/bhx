@@ -2,3 +2,8 @@
 buildroot-*/
 output/
 dl/
+
+# Convenience symlink the Makefile maintains pointing at
+# buildroot-*/output/images/rootfs.ext4. Soaks find it via this path
+# but it's regenerable on `make`.
+rootfs.ext4

@@ -84,7 +84,8 @@ timeout 60 "$BINARY" boot -t "$CARD" -l "$L2CPU" -d "$ROOTFS" --no-console >/dev
 note "letting guest reach steady-state I/O (10 s warm-up)"
 sleep 10
 
-rootfs_basename=$(basename "$ROOTFS")
+# Daemon stores the canonicalized path; match its basename.
+rootfs_basename=$(basename "$(readlink -f "$ROOTFS")")
 status=$("$BINARY" daemon status -t "$CARD")
 echo "$status" | grep -qE "l2cpu $L2CPU: Running disk=.*$rootfs_basename" \
     || fail "post-boot status mismatch:\n$status"
