@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Cargo deps for the Rust crate. Open a single batched PR per week so
+  # the lockfile updates land in one reviewable diff instead of one PR
+  # per minor-version bump.
+  - package-ecosystem: cargo
+    directory: /tt-bh-linux-rs
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      cargo-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions versions in the workflow files.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
