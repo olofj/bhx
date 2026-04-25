@@ -8,6 +8,12 @@
 //! won't work because they lack the VirtIO polling patches. The firmware bundle
 //! (fw_jump.bin + Image + blackhole-card.dtb) is published as a zip in each
 //! tt-bh-linux GitHub release.
+//!
+//! # PATH-based binary resolution
+//!
+//! `Command::new("wget")` and `Command::new("unzip")` resolve via
+//! `$PATH`. CLI-only path; see `image.rs`'s module doc-comment for the
+//! threat-model rationale.
 
 use std::fs;
 use std::path::{Path, PathBuf};

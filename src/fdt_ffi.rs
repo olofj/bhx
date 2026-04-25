@@ -112,14 +112,27 @@ impl Fdt {
         unsafe { std::slice::from_raw_parts(self.storage.as_ptr() as *const u8, self.byte_len) }
     }
 
-    /// Find a node by path. Returns None if not found.
-    pub fn path_offset(&self, path: &str) -> Option<c_int> {
-        let c_path = CString::new(path).ok()?;
+    /// Find a node by path. Three outcomes:
+    /// - `Ok(Some(idx))` — node found at byte offset `idx`.
+    /// - `Ok(None)` — node not present (libfdt returned `-FDT_ERR_NOTFOUND`).
+    ///   Callers that build-on-demand match on this branch.
+    /// - `Err(msg)` — embedded NUL in `path`, or some other libfdt
+    ///   error (badmagic, truncated, internal). Today every caller
+    ///   passes a static string so the NUL case isn't reachable, but
+    ///   surfacing it lets a future caller forward guest-supplied
+    ///   paths safely (security finding from #17).
+    pub fn path_offset(&self, path: &str) -> Result<Option<c_int>, String> {
+        let c_path = CString::new(path).map_err(|e| format!("path_offset({}): {}", path, e))?;
         let ret = unsafe { fdt_path_offset(self.ptr(), c_path.as_ptr()) };
-        if ret < 0 {
-            None
+        // libfdt returns -FDT_ERR_NOTFOUND (-1) for missing nodes; any
+        // other negative is a real error worth surfacing.
+        const NEG_NOTFOUND: c_int = -1;
+        if ret == NEG_NOTFOUND {
+            Ok(None)
+        } else if ret < 0 {
+            Err(format!("path_offset({}): {}", path, err_str(ret)))
         } else {
-            Some(ret)
+            Ok(Some(ret))
         }
     }
 
@@ -194,5 +207,43 @@ impl Fdt {
         // breaks Vec's allocator invariant (allocated as u64, freed as
         // u8); a copy is fine for a packed-DTB size that's a few KiB.
         Ok(self.buf_bytes()[..size].to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pinned copy of `blackhole-card.dtb` for hardware-free tests.
+    /// Same fixture `boot.rs::tests` uses.
+    const FIXTURE_DTB: &[u8] = include_bytes!("../tests/fixtures/blackhole-card.dtb");
+
+    #[test]
+    fn path_offset_returns_some_for_existing_node() {
+        let fdt = Fdt::open_into(FIXTURE_DTB, 0).unwrap();
+        let result = fdt.path_offset("/memory@400030000000").unwrap();
+        assert!(result.is_some(), "expected /memory@... to exist in fixture");
+    }
+
+    #[test]
+    fn path_offset_returns_ok_none_for_missing_node() {
+        let fdt = Fdt::open_into(FIXTURE_DTB, 0).unwrap();
+        // /chosen does not exist in the input fixture (modify_dtb adds it).
+        let result = fdt.path_offset("/this-path-does-not-exist-abc123").unwrap();
+        assert!(result.is_none(), "expected None for missing node");
+    }
+
+    #[test]
+    fn path_offset_returns_err_on_embedded_nul() {
+        let fdt = Fdt::open_into(FIXTURE_DTB, 0).unwrap();
+        let result = fdt.path_offset("/memory\0/embedded-nul");
+        match result {
+            Err(msg) => assert!(
+                msg.contains("nul") || msg.contains("NUL") || msg.contains("interior"),
+                "expected NUL-related error message, got: {}",
+                msg
+            ),
+            other => panic!("expected Err for NUL-bearing path, got {:?}", other),
+        }
     }
 }
