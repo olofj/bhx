@@ -93,6 +93,9 @@ pub fn serve(
                 port, e
             )));
         }
+        // The bound port is also the requested port (we don't pass 0
+        // through the CLI), so we don't need to log it here — the
+        // metrics module already logs the bind on its own.
     }
 
     // Install seccomp + landlock AFTER chip probe + warm-resume have
@@ -1269,6 +1272,91 @@ mod tests {
     }
 
     // ---- decide_boot_slot ----
+
+    /// Wiring test for #31's RPC counter: drive a real `Request::Status`
+    /// through `handle_client` over a unix socketpair and assert
+    /// `DAEMON_RPC_TOTAL{method=status}` ticked. Catches a regression
+    /// where someone accidentally removes the
+    /// `metrics::DAEMON_RPC_TOTAL.at(...).inc()` line — pre-#33 the
+    /// only thing keeping that line in place was code review. This
+    /// test exercises classify_request, the bump, and dispatch_status
+    /// in one shot.
+    ///
+    /// Note: globals are shared across tests in the same process. We
+    /// snapshot `before` rather than asserting an absolute count.
+    #[test]
+    fn handle_client_bumps_rpc_total_for_status() {
+        use crate::daemon::metrics::{RpcMethod, DAEMON_RPC_TOTAL};
+        use crate::shared_chip::SharedChip;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write_frame(&mut client, &Request::Status).unwrap();
+
+        let before = DAEMON_RPC_TOTAL.at(RpcMethod::Status).get();
+        let state = Arc::new(DaemonState::new(0, Arc::new(SharedChip::placeholder())));
+        // handle_client returns when the dispatch finishes; for Status
+        // that's near-instant since no chip access happens.
+        handle_client(server, state);
+
+        let after = DAEMON_RPC_TOTAL.at(RpcMethod::Status).get();
+        assert!(
+            after > before,
+            "expected at least one bump (got before={} after={})",
+            before,
+            after
+        );
+
+        // Sanity: client should see a framed response (we don't care
+        // which variant — Status payload, error, etc. — only that the
+        // dispatch returned a valid frame).
+        let resp: Response = read_frame(&mut client).expect("read response");
+        match resp {
+            Response::Status { .. } => {}
+            other => panic!("expected Status response, got {:?}", other),
+        }
+    }
+
+    /// Same shape as the Status test, but for AddDisk — proves
+    /// classify_request maps each Request variant to the right
+    /// RpcMethod, not just Status.
+    #[test]
+    fn handle_client_bumps_rpc_total_for_add_disk() {
+        use crate::daemon::metrics::{RpcMethod, DAEMON_RPC_TOTAL};
+        use crate::shared_chip::SharedChip;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        // AddDisk against an empty slot — dispatch will reply with
+        // an error ("l2cpu N is not running"), but the metrics bump
+        // happens before that, on the way into the dispatch.
+        write_frame(
+            &mut client,
+            &Request::AddDisk {
+                l2cpu: 0,
+                path: "/tmp/nonexistent.img".into(),
+            },
+        )
+        .unwrap();
+
+        let before = DAEMON_RPC_TOTAL.at(RpcMethod::AddDisk).get();
+        let state = Arc::new(DaemonState::new(0, Arc::new(SharedChip::placeholder())));
+        handle_client(server, state);
+
+        let after = DAEMON_RPC_TOTAL.at(RpcMethod::AddDisk).get();
+        assert!(after > before, "AddDisk counter didn't bump");
+
+        // Drain the response so the test doesn't leak the socket.
+        let _: Response = read_frame(&mut client).expect("read response");
+    }
 
     #[test]
     fn boot_decides_proceed_when_slot_empty_no_force() {

@@ -240,6 +240,36 @@ mod tests {
         (a, b)
     }
 
+    /// Wiring test (#33): attach + detach update
+    /// `metrics::L2CPU_CONSOLE_CLIENTS{idx=N}`. The hub takes its idx
+    /// at construction, so each test can use a distinct slot to
+    /// avoid bleeding state across the parallel test run.
+    #[test]
+    fn attach_and_detach_update_clients_gauge() {
+        use crate::daemon::metrics::L2CPU_CONSOLE_CLIENTS;
+
+        // Use idx=3 so we don't collide with the default-0 hub
+        // construction other tests use; the gauge is a global so
+        // test order matters otherwise.
+        let hub = ConsoleHub::new(3);
+        let before = L2CPU_CONSOLE_CLIENTS.at(3).get();
+
+        let (d1, _c1) = pair_nonblocking();
+        let (d2, _c2) = pair_nonblocking();
+
+        let (r1, _) = hub.attach(d1, ConsoleMode::Rw);
+        assert_eq!(L2CPU_CONSOLE_CLIENTS.at(3).get(), before + 1);
+
+        let (r2, _) = hub.attach(d2, ConsoleMode::Ro);
+        assert_eq!(L2CPU_CONSOLE_CLIENTS.at(3).get(), before + 2);
+
+        hub.detach(r1.id);
+        assert_eq!(L2CPU_CONSOLE_CLIENTS.at(3).get(), before + 1);
+
+        hub.detach(r2.id);
+        assert_eq!(L2CPU_CONSOLE_CLIENTS.at(3).get(), before);
+    }
+
     #[test]
     fn push_fans_out_to_all_clients() {
         let hub = ConsoleHub::new(0);

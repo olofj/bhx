@@ -774,23 +774,26 @@ fn write_gauge(out: &mut String, name: &str, help: &str, value: i64) {
 // HTTP exporter
 // ============================================================================
 
-/// Bind the HTTP listener and spawn the accept thread. Returns once the
-/// bind has succeeded — bind failure is fatal and propagates so the
-/// daemon refuses to start (mirrors the sandbox-install behavior). The
-/// thread runs until `state.shutdown` flips.
-pub fn spawn_exporter(port: u16, state: Arc<DaemonState>) -> io::Result<()> {
+/// Bind the HTTP listener and spawn the accept thread. Returns the
+/// actually-bound port — `port=0` lets the kernel pick a free one,
+/// which the integration test relies on. Bind failure is fatal and
+/// propagates so the daemon refuses to start (mirrors the
+/// sandbox-install behavior). The thread runs until `state.shutdown`
+/// flips.
+pub fn spawn_exporter(port: u16, state: Arc<DaemonState>) -> io::Result<u16> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let listener = TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
+    let bound_port = listener.local_addr()?.port();
     dlog!(
         "[metrics] exporter listening on http://127.0.0.1:{}/metrics",
-        port
+        bound_port
     );
 
     thread::spawn(move || {
         run_exporter(listener, state);
     });
-    Ok(())
+    Ok(bound_port)
 }
 
 fn run_exporter(listener: TcpListener, state: Arc<DaemonState>) {
@@ -1073,6 +1076,73 @@ mod tests {
         assert_eq!(m.tx(0).get(), 64);
         assert_eq!(m.rx(2).get(), 1500);
         assert_eq!(m.tx(2).get(), 0);
+    }
+
+    /// Drive an actual TCP request through `spawn_exporter` so the
+    /// HTTP layer is covered (request parsing, response shape,
+    /// content-length matching, connection-close semantics). Without
+    /// this, the only thing exercising `handle_request` is the
+    /// hardware soak — which doesn't run in CI.
+    #[test]
+    fn http_exporter_serves_metrics_and_404s() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        let state = Arc::new(DaemonState::new(0, Arc::new(SharedChip::placeholder())));
+        // Port 0 = kernel picks free; spawn_exporter returns the
+        // actually-bound port so we know where to connect.
+        let port = spawn_exporter(0, state.clone()).expect("bind on port 0");
+
+        // Helper: open a fresh connection (the exporter writes
+        // Connection: close so each request is its own TCP) and read
+        // the full response.
+        let request = |path: &str| -> (u16, String) {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            s.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+                .unwrap();
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).unwrap();
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            // Parse the status line: `HTTP/1.1 <code> <reason>`.
+            let status: u16 = text
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(0);
+            (status, text)
+        };
+
+        // /metrics → 200 + valid prom text.
+        let (code, body) = request("/metrics");
+        assert_eq!(code, 200, "got status {code}; body:\n{body}");
+        assert!(
+            body.contains("\r\n\r\ntt_bh_daemon_uptime_seconds")
+                || body.contains("\r\n\r\n# HELP tt_bh_daemon_uptime_seconds"),
+            "metrics body missing daemon uptime line; body:\n{body}"
+        );
+        // Content-Type matches the Prometheus text-format spec.
+        assert!(
+            body.contains("Content-Type: text/plain"),
+            "missing or wrong Content-Type; body:\n{body}"
+        );
+
+        // /healthz → 404 (we only serve /metrics).
+        let (code, _) = request("/healthz");
+        assert_eq!(code, 404);
+
+        // /metrics with extra query string still hits the route —
+        // we use prefix-match `starts_with("GET /metrics")`.
+        let (code, _) = request("/metrics?foo=bar");
+        assert_eq!(code, 200);
+
+        // Tell the exporter thread to stop. There's no join handle
+        // (the spawn is fire-and-forget so callers don't have to
+        // hold one), but flipping shutdown leaves the thread to
+        // exit on its own next poll cycle (≤100 ms).
+        state.shutdown.store(true, Ordering::Relaxed);
     }
 
     #[test]
