@@ -19,13 +19,6 @@ Ambition does not mean scope creep. Stay ruthless about simplicity:
   over creating a new one.
 - Fix root causes, not symptoms.
 
-Stay on the task the user actually asked for. "High-agency" means
-pushing the requested task through to a clean finish — compiling, lint-
-clean, tests passing, no half-done work. It does **not** mean picking up
-adjacent cleanup, refactors, or dead-code removal you happened to
-notice. Those are separate efforts and deserve their own decision from
-the user.
-
 When you spot unrelated rough edges mid-task (dead code, a stale
 comment, a missing test, a refactor that would be nice), do **not**
 silently fold them into the current change. Instead, finish the
@@ -93,11 +86,7 @@ src/
 ├── kernel.rs         # download kernel+OpenSBI+DTB bundles — hardware-free
 └── ramdisk.rs        # download initramfs images — hardware-free
 
-scripts/
-├── README.md
-├── soak_warm_resume.sh  # stop/start daemon, verify warm-resume adoption
-├── soak_add_remove.sh   # repeated add/remove-disk + add/remove-net on one L2CPU
-└── soak_concurrent.sh   # sequential cold boot of all 4 L2CPUs + 4-way concurrent add/remove hammer
+scripts/  (see scripts/README.md)
 ```
 
 The `slirp` feature is on by default and links `libvdeslirp`+`libslirp`;
@@ -117,8 +106,6 @@ disable with `--no-default-features` if you just need console+disk.
   nodes at boot time.
 - `tt-smi` (Python, installed by tt-installer into
   `~/.tenstorrent-venv/bin/`). Used to reset the card — see below.
-- For `image pull` workflows: `wget`, `xz-utils`, `unzip`, `qemu-utils`,
-  `fdisk` (`sfdisk`), `e2fsprogs` (`e2fsck`, `resize2fs`).
 
 ## Typical dev loop
 
@@ -160,16 +147,9 @@ with `timeout`:
 timeout 5 ./target/debug/tt-bh-linux connect -l 0 </dev/null 2>/tmp/stderr.log
 ```
 
-Hardware-free subcommands (no daemon, no card needed):
-
-```bash
-cargo run -- image list
-cargo run -- image info debian-13
-cargo run -- image pull debian         # downloads, converts, resizes -> images/debian-13.ext4
-cargo run -- kernel list
-cargo run -- kernel pull               # fw_jump.bin + Image + blackhole-card.dtb into cwd
-cargo run -- ramdisk list
-```
+Hardware-free: `cargo run -- image|kernel|ramdisk` subcommands (no
+daemon, no card needed). `image pull <distro>` downloads + converts to
+`.ext4`; `kernel pull` drops `fw_jump.bin`/`Image`/`*.dtb` into cwd.
 
 Low-level diagnostics that bypass the daemon (require the daemon
 stopped — enforced at the client):
@@ -192,14 +172,8 @@ descriptor-chain panics spinning, ioctl failures), reset it:
 
 The daemon's slots are stale after `tt-smi -r` — either stop+start
 (startup probe picks up what survives via warm-resume) or re-image with
-`--force`:
-
-```bash
-./target/debug/tt-bh-linux daemon stop -t 0
-(. ~/.tenstorrent-venv/bin/activate && tt-smi -r) >/dev/null 2>&1
-./target/debug/tt-bh-linux daemon start -t 0 --log-file ./daemon-card0.log
-./target/debug/tt-bh-linux boot -l 0 -d rootfs.ext4 -n
-```
+`--force`. Full reflow: `daemon stop` → `tt-smi -r` → `daemon start` →
+`boot --force`.
 
 If `tt-smi -r` doesn't recover the card, power-cycle the host.
 
@@ -230,7 +204,7 @@ cargo build                          # default features (slirp)
 cargo build --no-default-features    # no slirp link
 
 cargo clippy --all-targets -- -D warnings   # must stay clean
-cargo test                           # 54 unit tests
+cargo test                           # hardware-free unit tests
 ```
 
 Unit tests cover: CLI parsing + `absolutize`, daemon `protocol`
@@ -242,18 +216,14 @@ flag lifecycle, `chip_console::probe_warm_resume` byte decode +
 Hardware-gated soak scripts under `scripts/` (see `scripts/README.md`).
 Remaining coverage gaps: `dispatch_boot --force` state machine,
 `dispatch_add_disk` stuck-slot path, clock/tlb/virtio core handshake,
-image/kernel/ramdisk downloaders, the future `SharedChip` abstraction
-(issue #1).
+image/kernel/ramdisk downloaders.
 
 ## Useful parent-repo artifacts
 
 - `../rootfs.ext4`, `../fw_jump.bin`, `../Image`, `../blackhole-card.dtb`
   — default artifacts (typically symlinked into this crate's cwd).
-- `../boot.py` — legacy Python boot driver. No longer needed by this
-  crate; retained as reference for the C++ tool at `../console/`.
-- `../Makefile` — predates the Rust daemon; `make boot` there still
-  invokes `boot.py` + the C++ `tt-bh-linux`. Not part of this crate's
-  workflow.
+- `../boot.py` and `../Makefile` predate the Rust daemon — ignore
+  unless touching the C++ tool at `../console/`.
 - `../tt-kmd/` — local clone of the tt-kmd driver source (for concurrency
   audits and cross-references, e.g. issue #1).
 
