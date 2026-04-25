@@ -55,7 +55,9 @@ unsafe impl Send for VirtioNet {}
 impl Drop for VirtioNet {
     fn drop(&mut self) {
         if !self.slirp.is_null() {
-            unsafe { vdeslirp_close(self.slirp); }
+            unsafe {
+                vdeslirp_close(self.slirp);
+            }
         }
     }
 }
@@ -102,9 +104,15 @@ impl VirtioNet {
 }
 
 impl VirtioDeviceImpl for VirtioNet {
-    fn num_queues(&self) -> u32 { 2 }
-    fn queue_header_size(&self) -> u64 { self.queue_header_size }
-    fn device_id(&self) -> u32 { VIRTIO_ID_NET }
+    fn num_queues(&self) -> u32 {
+        2
+    }
+    fn queue_header_size(&self) -> u64 {
+        self.queue_header_size
+    }
+    fn device_id(&self) -> u32 {
+        VIRTIO_ID_NET
+    }
     fn device_features(&self) -> [u32; 2] {
         [0, VIRTIO_F_VERSION_1_BIT]
     }
@@ -142,17 +150,11 @@ impl VirtioDeviceImpl for VirtioNet {
         if queue_idx == 0 {
             // RX: receive packet from slirp
             let max_copy = (data_len as usize).min(PACKET_SIZE);
-            let pktlen = unsafe {
-                vdeslirp_recv(self.slirp, self.buffer.as_mut_ptr(), max_copy)
-            };
+            let pktlen = unsafe { vdeslirp_recv(self.slirp, self.buffer.as_mut_ptr(), max_copy) };
             if pktlen > 0 {
                 let copy_len = (pktlen as usize).min(max_copy);
                 unsafe {
-                    ptr::copy_nonoverlapping(
-                        self.buffer.as_ptr(),
-                        data_addr,
-                        copy_len,
-                    );
+                    ptr::copy_nonoverlapping(self.buffer.as_ptr(), data_addr, copy_len);
                 }
             }
         } else if queue_idx == 1 {
@@ -173,7 +175,9 @@ impl VirtioDeviceImpl for VirtioNet {
         if queue_idx == 0 {
             // RX: check if slirp has data via select with zero timeout
             let mut rfds = unsafe { std::mem::zeroed::<libc::fd_set>() };
-            unsafe { libc::FD_SET(self.slirp_fd, &mut rfds); }
+            unsafe {
+                libc::FD_SET(self.slirp_fd, &mut rfds);
+            }
             let mut tv = libc::timeval {
                 tv_sec: 0,
                 tv_usec: 0,
@@ -219,7 +223,10 @@ pub fn network_main(
         let mut net = match VirtioNet::new(ssh_port) {
             Ok(n) => n,
             Err(e) => {
-                eprintln!("network: failed to initialize slirp user-mode networking: {}", e);
+                eprintln!(
+                    "network: failed to initialize slirp user-mode networking: {}",
+                    e
+                );
                 return;
             }
         };

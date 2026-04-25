@@ -196,7 +196,10 @@ pub fn recv_fd(sock: &UnixStream) -> io::Result<OwnedFd> {
     )
     .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
 
-    for cmsg in msg.cmsgs().map_err(|e| io::Error::from_raw_os_error(e as i32))? {
+    for cmsg in msg
+        .cmsgs()
+        .map_err(|e| io::Error::from_raw_os_error(e as i32))?
+    {
         if let ControlMessageOwned::ScmRights(fds) = cmsg {
             if let Some(&fd) = fds.first() {
                 return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
@@ -360,7 +363,8 @@ mod tests {
         // A client compiled against an older protocol (no `force` field) should
         // be accepted by the daemon; `force` must default to false so old
         // behavior is preserved (reject duplicate boots).
-        let json = r#"{"op":"boot","l2cpu":0,"opensbi":"a","kernel":"b","dtb":"c","root_device":"vda"}"#;
+        let json =
+            r#"{"op":"boot","l2cpu":0,"opensbi":"a","kernel":"b","dtb":"c","root_device":"vda"}"#;
         let req: Request = serde_json::from_str(json).unwrap();
         match req {
             Request::Boot { force, .. } => assert!(!force),

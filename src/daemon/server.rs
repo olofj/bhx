@@ -20,7 +20,6 @@ use std::time::Duration;
 
 use crate::boot;
 use crate::daemon::chip_console;
-use crate::dlog;
 use crate::daemon::console_hub::ConsoleHub;
 use crate::daemon::lifetime;
 use crate::daemon::protocol::{
@@ -28,6 +27,7 @@ use crate::daemon::protocol::{
     StatusPayload,
 };
 use crate::daemon::{DaemonState, DiskWorker, L2CpuSlot, WorkerHandle};
+use crate::dlog;
 use crate::l2cpu::L2Cpu;
 use crate::virtio::block;
 use crate::virtio::interrupt::InterruptController;
@@ -109,15 +109,9 @@ pub fn serve(card: u32, listener: UnixListener) -> io::Result<()> {
 ///
 /// Safe to call even when the chip is wedged: reading the reset register
 /// is a single AXI read to tile (8,0), no state change.
-fn probe_initial_chip_state(
-    shared: &crate::shared_chip::SharedChip,
-    card: u32,
-) -> Vec<u8> {
+fn probe_initial_chip_state(shared: &crate::shared_chip::SharedChip, card: u32) -> Vec<u8> {
     let val = shared.read_l2cpu_reset();
-    dlog!(
-        "[probe] L2CPU_RESET={:#010x} (card {})",
-        val, card
-    );
+    dlog!("[probe] L2CPU_RESET={:#010x} (card {})", val, card);
     let mut released = Vec::new();
     for idx in 0..4u8 {
         let bit = (val >> (idx + 4)) & 1;
@@ -126,7 +120,13 @@ fn probe_initial_chip_state(
         } else {
             "held in reset (cold-bootable)"
         };
-        dlog!("[probe]   L2CPU {} bit {} = {} -> {}", idx, idx + 4, bit, state);
+        dlog!(
+            "[probe]   L2CPU {} bit {} = {} -> {}",
+            idx,
+            idx + 4,
+            bit,
+            state
+        );
         if bit == 1 {
             released.push(idx);
         }
@@ -450,7 +450,11 @@ fn dispatch_boot(
     let mut slot = match make_slot_from_l2cpu(l2cpu, l2cpu_idx) {
         Ok(s) => s,
         Err(e) => {
-            dlog!("[boot l2cpu {}] make_slot_from_l2cpu failed: {}", l2cpu_idx, e);
+            dlog!(
+                "[boot l2cpu {}] make_slot_from_l2cpu failed: {}",
+                l2cpu_idx,
+                e
+            );
             reply_err(sock, format!("post-boot L2Cpu init failed: {}", e));
             return;
         }
@@ -509,7 +513,11 @@ fn start_initial_workers(
     network: bool,
 ) -> Result<(), String> {
     if let Some(path) = disk {
-        dlog!("[boot l2cpu {}] spawning disk worker for {}", l2cpu_idx, path);
+        dlog!(
+            "[boot l2cpu {}] spawning disk worker for {}",
+            l2cpu_idx,
+            path
+        );
         start_disk_worker(slot, &path).map_err(|e| {
             dlog!("[boot l2cpu {}] start_disk_worker failed: {}", l2cpu_idx, e);
             format!("start disk worker failed: {}", e)
@@ -551,7 +559,14 @@ fn start_disk_worker(slot: &mut L2CpuSlot, path: &str) -> io::Result<()> {
     let exit_thread = exit.clone();
     let path_thread = path.to_string();
     let t = thread::spawn(move || {
-        block::disk_main(l2cpu, interrupt, DISK_INT, DISK_MMIO, path_thread, exit_thread);
+        block::disk_main(
+            l2cpu,
+            interrupt,
+            DISK_INT,
+            DISK_MMIO,
+            path_thread,
+            exit_thread,
+        );
     });
     slot.disks.push(DiskWorker {
         path: path.to_string(),
@@ -720,7 +735,10 @@ fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlo
     let (input_tx, input_rx) = mpsc::channel::<u8>();
     let exit = Arc::new(AtomicBool::new(false));
 
-    dlog!("[make_slot l2cpu {}] spawning chip_console thread", l2cpu_idx);
+    dlog!(
+        "[make_slot l2cpu {}] spawning chip_console thread",
+        l2cpu_idx
+    );
     let t = thread::spawn({
         let l2cpu = l2cpu.clone();
         let hub = hub.clone();
@@ -796,7 +814,8 @@ fn dispatch_attach_console(
     if !res.demoted.is_empty() {
         dlog!(
             "[daemon] l2cpu {} console takeover demoted {:?}",
-            l2cpu_idx, res.demoted
+            l2cpu_idx,
+            res.demoted
         );
     }
 
@@ -840,12 +859,7 @@ fn write_scrollback(mut sock: &UnixStream, bytes: &[u8]) -> io::Result<()> {
 
 /// Per-client reader: blocks on `sock`, forwards bytes to `input_tx` whenever
 /// this client is the writer. Terminates on EOF or hub-driven drop.
-fn client_reader_main(
-    sock: UnixStream,
-    id: u64,
-    hub: Arc<ConsoleHub>,
-    input_tx: mpsc::Sender<u8>,
-) {
+fn client_reader_main(sock: UnixStream, id: u64, hub: Arc<ConsoleHub>, input_tx: mpsc::Sender<u8>) {
     use std::io::Read;
     let mut buf = [0u8; 128];
     loop {
@@ -896,7 +910,14 @@ fn dispatch_add_disk(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8,
     let exit_thread = exit.clone();
     let path_thread = path.clone();
     let t = thread::spawn(move || {
-        block::disk_main(l2cpu, interrupt, DISK_INT, DISK_MMIO, path_thread, exit_thread);
+        block::disk_main(
+            l2cpu,
+            interrupt,
+            DISK_INT,
+            DISK_MMIO,
+            path_thread,
+            exit_thread,
+        );
     });
     slot.disks.push(DiskWorker {
         path: path.clone(),
@@ -993,7 +1014,10 @@ fn dispatch_add_net(
         thread: Some(t),
         description: format!("net l2cpu {}", l2cpu_idx),
     });
-    dlog!("[add_net l2cpu {}] dispatch complete — replying ok", l2cpu_idx);
+    dlog!(
+        "[add_net l2cpu {}] dispatch complete — replying ok",
+        l2cpu_idx
+    );
     reply_ok(sock);
 }
 
@@ -1051,10 +1075,7 @@ fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) {
     let taken = state.l2cpus[l2cpu_idx as usize].lock().unwrap().take();
     match taken {
         Some(slot) => {
-            dlog!(
-                "[stop l2cpu {}] slot taken; joining workers",
-                l2cpu_idx
-            );
+            dlog!("[stop l2cpu {}] slot taken; joining workers", l2cpu_idx);
             slot.shutdown();
             dlog!("[stop l2cpu {}] workers joined — replying ok", l2cpu_idx);
             reply_ok(sock);
@@ -1154,10 +1175,7 @@ mod tests {
 
     #[test]
     fn remove_disk_rejects_when_no_disk_attached() {
-        assert_eq!(
-            validate_remove_disk_request(true),
-            Err("no disk attached")
-        );
+        assert_eq!(validate_remove_disk_request(true), Err("no disk attached"));
     }
 
     #[test]
@@ -1165,4 +1183,3 @@ mod tests {
         assert_eq!(validate_remove_disk_request(false), Ok(()));
     }
 }
-

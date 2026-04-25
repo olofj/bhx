@@ -52,11 +52,7 @@ fn l2cpu_noc_write_bulk(l2cpu: &L2Cpu, addr: u64, data: &[u8]) -> std::io::Resul
         let window = l2cpu.get_persistent_2m_window(window_base)?;
         let dst = unsafe { window.get_window().add(offset_in_window) };
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr().add(written as usize),
-                dst,
-                chunk,
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr().add(written as usize), dst, chunk);
         }
         written += chunk as u64;
     }
@@ -82,12 +78,16 @@ pub fn boot_l2cpu(
     let tile = L2CPU_TILES[l2cpu_idx];
     eprintln!(
         "[boot_l2cpu] L2CPU {} -> tile ({}, {}), control_base=0x{:x}",
-        l2cpu_idx, tile.x, tile.y, regs_l2cpu::CONTROL_BASE
+        l2cpu_idx,
+        tile.x,
+        tile.y,
+        regs_l2cpu::CONTROL_BASE
     );
 
     eprintln!(
         "[boot_l2cpu] enabling L3 cache at 0x{:x}+{}",
-        regs_l2cpu::L3_CTRL_BASE, regs_l2cpu::L3_ENABLE_OFFSET
+        regs_l2cpu::L3_CTRL_BASE,
+        regs_l2cpu::L3_ENABLE_OFFSET
     );
     let l3_enable_addr = regs_l2cpu::L3_CTRL_BASE + regs_l2cpu::L3_ENABLE_OFFSET;
     l2cpu.write32(l3_enable_addr, regs_l2cpu::L3_ENABLE_VALUE);
@@ -161,7 +161,10 @@ pub fn configure_prefetchers(l2cpu: &L2Cpu) {
     let tile = L2CPU_TILES[l2cpu_idx];
     eprintln!(
         "[configure_prefetchers] L2CPU {} tile ({}, {}) base=0x{:x}",
-        l2cpu_idx, tile.x, tile.y, regs_l2cpu::L2_PREFETCH_BASE
+        l2cpu_idx,
+        tile.x,
+        tile.y,
+        regs_l2cpu::L2_PREFETCH_BASE
     );
     for i in 0..regs_l2cpu::L2_PREFETCH_NUM {
         let base = regs_l2cpu::L2_PREFETCH_BASE + i * regs_l2cpu::L2_PREFETCH_STRIDE;
@@ -193,8 +196,7 @@ pub fn modify_dtb(
     mem_start: u64,
     mem_size: u64,
 ) -> std::io::Result<Vec<u8>> {
-    modify_dtb_inner(dtb_bytes, boot_device, mem_start, mem_size)
-        .map_err(std::io::Error::other)
+    modify_dtb_inner(dtb_bytes, boot_device, mem_start, mem_size).map_err(std::io::Error::other)
 }
 
 // libfdt's wrappers in `fdt_ffi` return `Result<_, String>`; keep that
@@ -284,7 +286,10 @@ fn modify_dtb_inner(
     let mut plic_phandle = fdt.get_phandle(plic);
     if plic_phandle == 0 {
         plic_phandle = fdt.find_max_phandle()? + 1;
-        eprintln!("[modify_dtb]   PLIC had no phandle, allocating {}", plic_phandle);
+        eprintln!(
+            "[modify_dtb]   PLIC had no phandle, allocating {}",
+            plic_phandle
+        );
         fdt.setprop_u32(plic, "phandle", plic_phandle)?;
     } else {
         eprintln!("[modify_dtb]   PLIC phandle = {}", plic_phandle);
@@ -378,19 +383,30 @@ mod tests {
         let args = fdt.getprop(chosen, "bootargs").unwrap();
         // Trailing NUL — the fdt setprop wrote a C string.
         let s = std::str::from_utf8(&args[..args.len() - 1]).unwrap();
-        assert!(s.contains("root=/dev/vda"), "bootargs missing root=/dev/vda: {:?}", s);
+        assert!(
+            s.contains("root=/dev/vda"),
+            "bootargs missing root=/dev/vda: {:?}",
+            s
+        );
         assert!(s.contains("console=hvc0"), "bootargs missing hvc0: {:?}", s);
     }
 
     #[test]
     fn modify_dtb_bootargs_for_initramfs() {
-        let dev = BootDevice::Initramfs { addr: 0x4000_3210_0000, len: 4096 };
+        let dev = BootDevice::Initramfs {
+            addr: 0x4000_3210_0000,
+            len: 4096,
+        };
         let out = modify_dtb(FIXTURE_DTB, &dev, 0x4000_3000_0000, 0x1_0000_0000).unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let chosen = fdt.path_offset("/chosen").unwrap();
         let args = fdt.getprop(chosen, "bootargs").unwrap();
         let s = std::str::from_utf8(&args[..args.len() - 1]).unwrap();
-        assert!(s.contains("initrd=0x4000321"), "bootargs missing initrd addr: {:?}", s);
+        assert!(
+            s.contains("initrd=0x4000321"),
+            "bootargs missing initrd addr: {:?}",
+            s
+        );
         assert!(s.contains(",4096"), "bootargs missing initrd len: {:?}", s);
     }
 
@@ -407,7 +423,10 @@ mod tests {
         let res = fdt
             .path_offset("/reserved-memory/memory@4000afa00000")
             .expect("modify_dtb must create the virtio reserved-memory node");
-        assert!(fdt.getprop(res, "no-map").is_some(), "reserved region must be no-map");
+        assert!(
+            fdt.getprop(res, "no-map").is_some(),
+            "reserved region must be no-map"
+        );
         let reg = fdt.getprop(res, "reg").unwrap();
         let base = u64::from_be_bytes(reg[0..8].try_into().unwrap());
         let size = u64::from_be_bytes(reg[8..16].try_into().unwrap());
@@ -435,7 +454,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {}", path));
             // compatible = "virtio,mmio\0"
             let compat = fdt.getprop(node, "compatible").unwrap();
-            assert!(compat.starts_with(b"virtio,mmio"), "{} compatible={:?}", path, compat);
+            assert!(
+                compat.starts_with(b"virtio,mmio"),
+                "{} compatible={:?}",
+                path,
+                compat
+            );
             // interrupts is one big-endian u32; verify it descends.
             let irq = fdt.getprop(node, "interrupts").unwrap();
             assert_eq!(irq.len(), 4);

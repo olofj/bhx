@@ -104,7 +104,9 @@ impl L2Cpu {
             )
         };
         if memory == libc::MAP_FAILED {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(std::io::Error::last_os_error());
         }
         let memory = memory as *mut u8;

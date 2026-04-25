@@ -55,9 +55,9 @@ pub const KNOWN_RAMDISKS: &[KnownRamdisk] = &[
 /// Look up a ramdisk by name or alias.
 pub fn find_ramdisk(name: &str) -> Option<&'static KnownRamdisk> {
     let name_lower = name.to_lowercase();
-    KNOWN_RAMDISKS.iter().find(|r| {
-        r.name == name_lower || r.aliases.iter().any(|a| *a == name_lower)
-    })
+    KNOWN_RAMDISKS
+        .iter()
+        .find(|r| r.name == name_lower || r.aliases.iter().any(|a| *a == name_lower))
 }
 
 /// Default directory for ramdisk files.
@@ -137,9 +137,7 @@ pub fn pull_ramdisk(name: &str, output: Option<&Path>) -> Result<PathBuf, String
         }
     }
 
-    let size = fs::metadata(&output_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let size = fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
     eprintln!(
         "Ramdisk ready: {} ({:.1} MB)",
         output_path.display(),

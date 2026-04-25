@@ -95,13 +95,7 @@ fn writer_loop(stream: &UnixStream, exit: &AtomicBool) -> io::Result<()> {
             continue;
         }
         let mut b = [0u8; 1];
-        let n = unsafe {
-            libc::read(
-                libc::STDIN_FILENO,
-                b.as_mut_ptr() as *mut libc::c_void,
-                1,
-            )
-        };
+        let n = unsafe { libc::read(libc::STDIN_FILENO, b.as_mut_ptr() as *mut libc::c_void, 1) };
         if n <= 0 {
             break;
         }

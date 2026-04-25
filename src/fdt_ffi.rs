@@ -86,11 +86,7 @@ impl Fdt {
         // libfdt usage (it does a memmove internally if src == dst,
         // and our case is "moves into self" which is a noop).
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                src.as_ptr(),
-                storage.as_mut_ptr() as *mut u8,
-                src.len(),
-            );
+            std::ptr::copy_nonoverlapping(src.as_ptr(), storage.as_mut_ptr() as *mut u8, src.len());
         }
         let ret = unsafe {
             fdt_open_into(
@@ -100,15 +96,20 @@ impl Fdt {
             )
         };
         check(ret, "fdt_open_into")?;
-        Ok(Fdt { storage, byte_len: total })
+        Ok(Fdt {
+            storage,
+            byte_len: total,
+        })
     }
 
-    fn ptr(&self) -> *const c_void { self.storage.as_ptr() as *const c_void }
-    fn ptr_mut(&mut self) -> *mut c_void { self.storage.as_mut_ptr() as *mut c_void }
+    fn ptr(&self) -> *const c_void {
+        self.storage.as_ptr() as *const c_void
+    }
+    fn ptr_mut(&mut self) -> *mut c_void {
+        self.storage.as_mut_ptr() as *mut c_void
+    }
     fn buf_bytes(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(self.storage.as_ptr() as *const u8, self.byte_len)
-        }
+        unsafe { std::slice::from_raw_parts(self.storage.as_ptr() as *const u8, self.byte_len) }
     }
 
     /// Find a node by path. Returns None if not found.

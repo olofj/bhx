@@ -27,7 +27,9 @@ pub fn reset_board(card: u32) -> std::io::Result<()> {
     let bdf = {
         let fd = kmd::open_device(card)?;
         let info = kmd::get_device_info(fd);
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         let info = info?;
         let domain = info.pci_domain as u32;
         let bus = ((info.bus_dev_fn >> 8) & 0xff) as u32;
@@ -45,7 +47,9 @@ pub fn reset_board(card: u32) -> std::io::Result<()> {
     {
         let fd = kmd::open_device(card)?;
         let r = kmd::reset_device(fd, kmd::TENSTORRENT_RESET_DEVICE_CONFIG_WRITE);
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         r?;
     }
 
@@ -86,7 +90,9 @@ pub fn reset_board(card: u32) -> std::io::Result<()> {
     {
         let fd = kmd::open_device(card)?;
         let r = kmd::reset_device(fd, kmd::TENSTORRENT_RESET_DEVICE_RESTORE_STATE);
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         r?;
     }
     eprintln!("[reset_board] complete");

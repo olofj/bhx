@@ -32,7 +32,10 @@ fn expect_ok(resp: Response) -> io::Result<()> {
     match resp {
         Response::Ok => Ok(()),
         Response::Error { error } => Err(io::Error::other(error)),
-        other => Err(io::Error::other(format!("unexpected response: {:?}", other))),
+        other => Err(io::Error::other(format!(
+            "unexpected response: {:?}",
+            other
+        ))),
     }
 }
 
@@ -41,7 +44,10 @@ pub fn status(sock: &mut UnixStream) -> io::Result<StatusPayload> {
     match read_frame::<_, Response>(&mut *sock)? {
         Response::Status(s) => Ok(s),
         Response::Error { error } => Err(io::Error::other(error)),
-        other => Err(io::Error::other(format!("unexpected response: {:?}", other))),
+        other => Err(io::Error::other(format!(
+            "unexpected response: {:?}",
+            other
+        ))),
     }
 }
 
@@ -122,6 +128,9 @@ pub fn attach_console(
             Ok((scrollback_bytes, fd))
         }
         Response::Error { error } => Err(io::Error::other(error)),
-        other => Err(io::Error::other(format!("unexpected response: {:?}", other))),
+        other => Err(io::Error::other(format!(
+            "unexpected response: {:?}",
+            other
+        ))),
     }
 }

@@ -31,7 +31,8 @@ pub const KNOWN_KERNELS: &[KnownKernel] = &[
     KnownKernel {
         version: "0.10",
         url: "https://github.com/tenstorrent/tt-bh-linux/releases/download/v0.10/tt-bh-linux.zip",
-        description: "tt-bh-linux v0.10 — latest release (fw_jump.bin + Image + blackhole-card.dtb)",
+        description:
+            "tt-bh-linux v0.10 — latest release (fw_jump.bin + Image + blackhole-card.dtb)",
         is_default: true,
     },
     KnownKernel {
@@ -88,9 +89,7 @@ pub fn pull_kernel(version: Option<&str>, output_dir: Option<&Path>) -> Result<P
         )
     })?;
 
-    let dir = output_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(firmware_dir);
+    let dir = output_dir.map(PathBuf::from).unwrap_or_else(firmware_dir);
     let _ = fs::create_dir_all(&dir);
 
     // Check if files already exist

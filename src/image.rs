@@ -167,8 +167,12 @@ pub fn image_dir() -> PathBuf {
 ///
 /// Returns the path to the ready-to-use ext4 image.
 pub fn pull_image(name: &str, output: Option<&Path>) -> Result<PathBuf, String> {
-    let image = get_known_image(name)
-        .ok_or_else(|| format!("Unknown image '{}'. Use 'image list' to see available images.", name))?;
+    let image = get_known_image(name).ok_or_else(|| {
+        format!(
+            "Unknown image '{}'. Use 'image list' to see available images.",
+            name
+        )
+    })?;
 
     let dir = image_dir();
     let final_path = output
@@ -236,7 +240,12 @@ fn download_file(url: &str, dir: &Path, compression: Compression) -> Result<Path
                 .args(["-d", "-f"])
                 .arg(&download_path)
                 .status()
-                .map_err(|e| format!("Failed to run xz: {}. Install with: apt install xz-utils", e))?;
+                .map_err(|e| {
+                    format!(
+                        "Failed to run xz: {}. Install with: apt install xz-utils",
+                        e
+                    )
+                })?;
             if !status.success() {
                 return Err("xz decompression failed".to_string());
             }
@@ -250,7 +259,12 @@ fn download_file(url: &str, dir: &Path, compression: Compression) -> Result<Path
                 .arg(dir)
                 .arg(&download_path)
                 .status()
-                .map_err(|e| format!("Failed to run unzip: {}. Install with: apt install unzip", e))?;
+                .map_err(|e| {
+                    format!(
+                        "Failed to run unzip: {}. Install with: apt install unzip",
+                        e
+                    )
+                })?;
             let _ = fs::remove_file(&download_path);
             if !status.success() {
                 return Err("unzip failed".to_string());
@@ -277,11 +291,7 @@ fn download_file(url: &str, dir: &Path, compression: Compression) -> Result<Path
 }
 
 /// Convert a downloaded image to a raw ext4 filesystem.
-fn convert_to_ext4(
-    input: &Path,
-    format: ImageFormat,
-    output: &Path,
-) -> Result<PathBuf, String> {
+fn convert_to_ext4(input: &Path, format: ImageFormat, output: &Path) -> Result<PathBuf, String> {
     match format {
         ImageFormat::Ext4 => {
             // Already ext4, just rename/move
@@ -302,7 +312,12 @@ fn convert_to_ext4(
                 .arg(input)
                 .arg(&raw_path)
                 .status()
-                .map_err(|e| format!("Failed to run qemu-img: {}. Install with: apt install qemu-utils", e))?;
+                .map_err(|e| {
+                    format!(
+                        "Failed to run qemu-img: {}. Install with: apt install qemu-utils",
+                        e
+                    )
+                })?;
             if !status.success() {
                 return Err("qemu-img convert failed".to_string());
             }
@@ -332,7 +347,12 @@ fn extract_root_partition(disk: &Path, output: &Path) -> Result<(), String> {
         .args(["--json"])
         .arg(disk)
         .output()
-        .map_err(|e| format!("Failed to run sfdisk: {}. Install with: apt install fdisk", e))?;
+        .map_err(|e| {
+            format!(
+                "Failed to run sfdisk: {}. Install with: apt install fdisk",
+                e
+            )
+        })?;
 
     if !sfdisk_output.status.success() {
         return Err(format!(
@@ -397,8 +417,8 @@ fn extract_root_partition(disk: &Path, output: &Path) -> Result<(), String> {
 /// for the cloud images we convert (much larger than the `/boot` / EFI
 /// partitions that sit alongside it).
 fn parse_largest_partition(json: &str) -> Result<(u64, u64), String> {
-    let root: serde_json::Value = serde_json::from_str(json)
-        .map_err(|e| format!("sfdisk emitted non-JSON: {}", e))?;
+    let root: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("sfdisk emitted non-JSON: {}", e))?;
     let partitions = root
         .pointer("/partitiontable/partitions")
         .and_then(|v| v.as_array())
@@ -460,20 +480,19 @@ fn resize_image(path: &Path, size: &str) -> Result<(), String> {
     }
 
     // Then resize the filesystem
-    let status = Command::new("e2fsck")
-        .args(["-f", "-y"])
-        .arg(path)
-        .status();
+    let status = Command::new("e2fsck").args(["-f", "-y"]).arg(path).status();
     if let Ok(s) = status {
         if !s.success() && s.code() != Some(1) {
             eprintln!("  Warning: e2fsck returned {:?}", s.code());
         }
     }
 
-    let status = Command::new("resize2fs")
-        .arg(path)
-        .status()
-        .map_err(|e| format!("Failed to run resize2fs: {}. Install with: apt install e2fsprogs", e))?;
+    let status = Command::new("resize2fs").arg(path).status().map_err(|e| {
+        format!(
+            "Failed to run resize2fs: {}. Install with: apt install e2fsprogs",
+            e
+        )
+    })?;
 
     if !status.success() {
         eprintln!("  Warning: resize2fs failed. Image may not use full disk size.");
@@ -528,7 +547,14 @@ pub fn cmd_image_info(name: &str) {
             println!("URL:           {}", img.url);
             println!("Format:        {:?}", img.format);
             println!("Compression:   {:?}", img.compression);
-            println!("Resize to:     {}", if img.default_size.is_empty() { "none" } else { img.default_size });
+            println!(
+                "Resize to:     {}",
+                if img.default_size.is_empty() {
+                    "none"
+                } else {
+                    img.default_size
+                }
+            );
             println!("Aliases:       {}", img.aliases.join(", "));
             if !img.default_user.is_empty() {
                 println!("Default user:  {}", img.default_user);
@@ -536,10 +562,16 @@ pub fn cmd_image_info(name: &str) {
             if !img.default_password.is_empty() {
                 println!("Default pass:  {}", img.default_password);
             }
-            println!("Cloud-init:    {}", if img.cloud_init { "yes" } else { "no" });
+            println!(
+                "Cloud-init:    {}",
+                if img.cloud_init { "yes" } else { "no" }
+            );
         }
         None => {
-            eprintln!("Unknown image '{}'. Use 'image list' to see available images.", name);
+            eprintln!(
+                "Unknown image '{}'. Use 'image list' to see available images.",
+                name
+            );
             std::process::exit(1);
         }
     }
@@ -602,10 +634,7 @@ mod tests {
 
     #[test]
     fn parse_largest_partition_rejects_empty_partitions_array() {
-        let err = parse_largest_partition(
-            r#"{"partitiontable": {"partitions": []}}"#,
-        )
-        .unwrap_err();
+        let err = parse_largest_partition(r#"{"partitiontable": {"partitions": []}}"#).unwrap_err();
         assert!(err.contains("No partitions"), "got: {}", err);
     }
 

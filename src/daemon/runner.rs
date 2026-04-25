@@ -85,10 +85,7 @@ pub fn start(opts: StartOpts) -> io::Result<()> {
 /// the per-card default under the runtime directory. For an explicit
 /// path, persist the absolute location to a sidecar so `daemon logs`
 /// can locate it without re-parsing the original CLI args.
-fn resolve_log_path_with_override(
-    card: u32,
-    override_path: Option<&Path>,
-) -> io::Result<PathBuf> {
+fn resolve_log_path_with_override(card: u32, override_path: Option<&Path>) -> io::Result<PathBuf> {
     let runtime_dir = lifetime::runtime_dir(card);
     let sidecar = runtime_dir.join("logpath");
     match override_path {
@@ -120,7 +117,9 @@ fn acquire_pidfile_or_already_running(
             io::Error::other(format!(
                 "daemon already running for card {}{} (sock: {})",
                 card,
-                existing.map(|p| format!(" (pid {})", p)).unwrap_or_default(),
+                existing
+                    .map(|p| format!(" (pid {})", p))
+                    .unwrap_or_default(),
                 sock_path.display()
             ))
         } else {

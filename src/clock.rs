@@ -49,7 +49,9 @@ struct PllCntl5 {
 
 impl PllCntl5 {
     fn from_u32(val: u32) -> Self {
-        PllCntl5 { postdiv: val.to_le_bytes() }
+        PllCntl5 {
+            postdiv: val.to_le_bytes(),
+        }
     }
     fn to_u32(self) -> u32 {
         u32::from_le_bytes(self.postdiv)
@@ -63,8 +65,13 @@ pub trait PllAccess {
 }
 
 fn sleep_1ns() {
-    let ts = libc::timespec { tv_sec: 0, tv_nsec: 1 };
-    unsafe { libc::nanosleep(&ts, std::ptr::null_mut()); }
+    let ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 1,
+    };
+    unsafe {
+        libc::nanosleep(&ts, std::ptr::null_mut());
+    }
 }
 
 /// Step PLL to the target frequency using the given register accessor.
@@ -148,7 +155,11 @@ mod tests {
         // refdiv/postdiv. Pin the bit layout so a future "let me reorder
         // these" refactor fails this test instead of silently miswriting
         // the PLL register.
-        let c = PllCntl1 { refdiv: 0x12, postdiv: 0x34, fbdiv: 0xabcd };
+        let c = PllCntl1 {
+            refdiv: 0x12,
+            postdiv: 0x34,
+            fbdiv: 0xabcd,
+        };
         assert_eq!(c.to_u32(), 0xabcd_3412);
         let back = PllCntl1::from_u32(0xabcd_3412);
         assert_eq!(back.refdiv, 0x12);
@@ -161,7 +172,9 @@ mod tests {
         for v in [0u32, 0xffff_ffff, 0x0102_0304] {
             assert_eq!(PllCntl5::from_u32(v).to_u32(), v);
         }
-        let c = PllCntl5 { postdiv: [1, 2, 3, 4] };
+        let c = PllCntl5 {
+            postdiv: [1, 2, 3, 4],
+        };
         assert_eq!(c.to_u32(), 0x0403_0201);
     }
 
@@ -208,8 +221,16 @@ mod tests {
         // The exact ordering of writes is verified separately below; this
         // test pins only the final state because that's the contract
         // callers care about.
-        let initial_cntl1 = PllCntl1 { refdiv: 0, postdiv: 0, fbdiv: 140 }.to_u32();
-        let initial_cntl5 = PllCntl5 { postdiv: [1, 1, 1, 1] }.to_u32();
+        let initial_cntl1 = PllCntl1 {
+            refdiv: 0,
+            postdiv: 0,
+            fbdiv: 140,
+        }
+        .to_u32();
+        let initial_cntl5 = PllCntl5 {
+            postdiv: [1, 1, 1, 1],
+        }
+        .to_u32();
         let mock = MockPll::new(initial_cntl1, initial_cntl5);
 
         set_frequency(&mock, 200);
@@ -227,8 +248,16 @@ mod tests {
         // Verify the sequencing: every CNTL5 write happens *before* any
         // CNTL1 write, because dropping fbdiv at low postdiv would briefly
         // glitch the PLL above its safe range.
-        let initial_cntl1 = PllCntl1 { refdiv: 0, postdiv: 0, fbdiv: 140 }.to_u32();
-        let initial_cntl5 = PllCntl5 { postdiv: [1, 1, 1, 1] }.to_u32();
+        let initial_cntl1 = PllCntl1 {
+            refdiv: 0,
+            postdiv: 0,
+            fbdiv: 140,
+        }
+        .to_u32();
+        let initial_cntl5 = PllCntl5 {
+            postdiv: [1, 1, 1, 1],
+        }
+        .to_u32();
         let mock = MockPll::new(initial_cntl1, initial_cntl5);
 
         set_frequency(&mock, 200);

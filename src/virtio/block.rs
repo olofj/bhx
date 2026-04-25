@@ -14,7 +14,7 @@ use crate::virtio::interrupt::InterruptController;
 use crate::virtio::{self, VirtioDeviceImpl};
 
 // VirtIO block request types
-const VIRTIO_BLK_T_IN: u32 = 0;  // read from disk
+const VIRTIO_BLK_T_IN: u32 = 0; // read from disk
 const VIRTIO_BLK_T_OUT: u32 = 1; // write to disk
 
 // VirtIO IDs
@@ -73,8 +73,8 @@ impl VirtioBlk {
         )
         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
 
-        let stat = nix::sys::stat::fstat(fd)
-            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+        let stat =
+            nix::sys::stat::fstat(fd).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
         let file_size = stat.st_size as usize;
 
         let mapped_data = unsafe {
@@ -88,7 +88,9 @@ impl VirtioBlk {
             )
         };
         if mapped_data == libc::MAP_FAILED {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(std::io::Error::last_os_error());
         }
 
@@ -108,10 +110,18 @@ impl VirtioBlk {
 }
 
 impl VirtioDeviceImpl for VirtioBlk {
-    fn num_queues(&self) -> u32 { 1 }
-    fn queue_header_size(&self) -> u64 { std::mem::size_of::<VirtioBlkOuthdr>() as u64 }
-    fn device_id(&self) -> u32 { VIRTIO_ID_BLOCK }
-    fn device_features(&self) -> [u32; 2] { [0, VIRTIO_F_VERSION_1_BIT] }
+    fn num_queues(&self) -> u32 {
+        1
+    }
+    fn queue_header_size(&self) -> u64 {
+        std::mem::size_of::<VirtioBlkOuthdr>() as u64
+    }
+    fn device_id(&self) -> u32 {
+        VIRTIO_ID_BLOCK
+    }
+    fn device_features(&self) -> [u32; 2] {
+        [0, VIRTIO_F_VERSION_1_BIT]
+    }
 
     fn process_queue_start(&mut self, _queue_idx: u32, addr: *mut u8, _len: u64) {
         self.req = addr as *const VirtioBlkOuthdr;
@@ -162,7 +172,9 @@ impl VirtioDeviceImpl for VirtioBlk {
 
     fn process_queue_complete(&mut self, _queue_idx: u32, addr: *mut u8, _len: u64) {
         // Write status byte 0 = success
-        unsafe { ptr::write_volatile(addr, 0u8); }
+        unsafe {
+            ptr::write_volatile(addr, 0u8);
+        }
     }
 
     fn queue_has_data(&self, _queue_idx: u32) -> bool {

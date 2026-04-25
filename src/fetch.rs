@@ -45,8 +45,7 @@ pub fn download_to(url: &str, dest_path: &Path) -> Result<PathBuf, String> {
         return Err("Download failed".to_string());
     }
 
-    fs::rename(&temp_path, dest_path)
-        .map_err(|e| format!("Failed to rename download: {}", e))?;
+    fs::rename(&temp_path, dest_path).map_err(|e| format!("Failed to rename download: {}", e))?;
     Ok(dest_path.to_path_buf())
 }
 
@@ -63,7 +62,10 @@ mod tests {
     #[test]
     fn downloading_path_appends_suffix() {
         let p = Path::new("/tmp/foo.bin");
-        assert_eq!(downloading_path(p), PathBuf::from("/tmp/foo.bin.downloading"));
+        assert_eq!(
+            downloading_path(p),
+            PathBuf::from("/tmp/foo.bin.downloading")
+        );
     }
 
     #[test]

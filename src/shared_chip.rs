@@ -128,7 +128,9 @@ impl SharedChip {
         let window = match TlbWindow::new_2m(fd, AXI_TILE_X, AXI_TILE_Y, AXI_WINDOW_BASE) {
             Ok(w) => w,
             Err(e) => {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
                 return Err(e);
             }
         };
@@ -214,7 +216,10 @@ impl SharedChip {
         );
         self.axi_write32(L2CPU_RESET_ADDR, reset_val);
         let reset_val_after = self.axi_read32(L2CPU_RESET_ADDR);
-        eprintln!("[reset_x280] L2CPU_RESET readback: {:#010x}", reset_val_after);
+        eprintln!(
+            "[reset_x280] L2CPU_RESET readback: {:#010x}",
+            reset_val_after
+        );
 
         eprintln!("[reset_x280] stepping PLL up to 1750 MHz");
         clock::set_frequency(self, 1750);
