@@ -468,6 +468,17 @@ pub static NET_PACKETS_TOTAL: PerL2cpuNetDirCounter = PerL2cpuNetDirCounter::new
 /// to/from the slirp buffer (after `min(data_len, PACKET_SIZE)`).
 pub static NET_BYTES_TOTAL: PerL2cpuNetDirCounter = PerL2cpuNetDirCounter::new();
 
+/// Block-device interrupt count per L2CPU. Bumped on every
+/// `set_interrupt` call from the block worker's `run_device` loop. In
+/// the absence of interrupt coalescing, this tracks
+/// `BLK_REQUESTS_TOTAL{read} + {write}` 1:1 — a divergence is the
+/// observable signal that something dropped or coalesced.
+pub static BLK_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
+
+/// Net-device interrupt count per L2CPU. Same shape as
+/// `BLK_INTERRUPTS_TOTAL`.
+pub static NET_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
+
 // ============================================================================
 // Prometheus text formatter
 // ============================================================================
@@ -703,6 +714,34 @@ pub fn render_prometheus(state: &DaemonState) -> String {
             "tt_bh_net_bytes_total{{idx=\"{}\",direction=\"tx\"}} {}",
             idx,
             NET_BYTES_TOTAL.tx(idx).get()
+        );
+    }
+
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_blk_interrupts_total Block-device PLIC interrupts per L2CPU."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_blk_interrupts_total counter");
+    for idx in 0..4u8 {
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_blk_interrupts_total{{idx=\"{}\",disk_id=\"0\"}} {}",
+            idx,
+            BLK_INTERRUPTS_TOTAL.at(idx).get()
+        );
+    }
+
+    let _ = writeln!(
+        &mut out,
+        "# HELP tt_bh_net_interrupts_total Net-device PLIC interrupts per L2CPU."
+    );
+    let _ = writeln!(&mut out, "# TYPE tt_bh_net_interrupts_total counter");
+    for idx in 0..4u8 {
+        let _ = writeln!(
+            &mut out,
+            "tt_bh_net_interrupts_total{{idx=\"{}\"}} {}",
+            idx,
+            NET_INTERRUPTS_TOTAL.at(idx).get()
         );
     }
 
@@ -955,6 +994,8 @@ mod tests {
             "tt_bh_net_packets_total{idx=\"0\",direction=\"rx\"} ",
             "tt_bh_net_packets_total{idx=\"3\",direction=\"tx\"} ",
             "tt_bh_net_bytes_total{idx=\"2\",direction=\"rx\"} ",
+            "tt_bh_blk_interrupts_total{idx=\"0\",disk_id=\"0\"} ",
+            "tt_bh_net_interrupts_total{idx=\"3\"} ",
         ] {
             assert!(
                 out.contains(needle),

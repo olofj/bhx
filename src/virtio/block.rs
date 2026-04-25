@@ -322,6 +322,7 @@ pub fn disk_main(
             interrupt_number,
             mmio_region_offset,
             &exit_flag,
+            virtio::InterruptKind::Block,
         );
 
         std::thread::sleep(std::time::Duration::from_millis(100));

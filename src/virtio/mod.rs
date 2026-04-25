@@ -82,6 +82,26 @@ struct VringUsed {
     ring: [VringUsedElem; 0], // flexible array
 }
 
+/// Discriminator for the per-device interrupt counters in
+/// `crate::daemon::metrics`. The `run_device` accept loop is generic
+/// over device kind, but each interrupt belongs to exactly one of
+/// these two metric families — the caller picks at spawn time.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InterruptKind {
+    Block,
+    Net,
+}
+
+/// Bump the per-kind interrupt counter at index `idx`. Pulled out of
+/// `run_device` so the kind-mapping logic is unit-testable without
+/// having to drive the full chip-memory loop.
+pub(crate) fn bump_interrupt_metric(kind: InterruptKind, idx: u8) {
+    match kind {
+        InterruptKind::Block => crate::daemon::metrics::BLK_INTERRUPTS_TOTAL.at(idx).inc(),
+        InterruptKind::Net => crate::daemon::metrics::NET_INTERRUPTS_TOTAL.at(idx).inc(),
+    }
+}
+
 /// Trait that VirtIO device implementations must provide.
 pub trait VirtioDeviceImpl {
     fn num_queues(&self) -> u32;
@@ -260,6 +280,7 @@ pub fn run_device(
     interrupt_number: u32,
     mmio_region_offset: u64,
     exit_flag: &AtomicBool,
+    interrupt_kind: InterruptKind,
 ) {
     let starting_address = l2cpu.starting_address();
     let memory = l2cpu.get_memory_ptr();
@@ -740,6 +761,7 @@ pub fn run_device(
 
             if should_set_interrupt {
                 interrupt_ctl.set_interrupt(regs.interrupt_status, interrupt_number);
+                bump_interrupt_metric(interrupt_kind, l2cpu.idx() as u8);
                 did_work = true;
             }
         }
@@ -768,6 +790,29 @@ mod tests {
     use super::*;
 
     const FEATURES_OK: u32 = VIRTIO_CONFIG_S_FEATURES_OK;
+
+    #[test]
+    fn interrupt_kind_routes_to_correct_metric() {
+        // Both arms use distinct global statics; pick a fresh idx
+        // (use idx=2 — other tests touching these counters use 0/1
+        // implicitly via run_device hardware paths) and snapshot
+        // before/after.
+        use crate::daemon::metrics::{BLK_INTERRUPTS_TOTAL, NET_INTERRUPTS_TOTAL};
+        let blk_before = BLK_INTERRUPTS_TOTAL.at(2).get();
+        let net_before = NET_INTERRUPTS_TOTAL.at(2).get();
+
+        bump_interrupt_metric(InterruptKind::Block, 2);
+        bump_interrupt_metric(InterruptKind::Block, 2);
+        bump_interrupt_metric(InterruptKind::Net, 2);
+
+        assert_eq!(BLK_INTERRUPTS_TOTAL.at(2).get(), blk_before + 2);
+        assert_eq!(NET_INTERRUPTS_TOTAL.at(2).get(), net_before + 1);
+
+        // A different idx must not be affected.
+        let blk_other_before = BLK_INTERRUPTS_TOTAL.at(0).get();
+        bump_interrupt_metric(InterruptKind::Block, 2);
+        assert_eq!(BLK_INTERRUPTS_TOTAL.at(0).get(), blk_other_before);
+    }
 
     #[test]
     fn phase2_done_when_initial_status_has_features_ok() {

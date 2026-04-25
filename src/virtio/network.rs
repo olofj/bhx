@@ -260,6 +260,7 @@ pub fn network_main(
             interrupt_number,
             mmio_region_offset,
             &exit_flag,
+            virtio::InterruptKind::Net,
         );
 
         std::thread::sleep(std::time::Duration::from_millis(100));
