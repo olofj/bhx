@@ -3,11 +3,13 @@
 
 //! Control-socket server: accepts clients, dispatches ops, holds L2CPU state.
 //!
-//! Each accepted client gets its own thread that reads one request frame,
-//! dispatches it against [`DaemonState`], writes a response, and (for
-//! `AttachConsole`) stays alive as the client's console reader.
+//! Each accepted client gets its own thread. Most RPCs are short-lived
+//! request → reply (boot, status, add-disk, etc.). The exception is
+//! `AttachConsole`: the daemon keeps a per-client thread alive that
+//! shuttles bytes between the client's socketpair end and the hub's
+//! input channel for as long as the client stays attached.
 
-use std::io::{self, Write};
+use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -141,7 +143,7 @@ fn warm_resume_released(state: &Arc<DaemonState>, released: &[u8]) {
                     idx,
                     e
                 );
-                state.wedged[idx as usize].store(true, Ordering::SeqCst);
+                state.wedged[idx as usize].store(true, Ordering::Relaxed);
                 continue;
             }
         };
@@ -150,7 +152,7 @@ fn warm_resume_released(state: &Arc<DaemonState>, released: &[u8]) {
                 "[warm-resume l2cpu {}] probe failed — marking wedged, dropping L2Cpu",
                 idx
             );
-            state.wedged[idx as usize].store(true, Ordering::SeqCst);
+            state.wedged[idx as usize].store(true, Ordering::Relaxed);
             // Arc<L2Cpu> drops here; TLB windows and 8 GB VA released.
             continue;
         }
@@ -161,7 +163,7 @@ fn warm_resume_released(state: &Arc<DaemonState>, released: &[u8]) {
         match make_slot_from_l2cpu(l2cpu, idx) {
             Ok(slot) => {
                 *state.l2cpus[idx as usize].lock().unwrap() = Some(slot);
-                state.wedged[idx as usize].store(false, Ordering::SeqCst);
+                state.wedged[idx as usize].store(false, Ordering::Relaxed);
                 dlog!("[warm-resume l2cpu {}] slot adopted", idx);
             }
             Err(e) => {
@@ -170,7 +172,7 @@ fn warm_resume_released(state: &Arc<DaemonState>, released: &[u8]) {
                     idx,
                     e
                 );
-                state.wedged[idx as usize].store(true, Ordering::SeqCst);
+                state.wedged[idx as usize].store(true, Ordering::Relaxed);
             }
         }
     }
@@ -181,7 +183,13 @@ fn install_signal_handlers(flag: Arc<AtomicBool>) {
     // ctrlc handles both SIGINT and SIGTERM via set_handler (it spawns a
     // dedicated thread that converts signals into handler invocations, so
     // we don't have to think about async-signal-safety in the closure).
-    ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst))
+    //
+    // Relaxed is sufficient: the flag is the only thing we read on the
+    // accept-loop side, and there's nothing else that needs to be
+    // happens-before-ordered against the flag write. Both sides of the
+    // flag now use Relaxed; if you ever need to publish other state along
+    // with the shutdown signal, upgrade both sides together.
+    ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))
         .expect("failed to install SIGINT/SIGTERM handler");
 }
 
@@ -429,7 +437,7 @@ fn dispatch_boot(
     *state.l2cpus[l2cpu_idx as usize].lock().unwrap() = Some(slot);
     // Successful cold boot — core is freshly running with valid magic,
     // so any stale "wedged" mark from a prior startup probe is obsolete.
-    state.wedged[l2cpu_idx as usize].store(false, Ordering::SeqCst);
+    state.wedged[l2cpu_idx as usize].store(false, Ordering::Relaxed);
     dlog!(
         "[boot l2cpu {}] dispatch_boot complete — replying ok",
         l2cpu_idx
@@ -985,29 +993,3 @@ fn dispatch_shutdown(sock: &UnixStream, state: &Arc<DaemonState>) {
     reply_ok(sock);
 }
 
-/// Helper: spawn the per-client console reader. The reader owns one half of
-/// a cloned UnixStream (pointing at the same socketpair end the hub writes
-/// into for fan-out); bytes read from the socket become chip RX pushes
-/// whenever this client is the current writer.
-#[allow(dead_code)]
-fn spawn_client_reader(
-    daemon_end: UnixStream,
-    client_id: u64,
-    hub: Arc<ConsoleHub>,
-    input_tx: mpsc::Sender<u8>,
-) {
-    // TODO(phase-A.wire): currently unused — attach_console is still being
-    // finished. Placeholder for the reader-thread design so the module
-    // compiles while we iterate.
-    drop(daemon_end);
-    drop(hub);
-    drop(input_tx);
-    let _ = client_id;
-}
-
-/// Convenience: write a string line to a client socket (used by the client-
-/// side CLI for error rendering). Exported to keep the module testable.
-pub fn write_line(sock: &mut UnixStream, s: &str) -> io::Result<()> {
-    sock.write_all(s.as_bytes())?;
-    sock.write_all(b"\n")
-}

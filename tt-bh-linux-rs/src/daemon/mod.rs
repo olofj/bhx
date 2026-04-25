@@ -164,12 +164,12 @@ mod tests {
     fn wedged_flag_set_and_clear_per_core() {
         // Exercises the read/write semantics dispatch_status relies on.
         let s = DaemonState::new(1, Arc::new(SharedChip::placeholder()));
-        s.wedged[2].store(true, Ordering::SeqCst);
+        s.wedged[2].store(true, Ordering::Relaxed);
         assert!(s.wedged[2].load(Ordering::Relaxed));
         assert!(!s.wedged[0].load(Ordering::Relaxed));
         assert!(!s.wedged[1].load(Ordering::Relaxed));
         assert!(!s.wedged[3].load(Ordering::Relaxed));
-        s.wedged[2].store(false, Ordering::SeqCst);
+        s.wedged[2].store(false, Ordering::Relaxed);
         assert!(!s.wedged[2].load(Ordering::Relaxed));
     }
 }

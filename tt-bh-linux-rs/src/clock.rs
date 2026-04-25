@@ -68,6 +68,13 @@ fn sleep_1ns() {
 }
 
 /// Step PLL to the target frequency using the given register accessor.
+//
+// `clippy::needless_range_loop` would prefer `.iter_mut().enumerate()` for
+// the postdiv loops, but the body has to call `current_postdivs.to_u32()`
+// after each per-element mutation to write the *whole* struct back to
+// CNTL5. Holding a `&mut` to one array element while also reborrowing the
+// surrounding struct doesn't compile, so the indexed form is structurally
+// necessary.
 #[allow(clippy::needless_range_loop)]
 pub fn set_frequency(access: &dyn PllAccess, mhz: u32) {
     let (target_fbdiv, target_postdiv) = frequency_solution(mhz);
