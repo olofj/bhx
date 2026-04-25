@@ -73,6 +73,10 @@ echo "$status" | grep -qE "l2cpu $L2CPU: Running disk=- net=-" \
     || fail "pre-soak status mismatch:\n$status"
 note "starting state OK: Running, no disk, no net"
 
+# Match the daemon-side basename (CLI canonicalizes via readlink), so
+# the regex works for both regular files and the buildroot symlink.
+disk_basename=$(basename "$(readlink -f "$DISK_PATH")")
+
 # Soak loop ----------------------------------------------------------------
 note "starting $ITERATIONS add/remove cycles"
 for i in $(seq 1 "$ITERATIONS"); do
@@ -80,7 +84,7 @@ for i in $(seq 1 "$ITERATIONS"); do
 
     "$BINARY" add-disk -t "$CARD" -l "$L2CPU" "$DISK_PATH" >/dev/null
     status=$("$BINARY" daemon status -t "$CARD")
-    echo "$status" | grep -qE "l2cpu $L2CPU: Running disk=.*$DISK_PATH net=-" \
+    echo "$status" | grep -qE "l2cpu $L2CPU: Running disk=.*$disk_basename net=-" \
         || fail "iter $i: after add-disk:\n$status"
 
     "$BINARY" remove-disk -t "$CARD" -l "$L2CPU" >/dev/null

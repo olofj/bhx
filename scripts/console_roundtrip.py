@@ -5,14 +5,20 @@ End-to-end virtual-UART console I/O stress test via the daemon-mediated
 
 Prereqs (caller responsibility):
   - Daemon running on the selected card, the selected L2CPU booted with
-    disk (so a guest shell is reachable), login prompt visible.
-  - `debian` user on the guest has a passwordless console login.
+    a guest disk reachable.
+
+Auto-detects two rootfs flavors:
+  - Debian-style: `login:` prompt → send `debian\\r` → `$ ` prompt.
+  - Buildroot-style: auto-logged-in `# ` prompt directly (no login
+    needed, e.g. tests/rootfs/output/.../rootfs.ext4 from #16).
 
 Flow:
   1. Spawn `connect -l N` (default `--mode rw`). Reader thread
      accumulates stdout bytes.
-  2. Wait for `login:` prompt, send `debian\\r`.
-  3. Wait for shell prompt (`$ `).
+  2. Race-wait for either a `login:` prompt or a bare `# ` prompt
+     (whichever comes first within LOGIN_WAIT seconds).
+  3. If `login:` won, send `debian\\r` and wait for `$ ` shell prompt.
+     If `# ` won, we're already at the shell.
   4. Send `stty -echo` (so the next command's input isn't echoed back).
   5. Send one big compound command that flips stty raw, runs the
      guest-side test program (printf markers + cat file + sha256 read-
@@ -128,20 +134,42 @@ def send(data: bytes) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: get to a shell prompt. Precondition (caller's responsibility):
-# chip was freshly reset/booted, so we start at a `login:` prompt — the
-# daemon's 64 KiB scrollback ring is small enough that at 2 s after boot,
-# the ring already contains that prompt.
+# Step 1: get to a shell prompt. Race between `login:` (Debian-style;
+# we type `debian\r` to log in) and a bare `# ` prompt (buildroot-style
+# auto-login; we're already root). Whichever the rootfs hands us first
+# within LOGIN_WAIT seconds wins.
 # ---------------------------------------------------------------------------
-say("waiting for 'login:' prompt")
-login_idx = wait_for(b"login:", time.time() + LOGIN_WAIT)
-# Give getty a beat to fully render the prompt before we type.
-time.sleep(0.3)
-send(b"debian\r")
-say("sent 'debian\\r' — waiting for shell prompt")
-# Debian default prompt is `debian@tt-blackhole:~$ ` — match `$ `.
-prompt_idx = wait_for(b"$ ", time.time() + SHELL_WAIT, from_idx=login_idx)
-say("shell prompt found")
+say("waiting for either 'login:' or '# ' prompt")
+deadline = time.time() + LOGIN_WAIT
+prompt_idx = -1
+auto_login = False
+while time.time() < deadline:
+    with buf_lock:
+        snapshot = bytes(buf)
+    li = snapshot.find(b"login:")
+    hi = snapshot.find(b"# ")
+    if li >= 0 and (hi < 0 or li < hi):
+        # Debian-style — type the username and wait for `$ `.
+        time.sleep(0.3)  # let getty finish rendering before typing
+        send(b"debian\r")
+        say("sent 'debian\\r' — waiting for shell prompt")
+        # Debian default prompt is `debian@tt-blackhole:~$ ` — match `$ `.
+        prompt_idx = wait_for(b"$ ", time.time() + SHELL_WAIT, from_idx=li)
+        say("shell prompt found (Debian)")
+        break
+    if hi >= 0:
+        auto_login = True
+        prompt_idx = hi + len(b"# ")
+        say("auto-login detected (buildroot) — already at root shell")
+        break
+    time.sleep(0.05)
+
+if prompt_idx < 0:
+    with buf_lock:
+        tail = bytes(buf)[-400:]
+    say(f"TIMEOUT waiting for login or shell prompt — last 400 bytes: {tail!r}")
+    proc.kill()
+    raise SystemExit(10)
 
 
 # ---------------------------------------------------------------------------
@@ -151,14 +179,27 @@ say("shell prompt found")
 # and the parser can't tell the echoed-input marker from the actual
 # printf-output marker.
 # ---------------------------------------------------------------------------
+# Pick the prompt suffix matching the shell we landed on. busybox's
+# default PS1 ends in `# `; bash's user PS1 ends in `$ `.
+prompt_marker = b"# " if auto_login else b"$ "
+
+# Silence kernel printk to the console. Without this, lazy-init lines
+# like `random: crng init done` arrive mid-payload and pollute the
+# byte stream the host is parsing. Level 1 = emergency-only on
+# console; the guest's dmesg buffer is unaffected.
+send(b"dmesg -n 1\r")
+with buf_lock:
+    cursor = len(buf)
+wait_for(prompt_marker, time.time() + SHELL_WAIT, from_idx=cursor)
+
 send(b"stty -echo\r")
-# Wait for a new `$ ` prompt to appear after the one we already saw (the
+# Wait for a new prompt to appear after the one we already saw (the
 # stty command's execution reprints PS1).
 with buf_lock:
     echo_cursor = len(buf)
-# We can't just wait_for("$ ") because the previous prompt is still in the
-# buffer before echo_cursor — use from_idx to skip it.
-wait_for(b"$ ", time.time() + SHELL_WAIT, from_idx=echo_cursor)
+# We can't just wait_for(prompt_marker) because the previous prompt is
+# still in the buffer before echo_cursor — use from_idx to skip it.
+wait_for(prompt_marker, time.time() + SHELL_WAIT, from_idx=echo_cursor)
 
 
 # ---------------------------------------------------------------------------
