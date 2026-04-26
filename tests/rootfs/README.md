@@ -104,10 +104,20 @@ tests/rootfs/
   qemu_riscv64_virt config — set explicitly in `buildroot.config` if
   you ever drop that inheritance) forces buildroot to verify every
   downloaded source tarball.
-- Rebuilding from a clean checkout produces a byte-identical
-  `rootfs.ext4` *modulo* embedded timestamps. We don't currently set
-  `SOURCE_DATE_EPOCH`; if byte-identical reproducibility becomes
-  important, that's a separate issue.
+- `BR2_REPRODUCIBLE=y` is set in `buildroot.config`, and the Makefile
+  pins `SOURCE_DATE_EPOCH` to the timestamp of the last commit
+  touching `tests/rootfs/`. Two builds from the same commit produce a
+  byte-identical `rootfs.ext4`; a different commit (or
+  `SOURCE_DATE_EPOCH=N make` from the shell) produces a different but
+  equally reproducible image. UUID and ext4 hash_seed are pinned via
+  `BR2_TARGET_ROOTFS_EXT2_MKFS_OPTIONS` so `mkfs.ext4`'s libuuid call
+  doesn't reintroduce randomness in the superblock.
+
+  Verify reproducibility:
+  ```bash
+  make rebuild && sha256sum rootfs.ext4
+  make rebuild && sha256sum rootfs.ext4   # must match
+  ```
 
 ## Bumping buildroot
 

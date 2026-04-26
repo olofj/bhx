@@ -67,12 +67,23 @@ $(DL_DIR)/$(BUILDROOT_TARBALL):
 	wget -q -O $@.tmp $(BUILDROOT_URL)
 	@mv $@.tmp $@
 
+# Reproducibility: pin SOURCE_DATE_EPOCH to the timestamp of the last
+# commit that touched tests/rootfs/. Combined with BR2_REPRODUCIBLE=y
+# in buildroot.config this makes rootfs.ext4 byte-identical across
+# rebuilds from the same commit (mkfs.ext4 derives the UUID and inode
+# timestamps from this; gcc honors it for __DATE__/__TIME__). Anchored
+# at $(TOPDIR) rather than HEAD so unrelated repo commits don't bump
+# the cache; falls back to 0 if not in a git repo (release tarballs,
+# CI builds outside a checkout). See #39.
+SOURCE_DATE_EPOCH ?= $(shell git -C $(TOPDIR) log -1 --format=%ct -- $(TOPDIR) 2>/dev/null || echo 0)
+
 # Configure + build.  Buildroot's `make` is invoked from its own
 # directory; we set BR2_DEFCONFIG, BR2_EXTERNAL_*, and dl/output dirs
 # via env so the source tree itself doesn't get polluted.
 BR_MAKE_ENV := \
 	BR2_DEFCONFIG=$(DEFCONFIG) \
-	BR2_DL_DIR=$(DL_DIR)
+	BR2_DL_DIR=$(DL_DIR) \
+	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH)
 
 # Configure step: generates buildroot's in-tree .config from our
 # defconfig. The defconfig encodes BR2_ROOTFS_OVERLAY as a relative
