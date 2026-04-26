@@ -17,6 +17,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::error::{Error, Result};
+
 /// Compression format of the ramdisk download.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
@@ -76,14 +78,14 @@ pub fn pull_ramdisk(
     name: &str,
     output: Option<&Path>,
     force_refetch: bool,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf> {
     let ramdisk = find_ramdisk(name).ok_or_else(|| {
         let available: Vec<_> = KNOWN_RAMDISKS.iter().map(|r| r.name).collect();
-        format!(
+        Error::bad_request(format!(
             "Unknown ramdisk '{}'. Available: {}",
             name,
             available.join(", ")
-        )
+        ))
     })?;
 
     let dir = ramdisk_dir();
@@ -132,9 +134,9 @@ pub fn pull_ramdisk(
                 .arg("-f")
                 .arg(&download_path)
                 .status()
-                .map_err(|e| format!("Failed to run gunzip: {}", e))?;
+                .map_err(|e| Error::internal(format!("Failed to run gunzip: {}", e)))?;
             if !status.success() {
-                return Err("gunzip failed".to_string());
+                return Err(Error::internal("gunzip failed"));
             }
         }
         Compression::Xz => {
@@ -143,9 +145,9 @@ pub fn pull_ramdisk(
                 .args(["-d", "-f"])
                 .arg(&download_path)
                 .status()
-                .map_err(|e| format!("Failed to run xz: {}", e))?;
+                .map_err(|e| Error::internal(format!("Failed to run xz: {}", e)))?;
             if !status.success() {
-                return Err("xz decompression failed".to_string());
+                return Err(Error::internal("xz decompression failed"));
             }
         }
     }

@@ -19,6 +19,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::error::{Error, Result};
+
 /// A known kernel/firmware release.
 #[derive(Debug, Clone)]
 pub struct KnownKernel {
@@ -89,14 +91,14 @@ pub fn pull_kernel(
     version: Option<&str>,
     output_dir: Option<&Path>,
     force_refetch: bool,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf> {
     let kernel = get_known_kernel(version).ok_or_else(|| {
         let available: Vec<_> = KNOWN_KERNELS.iter().map(|k| k.version).collect();
-        format!(
+        Error::bad_request(format!(
             "Unknown kernel version '{}'. Available: {}",
             version.unwrap_or("?"),
             available.join(", ")
-        )
+        ))
     })?;
 
     let dir = output_dir.map(PathBuf::from).unwrap_or_else(firmware_dir);
@@ -133,12 +135,12 @@ pub fn pull_kernel(
         .arg(&dir)
         .arg(&zip_path)
         .status()
-        .map_err(|e| format!("Failed to run unzip: {}", e))?;
+        .map_err(|e| Error::internal(format!("Failed to run unzip: {}", e)))?;
 
     let _ = fs::remove_file(&zip_path);
 
     if !status.success() {
-        return Err("unzip failed".to_string());
+        return Err(Error::internal("unzip failed"));
     }
 
     // Verify expected files exist
@@ -151,7 +153,7 @@ pub fn pull_kernel(
     }
 
     if found.is_empty() {
-        return Err("No firmware files found in zip".to_string());
+        return Err(Error::internal("No firmware files found in zip"));
     }
 
     eprintln!("Firmware ready in {}:", dir.display());

@@ -24,6 +24,8 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{Error, Result};
+
 /// Cached HTTP-conditional metadata for a downloaded file. Persisted
 /// next to the destination as `<dest>.fetch.json`. Either field may be
 /// absent if the upstream doesn't emit it.
@@ -43,7 +45,7 @@ pub struct FetchMetadata {
 /// crashed run is removed before the new wget starts. On wget
 /// success, the temp is renamed to `dest_path` and the path is
 /// returned. On failure, the temp is removed.
-pub fn download_to(url: &str, dest_path: &Path) -> Result<PathBuf, String> {
+pub fn download_to(url: &str, dest_path: &Path) -> Result<PathBuf> {
     let temp_path = downloading_path(dest_path);
 
     // Stale `.downloading` from a previous crashed run: drop it before
@@ -58,14 +60,19 @@ pub fn download_to(url: &str, dest_path: &Path) -> Result<PathBuf, String> {
         .arg("--progress=bar:force:noscroll")
         .arg(url)
         .status()
-        .map_err(|e| format!("Failed to run wget: {}. Install with: apt install wget", e))?;
+        .map_err(|e| {
+            Error::internal(format!(
+                "Failed to run wget: {}. Install with: apt install wget",
+                e
+            ))
+        })?;
 
     if !status.success() {
         let _ = fs::remove_file(&temp_path);
-        return Err("Download failed".to_string());
+        return Err(Error::internal("Download failed"));
     }
 
-    fs::rename(&temp_path, dest_path).map_err(|e| format!("Failed to rename download: {}", e))?;
+    fs::rename(&temp_path, dest_path).map_err(Error::io_ctx("Failed to rename download"))?;
     Ok(dest_path.to_path_buf())
 }
 
@@ -98,7 +105,7 @@ pub fn download_to_cached(
     dest_path: &Path,
     sidecar_anchor: &Path,
     force: bool,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf> {
     if !force && cache_hit(url, sidecar_anchor) {
         eprintln!("  Skipping download — upstream unchanged ({})", url);
         return Ok(dest_path.to_path_buf());
@@ -156,7 +163,7 @@ pub(crate) fn upstream_matches(cached: &FetchMetadata, upstream: &FetchMetadata)
 /// Run `wget --spider --server-response <url>` and parse ETag /
 /// Last-Modified out of the response headers. Follows redirects (the
 /// last block of HTTP/1.1 lines is the one whose ETag we care about).
-fn head_metadata(url: &str) -> Result<FetchMetadata, String> {
+fn head_metadata(url: &str) -> Result<FetchMetadata> {
     let output = Command::new("wget")
         .arg("--spider")
         .arg("--server-response")
@@ -164,7 +171,7 @@ fn head_metadata(url: &str) -> Result<FetchMetadata, String> {
         .arg("--timeout=10")
         .arg(url)
         .output()
-        .map_err(|e| format!("Failed to run wget --spider: {}", e))?;
+        .map_err(|e| Error::internal(format!("Failed to run wget --spider: {}", e)))?;
     // wget --spider prints headers to stderr regardless of HTTP status.
     // We don't care if it returned non-zero (some servers 405 a HEAD);
     // we only want whatever headers it managed to capture.
@@ -238,14 +245,14 @@ pub(crate) fn read_sidecar(dest_path: &Path) -> Option<FetchMetadata> {
 
 /// Write the sidecar atomically (write to temp, rename). On any error,
 /// returns Err but the caller treats this as best-effort.
-fn write_sidecar(dest_path: &Path, meta: &FetchMetadata) -> Result<(), String> {
+fn write_sidecar(dest_path: &Path, meta: &FetchMetadata) -> Result<()> {
     let sc = sidecar_path(dest_path);
     let mut tmp = sc.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    let json = serde_json::to_vec_pretty(meta).map_err(|e| e.to_string())?;
-    fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, &sc).map_err(|e| e.to_string())?;
+    let json = serde_json::to_vec_pretty(meta)?;
+    fs::write(&tmp, json).map_err(Error::io_ctx("write sidecar tmp"))?;
+    fs::rename(&tmp, &sc).map_err(Error::io_ctx("rename sidecar"))?;
     Ok(())
 }
 

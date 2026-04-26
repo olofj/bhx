@@ -24,6 +24,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::error::{Error, Result};
+
 // ============================================================================
 // Image format and source definitions
 // ============================================================================
@@ -188,12 +190,12 @@ pub fn pull_image(
     name: &str,
     output: Option<&Path>,
     force_refetch: bool,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf> {
     let image = get_known_image(name).ok_or_else(|| {
-        format!(
+        Error::bad_request(format!(
             "Unknown image '{}'. Use 'image list' to see available images.",
             name
-        )
+        ))
     })?;
 
     let dir = image_dir();
@@ -263,7 +265,7 @@ fn download_file(
     compression: Compression,
     sidecar_anchor: &Path,
     force_refetch: bool,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf> {
     let filename = url.rsplit('/').next().unwrap_or("download");
     let download_path = dir.join(filename);
 
@@ -278,13 +280,13 @@ fn download_file(
                 .arg(&download_path)
                 .status()
                 .map_err(|e| {
-                    format!(
+                    Error::internal(format!(
                         "Failed to run xz: {}. Install with: apt install xz-utils",
                         e
-                    )
+                    ))
                 })?;
             if !status.success() {
-                return Err("xz decompression failed".to_string());
+                return Err(Error::internal("xz decompression failed"));
             }
             // `xz -d` strips `.xz` from the input filename.
             Ok(dir.join(filename.trim_end_matches(".xz")))
@@ -297,14 +299,14 @@ fn download_file(
                 .arg(&download_path)
                 .status()
                 .map_err(|e| {
-                    format!(
+                    Error::internal(format!(
                         "Failed to run unzip: {}. Install with: apt install unzip",
                         e
-                    )
+                    ))
                 })?;
             let _ = fs::remove_file(&download_path);
             if !status.success() {
-                return Err("unzip failed".to_string());
+                return Err(Error::internal("unzip failed"));
             }
             // For the tt-bh-linux zip, the extracted file is debian-riscv64.img
             let extracted = dir.join("debian-riscv64.img");
@@ -322,20 +324,20 @@ fn download_file(
                     }
                 }
             }
-            Err("Could not find extracted image file".to_string())
+            Err(Error::internal("Could not find extracted image file"))
         }
     }
 }
 
 /// Convert a downloaded image to a raw ext4 filesystem.
-fn convert_to_ext4(input: &Path, format: ImageFormat, output: &Path) -> Result<PathBuf, String> {
+fn convert_to_ext4(input: &Path, format: ImageFormat, output: &Path) -> Result<PathBuf> {
     match format {
         ImageFormat::Ext4 => {
             // Already ext4, just rename/move
             if input != output {
                 fs::rename(input, output)
                     .or_else(|_| fs::copy(input, output).map(|_| ()))
-                    .map_err(|e| format!("Failed to move image: {}", e))?;
+                    .map_err(Error::io_ctx("Failed to move image"))?;
                 let _ = fs::remove_file(input);
             }
             Ok(output.to_path_buf())
@@ -350,13 +352,13 @@ fn convert_to_ext4(input: &Path, format: ImageFormat, output: &Path) -> Result<P
                 .arg(&raw_path)
                 .status()
                 .map_err(|e| {
-                    format!(
+                    Error::internal(format!(
                         "Failed to run qemu-img: {}. Install with: apt install qemu-utils",
                         e
-                    )
+                    ))
                 })?;
             if !status.success() {
-                return Err("qemu-img convert failed".to_string());
+                return Err(Error::internal("qemu-img convert failed"));
             }
             let _ = fs::remove_file(input);
             // Now extract partition from raw disk
@@ -376,7 +378,7 @@ fn convert_to_ext4(input: &Path, format: ImageFormat, output: &Path) -> Result<P
 /// Extract the root (largest) partition from a GPT/MBR disk image.
 ///
 /// Uses `sfdisk --json` to find partition offsets, then `dd` to extract.
-fn extract_root_partition(disk: &Path, output: &Path) -> Result<(), String> {
+fn extract_root_partition(disk: &Path, output: &Path) -> Result<()> {
     eprintln!("  Extracting root partition...");
 
     // Parse partition table with sfdisk
@@ -385,17 +387,17 @@ fn extract_root_partition(disk: &Path, output: &Path) -> Result<(), String> {
         .arg(disk)
         .output()
         .map_err(|e| {
-            format!(
+            Error::internal(format!(
                 "Failed to run sfdisk: {}. Install with: apt install fdisk",
                 e
-            )
+            ))
         })?;
 
     if !sfdisk_output.status.success() {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "sfdisk failed: {}",
             String::from_utf8_lossy(&sfdisk_output.stderr)
-        ));
+        )));
     }
 
     let json_str = String::from_utf8_lossy(&sfdisk_output.stdout);
@@ -413,10 +415,10 @@ fn extract_root_partition(disk: &Path, output: &Path) -> Result<(), String> {
         .arg(format!("count={}", size_sectors))
         .arg("status=progress")
         .status()
-        .map_err(|e| format!("Failed to run dd: {}", e))?;
+        .map_err(|e| Error::internal(format!("Failed to run dd: {}", e)))?;
 
     if !status.success() {
-        return Err("dd failed to extract partition".to_string());
+        return Err(Error::internal("dd failed to extract partition"));
     }
 
     // Verify it's a valid ext4 filesystem
@@ -453,13 +455,13 @@ fn extract_root_partition(disk: &Path, output: &Path) -> Result<(), String> {
 /// We pick the partition with the largest `size`; that's reliably the rootfs
 /// for the cloud images we convert (much larger than the `/boot` / EFI
 /// partitions that sit alongside it).
-fn parse_largest_partition(json: &str) -> Result<(u64, u64), String> {
-    let root: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| format!("sfdisk emitted non-JSON: {}", e))?;
+fn parse_largest_partition(json: &str) -> Result<(u64, u64)> {
+    let root: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| Error::internal(format!("sfdisk emitted non-JSON: {}", e)))?;
     let partitions = root
         .pointer("/partitiontable/partitions")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| "sfdisk JSON missing /partitiontable/partitions array".to_string())?;
+        .ok_or_else(|| Error::internal("sfdisk JSON missing /partitiontable/partitions array"))?;
 
     let (best_start, best_size) = partitions
         .iter()
@@ -469,7 +471,7 @@ fn parse_largest_partition(json: &str) -> Result<(u64, u64), String> {
             Some((start, size))
         })
         .max_by_key(|(_, size)| *size)
-        .ok_or_else(|| "No partitions found in disk image".to_string())?;
+        .ok_or_else(|| Error::internal("No partitions found in disk image"))?;
 
     eprintln!(
         "  Found root partition: start={}, size={} sectors ({} MB)",
@@ -482,7 +484,7 @@ fn parse_largest_partition(json: &str) -> Result<(u64, u64), String> {
 }
 
 /// Resize an ext4 image to the given size.
-fn resize_image(path: &Path, size: &str) -> Result<(), String> {
+fn resize_image(path: &Path, size: &str) -> Result<()> {
     eprintln!("  Resizing to {}...", size);
 
     // First resize the file
@@ -494,25 +496,15 @@ fn resize_image(path: &Path, size: &str) -> Result<(), String> {
 
     match status {
         Ok(s) if s.success() => {}
-        Ok(_) => {
+        Ok(_) | Err(_) => {
             // Fallback: use truncate
             let size_bytes = parse_size(size)?;
             let file = fs::OpenOptions::new()
                 .write(true)
                 .open(path)
-                .map_err(|e| format!("Failed to open image for resize: {}", e))?;
+                .map_err(Error::io_ctx("Failed to open image for resize"))?;
             file.set_len(size_bytes)
-                .map_err(|e| format!("Failed to resize image: {}", e))?;
-        }
-        Err(_) => {
-            // Fallback: use truncate
-            let size_bytes = parse_size(size)?;
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .open(path)
-                .map_err(|e| format!("Failed to open image for resize: {}", e))?;
-            file.set_len(size_bytes)
-                .map_err(|e| format!("Failed to resize image: {}", e))?;
+                .map_err(Error::io_ctx("Failed to resize image"))?;
         }
     }
 
@@ -525,10 +517,10 @@ fn resize_image(path: &Path, size: &str) -> Result<(), String> {
     }
 
     let status = Command::new("resize2fs").arg(path).status().map_err(|e| {
-        format!(
+        Error::internal(format!(
             "Failed to run resize2fs: {}. Install with: apt install e2fsprogs",
             e
-        )
+        ))
     })?;
 
     if !status.success() {
@@ -539,10 +531,10 @@ fn resize_image(path: &Path, size: &str) -> Result<(), String> {
 }
 
 /// Parse a size string like "10G" or "2T" to bytes.
-fn parse_size(s: &str) -> Result<u64, String> {
+fn parse_size(s: &str) -> Result<u64> {
     let s = s.trim();
     if s.is_empty() {
-        return Err("empty size string".to_string());
+        return Err(Error::bad_request("empty size string"));
     }
 
     let (num_str, suffix) = if s.ends_with('G') || s.ends_with('g') {
@@ -557,7 +549,7 @@ fn parse_size(s: &str) -> Result<u64, String> {
 
     let num: u64 = num_str
         .parse()
-        .map_err(|e| format!("Invalid size '{}': {}", s, e))?;
+        .map_err(|e| Error::bad_request(format!("Invalid size '{}': {}", s, e)))?;
     Ok(num * suffix)
 }
 
@@ -659,19 +651,25 @@ mod tests {
 
     #[test]
     fn parse_largest_partition_rejects_non_json() {
-        let err = parse_largest_partition("<html>nope</html>").unwrap_err();
+        let err = parse_largest_partition("<html>nope</html>")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("non-JSON"), "got: {}", err);
     }
 
     #[test]
     fn parse_largest_partition_rejects_missing_partitions_array() {
-        let err = parse_largest_partition(r#"{"partitiontable": {}}"#).unwrap_err();
+        let err = parse_largest_partition(r#"{"partitiontable": {}}"#)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("partitions array"), "got: {}", err);
     }
 
     #[test]
     fn parse_largest_partition_rejects_empty_partitions_array() {
-        let err = parse_largest_partition(r#"{"partitiontable": {"partitions": []}}"#).unwrap_err();
+        let err = parse_largest_partition(r#"{"partitiontable": {"partitions": []}}"#)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("No partitions"), "got: {}", err);
     }
 
