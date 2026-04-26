@@ -1,0 +1,4 @@
+# Build artifacts.
+dl/
+u-boot-*/
+u-boot.bin

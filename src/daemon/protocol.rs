@@ -27,8 +27,17 @@ pub enum Request {
     Boot {
         l2cpu: u8,
         opensbi: String,
-        kernel: String,
+        /// What sits at `KERNEL_OFFSET` (start+0x20_0000) in L2CPU DRAM.
+        /// `Kernel` is the historical raw `Image` payload — OpenSBI's
+        /// fw_jump lands directly on it. `Uboot` is the S-mode
+        /// bootloader that loads the actual kernel + initrd from disk
+        /// at runtime. In `Uboot` mode the daemon does not preload an
+        /// initramfs and `modify_dtb` leaves bootargs to U-Boot. See
+        /// #44 for the umbrella.
+        payload: BootPayload,
         dtb: String,
+        /// Initramfs to preload into DRAM. Ignored in `Uboot` mode
+        /// (U-Boot reads the initrd from disk).
         #[serde(default)]
         initramfs: Option<String>,
         #[serde(default = "default_root_device")]
@@ -88,6 +97,38 @@ pub enum Request {
 
 fn default_root_device() -> String {
     "vda".to_string()
+}
+
+/// What sits at L2CPU DRAM `KERNEL_OFFSET` (start+0x20_0000) — either a
+/// Linux `Image` (OpenSBI fw_jump lands directly on it, classic boot) or
+/// the U-Boot S-mode payload (which then loads the actual kernel +
+/// initrd from disk via virtio-blk). See #44.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "path", rename_all = "snake_case")]
+pub enum BootPayload {
+    /// Raw Linux `Image`. OpenSBI's `fw_jump` jumps to this address;
+    /// the kernel takes the L2CPU directly.
+    Kernel(String),
+    /// U-Boot binary built for S-mode (e.g. `tests/uboot/u-boot.bin`).
+    /// OpenSBI hands control to U-Boot; U-Boot then reads kernel +
+    /// initrd from a virtio-blk disk and `booti`s into them.
+    Uboot(String),
+}
+
+impl BootPayload {
+    /// Path to the binary the daemon will load at `KERNEL_OFFSET`.
+    pub fn path(&self) -> &str {
+        match self {
+            BootPayload::Kernel(p) | BootPayload::Uboot(p) => p,
+        }
+    }
+
+    /// True iff this is a U-Boot payload (`modify_dtb` and the
+    /// initramfs-preload path use this to gate U-Boot-specific
+    /// behavior).
+    pub fn is_uboot(&self) -> bool {
+        matches!(self, BootPayload::Uboot(_))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -236,7 +277,7 @@ mod tests {
         let req = Request::Boot {
             l2cpu: 2,
             opensbi: "fw_jump.bin".into(),
-            kernel: "Image".into(),
+            payload: BootPayload::Kernel("Image".into()),
             dtb: "blackhole-card.dtb".into(),
             initramfs: None,
             root_device: "vda".into(),
@@ -248,7 +289,40 @@ mod tests {
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).unwrap();
         let decoded: Request = read_frame(Cursor::new(&buf)).unwrap();
-        assert!(matches!(decoded, Request::Boot { l2cpu: 2, .. }));
+        assert!(matches!(
+            decoded,
+            Request::Boot {
+                l2cpu: 2,
+                payload: BootPayload::Kernel(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn request_roundtrip_boot_uboot() {
+        let req = Request::Boot {
+            l2cpu: 0,
+            opensbi: "fw_jump.bin".into(),
+            payload: BootPayload::Uboot("u-boot.bin".into()),
+            dtb: "blackhole-card.dtb".into(),
+            initramfs: None,
+            root_device: "vda".into(),
+            force_reset_pcie: false,
+            disk: Some("debian.raw".into()),
+            network: false,
+            force: false,
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &req).unwrap();
+        let decoded: Request = read_frame(Cursor::new(&buf)).unwrap();
+        match decoded {
+            Request::Boot {
+                payload: BootPayload::Uboot(p),
+                ..
+            } => assert_eq!(p, "u-boot.bin"),
+            other => panic!("expected uboot variant, got {:?}", other),
+        }
     }
 
     #[test]
@@ -355,7 +429,7 @@ mod tests {
             let req = Request::Boot {
                 l2cpu: 1,
                 opensbi: "a".into(),
-                kernel: "b".into(),
+                payload: BootPayload::Kernel("b".into()),
                 dtb: "c".into(),
                 initramfs: None,
                 root_device: "vda".into(),
@@ -421,12 +495,16 @@ mod tests {
     }
 
     #[test]
-    fn boot_force_defaults_false_on_old_payload() {
-        // A client compiled against an older protocol (no `force` field) should
-        // be accepted by the daemon; `force` must default to false so old
-        // behavior is preserved (reject duplicate boots).
-        let json =
-            r#"{"op":"boot","l2cpu":0,"opensbi":"a","kernel":"b","dtb":"c","root_device":"vda"}"#;
+    fn boot_force_defaults_false_on_minimal_payload() {
+        // A request without the optional `force` field should still
+        // deserialize; `force` must default to false so the
+        // duplicate-boot rejection stays the safe default. Note: the
+        // `payload` field IS mandatory after #44/#45 (BootPayload
+        // replaced the historical `kernel: String`); a daemon receiving
+        // an older client's `{"kernel": "..."}` request will reject it
+        // at deserialize time. Within this monorepo daemon and client
+        // ship together, so this is OK.
+        let json = r#"{"op":"boot","l2cpu":0,"opensbi":"a","payload":{"kind":"kernel","path":"b"},"dtb":"c","root_device":"vda"}"#;
         let req: Request = serde_json::from_str(json).unwrap();
         match req {
             Request::Boot { force, .. } => assert!(!force),

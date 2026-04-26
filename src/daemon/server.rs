@@ -285,7 +285,7 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
         Request::Boot {
             l2cpu,
             opensbi,
-            kernel,
+            payload,
             dtb,
             initramfs,
             root_device,
@@ -298,7 +298,7 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             &state,
             l2cpu,
             &opensbi,
-            &kernel,
+            &payload,
             &dtb,
             initramfs.as_deref(),
             &root_device,
@@ -547,7 +547,7 @@ fn dispatch_boot(
     state: &Arc<DaemonState>,
     l2cpu_idx: u8,
     opensbi: &str,
-    kernel: &str,
+    payload: &crate::daemon::protocol::BootPayload,
     dtb: &str,
     initramfs: Option<&str>,
     root_device: &str,
@@ -556,9 +556,20 @@ fn dispatch_boot(
     network: bool,
     force: bool,
 ) -> crate::Result<()> {
+    // U-Boot mode reads kernel + initrd from disk at runtime, so the
+    // daemon's preloaded initramfs would be unreachable. Reject up
+    // front so the operator gets a clear error rather than a silent
+    // drop.
+    let initramfs = if payload.is_uboot() && initramfs.is_some() {
+        return Err(crate::Error::bad_request(
+            "--initramfs is not supported in --uboot mode (U-Boot loads initrd from disk)",
+        ));
+    } else {
+        initramfs
+    };
     dlog!(
-        "[boot l2cpu {}] dispatch_boot entry: opensbi={} kernel={} dtb={} initramfs={:?} root={} force_reset_pcie={} disk={:?} network={} force={}",
-        l2cpu_idx, opensbi, kernel, dtb, initramfs, root_device, force_reset_pcie, disk, network, force
+        "[boot l2cpu {}] dispatch_boot entry: opensbi={} payload={:?} dtb={} initramfs={:?} root={} force_reset_pcie={} disk={:?} network={} force={}",
+        l2cpu_idx, opensbi, payload, dtb, initramfs, root_device, force_reset_pcie, disk, network, force
     );
     validate_l2cpu(l2cpu_idx)?;
     handle_existing_slot(state, l2cpu_idx, force).map_err(crate::Error::slot_state)?;
@@ -574,7 +585,7 @@ fn dispatch_boot(
         state,
         l2cpu_idx,
         opensbi,
-        kernel,
+        payload,
         dtb,
         initramfs,
         root_device,
@@ -785,7 +796,7 @@ fn run_boot_sequence(
     state: &Arc<DaemonState>,
     l2cpu_idx: u8,
     opensbi: &str,
-    kernel: &str,
+    payload: &crate::daemon::protocol::BootPayload,
     dtb: &str,
     initramfs: Option<&str>,
     root_device: &str,
@@ -849,15 +860,22 @@ fn run_boot_sequence(
 
     dlog!("[run_boot l2cpu {}] reading DTB from {}", l2cpu_idx, dtb);
     let dtb_raw = boot::read_bin_file(Path::new(dtb))?;
-    let boot_device = match initramfs {
-        Some(p) => {
-            let bytes = boot::read_bin_file(Path::new(p))?;
-            boot::BootDevice::Initramfs {
-                addr: rootfs_addr,
-                len: bytes.len() as u64,
+    // U-Boot manages root + initrd at runtime. Skip the daemon's
+    // initramfs preload + leave bootargs to U-Boot (no `root=/dev/vda`
+    // injection).
+    let boot_device = if payload.is_uboot() {
+        boot::BootDevice::Uboot
+    } else {
+        match initramfs {
+            Some(p) => {
+                let bytes = boot::read_bin_file(Path::new(p))?;
+                boot::BootDevice::Initramfs {
+                    addr: rootfs_addr,
+                    len: bytes.len() as u64,
+                }
             }
+            None => boot::BootDevice::Vda(root_device.to_string()),
         }
-        None => boot::BootDevice::Vda(root_device.to_string()),
     };
     dlog!(
         "[run_boot l2cpu {}] patching DTB (memory start=0x{:x} size=0x{:x})",
@@ -876,7 +894,7 @@ fn run_boot_sequence(
         &l2cpu,
         Path::new(opensbi),
         opensbi_addr,
-        Some(Path::new(kernel)),
+        Some(Path::new(payload.path())),
         kernel_addr,
         &dtb_patched,
         dtb_addr,

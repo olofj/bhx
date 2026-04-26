@@ -56,7 +56,7 @@ pub fn boot(
     sock: &mut UnixStream,
     l2cpu: u8,
     opensbi: String,
-    kernel: String,
+    payload: crate::daemon::protocol::BootPayload,
     dtb: String,
     initramfs: Option<String>,
     root_device: String,
@@ -70,7 +70,7 @@ pub fn boot(
         &Request::Boot {
             l2cpu,
             opensbi,
-            kernel,
+            payload,
             dtb,
             initramfs,
             root_device,

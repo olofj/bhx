@@ -199,6 +199,12 @@ pub enum BootDevice {
     Vda(String),
     /// `initrd=<addr>,<len>` — no persistent disk, use the in-memory image.
     Initramfs { addr: u64, len: u64 },
+    /// U-Boot is the payload at KERNEL_OFFSET; it discovers root +
+    /// initrd at runtime from disk. Daemon-side bootargs is left as a
+    /// minimal `console=hvc0` so any kernel U-Boot eventually `booti`s
+    /// gets a working console even if U-Boot doesn't override the
+    /// cmdline. See #44.
+    Uboot,
 }
 
 /// Patch a DTB to match the layout boot.py produces.
@@ -252,11 +258,20 @@ pub fn modify_dtb(
         BootDevice::Initramfs { addr, len } => {
             format!("rw console=hvc0 earlycon=sbi initrd=0x{:x},{}", addr, len)
         }
+        BootDevice::Uboot => "console=hvc0 earlycon=sbi".to_string(),
     };
     eprintln!("[modify_dtb]   bootargs = {:?}", bootargs);
     let mut bootargs_bytes = bootargs.into_bytes();
     bootargs_bytes.push(0);
     fdt.setprop(chosen, "bootargs", &bootargs_bytes)?;
+    // /chosen/stdout-path. The blackhole-card.dtb has no console node;
+    // the kernel uses SBI's HVC console regardless. U-Boot relies on
+    // CONFIG_DEBUG_SBI_CONSOLE for pre-relocation output and (for now)
+    // doesn't have a DM serial driver for the SBI console — see #45's
+    // note. Setting stdout-path here is mostly forward-looking: when
+    // we add a DM SBI serial driver as a downstream U-Boot patch (see
+    // #45), it'll bind via this path.
+    fdt.setprop(chosen, "stdout-path", b"/chosen/sbi-console\0")?;
 
     // /reserved-memory (create if missing, mirroring boot.py)
     let reserved = match fdt.path_offset("/reserved-memory")? {

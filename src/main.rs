@@ -81,9 +81,16 @@ enum Commands {
         /// Path to OpenSBI binary
         #[arg(long, default_value = "fw_jump.bin")]
         opensbi: String,
-        /// Path to kernel Image
-        #[arg(long, default_value = "Image")]
-        kernel: String,
+        /// Path to a raw Linux Image (default; mutually exclusive with --uboot)
+        #[arg(long, conflicts_with = "uboot")]
+        kernel: Option<String>,
+        /// Path to a U-Boot binary (S-mode payload). Mutually exclusive
+        /// with --kernel. In this mode the daemon loads U-Boot at the
+        /// kernel offset and skips initramfs preload — U-Boot reads
+        /// the kernel + initrd from the attached --disk at runtime.
+        /// See #44.
+        #[arg(long, conflicts_with_all = ["kernel", "initramfs"])]
+        uboot: Option<String>,
         /// Path to device tree blob
         #[arg(long, default_value = "blackhole-card.dtb")]
         dtb: String,
@@ -341,6 +348,7 @@ fn main() -> std::process::ExitCode {
         Some(Commands::Boot {
             opensbi,
             kernel,
+            uboot,
             dtb,
             initramfs,
             root_device,
@@ -352,11 +360,21 @@ fn main() -> std::process::ExitCode {
                 DEFAULT_DISK_PATH,
                 std::path::Path::new(DEFAULT_DISK_PATH).exists(),
             );
+            // clap's `conflicts_with` already enforces mutual exclusion;
+            // here we just pick the variant. Default to kernel `Image`
+            // if neither flag was given (backwards-compat with the
+            // pre-#44 default).
+            let payload = match (kernel, uboot) {
+                (Some(_), Some(_)) => unreachable!("clap conflicts_with"),
+                (_, Some(p)) => daemon::protocol::BootPayload::Uboot(p),
+                (Some(p), None) => daemon::protocol::BootPayload::Kernel(p),
+                (None, None) => daemon::protocol::BootPayload::Kernel("Image".to_string()),
+            };
             run_boot_client(
                 cli.ttdevice,
                 cli.l2cpu as u8,
                 opensbi,
-                kernel,
+                payload,
                 dtb,
                 initramfs,
                 root_device,
@@ -495,7 +513,7 @@ fn run_boot_client(
     card: u32,
     l2cpu: u8,
     opensbi: String,
-    kernel: String,
+    payload: daemon::protocol::BootPayload,
     dtb: String,
     initramfs: Option<String>,
     root_device: String,
@@ -512,7 +530,14 @@ fn run_boot_client(
     // Paths are canonicalized here (client side) because the daemon runs
     // from cwd=/, so relative paths from the user's shell wouldn't resolve.
     let opensbi = absolutize(&opensbi)?;
-    let kernel = absolutize(&kernel)?;
+    let payload = match payload {
+        daemon::protocol::BootPayload::Kernel(p) => {
+            daemon::protocol::BootPayload::Kernel(absolutize(&p)?)
+        }
+        daemon::protocol::BootPayload::Uboot(p) => {
+            daemon::protocol::BootPayload::Uboot(absolutize(&p)?)
+        }
+    };
     let dtb = absolutize(&dtb)?;
     let initramfs = initramfs.map(|p| absolutize(&p)).transpose()?;
     let disk = disk.map(|p| absolutize(&p)).transpose()?;
@@ -521,7 +546,7 @@ fn run_boot_client(
         &mut sock,
         l2cpu,
         opensbi,
-        kernel,
+        payload,
         dtb,
         initramfs,
         root_device,
