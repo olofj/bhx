@@ -80,11 +80,84 @@ def measure_g2h_throughput(g: GuestSession, n_bytes: int) -> float:
 # ---- roundtrip_latency_p99: host sends 1B → guest echoes → host reads -----
 
 
-# Roundtrip-latency was prototyped here as a `head -c1 | printf '%s' "$c"`
-# loop but busybox's stdio buffers per-byte writes against /dev/hvc0.
-# The bench's main() emits SKIP rows and leaves the implementation
-# for a follow-up — likely a tiny C helper in the rootfs that uses
-# unbuffered write(2) for byte-by-byte echo.
+def measure_roundtrip_latency_us(
+    g: GuestSession, iterations: int
+) -> tuple[float, float, float]:
+    """Echo-loop latency. Guest runs the unbuffered `echo-byte` helper
+    (#36 — see tests/rootfs/echo-byte.c); host times each round trip.
+
+    Pattern: send a READY marker before invoking echo-byte so we know
+    when the guest is actually sitting in read(2). Then per-byte
+    timing. After `iterations` bytes we close the helper's stdin (Ctrl-D
+    via a shell exit), and a DONE marker confirms cleanup.
+
+    Returns (p50_us, p99_us, mean_us).
+    """
+    note(f"starting guest-side echo-byte loop ({iterations} iterations)")
+    ready_marker = "_BENCH_LAT_READY_"
+    done_marker = "_BENCH_LAT_DONE_"
+    # echo-byte takes an optional byte count; pass `iterations` so it
+    # exits cleanly without the bench needing to forge an EOF on the
+    # guest tty. We flip -icanon so read(0,&c,1) returns per byte instead
+    # of waiting for a newline (the GuestSession already runs with -echo
+    # off so we don't touch echo here).
+    cmd = (
+        f"if [ ! -x /usr/local/bin/echo-byte ]; then "
+        f"  printf 'BENCH_LAT_NO_HELPER\\n'; exit 0; "
+        f"fi; "
+        f"stty -icanon; "
+        f"printf '{ready_marker}\\n'; "
+        f"/usr/local/bin/echo-byte {iterations}; "
+        f"stty icanon; "
+        f"printf '\\n{done_marker}\\n'"
+    )
+    before = g.buffer_len()
+    g.send(f"{cmd}\n".encode())
+
+    # If the rootfs doesn't have echo-byte (operator hasn't rebuilt
+    # post-#36), the cmd printf's BENCH_LAT_NO_HELPER and exits.
+    # Detect that path before timing anything so the bench surfaces
+    # a clear SKIP rather than a wait_for timeout.
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        with g._lock:  # type: ignore[attr-defined]
+            snap = bytes(g._buf)  # type: ignore[attr-defined]
+        if b"BENCH_LAT_NO_HELPER" in snap[before:]:
+            raise RuntimeError(
+                "rootfs missing /usr/local/bin/echo-byte — rebuild tests/rootfs (#36)"
+            )
+        if ready_marker.encode() in snap[before:]:
+            break
+        time.sleep(0.05)
+    else:
+        fail("timeout waiting for echo-byte READY marker")
+
+    # Skip past the READY marker + its newline so the per-byte loop
+    # below searches forward from the right position.
+    ready_at = g.wait_for(ready_marker.encode(), timeout_s=2, from_idx=before)
+    next_idx = g.wait_for(b"\n", timeout_s=2, from_idx=ready_at + len(ready_marker)) + 1
+
+    samples_us: list[float] = []
+    payload = bytes((ord("a") + (i % 26)) for i in range(iterations))
+    for i in range(iterations):
+        b = bytes([payload[i]])
+        t0 = time.time()
+        g.send(b)
+        idx = g.wait_for(b, timeout_s=2.0, from_idx=next_idx)
+        elapsed_us = (time.time() - t0) * 1e6
+        samples_us.append(elapsed_us)
+        next_idx = idx + 1
+
+    # echo-byte exits after `iterations` bytes (count arg above);
+    # the shell prints DONE next.
+    g.wait_for(done_marker.encode(), timeout_s=10, from_idx=next_idx)
+
+    samples_us.sort()
+    n = len(samples_us)
+    p50 = samples_us[n // 2]
+    p99 = samples_us[min(n - 1, int(n * 0.99))]
+    mean = sum(samples_us) / n
+    return p50, p99, mean
 
 
 def main() -> int:
@@ -103,7 +176,7 @@ def main() -> int:
         "--latency-iters",
         type=int,
         default=200,
-        help="Roundtrip-latency iteration count (currently unused; latency test is SKIP — see source comment)",
+        help="Roundtrip-latency iteration count (default 200)",
     )
     args = ap.parse_args()
 
@@ -129,22 +202,28 @@ def main() -> int:
         note(f"g2h throughput: {bps / 1024:.1f} KiB/s ({args.g2h_bytes} bytes)")
         results.append(BenchResult("console", "bytes_per_sec_g2h", bps, "B/s"))
 
-        # Roundtrip-latency: skipped at this scope. busybox's
-        # `head -c1 | printf '%s' "$c"` doesn't flush byte-by-byte
-        # — printf is line-buffered against /dev/hvc0 — so the
-        # host-side wait_for never sees the echoed byte until the
-        # guest writes a newline. Fixing this needs either an
-        # unbuffered helper in the rootfs (e.g. a tiny C program that
-        # uses unistd write with no FILE*) or a different harness
-        # design (e.g. measure latency via an inotify-style channel,
-        # not the chip console). Emit SKIP so the CSV shape is stable
-        # for baseline diffs.
-        for metric in (
-            "roundtrip_latency_p50_us",
-            "roundtrip_latency_p99_us",
-            "roundtrip_latency_mean_us",
-        ):
-            results.append(BenchResult("console", metric, 0.0, "SKIP"))
+        # Roundtrip-latency uses the unbuffered `echo-byte` helper
+        # (#36) baked into tests/rootfs by the post-build script.
+        # If the rootfs is older than #36 it doesn't have the helper
+        # — we surface that as SKIP rather than failing the whole
+        # bench so existing CI / baseline runs still complete.
+        try:
+            p50, p99, mean = measure_roundtrip_latency_us(g, args.latency_iters)
+            note(
+                f"roundtrip latency: p50={p50:.0f} µs, p99={p99:.0f} µs, mean={mean:.0f} µs "
+                f"({args.latency_iters} samples)"
+            )
+            results.append(BenchResult("console", "roundtrip_latency_p50_us", p50, "us"))
+            results.append(BenchResult("console", "roundtrip_latency_p99_us", p99, "us"))
+            results.append(BenchResult("console", "roundtrip_latency_mean_us", mean, "us"))
+        except RuntimeError as e:
+            note(f"roundtrip latency: SKIP ({e})")
+            for metric in (
+                "roundtrip_latency_p50_us",
+                "roundtrip_latency_p99_us",
+                "roundtrip_latency_mean_us",
+            ):
+                results.append(BenchResult("console", metric, 0.0, "SKIP"))
 
     write_csv(args.csv, results)
     note(f"wrote {len(results)} metrics to {args.csv}")

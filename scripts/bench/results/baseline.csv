@@ -8,9 +8,9 @@ disk,rand_write_4k_qd16.latency_p99_us,29.312,us
 disk,seq_read_4M_qd1.bandwidth_mbps,53.7959,MB/s
 disk,seq_read_4M_qd1.iops,13.4492,IOPS
 disk,seq_read_4M_qd1.latency_p99_us,362807,us
-console,bytes_per_sec_g2h,181201,B/s
-console,roundtrip_latency_p50_us,0,SKIP
-console,roundtrip_latency_p99_us,0,SKIP
-console,roundtrip_latency_mean_us,0,SKIP
+console,bytes_per_sec_g2h,181052,B/s
+console,roundtrip_latency_p50_us,20086.8,us
+console,roundtrip_latency_p99_us,40173.3,us
+console,roundtrip_latency_mean_us,20783.6,us
 net,tcp_egress_30s.bandwidth_mbps,0,SKIP
 net,tcp_ingress_30s.bandwidth_mbps,0,SKIP
