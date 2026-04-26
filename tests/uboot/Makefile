@@ -75,11 +75,20 @@ help:
 	@echo "Cross-compiler:        $(CROSS_COMPILE)gcc"
 
 # Download + verify + extract the U-Boot tarball.
-$(UB_SRCDIR)/Makefile: $(DL_DIR)/$(UBOOT_TARBALL)
+$(UB_SRCDIR)/Makefile: $(DL_DIR)/$(UBOOT_TARBALL) $(TOPDIR)/patches/serial_sbi_dm.c
 	@echo "==> Verifying $(UBOOT_TARBALL)"
 	@cd $(DL_DIR) && sha256sum -c $(TOPDIR)/sha256sums --ignore-missing
 	@echo "==> Extracting"
 	tar -xf $(DL_DIR)/$(UBOOT_TARBALL) -C $(TOPDIR)
+	@echo "==> Installing tt-bh DM SBI serial driver"
+	cp $(TOPDIR)/patches/serial_sbi_dm.c $(UB_SRCDIR)/drivers/serial/
+	@# Append Kconfig entry + Makefile rule. Idempotent: only add if
+	@# not already present (so re-running this step on an existing
+	@# tree doesn't duplicate.)
+	@grep -q SERIAL_SBI_DM $(UB_SRCDIR)/drivers/serial/Kconfig || \
+		printf '\nconfig SERIAL_SBI_DM\n\tbool "DM serial driver wrapping SBI DBCN"\n\tdepends on DM_SERIAL && RISCV_SMODE\n\thelp\n\t  tt-bh downstream patch — see tests/uboot/patches/serial_sbi_dm.c.\n' >> $(UB_SRCDIR)/drivers/serial/Kconfig
+	@grep -q SERIAL_SBI_DM $(UB_SRCDIR)/drivers/serial/Makefile || \
+		echo 'obj-$$(CONFIG_SERIAL_SBI_DM) += serial_sbi_dm.o' >> $(UB_SRCDIR)/drivers/serial/Makefile
 	@touch $@
 
 $(DL_DIR)/$(UBOOT_TARBALL):

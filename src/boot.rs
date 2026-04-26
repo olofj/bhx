@@ -264,13 +264,13 @@ pub fn modify_dtb(
     let mut bootargs_bytes = bootargs.into_bytes();
     bootargs_bytes.push(0);
     fdt.setprop(chosen, "bootargs", &bootargs_bytes)?;
-    // /chosen/stdout-path. The blackhole-card.dtb has no console node;
-    // the kernel uses SBI's HVC console regardless. U-Boot relies on
-    // CONFIG_DEBUG_SBI_CONSOLE for pre-relocation output and (for now)
-    // doesn't have a DM serial driver for the SBI console — see #45's
-    // note. Setting stdout-path here is mostly forward-looking: when
-    // we add a DM SBI serial driver as a downstream U-Boot patch (see
-    // #45), it'll bind via this path.
+    // /chosen/sbi-console — bind point for U-Boot's downstream DM SBI
+    // serial driver (tests/uboot/patches/serial_sbi_dm.c, see #45).
+    // The Linux kernel uses its own SBI HVC driver regardless of DT;
+    // adding this node is harmless when booting raw kernel mode and
+    // required for U-Boot's interactive console.
+    let sbi_console = fdt.add_subnode(chosen, "sbi-console")?;
+    fdt.setprop(sbi_console, "compatible", b"riscv,sbi-debug-console\0")?;
     fdt.setprop(chosen, "stdout-path", b"/chosen/sbi-console\0")?;
 
     // /reserved-memory (create if missing, mirroring boot.py)
