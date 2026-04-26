@@ -1,0 +1,9 @@
+# Per-run outputs are not committed.
+results/*.csv
+# Bench-grown rootfs (~1 GiB).
+results/rootfs-bench.ext4
+
+# Exception: the operator commits a baseline.csv after a clean
+# main-tip run. Keep this file tracked so future PRs can be
+# compared against it via `run_all.sh --baseline`.
+!results/baseline.csv
