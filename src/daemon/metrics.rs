@@ -1066,6 +1066,143 @@ mod tests {
 
     use crate::shared_chip::SharedChip;
 
+    /// Process-global mutex acquired by tests that touch the shared
+    /// metric statics (DAEMON_RPC_TOTAL etc.). Holding it serializes
+    /// those tests against each other under cargo's default-parallel
+    /// runner — without it, two tests racing on the same counter
+    /// have to use snapshot-before/after assertions instead of
+    /// absolute values, which is fragile to expand.
+    ///
+    /// Re-exposed as a guard returned from `metrics_test_lock()` so
+    /// callers don't have to spell the static. A poisoned lock from
+    /// a panicking earlier test is recovered into a healthy guard
+    /// (the metric statics aren't structurally corruptable; they're
+    /// just integers).
+    fn metrics_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        M.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Validate `text` against the Prometheus 0.0.4 text-format spec
+    /// — the actual rules, not just our internal HELP/TYPE/value
+    /// shape. Returns `Ok(())` if every metric name, label name,
+    /// and label value is well-formed; `Err(reason)` otherwise.
+    /// Pulled out as a helper so the same validator runs against
+    /// `render_prometheus` output and (eventually) against any new
+    /// metric we wire up.
+    fn validate_prometheus_text(text: &str) -> Result<(), String> {
+        // Metric names: [a-zA-Z_:][a-zA-Z0-9_:]*. Label names:
+        // [a-zA-Z_][a-zA-Z0-9_]*. Label values: any UTF-8 with `\`,
+        // `"`, and newline escaped.
+        let valid_metric_name = |s: &str| -> bool {
+            let mut chars = s.chars();
+            match chars.next() {
+                Some(c) if c.is_ascii_alphabetic() || c == '_' || c == ':' => {}
+                _ => return false,
+            }
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        };
+        let valid_label_name = |s: &str| -> bool {
+            let mut chars = s.chars();
+            match chars.next() {
+                Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+                _ => return false,
+            }
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+        let valid_label_value = |s: &str| -> bool {
+            // Bare newlines and unescaped backslashes/quotes are
+            // illegal. Our renderer doesn't emit them, but a future
+            // change that interpolates user input could.
+            let mut iter = s.chars().peekable();
+            while let Some(c) = iter.next() {
+                if c == '\n' {
+                    return false;
+                }
+                if c == '\\' {
+                    match iter.next() {
+                        Some('\\') | Some('"') | Some('n') => {}
+                        _ => return false,
+                    }
+                } else if c == '"' {
+                    return false; // unescaped quote inside the value
+                }
+            }
+            true
+        };
+
+        for (lineno, raw) in text.lines().enumerate() {
+            let line = raw.trim_end_matches('\r');
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // value line: <name>[{<labels>}] <value>
+            let space = line.find(' ').ok_or_else(|| {
+                format!("line {}: missing value separator: {:?}", lineno + 1, line)
+            })?;
+            let (name_with_labels, _value) = line.split_at(space);
+
+            let (name, labels) = if let Some(brace) = name_with_labels.find('{') {
+                if !name_with_labels.ends_with('}') {
+                    return Err(format!("line {}: unclosed label brace", lineno + 1));
+                }
+                (
+                    &name_with_labels[..brace],
+                    Some(&name_with_labels[brace + 1..name_with_labels.len() - 1]),
+                )
+            } else {
+                (name_with_labels, None)
+            };
+
+            if !valid_metric_name(name) {
+                return Err(format!(
+                    "line {}: invalid metric name {:?}",
+                    lineno + 1,
+                    name
+                ));
+            }
+
+            if let Some(labels) = labels {
+                // Each label: <name>="<value>", comma-separated. We
+                // can't naively split on `,` because a label value
+                // could contain a `,` (escaped or not). The renderer
+                // we ship doesn't put commas in values, so split-on-
+                // comma is safe here — but assert no unescaped comma
+                // in the value half of each pair as we go.
+                for pair in labels.split(',') {
+                    let eq = pair
+                        .find('=')
+                        .ok_or_else(|| format!("line {}: label missing '='", lineno + 1))?;
+                    let (lname, rest) = pair.split_at(eq);
+                    let value_part = &rest[1..]; // skip the '='
+                    if !valid_label_name(lname) {
+                        return Err(format!(
+                            "line {}: invalid label name {:?}",
+                            lineno + 1,
+                            lname
+                        ));
+                    }
+                    if !value_part.starts_with('"') || !value_part.ends_with('"') {
+                        return Err(format!(
+                            "line {}: label value not quoted: {:?}",
+                            lineno + 1,
+                            value_part
+                        ));
+                    }
+                    let inner = &value_part[1..value_part.len() - 1];
+                    if !valid_label_value(inner) {
+                        return Err(format!(
+                            "line {}: invalid label value escape: {:?}",
+                            lineno + 1,
+                            inner
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn counter_inc_and_add() {
         let c = Counter::new();
@@ -1418,6 +1555,136 @@ mod tests {
         // hold one), but flipping shutdown leaves the thread to
         // exit on its own next poll cycle (≤100 ms).
         state.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Adversarial input handling for the HTTP exporter (#33). The
+    /// listener uses a fixed 1024-byte read buffer and only inspects
+    /// the first line of the request — which is fine, but easy to
+    /// break with a refactor. Test the three plausible regressions:
+    /// oversize requests, malformed first lines, and pipelined
+    /// follow-on requests on the same connection.
+    #[test]
+    fn http_exporter_handles_adversarial_inputs() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        let state = Arc::new(DaemonState::new(0, Arc::new(SharedChip::placeholder())));
+        let port = spawn_exporter(0, state.clone()).expect("bind on port 0");
+
+        let do_request = |raw_request: &[u8]| -> Vec<u8> {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            s.write_all(raw_request).unwrap();
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).unwrap();
+            buf
+        };
+
+        // Oversize request: 5 KiB of `X` headers BEFORE the request
+        // line gets the request line truncated, so it doesn't start
+        // with "GET /metrics" — should still produce a clean 404
+        // (or 400-class). Today's impl returns 404 because the
+        // first line of garbage doesn't match. The point is no
+        // panic, no hang, no leak.
+        let big_garbage: Vec<u8> = std::iter::repeat_n(b'X', 5000).collect();
+        let resp = do_request(&big_garbage);
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 404"),
+            "expected 404 on oversize garbage, got:\n{}",
+            text
+        );
+
+        // Non-UTF-8 bytes in the request line. `from_utf8_lossy`
+        // replaces invalid sequences with U+FFFD, so the literal
+        // doesn't match `GET /metrics` — should be 404.
+        let non_utf8 = b"\xff\xfe\xc3\x28GET /metrics HTTP/1.1\r\n\r\n";
+        let resp = do_request(non_utf8);
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 404"),
+            "expected 404 on non-UTF8 prefix, got:\n{}",
+            text
+        );
+
+        // Pipelined request: client sends two GETs in one write.
+        // Our impl uses Connection: close so the second is ignored —
+        // first should still get a clean 200 + the connection
+        // closes. The exporter must NOT hang waiting for the second
+        // body or panic on the leftover bytes.
+        let pipelined =
+            b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\nGET /metrics HTTP/1.1\r\nHost: x\r\n\r\n";
+        let resp = do_request(pipelined);
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "pipelined first-request should still 200, got:\n{}",
+            text
+        );
+
+        // Malformed request: just a CRLF, no method/URL.
+        let resp = do_request(b"\r\n\r\n");
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 404"),
+            "expected 404 on empty request line, got:\n{}",
+            text
+        );
+
+        state.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Spec-compliance check (#33). Run our renderer's output past
+    /// a hand-rolled validator covering the actual Prometheus
+    /// 0.0.4 grammar — metric-name charset, label-name charset,
+    /// label-value escape rules. Catches a regression where someone
+    /// emits a `:` in a label name or an unescaped `"` in a value.
+    /// Faster + more portable than wiring `promtool check metrics`
+    /// into CI (which would require the prometheus binary on the
+    /// runner).
+    #[test]
+    fn render_prometheus_passes_spec_validator() {
+        let _g = metrics_test_lock();
+        let state = DaemonState::new(0, Arc::new(SharedChip::placeholder()));
+        let out = render_prometheus(&state);
+        if let Err(reason) = validate_prometheus_text(&out) {
+            panic!(
+                "render_prometheus output failed spec validation: {}\nfull output:\n{}",
+                reason, out
+            );
+        }
+    }
+
+    /// Negative tests for the validator — confirms it rejects the
+    /// classes of malformed input it's meant to catch. Without these
+    /// the spec test above could pass against a no-op validator and
+    /// nobody would notice.
+    #[test]
+    fn validator_rejects_malformed_inputs() {
+        // Invalid metric name (digit prefix).
+        assert!(validate_prometheus_text("1bad_name 5\n").is_err());
+        // Invalid label name (digit prefix).
+        assert!(validate_prometheus_text("foo{1bad=\"x\"} 5\n").is_err());
+        // Unescaped quote inside label value.
+        assert!(validate_prometheus_text("foo{x=\"a\"b\"} 5\n").is_err());
+        // Bare newline inside label value.
+        assert!(validate_prometheus_text("foo{x=\"a\nb\"} 5\n").is_err());
+        // Unclosed brace.
+        assert!(validate_prometheus_text("foo{x=\"y\" 5\n").is_err());
+        // No value (missing space).
+        assert!(validate_prometheus_text("foo\n").is_err());
+
+        // And confirm the validator accepts the canonical happy paths.
+        assert!(validate_prometheus_text("foo 42\n").is_ok());
+        assert!(validate_prometheus_text("foo_bar:baz 42\n").is_ok());
+        assert!(validate_prometheus_text("foo{a=\"1\",b=\"two\"} 42\n").is_ok());
+        assert!(validate_prometheus_text("# HELP foo blah\n").is_ok());
+        assert!(validate_prometheus_text("# TYPE foo counter\n").is_ok());
+        // Escaped quote / backslash / newline are valid in values.
+        assert!(validate_prometheus_text("foo{x=\"a\\\"b\"} 42\n").is_ok());
+        assert!(validate_prometheus_text("foo{x=\"a\\\\b\"} 42\n").is_ok());
+        assert!(validate_prometheus_text("foo{x=\"a\\nb\"} 42\n").is_ok());
     }
 
     #[test]
