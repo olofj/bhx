@@ -21,6 +21,7 @@ Run them from `tt-bh-linux-rs/` after `cargo build`.
 | `soak_fio_remove_disk.py` | Like `soak_disk_io_pressure.sh` but drives a real `fio` job inside the guest writing 64 MiB to the rootfs at the moment we yank the disk. Requires the [tests/rootfs](../tests/rootfs/) buildroot rootfs (auto-login + `fio` in target/bin). Drives the virtio-blk descriptor path much harder than the kernel-journal-only version. |
 | `soak_net_teardown.sh` | N `remove-net` calls while a host-side TCP session is held open against the slirp-forwarded SSH port. Asserts the held connection drops cleanly (no host hang), the daemon survives, and add-net brings the listener back up. Doesn't depend on guest SSH credentials — just exercises the TCP-listener teardown. |
 | `console_roundtrip.py` | End-to-end console I/O stress — logs into the guest via `connect`, puts the tty in raw mode, then roundtrips 64 KiB of base64 text in each direction (guest→host and host→guest) and compares sha256. Validates `chip_console`'s `push_char` / `pop_char` + `ConsoleHub` fan-out under sustained transfers. Auto-detects buildroot (auto-login on `# `) vs Debian (`login:` → `debian\r` → `$ `); silences kernel printk to the console before the test so async kernel messages don't pollute the captured stream. See "Concurrent console roundtrip" below for the 4-way stress form. |
+| `soak_endurance.sh` | Long-running drift soak (default 8 h). Add-disk / remove-disk / add-net / remove-net cycle every `ITER_INTERVAL` seconds, with daemon `RSS` / `VSZ` / open-fd-count captured per-iteration into a CSV. Fails if RSS grows >`RSS_DRIFT_PCT`% (default 25) or fd-count grows >`FD_DRIFT_ABS` (default 10) above the per-uptime baseline. Periodically (`WARM_RESUME_EVERY` iters, default 100) does a daemon stop/start drill so warm-resume gets exercised across thousands of slot mutations. Background `connect` client stays attached the whole run so the chip-console pump path is continuously warm. Catches fd leaks, slow memory growth, slirp state accumulation, u32 counter wraparound — drift that the short soaks miss. |
 | `profile_daemon.sh` | Capture a `samply` CPU profile of the daemon for a fixed duration. Builds via the `profiling` cargo profile (release + debug info). Three scenarios: `--scenario idle` (no workload — surfaces the poll-loop hot path), `--scenario fio` (drives guest fio in parallel — surfaces the disk worker), `--scenario soak` (runs `soak_concurrent.sh` alongside — surfaces the dispatch path). Output goes to `profile-<scenario>-<timestamp>.json.gz`; view via `samply load <file>`. Used to quantify and verify the three-tier adaptive sleep (#27). |
 
 ## Env overrides
@@ -46,7 +47,17 @@ bash scripts/soak_add_remove.sh          # 10 cycles, ~20 s
 bash scripts/soak_concurrent.sh          # 4-core cold boot + 5 concurrent cycles, ~2 min
 
 ITERATIONS=20 bash scripts/soak_warm_resume.sh   # longer soak
+
+# Overnight drift soak — 8 hours, RSS/fd-count tracked per iteration.
+DURATION_HOURS=8 bash scripts/soak_endurance.sh
+
+# Quick smoke of the endurance script (~3 min, ~6 cycles).
+DURATION_HOURS=0.05 ITER_INTERVAL=10 bash scripts/soak_endurance.sh
 ```
+
+The endurance soak's CSV (`./soak_endurance-<timestamp>.csv`) is the
+primary artifact for an overnight run — drop it in the PR description
+or attach it to a release tag so trends are reviewable historically.
 
 Each `soak_*.sh` cleans up on exit (daemon stopped via trap), so Ctrl-C
 or an assertion failure leaves the host in a recoverable state. If you
