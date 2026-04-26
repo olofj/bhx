@@ -29,28 +29,30 @@ mod imp {
     };
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
 
+    use crate::error::{Error, Result};
+
     /// Apply both filters in order: landlock first (file paths), then
     /// seccomp (syscalls). Order matters — once seccomp installs, even
     /// `prctl(PR_SET_NO_NEW_PRIVS)` is blocked, but landlock requires
     /// `NO_NEW_PRIVS` to be set first if we don't have CAP_SYS_ADMIN
     /// (we don't), so landlock has to go first.
-    pub fn apply(card: u32, log_path: &Path) -> Result<(), String> {
+    pub fn apply(card: u32, log_path: &Path) -> Result<()> {
         apply_landlock(card, log_path)?;
         apply_seccomp()?;
         crate::dlog!("[sandbox] seccomp + landlock filters installed");
         Ok(())
     }
 
-    fn apply_landlock(card: u32, log_path: &Path) -> Result<(), String> {
+    fn apply_landlock(card: u32, log_path: &Path) -> Result<()> {
         // ABI v3 = Linux 6.2+. Older kernels: the crate transparently
         // negotiates down. Best-effort if the kernel is too old —
         // RulesetStatus::FullyEnforced is the sweet spot.
         let abi = ABI::V3;
         let mut ruleset = Ruleset::default()
             .handle_access(AccessFs::from_all(abi))
-            .map_err(|e| format!("landlock handle_access: {}", e))?
+            .map_err(|e| Error::internal(format!("landlock handle_access: {}", e)))?
             .create()
-            .map_err(|e| format!("landlock create: {}", e))?;
+            .map_err(|e| Error::internal(format!("landlock create: {}", e)))?;
 
         // Always-needed paths.
         let mut allow = Vec::<(PathBuf, BitFlags<AccessFs>)>::new();
@@ -151,9 +153,9 @@ mod imp {
             match PathFd::new(&path) {
                 Ok(fd) => {
                     let rule = PathBeneath::new(fd, access);
-                    ruleset = ruleset
-                        .add_rule(rule)
-                        .map_err(|e| format!("landlock add_rule({}): {}", path.display(), e))?;
+                    ruleset = ruleset.add_rule(rule).map_err(|e| {
+                        Error::internal(format!("landlock add_rule({}): {}", path.display(), e))
+                    })?;
                 }
                 Err(_) => {
                     // Path doesn't exist yet (e.g. log file's parent
@@ -164,7 +166,7 @@ mod imp {
 
         let status = ruleset
             .restrict_self()
-            .map_err(|e| format!("landlock restrict_self: {}", e))?;
+            .map_err(|e| Error::internal(format!("landlock restrict_self: {}", e)))?;
         match status.ruleset {
             RulesetStatus::FullyEnforced => {
                 crate::daemon::metrics::DAEMON_SANDBOX_STATUS.set(2);
@@ -179,13 +181,13 @@ mod imp {
                 );
                 Ok(())
             }
-            RulesetStatus::NotEnforced => {
-                Err("landlock not enforced (no kernel support)".to_string())
-            }
+            RulesetStatus::NotEnforced => Err(Error::internal(
+                "landlock not enforced (no kernel support)",
+            )),
         }
     }
 
-    fn apply_seccomp() -> Result<(), String> {
+    fn apply_seccomp() -> Result<()> {
         // Steady-state syscall whitelist. Source: docs/sandbox-syscalls.md.
         // Anything NOT in this list returns EPERM, which surfaces as a
         // fail-the-RPC error rather than a SIGSYS abort, so a missed
@@ -294,14 +296,14 @@ mod imp {
             SeccompAction::Allow,
             TargetArch::x86_64,
         )
-        .map_err(|e| format!("seccomp filter build: {:?}", e))?;
+        .map_err(|e| Error::internal(format!("seccomp filter build: {:?}", e)))?;
         let bpf: BpfProgram = filter
             .try_into()
-            .map_err(|e| format!("seccomp filter compile: {:?}", e))?;
+            .map_err(|e| Error::internal(format!("seccomp filter compile: {:?}", e)))?;
         // Apply to all threads (TSYNC) so chip-console workers spawned
         // by warm-resume before this point inherit too.
         seccompiler::apply_filter_all_threads(&bpf)
-            .map_err(|e| format!("seccomp install: {:?}", e))?;
+            .map_err(|e| Error::internal(format!("seccomp install: {:?}", e)))?;
         crate::dlog!(
             "[sandbox] seccomp filter installed (whitelist of {} syscalls)",
             allowed.len()
@@ -314,7 +316,7 @@ mod imp {
 pub use imp::apply;
 
 #[cfg(not(target_os = "linux"))]
-pub fn apply(_card: u32, _log_path: &std::path::Path) -> Result<(), String> {
+pub fn apply(_card: u32, _log_path: &std::path::Path) -> crate::error::Result<()> {
     // No-op on non-Linux; the daemon target is Linux but the build
     // is portable enough to compile elsewhere for tooling reasons.
     Ok(())

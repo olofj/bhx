@@ -106,11 +106,10 @@ pub fn serve(
     // `daemon start --no-sandbox` to opt out (debugging only). See
     // `docs/sandbox-syscalls.md` for the policy.
     if sandbox {
-        if let Err(e) = crate::daemon::sandbox::apply(card, log_path) {
-            // Failure to install is fatal — refuse to start rather
-            // than silently run unsandboxed.
-            return Err(io::Error::other(format!("sandbox install failed: {}", e)));
-        }
+        // Failure to install is fatal — refuse to start rather than
+        // silently run unsandboxed. The crate::Error → io::Error bridge
+        // (see error.rs) preserves the variant's display string.
+        crate::daemon::sandbox::apply(card, log_path)?;
     }
 
     while !state.shutdown.load(Ordering::Relaxed) {
