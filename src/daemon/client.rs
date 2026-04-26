@@ -93,8 +93,20 @@ pub fn remove_disk(sock: &mut UnixStream, l2cpu: u8) -> io::Result<()> {
     expect_ok(read_frame(&mut *sock)?)
 }
 
-pub fn add_net(sock: &mut UnixStream, l2cpu: u8, ssh_port: Option<u16>) -> io::Result<()> {
-    write_frame(&mut *sock, &Request::AddNet { l2cpu, ssh_port })?;
+pub fn add_net(
+    sock: &mut UnixStream,
+    l2cpu: u8,
+    ssh_port: Option<u16>,
+    extra_fwd: Vec<(u16, u16)>,
+) -> io::Result<()> {
+    write_frame(
+        &mut *sock,
+        &Request::AddNet {
+            l2cpu,
+            ssh_port,
+            extra_fwd,
+        },
+    )?;
     expect_ok(read_frame(&mut *sock)?)
 }
 

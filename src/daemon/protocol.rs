@@ -60,7 +60,23 @@ pub enum Request {
     /// to the host again.
     RemoveDisk { l2cpu: u8 },
     /// Add a virtio-net device to a running L2CPU.
-    AddNet { l2cpu: u8, ssh_port: Option<u16> },
+    ///
+    /// `ssh_port` is the host TCP port for the implicit SSH forward
+    /// (host:ssh_port → guest:22). Today's CLI default uses
+    /// `regs::slirp::ssh_port(card, l2cpu_idx)` so multiple cores
+    /// don't collide.
+    ///
+    /// `extra_fwd` is a list of additional host→guest TCP forwards as
+    /// `(host_port, guest_port)` pairs. Each gets its own slirp
+    /// `tcp_listen_add`. `#[serde(default)]` so older clients that
+    /// don't know the field stay wire-compatible (deserialize as an
+    /// empty Vec).
+    AddNet {
+        l2cpu: u8,
+        ssh_port: Option<u16>,
+        #[serde(default)]
+        extra_fwd: Vec<(u16, u16)>,
+    },
     /// Remove the virtio-net device from a running L2CPU. Joins the
     /// worker thread; libvdeslirp state (TCP/NAT) is dropped.
     RemoveNet { l2cpu: u8 },
@@ -355,6 +371,52 @@ mod tests {
                 Request::Boot { force: got, .. } => assert_eq!(got, force),
                 _ => panic!("wrong variant"),
             }
+        }
+    }
+
+    #[test]
+    fn add_net_roundtrips_extra_fwd() {
+        // Forwards survive serde encoding + decoding intact.
+        let req = Request::AddNet {
+            l2cpu: 2,
+            ssh_port: Some(2222),
+            extra_fwd: vec![(5201, 5201), (8080, 80)],
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &req).unwrap();
+        let decoded: Request = read_frame(Cursor::new(&buf)).unwrap();
+        match decoded {
+            Request::AddNet {
+                l2cpu,
+                ssh_port,
+                extra_fwd,
+            } => {
+                assert_eq!(l2cpu, 2);
+                assert_eq!(ssh_port, Some(2222));
+                assert_eq!(extra_fwd, vec![(5201, 5201), (8080, 80)]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn add_net_defaults_extra_fwd_empty_on_old_payload() {
+        // Pre-#37 clients send `{"op":"add-net","l2cpu":N,"ssh_port":...}`
+        // without `extra_fwd`. serde(default) makes the daemon accept
+        // them with an empty Vec — wire-compat preserved.
+        let json = r#"{"op":"add_net","l2cpu":1,"ssh_port":null}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::AddNet {
+                l2cpu,
+                ssh_port,
+                extra_fwd,
+            } => {
+                assert_eq!(l2cpu, 1);
+                assert!(ssh_port.is_none());
+                assert!(extra_fwd.is_empty());
+            }
+            _ => panic!("wrong variant"),
         }
     }
 

@@ -137,6 +137,14 @@ enum Commands {
         /// see `daemon ports` for the mapping.
         #[arg(long)]
         ssh_port: Option<u16>,
+        /// Additional TCP port forwards as `HOST:GUEST` pairs.
+        /// Repeatable: `--fwd 5201:5201 --fwd 8080:80`. Each adds a
+        /// slirp `tcp_listen_add` on `127.0.0.1:HOST` forwarding to
+        /// `10.0.2.15:GUEST`. The implicit SSH forward (above) stays
+        /// in place; this is for everything else (iperf3 server,
+        /// HTTP diagnostics, debugger over slirp, …).
+        #[arg(long = "fwd", value_parser = parse_fwd_pair)]
+        fwd: Vec<(u16, u16)>,
     },
     /// Detach virtio-net from a running L2CPU. Drops libvdeslirp state
     /// (active TCP/NAT sessions on the guest will reset).
@@ -379,9 +387,9 @@ fn main() -> std::process::ExitCode {
             let mut sock = daemon::client::connect(cli.ttdevice)?;
             daemon::client::remove_disk(&mut sock, cli.l2cpu as u8)
         }
-        Some(Commands::AddNet { ssh_port }) => {
+        Some(Commands::AddNet { ssh_port, fwd }) => {
             let mut sock = daemon::client::connect(cli.ttdevice)?;
-            daemon::client::add_net(&mut sock, cli.l2cpu as u8, ssh_port)
+            daemon::client::add_net(&mut sock, cli.l2cpu as u8, ssh_port, fwd)
         }
         Some(Commands::RemoveNet) => {
             let mut sock = daemon::client::connect(cli.ttdevice)?;
@@ -458,6 +466,28 @@ fn parse_console_mode(s: &str) -> std::io::Result<daemon::protocol::ConsoleMode>
             other
         ))),
     }
+}
+
+/// Parse `HOST:GUEST` for `add-net --fwd`. Both sides must be in the
+/// 1..=65535 range; bare numbers, leading whitespace, and missing
+/// halves all error out cleanly.
+fn parse_fwd_pair(s: &str) -> std::io::Result<(u16, u16)> {
+    let (h, g) = s.split_once(':').ok_or_else(|| {
+        std::io::Error::other(format!("invalid --fwd {:?}; expected HOST:GUEST", s))
+    })?;
+    let host: u16 = h
+        .parse()
+        .map_err(|_| std::io::Error::other(format!("invalid --fwd HOST {:?}", h)))?;
+    let guest: u16 = g
+        .parse()
+        .map_err(|_| std::io::Error::other(format!("invalid --fwd GUEST {:?}", g)))?;
+    if host == 0 || guest == 0 {
+        return Err(std::io::Error::other(format!(
+            "invalid --fwd {:?}; ports must be 1..=65535",
+            s
+        )));
+    }
+    Ok((host, guest))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -675,6 +705,42 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("clap failed to parse")
+    }
+
+    // --- parse_fwd_pair (#37) ----------------------------------------------
+
+    #[test]
+    fn parse_fwd_pair_accepts_valid() {
+        assert_eq!(parse_fwd_pair("5201:5201").unwrap(), (5201, 5201));
+        assert_eq!(parse_fwd_pair("8080:80").unwrap(), (8080, 80));
+        assert_eq!(parse_fwd_pair("65535:1").unwrap(), (65535, 1));
+    }
+
+    #[test]
+    fn parse_fwd_pair_rejects_malformed() {
+        // Missing separator.
+        assert!(parse_fwd_pair("5201").is_err());
+        assert!(parse_fwd_pair("5201/5201").is_err());
+        // Empty halves.
+        assert!(parse_fwd_pair(":80").is_err());
+        assert!(parse_fwd_pair("80:").is_err());
+        // Non-numeric.
+        assert!(parse_fwd_pair("abc:80").is_err());
+        assert!(parse_fwd_pair("80:xyz").is_err());
+        // Out of u16 range.
+        assert!(parse_fwd_pair("65536:80").is_err());
+        // Port 0 — kernel-pick wildcard, not what the operator wants.
+        assert!(parse_fwd_pair("0:80").is_err());
+        assert!(parse_fwd_pair("80:0").is_err());
+    }
+
+    #[test]
+    fn parse_fwd_pair_error_messages_name_the_input() {
+        // Operator-facing diagnostic shouldn't be cryptic.
+        let err = parse_fwd_pair("nope").unwrap_err();
+        assert!(format!("{}", err).contains("nope"));
+        let err = parse_fwd_pair("5201:notaport").unwrap_err();
+        assert!(format!("{}", err).contains("notaport"));
     }
 
     // --- absolutize ---------------------------------------------------------

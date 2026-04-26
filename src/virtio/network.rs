@@ -72,13 +72,17 @@ impl Drop for VirtioNet {
 }
 
 impl VirtioNet {
-    /// Construct a virtio-net device backed by slirp. `ssh_port` is the
-    /// host-side TCP port that gets forwarded to the guest's `:22` —
-    /// the daemon picks one based on (card, l2cpu_idx) via
-    /// `crate::regs::slirp::ssh_port`. This type doesn't know about
-    /// chip topology; the only piece of "where does this device live"
-    /// information that affects its behavior is the SSH-forward port.
-    pub fn new(ssh_port: u16, l2cpu_idx: u8) -> std::io::Result<Self> {
+    /// Construct a virtio-net device backed by slirp. `forwards` is
+    /// a list of `(host_port, guest_port)` TCP pairs to register as
+    /// slirp NAT entries — each becomes a `tcp_listen_add` on
+    /// `127.0.0.1:<host_port>` that forwards to `10.0.2.15:<guest_port>`.
+    ///
+    /// Today's call sites:
+    /// - `dispatch_add_net` builds `[(ssh_port, 22)]` plus any
+    ///   `--fwd HOST:GUEST` extras the operator passed.
+    /// - `start_net_worker` (the boot-path default) builds
+    ///   `[(regs::slirp::ssh_port(card, idx), 22)]`.
+    pub fn new(forwards: &[(u16, u16)], l2cpu_idx: u8) -> std::io::Result<Self> {
         let mut cfg: SlirpConfig = unsafe { std::mem::zeroed() };
         unsafe { vdeslirp_init(&mut cfg, VDE_INIT_DEFAULT) };
         let slirp = unsafe { vdeslirp_open(&mut cfg) };
@@ -96,8 +100,10 @@ impl VirtioNet {
 
         let host = InAddr::from_str("127.0.0.1");
         let guest = InAddr::from_str("10.0.2.15");
-        unsafe {
-            vdeslirp_add_fwd(slirp, 0, host, ssh_port as i32, guest, 22);
+        for &(host_port, guest_port) in forwards {
+            unsafe {
+                vdeslirp_add_fwd(slirp, 0, host, host_port as i32, guest, guest_port as i32);
+            }
         }
 
         let slirp_fd = unsafe { vdeslirp_fd(slirp) };
@@ -220,13 +226,14 @@ impl VirtioDeviceImpl for VirtioNet {
     }
 }
 
-/// Network device thread main function. `ssh_port` is the host TCP port
-/// to forward to the guest's `:22` — chosen by the caller via
-/// `crate::regs::slirp::ssh_port`. Keeping the chip-topology logic at
-/// the call site lets this thread know nothing about cards or L2CPU
-/// indices beyond the log prefix.
+/// Network device thread main function. `forwards` is the list of
+/// host→guest TCP NAT entries to register at slirp init — typically
+/// `[(ssh_port, 22)]` plus any extras the operator passed via
+/// `add-net --fwd HOST:GUEST`. Keeping chip-topology logic at the call
+/// site lets this thread know nothing about cards or L2CPU indices
+/// beyond the log prefix.
 pub fn network_main(
-    ssh_port: u16,
+    forwards: Vec<(u16, u16)>,
     l2cpu: Arc<L2Cpu>,
     interrupt_ctl: Arc<InterruptController>,
     interrupt_number: u32,
@@ -235,14 +242,14 @@ pub fn network_main(
 ) {
     let l2cpu_idx = l2cpu.idx();
     crate::dlog!(
-        "[net l2cpu {}] worker thread entered (mmio_offset=0x{:x}, irq={}, ssh_port={})",
+        "[net l2cpu {}] worker thread entered (mmio_offset=0x{:x}, irq={}, forwards={:?})",
         l2cpu_idx,
         mmio_region_offset,
         interrupt_number,
-        ssh_port
+        forwards
     );
     while !exit_flag.load(Ordering::Relaxed) {
-        let mut net = match VirtioNet::new(ssh_port, l2cpu_idx as u8) {
+        let mut net = match VirtioNet::new(&forwards, l2cpu_idx as u8) {
             Ok(n) => n,
             Err(e) => {
                 eprintln!(

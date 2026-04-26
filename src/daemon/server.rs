@@ -313,7 +313,11 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
         }
         Request::AddDisk { l2cpu, path } => dispatch_add_disk(&sock, &state, l2cpu, path),
         Request::RemoveDisk { l2cpu } => dispatch_remove_disk(&sock, &state, l2cpu),
-        Request::AddNet { l2cpu, ssh_port } => dispatch_add_net(&sock, &state, l2cpu, ssh_port),
+        Request::AddNet {
+            l2cpu,
+            ssh_port,
+            extra_fwd,
+        } => dispatch_add_net(&sock, &state, l2cpu, ssh_port, extra_fwd),
         Request::RemoveNet { l2cpu } => dispatch_remove_net(&sock, &state, l2cpu),
         Request::Stop { l2cpu } => dispatch_stop(&sock, &state, l2cpu),
         Request::Shutdown => dispatch_shutdown(&sock, &state),
@@ -758,8 +762,11 @@ fn start_net_worker(card: u32, slot: &mut L2CpuSlot) -> io::Result<()> {
     let exit_thread = exit.clone();
     let idx = slot.idx;
     let ssh_port = crate::regs::slirp::ssh_port(card, idx);
+    // Boot-path default: just the SSH forward. `add-net --fwd
+    // HOST:GUEST` is the path for arbitrary forwards post-boot.
+    let forwards = vec![(ssh_port, 22)];
     let t = thread::spawn(move || {
-        network::network_main(ssh_port, l2cpu, interrupt, NET_INT, NET_MMIO, exit_thread);
+        network::network_main(forwards, l2cpu, interrupt, NET_INT, NET_MMIO, exit_thread);
     });
     slot.net = Some(WorkerHandle {
         exit,
@@ -1132,11 +1139,13 @@ fn dispatch_add_net(
     state: &Arc<DaemonState>,
     l2cpu_idx: u8,
     ssh_port_override: Option<u16>,
+    extra_fwd: Vec<(u16, u16)>,
 ) -> crate::Result<()> {
     dlog!(
-        "[add_net l2cpu {}] dispatch entry (ssh_port_override={:?})",
+        "[add_net l2cpu {}] dispatch entry (ssh_port_override={:?}, extra_fwd={:?})",
         l2cpu_idx,
-        ssh_port_override
+        ssh_port_override,
+        extra_fwd
     );
     validate_l2cpu(l2cpu_idx)?;
     let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
@@ -1151,26 +1160,40 @@ fn dispatch_add_net(
     let ssh_port =
         ssh_port_override.unwrap_or_else(|| crate::regs::slirp::ssh_port(state.card, l2cpu_idx));
 
-    // Pre-check: confirm nothing else holds the port. There's a small
-    // TOCTOU window between dropping our probe-bind and slirp's bind,
-    // but we're catching the operator-error case (port held by another
-    // process for a long time), not concurrent-bind races.
-    probe_port_available(ssh_port).map_err(crate::Error::io_ctx(format!(
-        "ssh-forward port {} unavailable. Pass --ssh-port to pick a different host port, or stop whatever's using it",
-        ssh_port
-    )))?;
+    // Build the full forward list: implicit SSH first, then any
+    // operator-supplied extras in order.
+    let mut forwards: Vec<(u16, u16)> = vec![(ssh_port, 22)];
+    forwards.extend(extra_fwd.iter().copied());
+
+    // Pre-flight every host port. Reject the whole add-net if any
+    // one is unavailable — slirp's tcp_listen_add doesn't roll back
+    // on partial failure, so we'd be left in a half-installed state.
+    for &(host_port, _guest_port) in &forwards {
+        probe_port_available(host_port).map_err(crate::Error::io_ctx(format!(
+            "host port {} unavailable. Pass a different host port (--fwd HOST:GUEST or --ssh-port), or stop whatever's using it",
+            host_port
+        )))?;
+    }
 
     let exit = Arc::new(AtomicBool::new(false));
     let l2cpu = slot.l2cpu.clone();
     let interrupt = slot.interrupt.clone();
     let exit_thread = exit.clone();
     dlog!(
-        "[add_net l2cpu {}] spawning network worker thread (ssh_port={})",
+        "[add_net l2cpu {}] spawning network worker thread (forwards={:?})",
         l2cpu_idx,
-        ssh_port
+        forwards
     );
+    let forwards_thread = forwards.clone();
     let t = thread::spawn(move || {
-        network::network_main(ssh_port, l2cpu, interrupt, NET_INT, NET_MMIO, exit_thread);
+        network::network_main(
+            forwards_thread,
+            l2cpu,
+            interrupt,
+            NET_INT,
+            NET_MMIO,
+            exit_thread,
+        );
     });
     slot.net = Some(WorkerHandle {
         exit,
@@ -1191,6 +1214,7 @@ fn dispatch_add_net(
     _state: &Arc<DaemonState>,
     _l2cpu_idx: u8,
     _ssh_port: Option<u16>,
+    _extra_fwd: Vec<(u16, u16)>,
 ) -> crate::Result<()> {
     Err(crate::Error::bad_request(
         "daemon built without the slirp feature",

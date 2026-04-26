@@ -21,6 +21,7 @@ pub struct VdeSlirp {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct InAddr {
     pub s_addr: u32,
 }

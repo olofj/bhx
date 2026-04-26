@@ -108,11 +108,73 @@ def measure_tcp_egress(g: GuestSession, host_port: int, duration: int) -> float:
             server.kill()
 
 
-# tcp_ingress (host → guest TCP): not implemented today. Would
-# need `add-net` to expose an arbitrary host:guest port pair; today
-# it only takes a host port for the slirp SSH-forward (guest side
-# hard-coded to :22). Until that lands, the metric is emitted as
-# SKIP in main() so baseline diffs stay shape-stable.
+def measure_tcp_ingress(
+    g: GuestSession, card: int, l2cpu: int, port: int, duration: int
+) -> float:
+    """Host connects to 127.0.0.1:port → slirp NAT → guest's
+    iperf3 -s on `port`. Uses `add-net --fwd HOST:GUEST` (#37) for
+    the slirp forward; restarts net to install the new fwd cleanly.
+    """
+    note(f"tcp_ingress: re-attaching net with --fwd {port}:{port}")
+    subprocess.run(
+        [BINARY, "remove-net", "-t", str(card), "-l", str(l2cpu)],
+        capture_output=True,
+    )
+    r = subprocess.run(
+        [
+            BINARY,
+            "add-net",
+            "-t",
+            str(card),
+            "-l",
+            str(l2cpu),
+            "--fwd",
+            f"{port}:{port}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        fail(f"add-net --fwd failed: {r.stderr}")
+
+    # Start guest-side iperf3 -s in the background; -1 makes it serve
+    # exactly one connection then exit cleanly.
+    g.send(f"iperf3 -s -1 -p {port} >/dev/null 2>&1 &\n".encode())
+    time.sleep(2)
+
+    note(f"tcp_ingress: running iperf3 -c 127.0.0.1:{port} for {duration}s")
+    proc = subprocess.run(
+        [
+            "iperf3",
+            "-c",
+            "127.0.0.1",
+            "-p",
+            str(port),
+            "-t",
+            str(duration),
+            "-i",
+            "0",
+            "-f",
+            "m",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=duration + 30,
+    )
+    out = proc.stdout
+    mbps = parse_iperf3_summary_mbps(out)
+
+    # Reap the guest-side server so it doesn't linger past this
+    # benchmark run.
+    g.run_cmd("kill %1 2>/dev/null || true", timeout_s=5)
+
+    if mbps is None:
+        fail(
+            f"tcp_ingress: couldn't parse iperf3 summary:\n"
+            f"stdout:\n{out}\nstderr:\n{proc.stderr}"
+        )
+    note(f"tcp_ingress: {mbps:.1f} MB/s")
+    return mbps
 
 
 def main() -> int:
@@ -134,10 +196,10 @@ def main() -> int:
         help="Host-side iperf3 listen port for egress (default 5201)",
     )
     ap.add_argument(
-        "--guest-port",
+        "--ingress-port",
         type=int,
-        default=22,
-        help="Guest-side iperf3 listen port for ingress (default 22; the only fwd-able port without a multi-fwd CLI)",
+        default=5202,
+        help="Host+guest port for the ingress test (must be free; default 5202).",
     )
     args = ap.parse_args()
 
@@ -177,16 +239,11 @@ def main() -> int:
             BenchResult("net", "tcp_egress_30s.bandwidth_mbps", mbps, "MB/s")
         )
 
-        # Ingress requires forwarding an arbitrary host port to an
-        # arbitrary guest port. The CLI's `add-net --ssh-port` only
-        # exposes the host side of the fwd; the guest side is hard-
-        # coded to 22 (slirp's tcp_listen_add for SSH). Running
-        # iperf3 -s on the guest's :22 means stopping dropbear first
-        # and the buildroot rootfs's init re-spawns it. Until we
-        # extend `add-net` to take an arbitrary host:guest pair,
-        # ingress is SKIP — see #28's open follow-ups.
+        mbps = measure_tcp_ingress(
+            g, args.card, args.l2cpu, args.ingress_port, args.duration
+        )
         results.append(
-            BenchResult("net", "tcp_ingress_30s.bandwidth_mbps", 0.0, "SKIP")
+            BenchResult("net", "tcp_ingress_30s.bandwidth_mbps", mbps, "MB/s")
         )
 
     write_csv(args.csv, results)
