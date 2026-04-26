@@ -181,9 +181,9 @@ mod imp {
                 );
                 Ok(())
             }
-            RulesetStatus::NotEnforced => Err(Error::internal(
-                "landlock not enforced (no kernel support)",
-            )),
+            RulesetStatus::NotEnforced => {
+                Err(Error::internal("landlock not enforced (no kernel support)"))
+            }
         }
     }
 

@@ -186,11 +186,7 @@ pub fn image_dir() -> PathBuf {
 /// already-converted `.ext4` short-circuit at the top still applies
 /// because that's a separate "I already have the final artifact"
 /// signal and re-converting is far slower than the conditional GET.
-pub fn pull_image(
-    name: &str,
-    output: Option<&Path>,
-    force_refetch: bool,
-) -> Result<PathBuf> {
+pub fn pull_image(name: &str, output: Option<&Path>, force_refetch: bool) -> Result<PathBuf> {
     let image = get_known_image(name).ok_or_else(|| {
         Error::bad_request(format!(
             "Unknown image '{}'. Use 'image list' to see available images.",

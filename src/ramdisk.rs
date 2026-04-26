@@ -74,11 +74,7 @@ fn ramdisk_dir() -> PathBuf {
 }
 
 /// Pull a ramdisk/initramfs.
-pub fn pull_ramdisk(
-    name: &str,
-    output: Option<&Path>,
-    force_refetch: bool,
-) -> Result<PathBuf> {
+pub fn pull_ramdisk(name: &str, output: Option<&Path>, force_refetch: bool) -> Result<PathBuf> {
     let ramdisk = find_ramdisk(name).ok_or_else(|| {
         let available: Vec<_> = KNOWN_RAMDISKS.iter().map(|r| r.name).collect();
         Error::bad_request(format!(
