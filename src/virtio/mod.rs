@@ -612,10 +612,15 @@ pub fn run_device(
                     // `QUEUE_READY=1` and proceed to the next queue's
                     // `QUEUE_SEL` write so quickly that a sel-gated clear
                     // would lose the race.
-                    if unsafe { ptr::read_volatile(regs.queue_ready) } != 0 {
-                        unsafe {
-                            ptr::write_volatile(regs.queue_ready, 0);
-                        }
+                    // Unconditionally write 0; the kernel's writel(READY=1)
+                    // is destined to be cleared anyway, and reading first
+                    // costs an extra PCIe round-trip per iteration —
+                    // halving the poll cadence makes the race against the
+                    // next queue's readl(READY) tight enough to matter on
+                    // multi-queue devices (#58 manifested as virtio_net /
+                    // virtio_console probe `-ENOENT` in init_vqs).
+                    unsafe {
+                        ptr::write_volatile(regs.queue_ready, 0);
                     }
                     let curr_sel = unsafe { ptr::read_volatile(regs.queue_select) };
                     if curr_sel != last_sel {

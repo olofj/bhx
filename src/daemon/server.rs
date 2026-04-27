@@ -637,6 +637,10 @@ fn dispatch_boot(
 
     start_initial_workers(&mut slot, state.card, l2cpu_idx, disk, network, console)
         .map_err(crate::Error::slot_state)?;
+    // Workers are now in Phase 1 polling for the DRIVER bit. Release the
+    // L2CPU from reset so the kernel's virtio probe runs against a
+    // daemon that's already watching MMIO. See `release_l2cpu_from_reset`.
+    release_l2cpu_from_reset(state, l2cpu_idx, &slot.l2cpu);
     install_slot_and_reply_ok(state, l2cpu_idx, slot, sock);
     Ok(())
 }
@@ -1004,15 +1008,30 @@ fn run_boot_sequence(
         );
     }
 
+    dlog!("[run_boot l2cpu {}] image+pre_init done; deferring reset release until workers spawn", l2cpu_idx);
+    Ok(l2cpu)
+}
+
+/// Release the L2CPU from reset and configure its prefetchers. Called
+/// AFTER virtio worker threads are spawned so the kernel's first virtio
+/// probe doesn't race ahead of the daemon's Phase 1/2/3 handshake. The
+/// previous arrangement had reset release inside `run_boot_sequence`,
+/// which fired before workers were even constructed — kernel reached
+/// `vm_setup_vq` for queue 1 of multi-queue devices (net, console)
+/// while no daemon thread was clearing `QUEUE_READY` from queue 0's
+/// setup, so the kernel saw `READY=1` and bailed with `-ENOENT`. With
+/// workers already in Phase 3 polling when this returns, the
+/// guest-side `writel(READY=1)` → next-queue `readl(READY)` race is
+/// reliably won.
+fn release_l2cpu_from_reset(state: &Arc<DaemonState>, l2cpu_idx: u8, l2cpu: &L2Cpu) {
     dlog!("[run_boot l2cpu {}] releasing from reset", l2cpu_idx);
     // reset_x280 goes through SharedChip so the PLL step and the
     // L2CPU_RESET R-M-W serialize against any other boot RPC issuing the
     // same sequence.
     state.shared_chip.reset_x280(&[l2cpu_idx as usize]);
     dlog!("[run_boot l2cpu {}] configuring prefetchers", l2cpu_idx);
-    boot::configure_prefetchers(&l2cpu);
+    boot::configure_prefetchers(l2cpu);
     dlog!("[run_boot l2cpu {}] run_boot_sequence done", l2cpu_idx);
-    Ok(l2cpu)
 }
 
 /// Pre-write the standard virtio-mmio header registers (magic, version,
