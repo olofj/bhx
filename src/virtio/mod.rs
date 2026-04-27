@@ -469,16 +469,32 @@ pub fn run_device(
 
                 // Phase 1: Wait for DRIVER status.
                 //
-                // If the guest was already past virtio init when the server started,
-                // it won't re-assert DRIVER and this loop waits forever. Nudge the
-                // user every few seconds so it's clear what's happening.
+                // Tight-spin for the first 50 ms, then back off to 1 ms
+                // poll. The 50 ms tight window matters for the second
+                // cold-start (after a guest `STATUS=0` reset, #59): the
+                // kernel races through ACK → DRIVER → FEATURES_OK →
+                // queue setup in tens of microseconds, and a 1 ms sleep
+                // here would leave us behind, missing queue 0's
+                // address-register writes for multi-queue devices
+                // (#61). For the first cold-start the guest takes
+                // 100 ms+ to even reach virtio init, so the 50 ms tight
+                // window is irrelevant — we drop to 1 ms after it and
+                // stop burning CPU.
+                //
+                // If the guest was already past virtio init when the
+                // server started, it won't re-assert DRIVER and this
+                // loop waits forever. Nudge the user every few seconds
+                // so it's clear what's happening.
                 let phase1_start = std::time::Instant::now();
+                let phase1_tight_until =
+                    phase1_start + std::time::Duration::from_millis(50);
                 let mut next_hint = phase1_start + std::time::Duration::from_secs(5);
                 while !exit_flag.load(Ordering::Relaxed) {
                     if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_DRIVER != 0 {
                         break;
                     }
-                    if std::time::Instant::now() >= next_hint {
+                    let now = std::time::Instant::now();
+                    if now >= next_hint {
                         eprintln!(
                     "virtio: device {} still waiting for the guest to start virtio init (DRIVER bit). \
                      If the guest is already up, reboot it (`sudo reboot` on the guest console) to re-run init.",
@@ -486,8 +502,10 @@ pub fn run_device(
                 );
                         next_hint += std::time::Duration::from_secs(15);
                     }
-                    unsafe {
-                        libc::usleep(1000);
+                    if now >= phase1_tight_until {
+                        unsafe {
+                            libc::usleep(1000);
+                        }
                     }
                 }
 
@@ -557,36 +575,55 @@ pub fn run_device(
                 // registers, so each queue's writes overwrite the previous
                 // queue's values in the same DRAM cell.
                 //
-                // To recover per-queue values without the old `sel_generation`
-                // gate, we poll `QUEUE_SEL`: when the guest moves to the
-                // next queue, the previous queue's writes are complete and
-                // sitting in MMIO — we snapshot them into per-queue daemon
-                // state before the next queue's writes overwrite them.
-                // Tens of microseconds typically pass between
-                // `writel(SEL=next)` and the next queue's first
-                // `writel(DESC_LOW)` (kernel `vring_create_virtqueue` does
-                // memory allocation in between), comfortably wider than the
-                // daemon's PCIe poll cadence.
+                // Strategy:
                 //
-                // We also clear `QUEUE_READY` on every `SEL` transition so
-                // the next queue's "READY must be 0 at start of setup"
-                // check (vm_setup_vq returns -ENOENT otherwise) sees a fresh
-                // register. Patched guests get their `sel_generation` bumps
-                // echoed too so their spin-waits terminate.
+                // 1. On every iteration, write `QUEUE_READY = 0` and read
+                //    `QUEUE_SEL`. Two PCIe ops only — keeps the loop
+                //    cadence tight enough to win the kernel's
+                //    `writel(READY=1)` → next-queue `readl(READY)` race
+                //    (multi-queue probe `-ENOENT`, originally #58).
+                //
+                // 2. When `QUEUE_SEL` changes from N to M (and again at
+                //    Phase 3 exit), snapshot queue N's register cells
+                //    AND queue M's, with a SEL re-read guard to drop
+                //    torn reads. Capturing N catches the values the
+                //    kernel wrote while SEL=N; capturing M as soon as
+                //    we see SEL=M catches the kernel's just-written
+                //    queue-M state before subsequent writes overwrite
+                //    it. Without the SEL guard, the snapshot would
+                //    silently mix queues N and M during the kernel's
+                //    `writel(SEL=M)` → `writel(DESC_LOW for M)` window
+                //    (#61).
+                //
+                // 3. Patched guests get `sel_generation` bumps echoed
+                //    too so their spin-waits terminate.
                 let mut q_state: Vec<[u64; 3]> = vec![[0u64; 3]; num_queues as usize];
                 let mut last_sel: u32 = 0;
-                let snapshot_current_queue = |q_state: &mut Vec<[u64; 3]>, sel: u32| {
+                let snapshot_at_sel = |q_state: &mut Vec<[u64; 3]>, sel: u32| {
                     let qi = sel as usize;
                     if qi >= q_state.len() {
                         return;
                     }
                     unsafe {
-                        q_state[qi][0] = ((ptr::read_volatile(regs.queue_desc_high) as u64) << 32)
-                            | (ptr::read_volatile(regs.queue_desc_low) as u64);
-                        q_state[qi][1] = ((ptr::read_volatile(regs.queue_avail_high) as u64) << 32)
-                            | (ptr::read_volatile(regs.queue_avail_low) as u64);
-                        q_state[qi][2] = ((ptr::read_volatile(regs.queue_used_high) as u64) << 32)
-                            | (ptr::read_volatile(regs.queue_used_low) as u64);
+                        let dh = ptr::read_volatile(regs.queue_desc_high);
+                        let dl = ptr::read_volatile(regs.queue_desc_low);
+                        let ah = ptr::read_volatile(regs.queue_avail_high);
+                        let al = ptr::read_volatile(regs.queue_avail_low);
+                        let uh = ptr::read_volatile(regs.queue_used_high);
+                        let ul = ptr::read_volatile(regs.queue_used_low);
+                        // SEL re-read guard: discard if SEL moved during
+                        // the 6 reads above — those values would be a mix
+                        // from two different queues. A stable SEL means
+                        // the values came from the queue currently
+                        // selected, so they're at least internally
+                        // consistent.
+                        let sel_after = ptr::read_volatile(regs.queue_select);
+                        if sel_after != sel {
+                            return;
+                        }
+                        q_state[qi][0] = ((dh as u64) << 32) | (dl as u64);
+                        q_state[qi][1] = ((ah as u64) << 32) | (al as u64);
+                        q_state[qi][2] = ((uh as u64) << 32) | (ul as u64);
                     }
                 };
                 while !exit_flag.load(Ordering::Relaxed) {
@@ -623,14 +660,21 @@ pub fn run_device(
                         ptr::write_volatile(regs.queue_ready, 0);
                     }
                     let curr_sel = unsafe { ptr::read_volatile(regs.queue_select) };
-                    if curr_sel != last_sel {
-                        // The guest moved to a new queue. The previous
-                        // queue's writes (DESC / AVAIL / USED) are still in
-                        // MMIO; capture them into our per-queue state before
-                        // the next queue's writes overwrite them.
-                        snapshot_current_queue(&mut q_state, last_sel);
-                        last_sel = curr_sel;
-                    }
+                    // Snapshot the currently-selected queue every
+                    // iteration. While SEL=N is stable the kernel is
+                    // writing queue N's address registers; one of our
+                    // iterations during that window will capture a
+                    // complete state (re-read guard drops torn ones).
+                    // After the kernel writes SEL=N+1, we stop touching
+                    // q_state[N] and the last good value persists.
+                    // Costs ~7 PCIe reads per iteration but the
+                    // QUEUE_READY clear at the top still happens first,
+                    // and the kernel's per-queue setup window
+                    // (vring_create_virtqueue allocates GFP_KERNEL
+                    // memory) is wide enough that even a slowed-down
+                    // poll wins the READY race.
+                    snapshot_at_sel(&mut q_state, curr_sel);
+                    last_sel = curr_sel;
                     let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
                     if let Some(next) = echo_sel_generation(curr_gen, last_echoed_gen) {
                         unsafe {
@@ -640,11 +684,12 @@ pub fn run_device(
                     }
                 }
 
-                // The guest's last queue setup never had a following SEL
-                // change to trigger the snapshot above — DRIVER_OK was
-                // written instead. Capture it now from whatever the MMIO
-                // still holds for that queue.
-                snapshot_current_queue(&mut q_state, last_sel);
+                // One last snapshot at whatever SEL the guest left us at —
+                // catches the trailing queue's values which only stop
+                // changing once `DRIVER_OK` is written.
+                let final_sel = unsafe { ptr::read_volatile(regs.queue_select) };
+                snapshot_at_sel(&mut q_state, final_sel);
+                let _ = last_sel;
 
                 let mut desc = vec![0u64; num_queues as usize];
                 let mut avail = vec![0u64; num_queues as usize];
