@@ -74,8 +74,10 @@ help:
 	@echo "Pinned U-Boot version: $(UBOOT_VERSION)"
 	@echo "Cross-compiler:        $(CROSS_COMPILE)gcc"
 
+PATCH_FILES := $(sort $(wildcard $(TOPDIR)/patches/*.patch))
+
 # Download + verify + extract the U-Boot tarball.
-$(UB_SRCDIR)/Makefile: $(DL_DIR)/$(UBOOT_TARBALL) $(TOPDIR)/patches/serial_sbi_dm.c
+$(UB_SRCDIR)/Makefile: $(DL_DIR)/$(UBOOT_TARBALL) $(TOPDIR)/patches/serial_sbi_dm.c $(PATCH_FILES)
 	@echo "==> Verifying $(UBOOT_TARBALL)"
 	@cd $(DL_DIR) && sha256sum -c $(TOPDIR)/sha256sums --ignore-missing
 	@echo "==> Extracting"
@@ -89,6 +91,13 @@ $(UB_SRCDIR)/Makefile: $(DL_DIR)/$(UBOOT_TARBALL) $(TOPDIR)/patches/serial_sbi_d
 		printf '\nconfig SERIAL_SBI_DM\n\tbool "DM serial driver wrapping SBI DBCN"\n\tdepends on DM_SERIAL && RISCV_SMODE\n\thelp\n\t  tt-bh downstream patch — see tests/uboot/patches/serial_sbi_dm.c.\n' >> $(UB_SRCDIR)/drivers/serial/Kconfig
 	@grep -q SERIAL_SBI_DM $(UB_SRCDIR)/drivers/serial/Makefile || \
 		echo 'obj-$$(CONFIG_SERIAL_SBI_DM) += serial_sbi_dm.o' >> $(UB_SRCDIR)/drivers/serial/Makefile
+	@# Apply any *.patch files (alphabetical order). The patch tool's
+	@# -N flag skips already-applied hunks so a re-extract that left
+	@# stale .config behind doesn't double-patch.
+	@for p in $(PATCH_FILES); do \
+		echo "==> Applying $$(basename $$p)"; \
+		(cd $(UB_SRCDIR) && patch -p1 -N --quiet < $$p) || true; \
+	done
 	@touch $@
 
 $(DL_DIR)/$(UBOOT_TARBALL):

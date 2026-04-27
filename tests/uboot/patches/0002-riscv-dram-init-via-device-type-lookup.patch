@@ -1,0 +1,46 @@
+From: tt-bh-linux <noreply@tenstorrent.com>
+Subject: [PATCH] arch/riscv/cpu/generic: dram_init via device_type lookup
+
+The tt-bh-linux daemon's DTB names the memory node with its unit
+address (`/memory@400030000000`). Upstream `dram_init` calls
+`fdtdec_setup_mem_size_base()` which does an `ofnode_path("/memory")`
+literal lookup — that misses unit-addressed nodes. dram_init returns
+-EINVAL silently and U-Boot falls back to CFG_SYS_SDRAM_BASE =
+0x80000000 (the qemu default), placing the relocated U-Boot image and
+its malloc heap at ~0x17e00000_00 instead of inside the actual
+0x4000_3000_0000 + 4 GiB L2CPU DRAM range. virtqueue allocations then
+land outside DRAM and the host-side virtio worker panics with
+"virtqueue desc address X below L2CPU memory start".
+
+Switch to `fdtdec_setup_mem_size_base_lowest()` which walks
+device_type="memory" via get_next_memory_node and handles unit-
+addressed nodes correctly. dram_init_banksize already uses the
+device_type walker so this aligns the two halves.
+
+See tt-bh-linux #49.
+
+---
+--- a/arch/riscv/cpu/generic/dram.c
++++ b/arch/riscv/cpu/generic/dram.c
+@@ -12,7 +12,20 @@
+ 
+ int dram_init(void)
+ {
+-	return fdtdec_setup_mem_size_base();
++	/*
++	 * tt-bh: use the _lowest variant which walks device_type="memory"
++	 * via get_next_memory_node, so a unit-addressed
++	 * `/memory@400030000000` (our daemon's DTB shape, see #46) is
++	 * found. The original `fdtdec_setup_mem_size_base` calls
++	 * `ofnode_path("/memory")` which only matches the literal node
++	 * name with no unit address; on tt-bh hardware that fails
++	 * silently and U-Boot falls back to CFG_SYS_SDRAM_BASE =
++	 * 0x80000000 (the qemu default), which makes virtqueue desc
++	 * addresses land outside our actual DRAM range and the daemon
++	 * panics with "addr below L2CPU memory start". See tt-bh-linux
++	 * #49.
++	 */
++	return fdtdec_setup_mem_size_base_lowest();
+ }
+ 
+ int dram_init_banksize(void)
