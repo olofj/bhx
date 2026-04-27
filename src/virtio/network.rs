@@ -28,6 +28,85 @@ const VIRTIO_ID_NET: u32 = 1;
 // offload. By advertising no csum offload, the guest stack does the
 // checksum in software and slirp accepts the packets.
 const VIRTIO_F_VERSION_1_BIT: u32 = 1 << 0; // bit 0 of features[1]
+const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+
+/// Recompute the IPv4 TCP/UDP checksum in place. The guest sets this on
+/// outbound packets when it thinks we negotiated `VIRTIO_NET_F_CSUM` —
+/// our cold-start register multiplexing leaks the bit even though
+/// `device_features` doesn't advertise it (see comment on
+/// `tx_needs_csum`). Without this fix, TCP/UDP frames from the guest
+/// arrive at libslirp with a partial pseudo-header sum in the L4
+/// checksum field and slirp drops them as malformed.
+///
+/// Approach: zero the field, sum pseudo-header + L4 segment, fold,
+/// invert, write. Robust against either of the two pre-fill conventions
+/// (negated pseudo-sum vs. raw pseudo-sum) the kernel and spec disagree
+/// on. Only handles IPv4. IPv6 + TCP/UDP could be added later; for now
+/// IPv6 packets pass through unchanged and may get dropped by slirp.
+fn fix_tx_l4_checksum(buf: &mut [u8]) {
+    if buf.len() < 14 + 20 {
+        return;
+    }
+    let etype = u16::from_be_bytes([buf[12], buf[13]]);
+    if etype != 0x0800 {
+        return;
+    }
+    let ip_hdr_off = 14;
+    if (buf[ip_hdr_off] >> 4) != 4 {
+        return;
+    }
+    let ihl = (buf[ip_hdr_off] & 0x0f) as usize * 4;
+    if ihl < 20 || buf.len() < ip_hdr_off + ihl {
+        return;
+    }
+    let total_len = u16::from_be_bytes([buf[ip_hdr_off + 2], buf[ip_hdr_off + 3]]) as usize;
+    if total_len < ihl || buf.len() < ip_hdr_off + total_len {
+        return;
+    }
+    let proto = buf[ip_hdr_off + 9];
+    let csum_field_off = match proto {
+        6 => ip_hdr_off + ihl + 16,  // TCP checksum at offset 16 in TCP header
+        17 => ip_hdr_off + ihl + 6,  // UDP checksum at offset 6 in UDP header
+        _ => return,
+    };
+    if csum_field_off + 2 > buf.len() {
+        return;
+    }
+    let l4_off = ip_hdr_off + ihl;
+    let l4_len = total_len - ihl;
+
+    buf[csum_field_off] = 0;
+    buf[csum_field_off + 1] = 0;
+
+    let mut sum: u32 = 0;
+    // Pseudo-header: src(4) + dst(4) + 0,proto(2) + len(2)
+    for i in (0..4).step_by(2) {
+        sum += u16::from_be_bytes([buf[ip_hdr_off + 12 + i], buf[ip_hdr_off + 13 + i]]) as u32;
+        sum += u16::from_be_bytes([buf[ip_hdr_off + 16 + i], buf[ip_hdr_off + 17 + i]]) as u32;
+    }
+    sum += proto as u32;
+    sum += l4_len as u32;
+    // L4 segment (header + payload, with checksum field zeroed)
+    let l4 = &buf[l4_off..l4_off + l4_len];
+    let mut i = 0;
+    while i + 1 < l4.len() {
+        sum += u16::from_be_bytes([l4[i], l4[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < l4.len() {
+        sum += (l4[i] as u32) << 8;
+    }
+    while sum > 0xFFFF {
+        sum = (sum >> 16) + (sum & 0xFFFF);
+    }
+    let mut checksum: u16 = !(sum as u16);
+    // RFC 768: a UDP checksum of 0 means "no checksum"; transmit 0xFFFF instead.
+    if proto == 17 && checksum == 0 {
+        checksum = 0xFFFF;
+    }
+    buf[csum_field_off] = (checksum >> 8) as u8;
+    buf[csum_field_off + 1] = (checksum & 0xff) as u8;
+}
 
 /// VirtIO net header (virtio_net_hdr_mrg_rxbuf).
 #[repr(C)]
@@ -47,6 +126,30 @@ pub struct VirtioNet {
     slirp_fd: i32,
     buffer: [u8; PACKET_SIZE],
     header_processed: bool,
+    /// True when the most recent TX descriptor's vnet header had
+    /// `VIRTIO_NET_HDR_F_NEEDS_CSUM` set, meaning the guest stack
+    /// expects us to compute the L4 checksum before forwarding to slirp.
+    /// Set in `process_queue_start(queue=1, ...)` and consumed (cleared)
+    /// in `process_queue_complete(queue=1, ...)`. The bit is reachable
+    /// even though we no longer advertise `VIRTIO_NET_F_CSUM` because
+    /// the cold-start `device_features` register multiplexes via a
+    /// single MMIO cell — the high half (`VIRTIO_F_VERSION_1`, bit 0
+    /// of `features[1]`) leaks into the low-half read, and that bit
+    /// happens to be `VIRTIO_NET_F_CSUM`. The race that fixes the leak
+    /// is unwinnable on PCIe (see comment block in
+    /// `virtio::run_device`), so we just compute the checksum here.
+    tx_needs_csum: bool,
+    /// Bytes accumulated into `buffer` during a multi-descriptor TX
+    /// chain. The runner calls `process_queue_data` for every
+    /// descriptor between the header and the last one; each descriptor
+    /// holds a slice of the L2 frame the kernel built (Linux can split
+    /// an `skb` across multiple page-sized fragments). Dropping the
+    /// middle descriptors silently truncated the packet to whatever
+    /// the LAST descriptor held — for TCP that surfaced as the guest
+    /// emitting only the final fragment of an SSH banner, libslirp
+    /// dropping it as malformed, and the host SSH client timing out
+    /// at "banner exchange" (#58).
+    tx_offset: usize,
     queue_header_size: u64,
     /// L2CPU index this device serves. Stored only for metric labels.
     l2cpu_idx: u8,
@@ -113,6 +216,8 @@ impl VirtioNet {
             slirp_fd,
             buffer: [0u8; PACKET_SIZE],
             header_processed: false,
+            tx_needs_csum: false,
+            tx_offset: 0,
             queue_header_size: std::mem::size_of::<VirtioNetHdrMrgRxbuf>() as u64,
             l2cpu_idx,
         })
@@ -133,7 +238,7 @@ impl VirtioDeviceImpl for VirtioNet {
         [0, VIRTIO_F_VERSION_1_BIT]
     }
 
-    fn process_queue_start(&mut self, queue_idx: u32, addr: *mut u8, _len: u64) {
+    fn process_queue_start(&mut self, queue_idx: u32, addr: *mut u8, len: u64) {
         self.header_processed = true;
         if queue_idx == 0 {
             // RX: fill in net header
@@ -144,27 +249,65 @@ impl VirtioDeviceImpl for VirtioNet {
                 ptr::write_volatile(&mut (*hdr).gso_type, 0);
                 ptr::write_volatile(&mut (*hdr).gso_size, 0);
             }
+        } else if queue_idx == 1 {
+            // TX: read the guest-supplied vnet header to learn whether
+            // we need to fix up the L4 checksum before forwarding.
+            let hdr = addr as *const VirtioNetHdrMrgRxbuf;
+            let flags = unsafe { ptr::read_volatile(&(*hdr).flags) };
+            self.tx_needs_csum = flags & VIRTIO_NET_HDR_F_NEEDS_CSUM != 0;
+            self.tx_offset = 0;
+            // The descriptor isn't required to be exactly 12 bytes — Linux
+            // packs the L2 frame's leading bytes (Ethernet+IP+TCP headers)
+            // into the same descriptor as the vnet_hdr when the skb's
+            // first fragment is large enough. Anything past the 12-byte
+            // vnet_hdr is real packet data that must land in the buffer
+            // we hand to libslirp; ignoring it would emit a header-less
+            // packet (the SSH-banner truncation that surfaced as #58).
+            let hdr_size = self.queue_header_size as usize;
+            if len as usize > hdr_size {
+                let extra = len as usize - hdr_size;
+                let copy_len = extra.min(PACKET_SIZE);
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        addr.add(hdr_size),
+                        self.buffer.as_mut_ptr(),
+                        copy_len,
+                    );
+                }
+                self.tx_offset = copy_len;
+            }
         }
     }
 
-    fn process_queue_data(&mut self, _queue_idx: u32, _addr: *mut u8, _len: u64) {
-        // Nothing to do here
+    fn process_queue_data(&mut self, queue_idx: u32, addr: *mut u8, len: u64) {
+        if queue_idx == 1 {
+            // TX middle descriptor: append to the in-flight L2 frame.
+            // See `tx_offset` for why this isn't a no-op.
+            let copy_len = (len as usize).min(PACKET_SIZE - self.tx_offset);
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    addr,
+                    self.buffer.as_mut_ptr().add(self.tx_offset),
+                    copy_len,
+                );
+            }
+            self.tx_offset += copy_len;
+        }
     }
 
     fn process_queue_complete(&mut self, queue_idx: u32, addr: *mut u8, len: u64) -> u64 {
-        // Handle single-descriptor edge case: if header wasn't processed via
-        // a separate descriptor, process it from the start of this one and
-        // advance past it.
-        let mut data_addr = addr;
-        let mut data_len = len;
-        if !self.header_processed {
-            self.process_queue_start(queue_idx, addr, len);
-            data_addr = unsafe { addr.add(self.queue_header_size as usize) };
-            data_len = len.saturating_sub(self.queue_header_size);
-        }
-
         if queue_idx == 0 {
-            // RX: receive packet from slirp
+            // RX: single-descriptor path runs `start` inline so the
+            // vnet_hdr lands in place; multi-descriptor RX has the
+            // separate hdr descriptor and we just write the payload
+            // here. In both cases libslirp gives us a fresh frame.
+            let mut data_addr = addr;
+            let mut data_len = len;
+            if !self.header_processed {
+                self.process_queue_start(queue_idx, addr, len);
+                data_addr = unsafe { addr.add(self.queue_header_size as usize) };
+                data_len = len.saturating_sub(self.queue_header_size);
+            }
             let max_copy = (data_len as usize).min(PACKET_SIZE);
             let pktlen = unsafe { vdeslirp_recv(self.slirp, self.buffer.as_mut_ptr(), max_copy) };
             if pktlen > 0 {
@@ -180,11 +323,38 @@ impl VirtioDeviceImpl for VirtioNet {
                     .add(copy_len as u64);
             }
         } else if queue_idx == 1 {
-            // TX: send packet to slirp
-            let copy_len = (data_len as usize).min(PACKET_SIZE);
+            // TX: the L2 frame is reassembled into `self.buffer`
+            // across `process_queue_start` (vnet_hdr + leading bytes
+            // packed in the same descriptor) and `process_queue_data`
+            // (middle descriptors). What lands here is either:
+            //   - the trailing-data descriptor of a multi-descriptor
+            //     chain (`header_processed == true`), or
+            //   - the only descriptor of a single-descriptor chain
+            //     (`header_processed == false`).
+            // In the second case, `process_queue_start` does the
+            // vnet_hdr read AND copies the full L2 frame into the
+            // buffer; nothing left for us to append.
+            if !self.header_processed {
+                self.process_queue_start(queue_idx, addr, len);
+            } else {
+                let copy_len = (len as usize).min(PACKET_SIZE - self.tx_offset);
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        addr,
+                        self.buffer.as_mut_ptr().add(self.tx_offset),
+                        copy_len,
+                    );
+                }
+                self.tx_offset += copy_len;
+            }
+            let total_len = self.tx_offset;
+            self.tx_offset = 0;
+            if self.tx_needs_csum {
+                fix_tx_l4_checksum(&mut self.buffer[..total_len]);
+            }
+            self.tx_needs_csum = false;
             unsafe {
-                ptr::copy_nonoverlapping(data_addr, self.buffer.as_mut_ptr(), copy_len);
-                let ret = vdeslirp_send(self.slirp, self.buffer.as_ptr(), copy_len);
+                let ret = vdeslirp_send(self.slirp, self.buffer.as_ptr(), total_len);
                 if ret < 0 {
                     eprintln!("vdeslirp_send failed: {}", ret);
                 }
@@ -194,7 +364,7 @@ impl VirtioDeviceImpl for VirtioNet {
                 .inc();
             crate::daemon::metrics::NET_BYTES_TOTAL
                 .tx(self.l2cpu_idx)
-                .add(copy_len as u64);
+                .add(total_len as u64);
         }
         self.header_processed = false;
         // Buffer capacity, summed with earlier descriptors. virtio-net
