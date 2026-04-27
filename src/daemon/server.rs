@@ -1507,12 +1507,9 @@ fn dispatch_add_console(
         .as_mut()
         .ok_or_else(|| crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx)))?;
     if slot.virtio_console.is_some() {
-        return Err(crate::Error::slot_state(
-            "virtio-console already attached",
-        ));
+        return Err(crate::Error::slot_state("virtio-console already attached"));
     }
-    start_console_worker(slot)
-        .map_err(crate::Error::io_ctx("start virtio-console worker"))?;
+    start_console_worker(slot).map_err(crate::Error::io_ctx("start virtio-console worker"))?;
     dlog!(
         "[add_console l2cpu {}] dispatch complete — replying ok",
         l2cpu_idx
@@ -1540,10 +1537,7 @@ fn dispatch_remove_console(
     };
     dlog!("[remove_console l2cpu {}] joining worker", l2cpu_idx);
     vc.worker.stop_and_join();
-    dlog!(
-        "[remove_console l2cpu {}] done — replying ok",
-        l2cpu_idx
-    );
+    dlog!("[remove_console l2cpu {}] done — replying ok", l2cpu_idx);
     reply_ok(sock);
     Ok(())
 }

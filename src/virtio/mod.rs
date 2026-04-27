@@ -102,7 +102,9 @@ pub(crate) fn bump_interrupt_metric(kind: InterruptKind, idx: u8) {
     match kind {
         InterruptKind::Block => crate::daemon::metrics::BLK_INTERRUPTS_TOTAL.at(idx).inc(),
         InterruptKind::Net => crate::daemon::metrics::NET_INTERRUPTS_TOTAL.at(idx).inc(),
-        InterruptKind::Console => crate::daemon::metrics::CONSOLE_INTERRUPTS_TOTAL.at(idx).inc(),
+        InterruptKind::Console => crate::daemon::metrics::CONSOLE_INTERRUPTS_TOTAL
+            .at(idx)
+            .inc(),
     }
 }
 
@@ -396,545 +398,549 @@ pub fn run_device(
     // queue rings).
     let mut warm_restarted = warm_restarted;
     'session: loop {
-    let (descriptor_table_address, available_ring_address, used_ring_address) = if warm_restarted {
-        (
-            descriptor_table_address.clone(),
-            available_ring_address.clone(),
-            used_ring_address.clone(),
-        )
-    } else {
-        // Cold start: drive the guest through the init handshake.
-        //
-        // Zeroing of the standard register window [0x00, 0x200)
-        // happened in `pre_init_virtio_mmio` (server.rs), before
-        // reset release. We don't touch the layout here — the
-        // re-writes below are idempotent with what pre_init
-        // already wrote, and any kernel-issued writes since then
-        // are state we want to preserve and act on (sel_generation
-        // bumps, etc.).
-        let features = device.device_features();
-        unsafe {
-            ptr::write_volatile(regs.magic_value, VIRTIO_MAGIC);
-            ptr::write_volatile(mmio_base.add(VIRTIO_MMIO_VERSION) as *mut u32, 2);
-            ptr::write_volatile(
-                mmio_base.add(VIRTIO_MMIO_DEVICE_ID) as *mut u32,
-                device.device_id(),
-            );
-            ptr::write_volatile(regs.queue_num_max, QUEUE_SIZE as u32);
-            ptr::write_volatile(mmio_base.add(0x018) as *mut u32, 1); // sw_impl
-            ptr::write_volatile(regs.sel_generation, 0);
-            // Initialize `device_features_sel` to 1 to match the
-            // pre-populated `device_features = features[1]` below.
-            // Phase 2's poll loop tracks `last_published_sel = 1`;
-            // if MMIO `_sel` is 0 (the post-zeroing default), the
-            // first poll iteration spuriously fires a 1→0
-            // "transition" and overwrites our coherent
-            // pre-populated value with `features[0]` *before* the
-            // guest has ever touched `_sel`. Keeping MMIO and
-            // bookkeeping in sync prevents the spurious update.
-            ptr::write_volatile(regs.device_features_sel, 1);
-            // Pre-populate `device_features` with the **high** half
-            // (`features[1]`) BEFORE we wait for the guest's DRIVER
-            // bit. Stock guests read `_features` within microseconds
-            // of writing `_sel = 1`; if the daemon waits to seed
-            // `_features` until Phase 2, the kernel reads 0 (post-
-            // zeroing default) on its first feature access and
-            // rejects the device for missing `VIRTIO_F_VERSION_1`.
-            //
-            // Linux's `vm_get_features` reads `_sel = 1` first
-            // (`features = readl(_features); features <<= 32`), so
-            // `features[1]` is the value we want exposed at the
-            // initial cold-start moment.
-            //
-            // For all three of our devices today (blk, net, console)
-            // `features[0]` is `0`, so a stale read of
-            // `features[1]` for the second `_sel = 0` access just
-            // leaks bit 0 of `features[1]` into the low half — which
-            // maps to harmless / no-op feature bits per device:
-            // `VIRTIO_BLK_F_BARRIER` (deprecated), `VIRTIO_NET_F_CSUM`
-            // (the one to revisit if stock virtio-net ever needs to
-            // work), `VIRTIO_CONSOLE_F_SIZE` (config reports 0×0,
-            // tolerated). If `features[0]` ever goes non-zero the
-            // race becomes harder to paper over and we'd need a
-            // real synchronization mechanism.
-            ptr::write_volatile(regs.device_features, features[1]);
-        }
+        let (descriptor_table_address, available_ring_address, used_ring_address) =
+            if warm_restarted {
+                (
+                    descriptor_table_address.clone(),
+                    available_ring_address.clone(),
+                    used_ring_address.clone(),
+                )
+            } else {
+                // Cold start: drive the guest through the init handshake.
+                //
+                // Zeroing of the standard register window [0x00, 0x200)
+                // happened in `pre_init_virtio_mmio` (server.rs), before
+                // reset release. We don't touch the layout here — the
+                // re-writes below are idempotent with what pre_init
+                // already wrote, and any kernel-issued writes since then
+                // are state we want to preserve and act on (sel_generation
+                // bumps, etc.).
+                let features = device.device_features();
+                unsafe {
+                    ptr::write_volatile(regs.magic_value, VIRTIO_MAGIC);
+                    ptr::write_volatile(mmio_base.add(VIRTIO_MMIO_VERSION) as *mut u32, 2);
+                    ptr::write_volatile(
+                        mmio_base.add(VIRTIO_MMIO_DEVICE_ID) as *mut u32,
+                        device.device_id(),
+                    );
+                    ptr::write_volatile(regs.queue_num_max, QUEUE_SIZE as u32);
+                    ptr::write_volatile(mmio_base.add(0x018) as *mut u32, 1); // sw_impl
+                    ptr::write_volatile(regs.sel_generation, 0);
+                    // Initialize `device_features_sel` to 1 to match the
+                    // pre-populated `device_features = features[1]` below.
+                    // Phase 2's poll loop tracks `last_published_sel = 1`;
+                    // if MMIO `_sel` is 0 (the post-zeroing default), the
+                    // first poll iteration spuriously fires a 1→0
+                    // "transition" and overwrites our coherent
+                    // pre-populated value with `features[0]` *before* the
+                    // guest has ever touched `_sel`. Keeping MMIO and
+                    // bookkeeping in sync prevents the spurious update.
+                    ptr::write_volatile(regs.device_features_sel, 1);
+                    // Pre-populate `device_features` with the **high** half
+                    // (`features[1]`) BEFORE we wait for the guest's DRIVER
+                    // bit. Stock guests read `_features` within microseconds
+                    // of writing `_sel = 1`; if the daemon waits to seed
+                    // `_features` until Phase 2, the kernel reads 0 (post-
+                    // zeroing default) on its first feature access and
+                    // rejects the device for missing `VIRTIO_F_VERSION_1`.
+                    //
+                    // Linux's `vm_get_features` reads `_sel = 1` first
+                    // (`features = readl(_features); features <<= 32`), so
+                    // `features[1]` is the value we want exposed at the
+                    // initial cold-start moment.
+                    //
+                    // For all three of our devices today (blk, net, console)
+                    // `features[0]` is `0`, so a stale read of
+                    // `features[1]` for the second `_sel = 0` access just
+                    // leaks bit 0 of `features[1]` into the low half — which
+                    // maps to harmless / no-op feature bits per device:
+                    // `VIRTIO_BLK_F_BARRIER` (deprecated), `VIRTIO_NET_F_CSUM`
+                    // (the one to revisit if stock virtio-net ever needs to
+                    // work), `VIRTIO_CONSOLE_F_SIZE` (config reports 0×0,
+                    // tolerated). If `features[0]` ever goes non-zero the
+                    // race becomes harder to paper over and we'd need a
+                    // real synchronization mechanism.
+                    ptr::write_volatile(regs.device_features, features[1]);
+                }
 
-        // Populate device-specific config region now that the zero above
-        // has cleared it. The guest will read this during probe.
-        device.init_config(unsafe { mmio_base.add(VIRTIO_MMIO_CONFIG) });
+                // Populate device-specific config region now that the zero above
+                // has cleared it. The guest will read this during probe.
+                device.init_config(unsafe { mmio_base.add(VIRTIO_MMIO_CONFIG) });
 
-        // Phase 1: Wait for DRIVER status.
-        //
-        // If the guest was already past virtio init when the server started,
-        // it won't re-assert DRIVER and this loop waits forever. Nudge the
-        // user every few seconds so it's clear what's happening.
-        let phase1_start = std::time::Instant::now();
-        let mut next_hint = phase1_start + std::time::Duration::from_secs(5);
-        while !exit_flag.load(Ordering::Relaxed) {
-            if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_DRIVER != 0 {
-                break;
-            }
-            if std::time::Instant::now() >= next_hint {
-                eprintln!(
+                // Phase 1: Wait for DRIVER status.
+                //
+                // If the guest was already past virtio init when the server started,
+                // it won't re-assert DRIVER and this loop waits forever. Nudge the
+                // user every few seconds so it's clear what's happening.
+                let phase1_start = std::time::Instant::now();
+                let mut next_hint = phase1_start + std::time::Duration::from_secs(5);
+                while !exit_flag.load(Ordering::Relaxed) {
+                    if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_DRIVER != 0 {
+                        break;
+                    }
+                    if std::time::Instant::now() >= next_hint {
+                        eprintln!(
                     "virtio: device {} still waiting for the guest to start virtio init (DRIVER bit). \
                      If the guest is already up, reboot it (`sudo reboot` on the guest console) to re-run init.",
                     device.device_id()
                 );
-                next_hint += std::time::Duration::from_secs(15);
-            }
-            unsafe {
-                libc::usleep(1000);
-            }
-        }
-
-        // Phase 2: feature negotiation.
-        //
-        // Two flavors of guest share this loop:
-        // - **Stock** virtio-mmio drivers (upstream Linux without our
-        //   patch, U-Boot DM virtio without #49's patch) write
-        //   `device_features_sel` then immediately read
-        //   `device_features` — no spin-gate. We pre-populate
-        //   `device_features` with `features[0]` so the first read at
-        //   the default `_sel = 0` is correct, then poll `_sel` and
-        //   update `device_features` whenever it changes. The race
-        //   window between the guest's `_sel` write and `_features`
-        //   read is shorter than the daemon's busy-poll cadence on
-        //   real hardware (#50); on Blackhole, uncached MMIO reads
-        //   from the L2CPU side are slower than our PCIe round-trip.
-        // - **Patched** drivers (our kernel + U-Boot tree) additionally
-        //   bump `sel_generation = prev + 1` after each register write
-        //   and spin until the daemon echoes a different value. We
-        //   keep echoing those bumps so patched drivers terminate
-        //   their spin — but we no longer *require* a bump to do
-        //   feature work, so a stock driver is no longer fatally
-        //   stuck here.
-        //
-        // No `usleep` in this loop: tight polling is the only way the
-        // daemon catches the stock-driver `_sel → _features` window
-        // before the guest's read returns. The loop terminates when
-        // the guest sets `FEATURES_OK`, which it does within a
-        // microsecond after the second feature read on every guest
-        // we've measured.
-        // `device_features` is left at the pre-populated `features[1]`
-        // from cold-start for the duration of Phase 2. The stale read
-        // for `_sel = 0` is benign (see cold-start comment); the
-        // alternative — eagerly republishing on `_sel` polls — loses
-        // the race against the guest's back-to-back `writel(_sel) +
-        // readl(_features)` and ends up exposing zero (post-zeroing
-        // default) on the first feature read.
-        //
-        // Patched guests still bump `sel_generation` between writes
-        // and spin on the echo; we keep responding so they don't get
-        // stuck.
-        let _ = features; // silence unused-variable lint after removing the per-_sel update
-        let mut last_echoed_gen: u32 = 0;
-        while !exit_flag.load(Ordering::Relaxed) {
-            if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_FEATURES_OK != 0 {
-                break;
-            }
-            let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
-            if let Some(next) = echo_sel_generation(curr_gen, last_echoed_gen) {
-                unsafe {
-                    ptr::write_volatile(regs.sel_generation, next);
+                        next_hint += std::time::Duration::from_secs(15);
+                    }
+                    unsafe {
+                        libc::usleep(1000);
+                    }
                 }
-                last_echoed_gen = next;
-            }
-        }
 
-        // Phase 3: capture per-queue config as the guest writes it,
-        // then wait for DRIVER_OK.
-        //
-        // The virtio-mmio spec multiplexes `QUEUE_DESC` /
-        // `QUEUE_AVAIL` / `QUEUE_USED` (and `QUEUE_READY`) through
-        // `QUEUE_SEL`: each per-queue register access is implicitly
-        // scoped to the currently-selected queue. Real hardware
-        // demultiplexes per access; we have flat DRAM-backed
-        // registers, so each queue's writes overwrite the previous
-        // queue's values in the same DRAM cell.
-        //
-        // To recover per-queue values without the old `sel_generation`
-        // gate, we poll `QUEUE_SEL`: when the guest moves to the
-        // next queue, the previous queue's writes are complete and
-        // sitting in MMIO — we snapshot them into per-queue daemon
-        // state before the next queue's writes overwrite them.
-        // Tens of microseconds typically pass between
-        // `writel(SEL=next)` and the next queue's first
-        // `writel(DESC_LOW)` (kernel `vring_create_virtqueue` does
-        // memory allocation in between), comfortably wider than the
-        // daemon's PCIe poll cadence.
-        //
-        // We also clear `QUEUE_READY` on every `SEL` transition so
-        // the next queue's "READY must be 0 at start of setup"
-        // check (vm_setup_vq returns -ENOENT otherwise) sees a fresh
-        // register. Patched guests get their `sel_generation` bumps
-        // echoed too so their spin-waits terminate.
-        let mut q_state: Vec<[u64; 3]> = vec![[0u64; 3]; num_queues as usize];
-        let mut last_sel: u32 = 0;
-        let snapshot_current_queue = |q_state: &mut Vec<[u64; 3]>, sel: u32| {
-            let qi = sel as usize;
-            if qi >= q_state.len() {
-                return;
-            }
-            unsafe {
-                q_state[qi][0] = ((ptr::read_volatile(regs.queue_desc_high) as u64) << 32)
-                    | (ptr::read_volatile(regs.queue_desc_low) as u64);
-                q_state[qi][1] = ((ptr::read_volatile(regs.queue_avail_high) as u64) << 32)
-                    | (ptr::read_volatile(regs.queue_avail_low) as u64);
-                q_state[qi][2] = ((ptr::read_volatile(regs.queue_used_high) as u64) << 32)
-                    | (ptr::read_volatile(regs.queue_used_low) as u64);
-            }
-        };
-        while !exit_flag.load(Ordering::Relaxed) {
-            if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_DRIVER_OK != 0 {
-                break;
-            }
-            // Eager `QUEUE_READY` clear: the guest just wrote 1 to
-            // mark the current queue ready, but its first action on
-            // the next queue is `readl(QUEUE_READY)` expecting 0
-            // (vm_setup_vq returns -ENOENT otherwise). Real hardware
-            // demultiplexes through `QUEUE_SEL`; we clear the single
-            // DRAM cell as soon as we see it set so the next queue's
-            // start-of-setup read sees fresh 0.
-            //
-            // Race window between the guest's `writel(QUEUE_READY=1)`
-            // and the next queue's `readl(QUEUE_READY)`: the
-            // kernel/U-Boot returns from `setup_vq`, runs the per-queue
-            // loop body, calls `setup_vq` again, then issues two
-            // MMIO ops (`QUEUE_SEL` write + `QUEUE_READY` read) — on
-            // the order of microseconds, comfortably wider than this
-            // poll loop's PCIe iteration cost. The clear isn't gated
-            // on `QUEUE_SEL` change because the guest may set
-            // `QUEUE_READY=1` and proceed to the next queue's
-            // `QUEUE_SEL` write so quickly that a sel-gated clear
-            // would lose the race.
-            if unsafe { ptr::read_volatile(regs.queue_ready) } != 0 {
-                unsafe {
-                    ptr::write_volatile(regs.queue_ready, 0);
+                // Phase 2: feature negotiation.
+                //
+                // Two flavors of guest share this loop:
+                // - **Stock** virtio-mmio drivers (upstream Linux without our
+                //   patch, U-Boot DM virtio without #49's patch) write
+                //   `device_features_sel` then immediately read
+                //   `device_features` — no spin-gate. We pre-populate
+                //   `device_features` with `features[0]` so the first read at
+                //   the default `_sel = 0` is correct, then poll `_sel` and
+                //   update `device_features` whenever it changes. The race
+                //   window between the guest's `_sel` write and `_features`
+                //   read is shorter than the daemon's busy-poll cadence on
+                //   real hardware (#50); on Blackhole, uncached MMIO reads
+                //   from the L2CPU side are slower than our PCIe round-trip.
+                // - **Patched** drivers (our kernel + U-Boot tree) additionally
+                //   bump `sel_generation = prev + 1` after each register write
+                //   and spin until the daemon echoes a different value. We
+                //   keep echoing those bumps so patched drivers terminate
+                //   their spin — but we no longer *require* a bump to do
+                //   feature work, so a stock driver is no longer fatally
+                //   stuck here.
+                //
+                // No `usleep` in this loop: tight polling is the only way the
+                // daemon catches the stock-driver `_sel → _features` window
+                // before the guest's read returns. The loop terminates when
+                // the guest sets `FEATURES_OK`, which it does within a
+                // microsecond after the second feature read on every guest
+                // we've measured.
+                // `device_features` is left at the pre-populated `features[1]`
+                // from cold-start for the duration of Phase 2. The stale read
+                // for `_sel = 0` is benign (see cold-start comment); the
+                // alternative — eagerly republishing on `_sel` polls — loses
+                // the race against the guest's back-to-back `writel(_sel) +
+                // readl(_features)` and ends up exposing zero (post-zeroing
+                // default) on the first feature read.
+                //
+                // Patched guests still bump `sel_generation` between writes
+                // and spin on the echo; we keep responding so they don't get
+                // stuck.
+                let _ = features; // silence unused-variable lint after removing the per-_sel update
+                let mut last_echoed_gen: u32 = 0;
+                while !exit_flag.load(Ordering::Relaxed) {
+                    if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_FEATURES_OK != 0
+                    {
+                        break;
+                    }
+                    let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
+                    if let Some(next) = echo_sel_generation(curr_gen, last_echoed_gen) {
+                        unsafe {
+                            ptr::write_volatile(regs.sel_generation, next);
+                        }
+                        last_echoed_gen = next;
+                    }
                 }
-            }
-            let curr_sel = unsafe { ptr::read_volatile(regs.queue_select) };
-            if curr_sel != last_sel {
-                // The guest moved to a new queue. The previous
-                // queue's writes (DESC / AVAIL / USED) are still in
-                // MMIO; capture them into our per-queue state before
-                // the next queue's writes overwrite them.
+
+                // Phase 3: capture per-queue config as the guest writes it,
+                // then wait for DRIVER_OK.
+                //
+                // The virtio-mmio spec multiplexes `QUEUE_DESC` /
+                // `QUEUE_AVAIL` / `QUEUE_USED` (and `QUEUE_READY`) through
+                // `QUEUE_SEL`: each per-queue register access is implicitly
+                // scoped to the currently-selected queue. Real hardware
+                // demultiplexes per access; we have flat DRAM-backed
+                // registers, so each queue's writes overwrite the previous
+                // queue's values in the same DRAM cell.
+                //
+                // To recover per-queue values without the old `sel_generation`
+                // gate, we poll `QUEUE_SEL`: when the guest moves to the
+                // next queue, the previous queue's writes are complete and
+                // sitting in MMIO — we snapshot them into per-queue daemon
+                // state before the next queue's writes overwrite them.
+                // Tens of microseconds typically pass between
+                // `writel(SEL=next)` and the next queue's first
+                // `writel(DESC_LOW)` (kernel `vring_create_virtqueue` does
+                // memory allocation in between), comfortably wider than the
+                // daemon's PCIe poll cadence.
+                //
+                // We also clear `QUEUE_READY` on every `SEL` transition so
+                // the next queue's "READY must be 0 at start of setup"
+                // check (vm_setup_vq returns -ENOENT otherwise) sees a fresh
+                // register. Patched guests get their `sel_generation` bumps
+                // echoed too so their spin-waits terminate.
+                let mut q_state: Vec<[u64; 3]> = vec![[0u64; 3]; num_queues as usize];
+                let mut last_sel: u32 = 0;
+                let snapshot_current_queue = |q_state: &mut Vec<[u64; 3]>, sel: u32| {
+                    let qi = sel as usize;
+                    if qi >= q_state.len() {
+                        return;
+                    }
+                    unsafe {
+                        q_state[qi][0] = ((ptr::read_volatile(regs.queue_desc_high) as u64) << 32)
+                            | (ptr::read_volatile(regs.queue_desc_low) as u64);
+                        q_state[qi][1] = ((ptr::read_volatile(regs.queue_avail_high) as u64) << 32)
+                            | (ptr::read_volatile(regs.queue_avail_low) as u64);
+                        q_state[qi][2] = ((ptr::read_volatile(regs.queue_used_high) as u64) << 32)
+                            | (ptr::read_volatile(regs.queue_used_low) as u64);
+                    }
+                };
+                while !exit_flag.load(Ordering::Relaxed) {
+                    if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_DRIVER_OK != 0 {
+                        break;
+                    }
+                    // Eager `QUEUE_READY` clear: the guest just wrote 1 to
+                    // mark the current queue ready, but its first action on
+                    // the next queue is `readl(QUEUE_READY)` expecting 0
+                    // (vm_setup_vq returns -ENOENT otherwise). Real hardware
+                    // demultiplexes through `QUEUE_SEL`; we clear the single
+                    // DRAM cell as soon as we see it set so the next queue's
+                    // start-of-setup read sees fresh 0.
+                    //
+                    // Race window between the guest's `writel(QUEUE_READY=1)`
+                    // and the next queue's `readl(QUEUE_READY)`: the
+                    // kernel/U-Boot returns from `setup_vq`, runs the per-queue
+                    // loop body, calls `setup_vq` again, then issues two
+                    // MMIO ops (`QUEUE_SEL` write + `QUEUE_READY` read) — on
+                    // the order of microseconds, comfortably wider than this
+                    // poll loop's PCIe iteration cost. The clear isn't gated
+                    // on `QUEUE_SEL` change because the guest may set
+                    // `QUEUE_READY=1` and proceed to the next queue's
+                    // `QUEUE_SEL` write so quickly that a sel-gated clear
+                    // would lose the race.
+                    if unsafe { ptr::read_volatile(regs.queue_ready) } != 0 {
+                        unsafe {
+                            ptr::write_volatile(regs.queue_ready, 0);
+                        }
+                    }
+                    let curr_sel = unsafe { ptr::read_volatile(regs.queue_select) };
+                    if curr_sel != last_sel {
+                        // The guest moved to a new queue. The previous
+                        // queue's writes (DESC / AVAIL / USED) are still in
+                        // MMIO; capture them into our per-queue state before
+                        // the next queue's writes overwrite them.
+                        snapshot_current_queue(&mut q_state, last_sel);
+                        last_sel = curr_sel;
+                    }
+                    let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
+                    if let Some(next) = echo_sel_generation(curr_gen, last_echoed_gen) {
+                        unsafe {
+                            ptr::write_volatile(regs.sel_generation, next);
+                        }
+                        last_echoed_gen = next;
+                    }
+                }
+
+                // The guest's last queue setup never had a following SEL
+                // change to trigger the snapshot above — DRIVER_OK was
+                // written instead. Capture it now from whatever the MMIO
+                // still holds for that queue.
                 snapshot_current_queue(&mut q_state, last_sel);
-                last_sel = curr_sel;
-            }
-            let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
-            if let Some(next) = echo_sel_generation(curr_gen, last_echoed_gen) {
-                unsafe {
-                    ptr::write_volatile(regs.sel_generation, next);
+
+                let mut desc = vec![0u64; num_queues as usize];
+                let mut avail = vec![0u64; num_queues as usize];
+                let mut used = vec![0u64; num_queues as usize];
+                for i in 0..num_queues as usize {
+                    desc[i] = q_state[i][0];
+                    avail[i] = q_state[i][1];
+                    used[i] = q_state[i][2];
                 }
-                last_echoed_gen = next;
-            }
-        }
 
-        // The guest's last queue setup never had a following SEL
-        // change to trigger the snapshot above — DRIVER_OK was
-        // written instead. Capture it now from whatever the MMIO
-        // still holds for that queue.
-        snapshot_current_queue(&mut q_state, last_sel);
+                // Persist the queue addresses so a future server instance can resume.
+                unsafe {
+                    for i in 0..num_queues as usize {
+                        let base = mmio_base.add(STASH_OFFSET + i * STASH_PER_QUEUE);
+                        ptr::write_volatile(base as *mut u64, desc[i]);
+                        ptr::write_volatile(base.add(8) as *mut u64, avail[i]);
+                        ptr::write_volatile(base.add(16) as *mut u64, used[i]);
+                    }
+                }
 
-        let mut desc = vec![0u64; num_queues as usize];
-        let mut avail = vec![0u64; num_queues as usize];
-        let mut used = vec![0u64; num_queues as usize];
-        for i in 0..num_queues as usize {
-            desc[i] = q_state[i][0];
-            avail[i] = q_state[i][1];
-            used[i] = q_state[i][2];
-        }
+                (desc, avail, used)
+            };
 
-        // Persist the queue addresses so a future server instance can resume.
-        unsafe {
-            for i in 0..num_queues as usize {
-                let base = mmio_base.add(STASH_OFFSET + i * STASH_PER_QUEUE);
-                ptr::write_volatile(base as *mut u64, desc[i]);
-                ptr::write_volatile(base.add(8) as *mut u64, avail[i]);
-                ptr::write_volatile(base.add(16) as *mut u64, used[i]);
-            }
-        }
-
-        (desc, avail, used)
-    };
-
-    // If the user interrupted the handshake, bail out cleanly rather than
-    // falling through to validate_addr with zeroed addresses.
-    if exit_flag.load(Ordering::Relaxed) {
-        return;
-    }
-
-    // Compute pointers to virtqueue structures in L2CPU memory
-    let mut desc_ptrs: Vec<*mut VringDesc> = Vec::new();
-    let mut avail_ptrs: Vec<*mut VringAvail> = Vec::new();
-    let mut used_ptrs: Vec<*mut VringUsed> = Vec::new();
-
-    // Validate and compute pointers to virtqueue structures in L2CPU memory.
-    // Both the start address AND the full ring extent must lie inside the
-    // mapped DRAM window. Without the size check, a guest could place a
-    // ring at `mem_end - 8` and the daemon would walk descriptor entries
-    // past the end of valid memory (security finding from #17).
-    let validate_addr = |addr: u64, size: u64, label: &str, qi: usize| -> usize {
-        if addr < starting_address {
-            panic!(
-                "virtqueue {} address {:#x} for queue {} below L2CPU memory start {:#x}",
-                label, addr, qi, starting_address
-            );
-        }
-        let end = addr.saturating_add(size);
-        if end > mem_end {
-            panic!(
-                "virtqueue {} for queue {} extends past L2CPU memory: addr={:#x} size={:#x} mem_end={:#x}",
-                label, qi, addr, size, mem_end
-            );
-        }
-        (addr - starting_address) as usize
-    };
-
-    // Per the virtio spec (no EVENT_IDX negotiated):
-    //   desc table: QUEUE_SIZE × 16-byte VringDesc
-    //   avail ring: 2-byte flags + 2-byte idx + QUEUE_SIZE × 2-byte ring entry
-    //   used ring : 2-byte flags + 2-byte idx + QUEUE_SIZE × 8-byte VringUsedElem
-    let queue_size = QUEUE_SIZE as u64;
-    let desc_bytes = queue_size * std::mem::size_of::<VringDesc>() as u64;
-    let avail_bytes = 4 + queue_size * std::mem::size_of::<u16>() as u64;
-    let used_bytes = 4 + queue_size * std::mem::size_of::<VringUsedElem>() as u64;
-
-    for i in 0..num_queues as usize {
-        desc_ptrs.push(unsafe {
-            memory.add(validate_addr(
-                descriptor_table_address[i],
-                desc_bytes,
-                "desc",
-                i,
-            )) as *mut VringDesc
-        });
-        avail_ptrs.push(unsafe {
-            memory.add(validate_addr(
-                available_ring_address[i],
-                avail_bytes,
-                "avail",
-                i,
-            )) as *mut VringAvail
-        });
-        used_ptrs.push(unsafe {
-            memory.add(validate_addr(used_ring_address[i], used_bytes, "used", i)) as *mut VringUsed
-        });
-    }
-
-    // Main device loop. On warm restart, resume processed[qi] from the used
-    // ring's idx — everything before that was completed by the previous server,
-    // so we pick up exactly where it left off.
-    let mut processed = vec![0u16; num_queues as usize];
-    if warm_restarted {
-        for qi in 0..num_queues as usize {
-            processed[qi] = unsafe { ptr::read_volatile(&(*used_ptrs[qi]).idx) };
-        }
-    }
-    let queue_header_size = device.queue_header_size();
-
-    // Three-tier adaptive sleep with hysteresis:
-    //   - FAST  (1 µs)   while guest is actively pushing descriptors
-    //   - SLOW  (1 ms)   when no activity for FAST_WINDOW (200 ms)
-    //   - IDLE  (10 ms)  when no activity for IDLE_WINDOW (2 s)
-    // Hysteresis avoids flapping: a single empty pass mid-burst stays
-    // FAST; a sustained quiet stretch falls all the way to IDLE.
-    //
-    // Tier-3 (IDLE) is the difference between ~6% idle CPU (worker
-    // polling at 1 ms = 1000 Hz) and well under 1% (10 ms = 100 Hz).
-    // The cost is at most one IDLE_SLEEP of latency on the first
-    // descriptor after a long idle stretch — fine for guest workloads
-    // whose timeouts are at the seconds level. See `chip_console.rs`
-    // for the matching shape and #27 for the measurement that drove
-    // the tier.
-    const FAST_SLEEP_US: libc::c_uint = 1;
-    const SLOW_SLEEP_US: libc::c_uint = 1000;
-    const IDLE_SLEEP_US: libc::c_uint = 10_000;
-    const FAST_WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
-    const IDLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
-    let mut last_active = std::time::Instant::now();
-
-    while !exit_flag.load(Ordering::Relaxed) {
-        // Check magic still valid
-        if unsafe { ptr::read_volatile(regs.magic_value) } != VIRTIO_MAGIC {
+        // If the user interrupted the handshake, bail out cleanly rather than
+        // falling through to validate_addr with zeroed addresses.
+        if exit_flag.load(Ordering::Relaxed) {
             return;
         }
 
-        // Reset detection (#59). The kernel writes `STATUS = 0` to
-        // start a fresh virtio session — typically when a previous
-        // consumer (U-Boot DM-virtio under our `--uboot` boot path)
-        // already brought the device past `DRIVER_OK` and the new
-        // consumer wants to re-run init from scratch. Without this
-        // check the daemon stays in runtime ignoring the kernel's
-        // re-init writes; the patched kernel times out on
-        // `sel_generation` and stock kernels fail at queue setup.
-        // We exit the runtime loop and `continue 'session` to
-        // re-enter the cold-start handshake.
-        let status = unsafe { ptr::read_volatile(regs.status) };
-        if status == 0 {
-            eprintln!(
-                "virtio: device {} guest reset (STATUS=0); re-entering handshake",
-                device.device_id()
-            );
-            warm_restarted = false;
-            // Zero our stash region — the previous session's queue
-            // addresses are gone, and we don't want them to confuse
-            // a future warm-restart probe (or, after we
-            // `continue 'session`, the next cold-start's stash
-            // write).
-            unsafe {
-                for i in 0..num_queues as usize {
-                    let base = mmio_base.add(STASH_OFFSET + i * STASH_PER_QUEUE);
-                    ptr::write_volatile(base as *mut u64, 0);
-                    ptr::write_volatile(base.add(8) as *mut u64, 0);
-                    ptr::write_volatile(base.add(16) as *mut u64, 0);
-                }
+        // Compute pointers to virtqueue structures in L2CPU memory
+        let mut desc_ptrs: Vec<*mut VringDesc> = Vec::new();
+        let mut avail_ptrs: Vec<*mut VringAvail> = Vec::new();
+        let mut used_ptrs: Vec<*mut VringUsed> = Vec::new();
+
+        // Validate and compute pointers to virtqueue structures in L2CPU memory.
+        // Both the start address AND the full ring extent must lie inside the
+        // mapped DRAM window. Without the size check, a guest could place a
+        // ring at `mem_end - 8` and the daemon would walk descriptor entries
+        // past the end of valid memory (security finding from #17).
+        let validate_addr = |addr: u64, size: u64, label: &str, qi: usize| -> usize {
+            if addr < starting_address {
+                panic!(
+                    "virtqueue {} address {:#x} for queue {} below L2CPU memory start {:#x}",
+                    label, addr, qi, starting_address
+                );
             }
-            continue 'session;
+            let end = addr.saturating_add(size);
+            if end > mem_end {
+                panic!(
+                "virtqueue {} for queue {} extends past L2CPU memory: addr={:#x} size={:#x} mem_end={:#x}",
+                label, qi, addr, size, mem_end
+            );
+            }
+            (addr - starting_address) as usize
+        };
+
+        // Per the virtio spec (no EVENT_IDX negotiated):
+        //   desc table: QUEUE_SIZE × 16-byte VringDesc
+        //   avail ring: 2-byte flags + 2-byte idx + QUEUE_SIZE × 2-byte ring entry
+        //   used ring : 2-byte flags + 2-byte idx + QUEUE_SIZE × 8-byte VringUsedElem
+        let queue_size = QUEUE_SIZE as u64;
+        let desc_bytes = queue_size * std::mem::size_of::<VringDesc>() as u64;
+        let avail_bytes = 4 + queue_size * std::mem::size_of::<u16>() as u64;
+        let used_bytes = 4 + queue_size * std::mem::size_of::<VringUsedElem>() as u64;
+
+        for i in 0..num_queues as usize {
+            desc_ptrs.push(unsafe {
+                memory.add(validate_addr(
+                    descriptor_table_address[i],
+                    desc_bytes,
+                    "desc",
+                    i,
+                )) as *mut VringDesc
+            });
+            avail_ptrs.push(unsafe {
+                memory.add(validate_addr(
+                    available_ring_address[i],
+                    avail_bytes,
+                    "avail",
+                    i,
+                )) as *mut VringAvail
+            });
+            used_ptrs.push(unsafe {
+                memory.add(validate_addr(used_ring_address[i], used_bytes, "used", i))
+                    as *mut VringUsed
+            });
         }
 
-        interrupt_ctl.ack_interrupt(regs.interrupt_ack);
+        // Main device loop. On warm restart, resume processed[qi] from the used
+        // ring's idx — everything before that was completed by the previous server,
+        // so we pick up exactly where it left off.
+        let mut processed = vec![0u16; num_queues as usize];
+        if warm_restarted {
+            for qi in 0..num_queues as usize {
+                processed[qi] = unsafe { ptr::read_volatile(&(*used_ptrs[qi]).idx) };
+            }
+        }
+        let queue_header_size = device.queue_header_size();
 
-        // Track whether any queue actually had work to do this pass, so we
-        // can stretch the sleep at the bottom when the guest is idle. See
-        // the sleep site below.
-        let mut did_work = false;
+        // Three-tier adaptive sleep with hysteresis:
+        //   - FAST  (1 µs)   while guest is actively pushing descriptors
+        //   - SLOW  (1 ms)   when no activity for FAST_WINDOW (200 ms)
+        //   - IDLE  (10 ms)  when no activity for IDLE_WINDOW (2 s)
+        // Hysteresis avoids flapping: a single empty pass mid-burst stays
+        // FAST; a sustained quiet stretch falls all the way to IDLE.
+        //
+        // Tier-3 (IDLE) is the difference between ~6% idle CPU (worker
+        // polling at 1 ms = 1000 Hz) and well under 1% (10 ms = 100 Hz).
+        // The cost is at most one IDLE_SLEEP of latency on the first
+        // descriptor after a long idle stretch — fine for guest workloads
+        // whose timeouts are at the seconds level. See `chip_console.rs`
+        // for the matching shape and #27 for the measurement that drove
+        // the tier.
+        const FAST_SLEEP_US: libc::c_uint = 1;
+        const SLOW_SLEEP_US: libc::c_uint = 1000;
+        const IDLE_SLEEP_US: libc::c_uint = 10_000;
+        const FAST_WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
+        const IDLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+        let mut last_active = std::time::Instant::now();
 
-        for queue_idx in 0..num_queues {
-            let qi = queue_idx as usize;
-            let desc_q = desc_ptrs[qi];
-            let avail_q = avail_ptrs[qi];
-            let used_q = used_ptrs[qi];
+        while !exit_flag.load(Ordering::Relaxed) {
+            // Check magic still valid
+            if unsafe { ptr::read_volatile(regs.magic_value) } != VIRTIO_MAGIC {
+                return;
+            }
 
-            std::sync::atomic::fence(Ordering::SeqCst);
-
-            let avail_idx = unsafe { ptr::read_volatile(&(*avail_q).idx) };
-            let mut should_set_interrupt = false;
-
-            if processed[qi] != avail_idx && device.queue_has_data(queue_idx) {
-                let desc_idx_first = unsafe {
-                    let ring_ptr = (*avail_q).ring.as_ptr();
-                    ptr::read_volatile(ring_ptr.add((processed[qi] % QUEUE_SIZE) as usize))
-                };
-                let mut desc_idx = desc_idx_first;
-
-                let mut num_bytes_written: u64 = 0;
-                let mut chain_valid = true;
-                let mut steps: u16 = 0;
-
-                loop {
-                    // Cycle detection: a valid chain can visit at most QUEUE_SIZE descriptors
-                    if steps >= QUEUE_SIZE {
-                        eprintln!(
-                            "virtio: descriptor chain exceeded {} steps, breaking",
-                            QUEUE_SIZE
-                        );
-                        chain_valid = false;
-                        break;
+            // Reset detection (#59). The kernel writes `STATUS = 0` to
+            // start a fresh virtio session — typically when a previous
+            // consumer (U-Boot DM-virtio under our `--uboot` boot path)
+            // already brought the device past `DRIVER_OK` and the new
+            // consumer wants to re-run init from scratch. Without this
+            // check the daemon stays in runtime ignoring the kernel's
+            // re-init writes; the patched kernel times out on
+            // `sel_generation` and stock kernels fail at queue setup.
+            // We exit the runtime loop and `continue 'session` to
+            // re-enter the cold-start handshake.
+            let status = unsafe { ptr::read_volatile(regs.status) };
+            if status == 0 {
+                eprintln!(
+                    "virtio: device {} guest reset (STATUS=0); re-entering handshake",
+                    device.device_id()
+                );
+                warm_restarted = false;
+                // Zero our stash region — the previous session's queue
+                // addresses are gone, and we don't want them to confuse
+                // a future warm-restart probe (or, after we
+                // `continue 'session`, the next cold-start's stash
+                // write).
+                unsafe {
+                    for i in 0..num_queues as usize {
+                        let base = mmio_base.add(STASH_OFFSET + i * STASH_PER_QUEUE);
+                        ptr::write_volatile(base as *mut u64, 0);
+                        ptr::write_volatile(base.add(8) as *mut u64, 0);
+                        ptr::write_volatile(base.add(16) as *mut u64, 0);
                     }
-                    steps += 1;
+                }
+                continue 'session;
+            }
 
-                    let d =
-                        unsafe { ptr::read_volatile(desc_q.add((desc_idx % QUEUE_SIZE) as usize)) };
+            interrupt_ctl.ack_interrupt(regs.interrupt_ack);
 
-                    // Validate descriptor address is within L2CPU memory.
-                    // Use checked arithmetic to prevent overflow bypassing the check.
-                    let addr_end = (d.addr).checked_add(d.len as u64);
-                    if d.addr < starting_address
-                        || d.addr >= mem_end
-                        || addr_end.is_none()
-                        || addr_end.unwrap() > mem_end
-                    {
-                        eprintln!(
+            // Track whether any queue actually had work to do this pass, so we
+            // can stretch the sleep at the bottom when the guest is idle. See
+            // the sleep site below.
+            let mut did_work = false;
+
+            for queue_idx in 0..num_queues {
+                let qi = queue_idx as usize;
+                let desc_q = desc_ptrs[qi];
+                let avail_q = avail_ptrs[qi];
+                let used_q = used_ptrs[qi];
+
+                std::sync::atomic::fence(Ordering::SeqCst);
+
+                let avail_idx = unsafe { ptr::read_volatile(&(*avail_q).idx) };
+                let mut should_set_interrupt = false;
+
+                if processed[qi] != avail_idx && device.queue_has_data(queue_idx) {
+                    let desc_idx_first = unsafe {
+                        let ring_ptr = (*avail_q).ring.as_ptr();
+                        ptr::read_volatile(ring_ptr.add((processed[qi] % QUEUE_SIZE) as usize))
+                    };
+                    let mut desc_idx = desc_idx_first;
+
+                    let mut num_bytes_written: u64 = 0;
+                    let mut chain_valid = true;
+                    let mut steps: u16 = 0;
+
+                    loop {
+                        // Cycle detection: a valid chain can visit at most QUEUE_SIZE descriptors
+                        if steps >= QUEUE_SIZE {
+                            eprintln!(
+                                "virtio: descriptor chain exceeded {} steps, breaking",
+                                QUEUE_SIZE
+                            );
+                            chain_valid = false;
+                            break;
+                        }
+                        steps += 1;
+
+                        let d = unsafe {
+                            ptr::read_volatile(desc_q.add((desc_idx % QUEUE_SIZE) as usize))
+                        };
+
+                        // Validate descriptor address is within L2CPU memory.
+                        // Use checked arithmetic to prevent overflow bypassing the check.
+                        let addr_end = (d.addr).checked_add(d.len as u64);
+                        if d.addr < starting_address
+                            || d.addr >= mem_end
+                            || addr_end.is_none()
+                            || addr_end.unwrap() > mem_end
+                        {
+                            eprintln!(
                             "virtio: descriptor addr {:#x} len {} outside memory [{:#x}, {:#x}), skipping chain",
                             d.addr, d.len, starting_address, mem_end
                         );
-                        chain_valid = false;
-                        break;
-                    }
-                    let addr = unsafe { memory.add((d.addr - starting_address) as usize) };
-
-                    if d.flags & VRING_DESC_F_NEXT != 0 {
-                        if num_bytes_written < queue_header_size {
-                            device.process_queue_start(queue_idx, addr, d.len as u64);
-                        } else {
-                            device.process_queue_data(queue_idx, addr, d.len as u64);
+                            chain_valid = false;
+                            break;
                         }
-                        num_bytes_written += d.len as u64;
-                        desc_idx = d.next;
-                    } else {
-                        // The last descriptor's actual-bytes-written
-                        // can be less than its buffer capacity (e.g.
-                        // virtio-console RX with partial input). The
-                        // device returns the real count; block/net
-                        // pass `d.len` through unchanged.
-                        let actual =
-                            device.process_queue_complete(queue_idx, addr, d.len as u64);
-                        num_bytes_written += actual;
-                        break;
+                        let addr = unsafe { memory.add((d.addr - starting_address) as usize) };
+
+                        if d.flags & VRING_DESC_F_NEXT != 0 {
+                            if num_bytes_written < queue_header_size {
+                                device.process_queue_start(queue_idx, addr, d.len as u64);
+                            } else {
+                                device.process_queue_data(queue_idx, addr, d.len as u64);
+                            }
+                            num_bytes_written += d.len as u64;
+                            desc_idx = d.next;
+                        } else {
+                            // The last descriptor's actual-bytes-written
+                            // can be less than its buffer capacity (e.g.
+                            // virtio-console RX with partial input). The
+                            // device returns the real count; block/net
+                            // pass `d.len` through unchanged.
+                            let actual =
+                                device.process_queue_complete(queue_idx, addr, d.len as u64);
+                            num_bytes_written += actual;
+                            break;
+                        }
                     }
+
+                    // Only update the used ring if the entire chain was processed
+                    // successfully. Posting a partial completion confuses the guest driver.
+                    if chain_valid {
+                        should_set_interrupt = true;
+
+                        let used_idx = unsafe { ptr::read_volatile(&(*used_q).idx) };
+                        unsafe {
+                            let ring_ptr = (*used_q).ring.as_mut_ptr();
+                            let elem = ring_ptr.add((used_idx % QUEUE_SIZE) as usize);
+                            ptr::write_volatile(&mut (*elem).id, desc_idx_first as u32);
+                            ptr::write_volatile(&mut (*elem).len, num_bytes_written as u32);
+                        }
+                        std::sync::atomic::fence(Ordering::SeqCst);
+                        unsafe {
+                            ptr::write_volatile(&mut (*used_q).idx, used_idx.wrapping_add(1));
+                        }
+                    }
+
+                    processed[qi] = processed[qi].wrapping_add(1);
                 }
 
-                // Only update the used ring if the entire chain was processed
-                // successfully. Posting a partial completion confuses the guest driver.
-                if chain_valid {
-                    should_set_interrupt = true;
-
-                    let used_idx = unsafe { ptr::read_volatile(&(*used_q).idx) };
-                    unsafe {
-                        let ring_ptr = (*used_q).ring.as_mut_ptr();
-                        let elem = ring_ptr.add((used_idx % QUEUE_SIZE) as usize);
-                        ptr::write_volatile(&mut (*elem).id, desc_idx_first as u32);
-                        ptr::write_volatile(&mut (*elem).len, num_bytes_written as u32);
-                    }
-                    std::sync::atomic::fence(Ordering::SeqCst);
-                    unsafe {
-                        ptr::write_volatile(&mut (*used_q).idx, used_idx.wrapping_add(1));
-                    }
+                if should_set_interrupt {
+                    interrupt_ctl.set_interrupt(regs.interrupt_status, interrupt_number);
+                    bump_interrupt_metric(interrupt_kind, l2cpu.idx() as u8);
+                    did_work = true;
                 }
-
-                processed[qi] = processed[qi].wrapping_add(1);
             }
 
-            if should_set_interrupt {
-                interrupt_ctl.set_interrupt(regs.interrupt_status, interrupt_number);
-                bump_interrupt_metric(interrupt_kind, l2cpu.idx() as u8);
-                did_work = true;
+            // Adaptive sleep — see the FAST/SLOW/IDLE constants above for
+            // the tiers and rationale.
+            if did_work {
+                last_active = std::time::Instant::now();
+            }
+            let elapsed = last_active.elapsed();
+            let tier = crate::daemon::metrics::classify_tier(elapsed, FAST_WINDOW, IDLE_WINDOW);
+            let sleep_us = match tier {
+                crate::daemon::metrics::Tier::Fast => FAST_SLEEP_US,
+                crate::daemon::metrics::Tier::Slow => SLOW_SLEEP_US,
+                crate::daemon::metrics::Tier::Idle => IDLE_SLEEP_US,
+            };
+            let worker = match interrupt_kind {
+                InterruptKind::Block => crate::daemon::metrics::WorkerKind::VirtioBlk,
+                InterruptKind::Net => crate::daemon::metrics::WorkerKind::VirtioNet,
+                InterruptKind::Console => crate::daemon::metrics::WorkerKind::VirtioConsole,
+            };
+            let idx_u8 = l2cpu.idx() as u8;
+            crate::daemon::metrics::WORKER_POLL_ITERATIONS_TOTAL
+                .at(worker, idx_u8, tier)
+                .inc();
+            crate::daemon::metrics::WORKER_TIER_NANOS_TOTAL
+                .at(worker, idx_u8, tier)
+                .add(sleep_us as u64 * 1_000);
+            unsafe {
+                libc::usleep(sleep_us);
             }
         }
-
-        // Adaptive sleep — see the FAST/SLOW/IDLE constants above for
-        // the tiers and rationale.
-        if did_work {
-            last_active = std::time::Instant::now();
-        }
-        let elapsed = last_active.elapsed();
-        let tier = crate::daemon::metrics::classify_tier(elapsed, FAST_WINDOW, IDLE_WINDOW);
-        let sleep_us = match tier {
-            crate::daemon::metrics::Tier::Fast => FAST_SLEEP_US,
-            crate::daemon::metrics::Tier::Slow => SLOW_SLEEP_US,
-            crate::daemon::metrics::Tier::Idle => IDLE_SLEEP_US,
-        };
-        let worker = match interrupt_kind {
-            InterruptKind::Block => crate::daemon::metrics::WorkerKind::VirtioBlk,
-            InterruptKind::Net => crate::daemon::metrics::WorkerKind::VirtioNet,
-            InterruptKind::Console => crate::daemon::metrics::WorkerKind::VirtioConsole,
-        };
-        let idx_u8 = l2cpu.idx() as u8;
-        crate::daemon::metrics::WORKER_POLL_ITERATIONS_TOTAL
-            .at(worker, idx_u8, tier)
-            .inc();
-        crate::daemon::metrics::WORKER_TIER_NANOS_TOTAL
-            .at(worker, idx_u8, tier)
-            .add(sleep_us as u64 * 1_000);
-        unsafe {
-            libc::usleep(sleep_us);
-        }
-    }
-    // Exit-flag tripped during runtime; bail out (the outer 'session
-    // loop is escaped by `return`s above on errors).
-    return;
+        // Exit-flag tripped during runtime; bail out (the outer 'session
+        // loop is escaped by `return`s above on errors).
+        return;
     } // 'session: loop
 }
 
