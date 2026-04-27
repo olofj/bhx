@@ -25,6 +25,7 @@ const VIRTIO_MMIO_DRIVER_FEATURES: usize = 0x020;
 const VIRTIO_MMIO_DRIVER_FEATURES_SEL: usize = 0x024;
 const VIRTIO_MMIO_QUEUE_SEL: usize = 0x030;
 const VIRTIO_MMIO_QUEUE_NUM_MAX: usize = 0x034;
+const VIRTIO_MMIO_QUEUE_NUM: usize = 0x038;
 const VIRTIO_MMIO_QUEUE_READY: usize = 0x044;
 const VIRTIO_MMIO_QUEUE_NOTIFY: usize = 0x050;
 const VIRTIO_MMIO_INTERRUPT_STATUS: usize = 0x060;
@@ -137,6 +138,7 @@ struct MmioRegs {
     device_features_sel: *mut u32,
     driver_features_sel: *mut u32,
     queue_num_max: *mut u32,
+    queue_num: *mut u32,
     queue_ready: *mut u32,
     interrupt_status: *mut u32,
     interrupt_ack: *mut u32,
@@ -174,6 +176,7 @@ impl MmioRegs {
                 device_features_sel: base.add(VIRTIO_MMIO_DEVICE_FEATURES_SEL) as *mut u32,
                 driver_features_sel: base.add(VIRTIO_MMIO_DRIVER_FEATURES_SEL) as *mut u32,
                 queue_num_max: base.add(VIRTIO_MMIO_QUEUE_NUM_MAX) as *mut u32,
+                queue_num: base.add(VIRTIO_MMIO_QUEUE_NUM) as *mut u32,
                 queue_ready: base.add(VIRTIO_MMIO_QUEUE_READY) as *mut u32,
                 interrupt_status: base.add(VIRTIO_MMIO_INTERRUPT_STATUS) as *mut u32,
                 interrupt_ack: base.add(VIRTIO_MMIO_INTERRUPT_ACK) as *mut u32,
@@ -391,12 +394,15 @@ pub fn run_device(
             used_ring_address,
         )
     } else {
-        // Cold start: zero the standard register window (preserving stash at
-        // 0x200+) and drive the guest through the init handshake.
-        unsafe {
-            ptr::write_bytes(mmio_base, 0, 0x200);
-        }
-
+        // Cold start: drive the guest through the init handshake.
+        //
+        // Zeroing of the standard register window [0x00, 0x200)
+        // happened in `pre_init_virtio_mmio` (server.rs), before
+        // reset release. We don't touch the layout here — the
+        // re-writes below are idempotent with what pre_init
+        // already wrote, and any kernel-issued writes since then
+        // are state we want to preserve and act on (sel_generation
+        // bumps, etc.).
         let features = device.device_features();
         unsafe {
             ptr::write_volatile(regs.magic_value, VIRTIO_MAGIC);

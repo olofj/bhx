@@ -1054,6 +1054,7 @@ fn pre_init_virtio_mmio(l2cpu: &L2Cpu, mmio_addr: u64, device_id: u32) {
     const OFF_DEVICE_ID: u64 = 0x008;
     const OFF_DEVICE_FEATURES: u64 = 0x010;
     const OFF_QUEUE_NUM_MAX: u64 = 0x034;
+    const OFF_SW_IMPL: u64 = 0x018;
     let queue_size_pre: u32 = crate::virtio::QUEUE_SIZE as u32;
     const VIRTIO_F_VERSION_1_HIGH: u32 = 1; // bit 32 of the 64-bit space
 
@@ -1065,6 +1066,19 @@ fn pre_init_virtio_mmio(l2cpu: &L2Cpu, mmio_addr: u64, device_id: u32) {
         VIRTIO_F_VERSION_1_HIGH,
         queue_size_pre
     );
+    // Zero the standard register window [0x00, 0x200) BEFORE writing
+    // the device-presence values. The worker's cold-start used to do
+    // this zeroing itself, but it ran AFTER reset release — direct-
+    // kernel boots race into virtio probe ~50ms after release while
+    // the worker hasn't yet spawned, so the zeroing took 1+ ms of
+    // byte-at-a-time PCIe writes during which the kernel saw garbage.
+    // Doing it here, before reset release, means by the time the
+    // kernel can probe, MMIO is in a coherent state with our pre_init
+    // values present. The worker's cold-start path now relies on
+    // this and just re-writes idempotent values.
+    for off in (0..0x200u64).step_by(4) {
+        l2cpu.write32(mmio_addr + off, 0);
+    }
     l2cpu.write32(mmio_addr + OFF_MAGIC, VIRTIO_MAGIC);
     l2cpu.write32(mmio_addr + OFF_VERSION, 2); // virtio 1.0+ MMIO
     l2cpu.write32(mmio_addr + OFF_DEVICE_ID, device_id);
@@ -1075,6 +1089,13 @@ fn pre_init_virtio_mmio(l2cpu: &L2Cpu, mmio_addr: u64, device_id: u32) {
     // worker hasn't started its cold-start yet.
     l2cpu.write32(mmio_addr + OFF_DEVICE_FEATURES, VIRTIO_F_VERSION_1_HIGH);
     l2cpu.write32(mmio_addr + OFF_QUEUE_NUM_MAX, queue_size_pre);
+    // sw_impl=1 lets our patched virtio-mmio driver enable the
+    // sel_generation handshake; a stock kernel just ignores this
+    // register. The patched kernel rejects the device with
+    // "SW_IMPL value must be 0 or 1" if it reads garbage here, so we
+    // must write 1 *before* reset release rather than waiting for
+    // the worker's cold-start.
+    l2cpu.write32(mmio_addr + OFF_SW_IMPL, 1);
     // Read back features to verify the write took effect.
     let features_back = l2cpu.read32(mmio_addr + OFF_DEVICE_FEATURES);
     let qnum_back = l2cpu.read32(mmio_addr + OFF_QUEUE_NUM_MAX);
