@@ -190,7 +190,7 @@ impl MmioRegs {
     }
 }
 
-const QUEUE_SIZE: u16 = 16384;
+pub(crate) const QUEUE_SIZE: u16 = 16384;
 
 // Warm-restart stash: we persist the per-queue descriptor/avail/used ring
 // addresses in the high half of the MMIO region so a fresh server can resume
@@ -397,6 +397,7 @@ pub fn run_device(
             ptr::write_bytes(mmio_base, 0, 0x200);
         }
 
+        let features = device.device_features();
         unsafe {
             ptr::write_volatile(regs.magic_value, VIRTIO_MAGIC);
             ptr::write_volatile(mmio_base.add(VIRTIO_MMIO_VERSION) as *mut u32, 2);
@@ -407,13 +408,46 @@ pub fn run_device(
             ptr::write_volatile(regs.queue_num_max, QUEUE_SIZE as u32);
             ptr::write_volatile(mmio_base.add(0x018) as *mut u32, 1); // sw_impl
             ptr::write_volatile(regs.sel_generation, 0);
+            // Initialize `device_features_sel` to 1 to match the
+            // pre-populated `device_features = features[1]` below.
+            // Phase 2's poll loop tracks `last_published_sel = 1`;
+            // if MMIO `_sel` is 0 (the post-zeroing default), the
+            // first poll iteration spuriously fires a 1→0
+            // "transition" and overwrites our coherent
+            // pre-populated value with `features[0]` *before* the
+            // guest has ever touched `_sel`. Keeping MMIO and
+            // bookkeeping in sync prevents the spurious update.
+            ptr::write_volatile(regs.device_features_sel, 1);
+            // Pre-populate `device_features` with the **high** half
+            // (`features[1]`) BEFORE we wait for the guest's DRIVER
+            // bit. Stock guests read `_features` within microseconds
+            // of writing `_sel = 1`; if the daemon waits to seed
+            // `_features` until Phase 2, the kernel reads 0 (post-
+            // zeroing default) on its first feature access and
+            // rejects the device for missing `VIRTIO_F_VERSION_1`.
+            //
+            // Linux's `vm_get_features` reads `_sel = 1` first
+            // (`features = readl(_features); features <<= 32`), so
+            // `features[1]` is the value we want exposed at the
+            // initial cold-start moment.
+            //
+            // For all three of our devices today (blk, net, console)
+            // `features[0]` is `0`, so a stale read of
+            // `features[1]` for the second `_sel = 0` access just
+            // leaks bit 0 of `features[1]` into the low half — which
+            // maps to harmless / no-op feature bits per device:
+            // `VIRTIO_BLK_F_BARRIER` (deprecated), `VIRTIO_NET_F_CSUM`
+            // (the one to revisit if stock virtio-net ever needs to
+            // work), `VIRTIO_CONSOLE_F_SIZE` (config reports 0×0,
+            // tolerated). If `features[0]` ever goes non-zero the
+            // race becomes harder to paper over and we'd need a
+            // real synchronization mechanism.
+            ptr::write_volatile(regs.device_features, features[1]);
         }
 
         // Populate device-specific config region now that the zero above
         // has cleared it. The guest will read this during probe.
         device.init_config(unsafe { mmio_base.add(VIRTIO_MMIO_CONFIG) });
-
-        let features = device.device_features();
 
         // Phase 1: Wait for DRIVER status.
         //
@@ -467,23 +501,22 @@ pub fn run_device(
         // the guest sets `FEATURES_OK`, which it does within a
         // microsecond after the second feature read on every guest
         // we've measured.
-        unsafe {
-            // Pre-populate so the first stock-guest read sees a
-            // coherent value (sel=0 is the post-zeroing default).
-            ptr::write_volatile(regs.device_features, features[0]);
-        }
-        let mut last_published_sel: u32 = 0;
+        // `device_features` is left at the pre-populated `features[1]`
+        // from cold-start for the duration of Phase 2. The stale read
+        // for `_sel = 0` is benign (see cold-start comment); the
+        // alternative — eagerly republishing on `_sel` polls — loses
+        // the race against the guest's back-to-back `writel(_sel) +
+        // readl(_features)` and ends up exposing zero (post-zeroing
+        // default) on the first feature read.
+        //
+        // Patched guests still bump `sel_generation` between writes
+        // and spin on the echo; we keep responding so they don't get
+        // stuck.
+        let _ = features; // silence unused-variable lint after removing the per-_sel update
         let mut last_echoed_gen: u32 = 0;
         while !exit_flag.load(Ordering::Relaxed) {
             if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_FEATURES_OK != 0 {
                 break;
-            }
-            let curr_sel = unsafe { ptr::read_volatile(regs.device_features_sel) };
-            if let Some(idx) = next_features_sel(curr_sel, last_published_sel) {
-                unsafe {
-                    ptr::write_volatile(regs.device_features, features[idx]);
-                }
-                last_published_sel = curr_sel;
             }
             let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
             if let Some(next) = echo_sel_generation(curr_gen, last_echoed_gen) {

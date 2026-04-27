@@ -1016,30 +1016,74 @@ fn run_boot_sequence(
 }
 
 /// Pre-write the standard virtio-mmio header registers (magic, version,
-/// device-id) for one MMIO slot. Called from `run_boot_sequence` after
-/// boot_l2cpu but before reset release, gated on whether a worker for
-/// that slot will be spawned in `start_initial_workers`. The actual
-/// worker re-writes the same bytes during cold-start handshake.
+/// device-id, plus the registers a fast-init guest reads right after
+/// the device-id check) for one MMIO slot. Called from
+/// `run_boot_sequence` after boot_l2cpu but before reset release, gated
+/// on whether a worker for that slot will be spawned in
+/// `start_initial_workers`.
 ///
-/// This is a per-volatile-store helper that doesn't try to do the full
-/// init the worker eventually does — it just gets the header to a state
-/// where a fast guest probe (e.g. U-Boot's DM virtio-mmio bind) sees
-/// the right magic and device-id. See #46.
+/// Writes everything the guest can read between reset release and the
+/// daemon worker's cold-start completion:
+/// - **Magic / version / device-id**: the device-presence handshake;
+///   pre_init was originally added in #46 to keep U-Boot's sub-µs
+///   probe from seeing zeros.
+/// - **`device_features` (high half)**: stock virtio-mmio guests
+///   write `_sel = 1` then read `_features` immediately, with no
+///   spin gate. The daemon worker doesn't run cold-start until
+///   ~tens-of-ms after reset release; if the guest gets to feature
+///   negotiation in that window (short paths exist via early
+///   initramfs) the read returns zero and the kernel rejects the
+///   device with "must provide VIRTIO_F_VERSION_1 feature!". We
+///   pre-publish the high-half features (which carry
+///   `VIRTIO_F_VERSION_1`) so that initial read is always coherent.
+///   The worker re-writes this with the real value (still
+///   `features[1]` for all our devices today) during cold-start.
+/// - **`queue_num_max`**: the kernel's per-queue setup expects a
+///   non-zero max; same race as features.
+///
+/// `device_features_high` is hardcoded to the `VIRTIO_F_VERSION_1` bit
+/// (bit 32 of the 64-bit feature space, = bit 0 of the high u32) — the
+/// only feature any of our devices currently advertise. If a device
+/// ever advertises additional high-half features, plumb them through
+/// here too.
 fn pre_init_virtio_mmio(l2cpu: &L2Cpu, mmio_addr: u64, device_id: u32) {
     const VIRTIO_MAGIC: u32 = 0x74726976; // 'v'|'i'<<8|'r'<<16|'t'<<24
                                           // Standard virtio-mmio register offsets (see virtio 1.2 § 4.2.2).
     const OFF_MAGIC: u64 = 0x000;
     const OFF_VERSION: u64 = 0x004;
     const OFF_DEVICE_ID: u64 = 0x008;
+    const OFF_DEVICE_FEATURES: u64 = 0x010;
+    const OFF_QUEUE_NUM_MAX: u64 = 0x034;
+    let queue_size_pre: u32 = crate::virtio::QUEUE_SIZE as u32;
+    const VIRTIO_F_VERSION_1_HIGH: u32 = 1; // bit 32 of the 64-bit space
+
     dlog!(
-        "[pre_init_virtio l2cpu {}] mmio_addr=0x{:x} device_id={}",
+        "[pre_init_virtio l2cpu {}] mmio_addr=0x{:x} device_id={} features_high={} qnum_max={}",
         l2cpu.idx(),
         mmio_addr,
-        device_id
+        device_id,
+        VIRTIO_F_VERSION_1_HIGH,
+        queue_size_pre
     );
     l2cpu.write32(mmio_addr + OFF_MAGIC, VIRTIO_MAGIC);
     l2cpu.write32(mmio_addr + OFF_VERSION, 2); // virtio 1.0+ MMIO
     l2cpu.write32(mmio_addr + OFF_DEVICE_ID, device_id);
+    // device_features at offset 0x10 is sel-driven (sel=0 → low,
+    // sel=1 → high). After cold-start zeroing _sel = 0; but Linux
+    // writes _sel = 1 first. We pre-publish the high half here so
+    // the first stock-guest read sees VIRTIO_F_VERSION_1 even if the
+    // worker hasn't started its cold-start yet.
+    l2cpu.write32(mmio_addr + OFF_DEVICE_FEATURES, VIRTIO_F_VERSION_1_HIGH);
+    l2cpu.write32(mmio_addr + OFF_QUEUE_NUM_MAX, queue_size_pre);
+    // Read back features to verify the write took effect.
+    let features_back = l2cpu.read32(mmio_addr + OFF_DEVICE_FEATURES);
+    let qnum_back = l2cpu.read32(mmio_addr + OFF_QUEUE_NUM_MAX);
+    dlog!(
+        "[pre_init_virtio l2cpu {}] readback: features=0x{:x} qnum_max=0x{:x}",
+        l2cpu.idx(),
+        features_back,
+        qnum_back
+    );
 }
 
 /// Build the runtime slot on top of an already-constructed `L2Cpu`. All
