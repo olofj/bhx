@@ -1008,7 +1008,10 @@ fn run_boot_sequence(
         );
     }
 
-    dlog!("[run_boot l2cpu {}] image+pre_init done; deferring reset release until workers spawn", l2cpu_idx);
+    dlog!(
+        "[run_boot l2cpu {}] image+pre_init done; deferring reset release until workers spawn",
+        l2cpu_idx
+    );
     Ok(l2cpu)
 }
 

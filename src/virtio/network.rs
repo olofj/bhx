@@ -65,8 +65,8 @@ fn fix_tx_l4_checksum(buf: &mut [u8]) {
     }
     let proto = buf[ip_hdr_off + 9];
     let csum_field_off = match proto {
-        6 => ip_hdr_off + ihl + 16,  // TCP checksum at offset 16 in TCP header
-        17 => ip_hdr_off + ihl + 6,  // UDP checksum at offset 6 in UDP header
+        6 => ip_hdr_off + ihl + 16, // TCP checksum at offset 16 in TCP header
+        17 => ip_hdr_off + ihl + 6, // UDP checksum at offset 6 in UDP header
         _ => return,
     };
     if csum_field_off + 2 > buf.len() {
