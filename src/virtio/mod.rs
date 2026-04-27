@@ -532,9 +532,35 @@ pub fn run_device(
                 // stuck.
                 let _ = features; // silence unused-variable lint after removing the per-_sel update
                 let mut last_echoed_gen: u32 = 0;
+                let mut phase2_reset = false;
                 while !exit_flag.load(Ordering::Relaxed) {
-                    if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_FEATURES_OK != 0
-                    {
+                    let s = unsafe { ptr::read_volatile(regs.status) };
+                    // Reset detection. Phase 1 only exits with the
+                    // DRIVER bit set, so by here `status & 2 != 0` —
+                    // a read of `0` means the guest reset the device.
+                    // Without this, a stuck Phase 2 (e.g. virtio
+                    // finalize_features failing in a probe-retry loop,
+                    // leaving status bouncing between 0x82 and 0x2)
+                    // never recovers when the guest finally retries
+                    // with a fresh `STATUS=0` reset (#61).
+                    if s == 0 {
+                        eprintln!(
+                            "virtio: device {} guest reset (STATUS=0) during Phase 2; re-entering handshake",
+                            device.device_id()
+                        );
+                        warm_restarted = false;
+                        unsafe {
+                            for i in 0..num_queues as usize {
+                                let base = mmio_base.add(STASH_OFFSET + i * STASH_PER_QUEUE);
+                                ptr::write_volatile(base as *mut u64, 0);
+                                ptr::write_volatile(base.add(8) as *mut u64, 0);
+                                ptr::write_volatile(base.add(16) as *mut u64, 0);
+                            }
+                        }
+                        phase2_reset = true;
+                        break;
+                    }
+                    if s & VIRTIO_CONFIG_S_FEATURES_OK != 0 {
                         break;
                     }
                     let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
@@ -544,6 +570,9 @@ pub fn run_device(
                         }
                         last_echoed_gen = next;
                     }
+                }
+                if phase2_reset {
+                    continue 'session;
                 }
 
                 // Phase 3: capture per-queue config as the guest writes it,
@@ -589,8 +618,32 @@ pub fn run_device(
                             | (ptr::read_volatile(regs.queue_used_low) as u64);
                     }
                 };
+                let mut phase3_reset = false;
                 while !exit_flag.load(Ordering::Relaxed) {
-                    if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_DRIVER_OK != 0 {
+                    let s = unsafe { ptr::read_volatile(regs.status) };
+                    // Reset detection: same rationale as Phase 2's. A
+                    // stuck Phase 3 (multi-queue probe failing, status
+                    // bouncing between FAILED+DRIVER and DRIVER) needs
+                    // to recover when the guest finally retries with a
+                    // fresh `STATUS=0` reset.
+                    if s == 0 {
+                        eprintln!(
+                            "virtio: device {} guest reset (STATUS=0) during Phase 3; re-entering handshake",
+                            device.device_id()
+                        );
+                        warm_restarted = false;
+                        unsafe {
+                            for i in 0..num_queues as usize {
+                                let base = mmio_base.add(STASH_OFFSET + i * STASH_PER_QUEUE);
+                                ptr::write_volatile(base as *mut u64, 0);
+                                ptr::write_volatile(base.add(8) as *mut u64, 0);
+                                ptr::write_volatile(base.add(16) as *mut u64, 0);
+                            }
+                        }
+                        phase3_reset = true;
+                        break;
+                    }
+                    if s & VIRTIO_CONFIG_S_DRIVER_OK != 0 {
                         break;
                     }
                     // Eager `QUEUE_READY` clear: the guest just wrote 1 to
@@ -638,6 +691,10 @@ pub fn run_device(
                         }
                         last_echoed_gen = next;
                     }
+                }
+
+                if phase3_reset {
+                    continue 'session;
                 }
 
                 // The guest's last queue setup never had a following SEL
