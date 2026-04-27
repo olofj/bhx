@@ -317,6 +317,7 @@ impl Tier {
 pub enum WorkerKind {
     VirtioBlk,
     VirtioNet,
+    VirtioConsole,
     ChipConsole,
 }
 impl WorkerKind {
@@ -324,6 +325,7 @@ impl WorkerKind {
         match self {
             WorkerKind::VirtioBlk => "virtio_blk",
             WorkerKind::VirtioNet => "virtio_net",
+            WorkerKind::VirtioConsole => "virtio_console",
             WorkerKind::ChipConsole => "chip_console",
         }
     }
@@ -331,6 +333,7 @@ impl WorkerKind {
         &[
             WorkerKind::VirtioBlk,
             WorkerKind::VirtioNet,
+            WorkerKind::VirtioConsole,
             WorkerKind::ChipConsole,
         ]
     }
@@ -338,7 +341,8 @@ impl WorkerKind {
         match self {
             WorkerKind::VirtioBlk => 0,
             WorkerKind::VirtioNet => 1,
-            WorkerKind::ChipConsole => 2,
+            WorkerKind::VirtioConsole => 2,
+            WorkerKind::ChipConsole => 3,
         }
     }
 }
@@ -357,16 +361,16 @@ pub fn classify_tier(elapsed: Duration, fast_window: Duration, idle_window: Dura
     }
 }
 
-/// 3D counter: `[worker][idx][tier]`. 3 × 4 × 3 = 36 cells per metric.
+/// 3D counter: `[worker][idx][tier]`. 4 × 4 × 3 = 48 cells per metric.
 /// Indexed by `at(WorkerKind, idx: u8, Tier)`. Both keying enums have
 /// stable `name()` strings the renderer uses verbatim.
 pub struct WorkerTierCounter {
-    values: [[[Counter; 3]; 4]; 3],
+    values: [[[Counter; 3]; 4]; 4],
 }
 impl WorkerTierCounter {
     pub const fn new() -> Self {
         Self {
-            values: [const { [const { [const { Counter::new() }; 3] }; 4] }; 3],
+            values: [const { [const { [const { Counter::new() }; 3] }; 4] }; 4],
         }
     }
     pub fn at(&self, worker: WorkerKind, idx: u8, tier: Tier) -> &Counter {
@@ -416,6 +420,8 @@ pub struct RpcMethodCounter {
     pub remove_disk: Counter,
     pub add_net: Counter,
     pub remove_net: Counter,
+    pub add_console: Counter,
+    pub remove_console: Counter,
     pub stop: Counter,
     pub shutdown: Counter,
 }
@@ -429,6 +435,8 @@ impl RpcMethodCounter {
             remove_disk: Counter::new(),
             add_net: Counter::new(),
             remove_net: Counter::new(),
+            add_console: Counter::new(),
+            remove_console: Counter::new(),
             stop: Counter::new(),
             shutdown: Counter::new(),
         }
@@ -442,6 +450,8 @@ impl RpcMethodCounter {
             RpcMethod::RemoveDisk => &self.remove_disk,
             RpcMethod::AddNet => &self.add_net,
             RpcMethod::RemoveNet => &self.remove_net,
+            RpcMethod::AddConsole => &self.add_console,
+            RpcMethod::RemoveConsole => &self.remove_console,
             RpcMethod::Stop => &self.stop,
             RpcMethod::Shutdown => &self.shutdown,
         }
@@ -464,6 +474,8 @@ pub enum RpcMethod {
     RemoveDisk,
     AddNet,
     RemoveNet,
+    AddConsole,
+    RemoveConsole,
     Stop,
     Shutdown,
 }
@@ -477,6 +489,8 @@ impl RpcMethod {
             RpcMethod::RemoveDisk => "remove_disk",
             RpcMethod::AddNet => "add_net",
             RpcMethod::RemoveNet => "remove_net",
+            RpcMethod::AddConsole => "add_console",
+            RpcMethod::RemoveConsole => "remove_console",
             RpcMethod::Stop => "stop",
             RpcMethod::Shutdown => "shutdown",
         }
@@ -490,6 +504,8 @@ impl RpcMethod {
             RpcMethod::RemoveDisk,
             RpcMethod::AddNet,
             RpcMethod::RemoveNet,
+            RpcMethod::AddConsole,
+            RpcMethod::RemoveConsole,
             RpcMethod::Stop,
             RpcMethod::Shutdown,
         ]
@@ -571,6 +587,10 @@ pub static BLK_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
 /// Net-device interrupt count per L2CPU. Same shape as
 /// `BLK_INTERRUPTS_TOTAL`.
 pub static NET_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
+
+/// virtio-console interrupt count per L2CPU. Bumped from the console
+/// worker's `run_device` loop. See #51.
+pub static CONSOLE_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
 
 // --- Worker poll loop ---
 

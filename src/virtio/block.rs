@@ -213,7 +213,7 @@ impl VirtioDeviceImpl for VirtioBlk {
         self.data_offset += len;
     }
 
-    fn process_queue_complete(&mut self, _queue_idx: u32, addr: *mut u8, _len: u64) {
+    fn process_queue_complete(&mut self, _queue_idx: u32, addr: *mut u8, len: u64) -> u64 {
         // Emit the status byte set by `process_queue_data`. S_OK if no
         // overflow / unsupported-type was observed; S_IOERR on
         // overflow; S_UNSUPP on an unknown request type.
@@ -252,6 +252,9 @@ impl VirtioDeviceImpl for VirtioBlk {
         }
 
         self.req_status = VIRTIO_BLK_S_OK;
+        // Pass the buffer capacity through unchanged — block driver
+        // expects the chain-summed length.
+        len
     }
 
     fn queue_has_data(&self, _queue_idx: u32) -> bool {

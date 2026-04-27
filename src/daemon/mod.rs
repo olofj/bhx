@@ -68,10 +68,27 @@ pub struct L2CpuSlot {
     pub console_worker: WorkerHandle,
     pub disks: Vec<DiskWorker>,
     pub net: Option<WorkerHandle>,
+    /// virtio-console worker (#51). When `Some`, kernel sees a
+    /// virtio-mmio device with id=3 in the third virtio slot. Operator
+    /// keystrokes are fanned out to both this and `console_input_tx`
+    /// in `client_reader_main`; whichever HVC driver the kernel
+    /// activates as its console absorbs them.
+    pub virtio_console: Option<VirtioConsoleSlot>,
     /// Wall-clock instant the slot was installed. Drives
     /// `tt_bh_l2cpu_uptime_seconds`. Set once at construction; never
     /// updated.
     pub started: Instant,
+}
+
+/// Per-L2CPU virtio-console state — the worker handle plus the
+/// keystroke queue the worker drains. Held inside the slot so client
+/// reader threads can fan input into it.
+pub struct VirtioConsoleSlot {
+    pub worker: WorkerHandle,
+    /// Operator → guest keystroke buffer, drained by the worker on
+    /// each RX descriptor. Bounded at `RX_BUFFER_CAP` bytes; overflow
+    /// drops oldest in `client_reader_main`.
+    pub input_buf: Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
 }
 
 pub struct DiskWorker {
@@ -86,6 +103,9 @@ impl L2CpuSlot {
         }
         if let Some(n) = self.net {
             n.stop_and_join();
+        }
+        if let Some(vc) = self.virtio_console {
+            vc.worker.stop_and_join();
         }
         self.console_worker.stop_and_join();
         // Arc<L2Cpu> and Arc<InterruptController> drop here when the last

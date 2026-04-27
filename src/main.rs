@@ -113,6 +113,13 @@ enum Commands {
         /// core — e.g. switching rootfs without an explicit `stop` first.
         #[arg(long)]
         force: bool,
+        /// Attach a virtio-console device alongside the boot. Stock distro
+        /// kernels with `CONFIG_VIRTIO_CONSOLE` register this as `/dev/hvc0`
+        /// and direct their console output through it instead of the
+        /// OpenSBI debug UART (which often requires `CONFIG_HVC_RISCV_SBI`,
+        /// not enabled in upstream-portable distro kernels). See #51.
+        #[arg(long = "virtio-console")]
+        virtio_console: bool,
     },
     /// Attach a terminal to a booted L2CPU's console via the daemon.
     Connect {
@@ -156,6 +163,13 @@ enum Commands {
     /// Detach virtio-net from a running L2CPU. Drops libvdeslirp state
     /// (active TCP/NAT sessions on the guest will reset).
     RemoveNet,
+    /// Attach a virtio-console device to a running L2CPU (#51). Stock
+    /// distro kernels with `CONFIG_VIRTIO_CONSOLE` register this as
+    /// `/dev/hvc0`.
+    AddConsole,
+    /// Detach the virtio-console device from a running L2CPU. Joins the
+    /// worker thread; any in-flight RX descriptors are dropped.
+    RemoveConsole,
     /// Manage disk images
     Image {
         #[command(subcommand)]
@@ -354,6 +368,7 @@ fn main() -> std::process::ExitCode {
             root_device,
             force_reset_pcie,
             force,
+            virtio_console,
         }) => {
             let disk = resolve_disk_path(
                 cli.disk,
@@ -381,6 +396,7 @@ fn main() -> std::process::ExitCode {
                 force_reset_pcie,
                 disk,
                 cli.network,
+                virtio_console,
                 force,
             )
         }
@@ -412,6 +428,14 @@ fn main() -> std::process::ExitCode {
         Some(Commands::RemoveNet) => {
             let mut sock = daemon::client::connect(cli.ttdevice)?;
             daemon::client::remove_net(&mut sock, cli.l2cpu as u8)
+        }
+        Some(Commands::AddConsole) => {
+            let mut sock = daemon::client::connect(cli.ttdevice)?;
+            daemon::client::add_console(&mut sock, cli.l2cpu as u8)
+        }
+        Some(Commands::RemoveConsole) => {
+            let mut sock = daemon::client::connect(cli.ttdevice)?;
+            daemon::client::remove_console(&mut sock, cli.l2cpu as u8)
         }
         Some(Commands::Daemon { action }) => run_daemon_cmd(cli.ttdevice, action),
         Some(Commands::Image { action }) => {
@@ -520,6 +544,7 @@ fn run_boot_client(
     force_reset_pcie: bool,
     disk: Option<String>,
     network: bool,
+    console: bool,
     force: bool,
 ) -> std::io::Result<()> {
     // Bundle disk + network into the Boot RPC so the virtio workers come up
@@ -553,6 +578,7 @@ fn run_boot_client(
         force_reset_pcie,
         disk,
         network,
+        console,
         force,
     )
 }

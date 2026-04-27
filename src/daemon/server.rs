@@ -36,7 +36,10 @@ use crate::virtio::network;
 
 // VirtIO MMIO offsets and interrupt numbers come from `crate::regs::virtio_mmio`;
 // re-export under the legacy short names so the dispatch code reads cleanly.
-use crate::regs::virtio_mmio::{DISK_IRQ as DISK_INT, DISK_OFFSET as DISK_MMIO};
+use crate::regs::virtio_mmio::{
+    CONSOLE_IRQ as CONSOLE_INT, CONSOLE_OFFSET as CONSOLE_MMIO, DISK_IRQ as DISK_INT,
+    DISK_OFFSET as DISK_MMIO,
+};
 #[cfg(feature = "slirp")]
 use crate::regs::virtio_mmio::{NET_IRQ as NET_INT, NET_OFFSET as NET_MMIO};
 
@@ -292,6 +295,7 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             force_reset_pcie,
             disk,
             network,
+            console,
             force,
         } => dispatch_boot(
             &sock,
@@ -305,6 +309,7 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             force_reset_pcie,
             disk,
             network,
+            console,
             force,
         ),
         Request::AttachConsole { l2cpu, mode } => {
@@ -318,6 +323,8 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             extra_fwd,
         } => dispatch_add_net(&sock, &state, l2cpu, ssh_port, extra_fwd),
         Request::RemoveNet { l2cpu } => dispatch_remove_net(&sock, &state, l2cpu),
+        Request::AddConsole { l2cpu } => dispatch_add_console(&sock, &state, l2cpu),
+        Request::RemoveConsole { l2cpu } => dispatch_remove_console(&sock, &state, l2cpu),
         Request::Stop { l2cpu } => dispatch_stop(&sock, &state, l2cpu),
         Request::Shutdown => dispatch_shutdown(&sock, &state),
     };
@@ -366,6 +373,8 @@ fn classify_request(req: &Request) -> crate::daemon::metrics::RpcMethod {
         Request::RemoveDisk { .. } => RpcMethod::RemoveDisk,
         Request::AddNet { .. } => RpcMethod::AddNet,
         Request::RemoveNet { .. } => RpcMethod::RemoveNet,
+        Request::AddConsole { .. } => RpcMethod::AddConsole,
+        Request::RemoveConsole { .. } => RpcMethod::RemoveConsole,
         Request::Stop { .. } => RpcMethod::Stop,
         Request::Shutdown => RpcMethod::Shutdown,
     }
@@ -554,6 +563,7 @@ fn dispatch_boot(
     force_reset_pcie: bool,
     disk: Option<String>,
     network: bool,
+    console: bool,
     force: bool,
 ) -> crate::Result<()> {
     // U-Boot mode reads kernel + initrd from disk at runtime, so the
@@ -592,6 +602,7 @@ fn dispatch_boot(
         force_reset_pcie,
         disk.is_some(),
         network,
+        console,
     )
     .map_err(|e| {
         dlog!("[boot l2cpu {}] boot sequence failed: {}", l2cpu_idx, e);
@@ -624,7 +635,7 @@ fn dispatch_boot(
         l2cpu_idx
     );
 
-    start_initial_workers(&mut slot, state.card, l2cpu_idx, disk, network)
+    start_initial_workers(&mut slot, state.card, l2cpu_idx, disk, network, console)
         .map_err(crate::Error::slot_state)?;
     install_slot_and_reply_ok(state, l2cpu_idx, slot, sock);
     Ok(())
@@ -670,6 +681,7 @@ fn start_initial_workers(
     l2cpu_idx: u8,
     disk: Option<String>,
     network: bool,
+    console: bool,
 ) -> Result<(), String> {
     if let Some(path) = disk {
         dlog!(
@@ -703,6 +715,17 @@ fn start_initial_workers(
         start_net_worker(card, slot).map_err(|e| {
             dlog!("[boot l2cpu {}] start_net_worker failed: {}", l2cpu_idx, e);
             format!("start net worker failed: {}", e)
+        })?;
+    }
+    if console {
+        dlog!("[boot l2cpu {}] spawning virtio-console worker", l2cpu_idx);
+        start_console_worker(slot).map_err(|e| {
+            dlog!(
+                "[boot l2cpu {}] start_console_worker failed: {}",
+                l2cpu_idx,
+                e
+            );
+            format!("start console worker failed: {}", e)
         })?;
     }
     Ok(())
@@ -793,6 +816,45 @@ fn start_net_worker(_card: u32, _slot: &mut L2CpuSlot) -> io::Result<()> {
     Err(io::Error::other("daemon built without the slirp feature"))
 }
 
+/// Spawn the virtio-console worker (#51). The worker drains the
+/// kernel's TX queue into the console hub and fills RX descriptors
+/// from the per-slot `input_buf`. Idempotent guard via the slot's
+/// existing `virtio_console: Option<...>`: caller checks that.
+fn start_console_worker(slot: &mut L2CpuSlot) -> io::Result<()> {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    let exit = Arc::new(AtomicBool::new(false));
+    let l2cpu = slot.l2cpu.clone();
+    let interrupt = slot.interrupt.clone();
+    let hub = slot.console_hub.clone();
+    let input_buf = Arc::new(Mutex::new(VecDeque::with_capacity(
+        crate::virtio::console::RX_BUFFER_CAP,
+    )));
+    let input_buf_thread = input_buf.clone();
+    let exit_thread = exit.clone();
+    let idx = slot.idx;
+    let t = thread::spawn(move || {
+        crate::virtio::console::console_main(
+            l2cpu,
+            interrupt,
+            CONSOLE_INT,
+            CONSOLE_MMIO,
+            hub,
+            input_buf_thread,
+            exit_thread,
+        );
+    });
+    slot.virtio_console = Some(crate::daemon::VirtioConsoleSlot {
+        worker: WorkerHandle {
+            exit,
+            thread: Some(t),
+            description: format!("virtio-console l2cpu {}", idx),
+        },
+        input_buf,
+    });
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_boot_sequence(
     state: &Arc<DaemonState>,
@@ -805,6 +867,7 @@ fn run_boot_sequence(
     force_reset_pcie: bool,
     has_disk: bool,
     has_network: bool,
+    has_console: bool,
 ) -> io::Result<Arc<L2Cpu>> {
     use crate::regs::boot_image;
 
@@ -933,6 +996,13 @@ fn run_boot_sequence(
             crate::regs::virtio_mmio::VIRTIO_ID_NET,
         );
     }
+    if has_console {
+        pre_init_virtio_mmio(
+            &l2cpu,
+            starting_address + memory_size - crate::regs::virtio_mmio::CONSOLE_OFFSET,
+            crate::regs::virtio_mmio::VIRTIO_ID_CONSOLE,
+        );
+    }
 
     dlog!("[run_boot l2cpu {}] releasing from reset", l2cpu_idx);
     // reset_x280 goes through SharedChip so the PLL step and the
@@ -1013,6 +1083,7 @@ fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlo
         },
         disks: Vec::new(),
         net: None,
+        virtio_console: None,
         started: Instant::now(),
     })
 }
@@ -1040,13 +1111,22 @@ fn dispatch_attach_console(
         .map_err(crate::Error::io_ctx("try_clone"))?;
 
     // Grab everything we need from the slot under the mutex, then release it
-    // before doing any IO so other client handlers don't stall.
-    let (hub, input_tx) = {
+    // before doing any IO so other client handlers don't stall. The
+    // virtio-console input_buf is `Some` only when an operator opted in
+    // with `boot --virtio-console` or `add-console`; when it's present
+    // we fan keystrokes into both the chip UART (`input_tx`) and the
+    // virtio-console (`vc_input`) so whichever HVC the kernel ended up
+    // using as its console picks them up.
+    let (hub, input_tx, vc_input) = {
         let slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
         let slot = slot_guard.as_ref().ok_or_else(|| {
             crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx))
         })?;
-        (slot.console_hub.clone(), slot.console_input_tx.clone())
+        (
+            slot.console_hub.clone(),
+            slot.console_input_tx.clone(),
+            slot.virtio_console.as_ref().map(|vc| vc.input_buf.clone()),
+        )
     };
 
     let (res, scrollback) = hub.attach(daemon_end, mode);
@@ -1092,7 +1172,7 @@ fn dispatch_attach_console(
         return Ok(());
     }
 
-    thread::spawn(move || client_reader_main(daemon_read, res.id, hub, input_tx));
+    thread::spawn(move || client_reader_main(daemon_read, res.id, hub, input_tx, vc_input));
     Ok(())
 }
 
@@ -1103,9 +1183,24 @@ fn write_scrollback(mut sock: &UnixStream, bytes: &[u8]) -> io::Result<()> {
     sock.write_all(bytes)
 }
 
-/// Per-client reader: blocks on `sock`, forwards bytes to `input_tx` whenever
-/// this client is the writer. Terminates on EOF or hub-driven drop.
-fn client_reader_main(sock: UnixStream, id: u64, hub: Arc<ConsoleHub>, input_tx: mpsc::Sender<u8>) {
+/// Per-client reader: blocks on `sock`, forwards bytes whenever this client
+/// is the writer. Bytes go to **both** the chip-side OpenSBI debug UART
+/// (`input_tx`) and, if attached, the virtio-console RX queue
+/// (`vc_input`). Whichever HVC the kernel chose as its console absorbs
+/// them; the other side just sits idle. Terminates on EOF or hub-driven
+/// drop.
+///
+/// `vc_input` is bounded at `RX_BUFFER_CAP` (16 KiB). On overflow we
+/// drop the oldest byte in the deque rather than blocking — the chip
+/// path is the primary console for diagnostic kernels, and a bursty
+/// paste shouldn't wedge the reader.
+fn client_reader_main(
+    sock: UnixStream,
+    id: u64,
+    hub: Arc<ConsoleHub>,
+    input_tx: mpsc::Sender<u8>,
+    vc_input: Option<Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>>,
+) {
     use std::io::Read;
     let mut buf = [0u8; 128];
     loop {
@@ -1116,6 +1211,15 @@ fn client_reader_main(sock: UnixStream, id: u64, hub: Arc<ConsoleHub>, input_tx:
                     for &b in &buf[..n] {
                         if input_tx.send(b).is_err() {
                             return;
+                        }
+                    }
+                    if let Some(vc) = vc_input.as_ref() {
+                        let mut g = vc.lock().unwrap();
+                        for &b in &buf[..n] {
+                            if g.len() >= crate::virtio::console::RX_BUFFER_CAP {
+                                g.pop_front();
+                            }
+                            g.push_back(b);
                         }
                     }
                 }
@@ -1318,6 +1422,63 @@ fn dispatch_remove_net(
     dlog!("[remove_net l2cpu {}] joining worker", l2cpu_idx);
     net.stop_and_join();
     dlog!("[remove_net l2cpu {}] done — replying ok", l2cpu_idx);
+    reply_ok(sock);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// AddConsole / RemoveConsole (virtio-console, #51)
+// ---------------------------------------------------------------------------
+
+fn dispatch_add_console(
+    sock: &UnixStream,
+    state: &Arc<DaemonState>,
+    l2cpu_idx: u8,
+) -> crate::Result<()> {
+    dlog!("[add_console l2cpu {}] dispatch entry", l2cpu_idx);
+    validate_l2cpu(l2cpu_idx)?;
+    let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
+    let slot = slot_guard
+        .as_mut()
+        .ok_or_else(|| crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx)))?;
+    if slot.virtio_console.is_some() {
+        return Err(crate::Error::slot_state(
+            "virtio-console already attached",
+        ));
+    }
+    start_console_worker(slot)
+        .map_err(crate::Error::io_ctx("start virtio-console worker"))?;
+    dlog!(
+        "[add_console l2cpu {}] dispatch complete — replying ok",
+        l2cpu_idx
+    );
+    reply_ok(sock);
+    Ok(())
+}
+
+fn dispatch_remove_console(
+    sock: &UnixStream,
+    state: &Arc<DaemonState>,
+    l2cpu_idx: u8,
+) -> crate::Result<()> {
+    dlog!("[remove_console l2cpu {}] dispatch entry", l2cpu_idx);
+    validate_l2cpu(l2cpu_idx)?;
+    // Take the slot under the lock, join outside.
+    let vc = {
+        let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
+        let slot = slot_guard.as_mut().ok_or_else(|| {
+            crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx))
+        })?;
+        slot.virtio_console
+            .take()
+            .ok_or_else(|| crate::Error::slot_state("no virtio-console attached"))?
+    };
+    dlog!("[remove_console l2cpu {}] joining worker", l2cpu_idx);
+    vc.worker.stop_and_join();
+    dlog!(
+        "[remove_console l2cpu {}] done — replying ok",
+        l2cpu_idx
+    );
     reply_ok(sock);
     Ok(())
 }

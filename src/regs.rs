@@ -94,17 +94,26 @@ pub mod virtio_mmio {
     pub const DISK_OFFSET: u64 = MMIO_SLOT_SIZE;
     /// Network device region offset: 4 MiB before `mem_end`.
     pub const NET_OFFSET: u64 = 2 * MMIO_SLOT_SIZE;
+    /// Console device region offset: 6 MiB before `mem_end`. Slot 3 in
+    /// `boot::modify_dtb`'s `i = 0..4` loop, paired with IRQ 31. See
+    /// #51 for rationale.
+    pub const CONSOLE_OFFSET: u64 = 3 * MMIO_SLOT_SIZE;
 
     /// PLIC interrupt for virtio-disk. DTB ties together as
     /// `virtio@<addr> { interrupts = <DISK_IRQ>; }`.
     pub const DISK_IRQ: u32 = 33;
     /// PLIC interrupt for virtio-net.
     pub const NET_IRQ: u32 = 32;
+    /// PLIC interrupt for virtio-console.
+    pub const CONSOLE_IRQ: u32 = 31;
 
     /// VirtIO `device_id` value for the block device (block = 2).
     pub const VIRTIO_ID_BLOCK: u32 = 2;
     /// VirtIO `device_id` value for the network device (net = 1).
     pub const VIRTIO_ID_NET: u32 = 1;
+    /// VirtIO `device_id` value for the console device (console = 3).
+    /// virtio 1.2 §5.3.
+    pub const VIRTIO_ID_CONSOLE: u32 = 3;
 }
 
 /// Slirp host-side port allocation for SSH forwarding to the guest.
@@ -161,6 +170,12 @@ mod tests {
         assert!(virtio_mmio::DISK_OFFSET == virtio_mmio::MMIO_SLOT_SIZE);
         assert!(virtio_mmio::NET_OFFSET == 2 * virtio_mmio::MMIO_SLOT_SIZE);
         assert!(virtio_mmio::NET_IRQ == virtio_mmio::DISK_IRQ - 1);
+        // Console gets slot index 2 (0 = disk, 1 = net, 2 = console).
+        assert!(virtio_mmio::CONSOLE_OFFSET == 3 * virtio_mmio::MMIO_SLOT_SIZE);
+        assert!(virtio_mmio::CONSOLE_OFFSET <= virtio_mmio::RESERVED_SIZE);
+        assert!(virtio_mmio::CONSOLE_OFFSET != virtio_mmio::DISK_OFFSET);
+        assert!(virtio_mmio::CONSOLE_OFFSET != virtio_mmio::NET_OFFSET);
+        assert!(virtio_mmio::CONSOLE_IRQ == virtio_mmio::DISK_IRQ - 2);
     };
 
     // Compile-time invariants on the boot-image layout: each must be

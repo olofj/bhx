@@ -151,7 +151,7 @@ impl VirtioDeviceImpl for VirtioNet {
         // Nothing to do here
     }
 
-    fn process_queue_complete(&mut self, queue_idx: u32, addr: *mut u8, len: u64) {
+    fn process_queue_complete(&mut self, queue_idx: u32, addr: *mut u8, len: u64) -> u64 {
         // Handle single-descriptor edge case: if header wasn't processed via
         // a separate descriptor, process it from the start of this one and
         // advance past it.
@@ -197,6 +197,10 @@ impl VirtioDeviceImpl for VirtioNet {
                 .add(copy_len as u64);
         }
         self.header_processed = false;
+        // Buffer capacity, summed with earlier descriptors. virtio-net
+        // RX may write less than the buffer (small packet); existing
+        // kernels tolerate the over-report — leaving as-is for parity.
+        len
     }
 
     fn queue_has_data(&self, queue_idx: u32) -> bool {

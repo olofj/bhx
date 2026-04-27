@@ -48,6 +48,13 @@ pub enum Request {
         disk: Option<String>,
         #[serde(default)]
         network: bool,
+        /// Attach a virtio-console device alongside the boot. Stock
+        /// distro kernels with `CONFIG_VIRTIO_CONSOLE` register this
+        /// as `/dev/hvc0` and direct their console to it. Older
+        /// clients without this field hit the `serde(default)` =
+        /// false path. See #51.
+        #[serde(default)]
+        console: bool,
         /// If true and a slot already exists for this L2CPU, the daemon
         /// tears it down (stop workers, drop L2Cpu) before re-imaging.
         /// Default false → duplicate boots are rejected with an error.
@@ -89,6 +96,13 @@ pub enum Request {
     /// Remove the virtio-net device from a running L2CPU. Joins the
     /// worker thread; libvdeslirp state (TCP/NAT) is dropped.
     RemoveNet { l2cpu: u8 },
+    /// Attach a virtio-console device to a running L2CPU. Stock
+    /// distro kernels with `CONFIG_VIRTIO_CONSOLE` will pick it up as
+    /// `/dev/hvc0`. See #51.
+    AddConsole { l2cpu: u8 },
+    /// Remove the virtio-console device from a running L2CPU. Joins
+    /// the worker thread; any in-flight RX descriptors are dropped.
+    RemoveConsole { l2cpu: u8 },
     /// Stop a single L2CPU's device threads.
     Stop { l2cpu: u8 },
     /// Ask the daemon to exit.
@@ -284,6 +298,7 @@ mod tests {
             force_reset_pcie: false,
             disk: None,
             network: false,
+            console: false,
             force: false,
         };
         let mut buf = Vec::new();
@@ -311,6 +326,7 @@ mod tests {
             force_reset_pcie: false,
             disk: Some("debian.raw".into()),
             network: false,
+            console: false,
             force: false,
         };
         let mut buf = Vec::new();
@@ -436,6 +452,7 @@ mod tests {
                 force_reset_pcie: false,
                 disk: None,
                 network: false,
+                console: false,
                 force,
             };
             let mut buf = Vec::new();

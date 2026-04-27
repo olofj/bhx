@@ -4,6 +4,7 @@
 //! VirtIO MMIO device framework — base implementation for device emulation.
 
 pub mod block;
+pub mod console;
 pub mod interrupt;
 #[cfg(feature = "slirp")]
 pub mod network;
@@ -90,6 +91,7 @@ struct VringUsed {
 pub enum InterruptKind {
     Block,
     Net,
+    Console,
 }
 
 /// Bump the per-kind interrupt counter at index `idx`. Pulled out of
@@ -99,6 +101,7 @@ pub(crate) fn bump_interrupt_metric(kind: InterruptKind, idx: u8) {
     match kind {
         InterruptKind::Block => crate::daemon::metrics::BLK_INTERRUPTS_TOTAL.at(idx).inc(),
         InterruptKind::Net => crate::daemon::metrics::NET_INTERRUPTS_TOTAL.at(idx).inc(),
+        InterruptKind::Console => crate::daemon::metrics::CONSOLE_INTERRUPTS_TOTAL.at(idx).inc(),
     }
 }
 
@@ -110,7 +113,14 @@ pub trait VirtioDeviceImpl {
     fn device_features(&self) -> [u32; 2];
     fn process_queue_start(&mut self, queue_idx: u32, addr: *mut u8, len: u64);
     fn process_queue_data(&mut self, queue_idx: u32, addr: *mut u8, len: u64);
-    fn process_queue_complete(&mut self, queue_idx: u32, addr: *mut u8, len: u64);
+    /// Process the LAST descriptor of a chain. Returns the bytes the
+    /// device wrote into this descriptor's buffer; the runner uses this
+    /// for the used-ring `len` field (combined with chain-summed lens
+    /// for the earlier descriptors). For block/net the chain-summed
+    /// shape is what existing kernels expect, so they return `len`
+    /// unchanged. virtio-console RX writes less than the buffer
+    /// capacity when input is short, so it returns the real count.
+    fn process_queue_complete(&mut self, queue_idx: u32, addr: *mut u8, len: u64) -> u64;
     fn queue_has_data(&self, queue_idx: u32) -> bool;
     /// Populate device-specific config at MMIO offset 0x100. Called once
     /// during cold-start, after the framework has zeroed the standard
@@ -732,8 +742,14 @@ pub fn run_device(
                         num_bytes_written += d.len as u64;
                         desc_idx = d.next;
                     } else {
-                        device.process_queue_complete(queue_idx, addr, d.len as u64);
-                        num_bytes_written += d.len as u64;
+                        // The last descriptor's actual-bytes-written
+                        // can be less than its buffer capacity (e.g.
+                        // virtio-console RX with partial input). The
+                        // device returns the real count; block/net
+                        // pass `d.len` through unchanged.
+                        let actual =
+                            device.process_queue_complete(queue_idx, addr, d.len as u64);
+                        num_bytes_written += actual;
                         break;
                     }
                 }
@@ -781,6 +797,7 @@ pub fn run_device(
         let worker = match interrupt_kind {
             InterruptKind::Block => crate::daemon::metrics::WorkerKind::VirtioBlk,
             InterruptKind::Net => crate::daemon::metrics::WorkerKind::VirtioNet,
+            InterruptKind::Console => crate::daemon::metrics::WorkerKind::VirtioConsole,
         };
         let idx_u8 = l2cpu.idx() as u8;
         crate::daemon::metrics::WORKER_POLL_ITERATIONS_TOTAL

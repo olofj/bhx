@@ -63,6 +63,7 @@ pub fn boot(
     force_reset_pcie: bool,
     disk: Option<String>,
     network: bool,
+    console: bool,
     force: bool,
 ) -> io::Result<()> {
     write_frame(
@@ -77,9 +78,20 @@ pub fn boot(
             force_reset_pcie,
             disk,
             network,
+            console,
             force,
         },
     )?;
+    expect_ok(read_frame(&mut *sock)?)
+}
+
+pub fn add_console(sock: &mut UnixStream, l2cpu: u8) -> io::Result<()> {
+    write_frame(&mut *sock, &Request::AddConsole { l2cpu })?;
+    expect_ok(read_frame(&mut *sock)?)
+}
+
+pub fn remove_console(sock: &mut UnixStream, l2cpu: u8) -> io::Result<()> {
+    write_frame(&mut *sock, &Request::RemoveConsole { l2cpu })?;
     expect_ok(read_frame(&mut *sock)?)
 }
 
