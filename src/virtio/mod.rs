@@ -387,11 +387,20 @@ pub fn run_device(
 
     let regs = MmioRegs::new(mmio_base);
 
+    // Track which session we're on. The first time through we may use
+    // the warm-restart path (stashed queue addresses from a prior
+    // daemon run). On a guest-driven reset (STATUS=0 detected in the
+    // runtime loop) we loop back here with `warm_restarted = false`
+    // and run a fresh cold-start handshake — the stash from the
+    // previous session is stale (the new guest will allocate new
+    // queue rings).
+    let mut warm_restarted = warm_restarted;
+    'session: loop {
     let (descriptor_table_address, available_ring_address, used_ring_address) = if warm_restarted {
         (
-            descriptor_table_address,
-            available_ring_address,
-            used_ring_address,
+            descriptor_table_address.clone(),
+            available_ring_address.clone(),
+            used_ring_address.clone(),
         )
     } else {
         // Cold start: drive the guest through the init handshake.
@@ -752,6 +761,39 @@ pub fn run_device(
             return;
         }
 
+        // Reset detection (#59). The kernel writes `STATUS = 0` to
+        // start a fresh virtio session — typically when a previous
+        // consumer (U-Boot DM-virtio under our `--uboot` boot path)
+        // already brought the device past `DRIVER_OK` and the new
+        // consumer wants to re-run init from scratch. Without this
+        // check the daemon stays in runtime ignoring the kernel's
+        // re-init writes; the patched kernel times out on
+        // `sel_generation` and stock kernels fail at queue setup.
+        // We exit the runtime loop and `continue 'session` to
+        // re-enter the cold-start handshake.
+        let status = unsafe { ptr::read_volatile(regs.status) };
+        if status == 0 {
+            eprintln!(
+                "virtio: device {} guest reset (STATUS=0); re-entering handshake",
+                device.device_id()
+            );
+            warm_restarted = false;
+            // Zero our stash region — the previous session's queue
+            // addresses are gone, and we don't want them to confuse
+            // a future warm-restart probe (or, after we
+            // `continue 'session`, the next cold-start's stash
+            // write).
+            unsafe {
+                for i in 0..num_queues as usize {
+                    let base = mmio_base.add(STASH_OFFSET + i * STASH_PER_QUEUE);
+                    ptr::write_volatile(base as *mut u64, 0);
+                    ptr::write_volatile(base.add(8) as *mut u64, 0);
+                    ptr::write_volatile(base.add(16) as *mut u64, 0);
+                }
+            }
+            continue 'session;
+        }
+
         interrupt_ctl.ack_interrupt(regs.interrupt_ack);
 
         // Track whether any queue actually had work to do this pass, so we
@@ -890,6 +932,10 @@ pub fn run_device(
             libc::usleep(sleep_us);
         }
     }
+    // Exit-flag tripped during runtime; bail out (the outer 'session
+    // loop is escaped by `return`s above on errors).
+    return;
+    } // 'session: loop
 }
 
 #[cfg(test)]
