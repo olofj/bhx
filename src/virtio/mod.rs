@@ -204,66 +204,43 @@ const STASH_PER_QUEUE: usize = 24; // desc_addr + avail_addr + used_addr, each u
 // Pure-decode handshake helpers
 //
 // These are the decisions `run_device` makes after each MMIO read. Pulling
-// them out lets unit tests pin behavior (notably the `wrapping_add(1)` fix
-// for sel_generation overflow at u32::MAX — a regression that hardware
+// them out lets unit tests pin the behavior (notably the `wrapping_add(1)`
+// fix for sel_generation overflow at u32::MAX — a regression that hardware
 // observation alone wouldn't catch quickly) without poking real registers.
 // ---------------------------------------------------------------------------
 
-/// Phase 2 decision: feature negotiation via `sel_generation`.
+/// `sel_generation` echo helper. Patched guests (Linux + U-Boot) write
+/// `prev + 1` to the daemon-private `sel_generation` register at offset
+/// `0x01c` and spin until the daemon writes back something different.
+/// Stock guests don't touch this register at all.
 ///
-/// Inputs:
-/// - `initial_status`: status read at the *top* of the loop iteration.
-/// - `recheck_status`: status re-read *after* observing curr_gen != prev_gen,
-///   to close the window where the guest flipped FEATURES_OK and bumped
-///   the generation for queue setup between our two reads. Ignored when
-///   `curr_gen == prev_gen`.
-/// - `curr_gen` / `prev_gen`: latest and last-acked sel_generation values.
-#[derive(Debug, PartialEq, Eq)]
-enum Phase2Action {
-    Done,
-    Wait,
-    BumpFeatures { next_gen: u32 },
-}
-
-fn phase2_decide(
-    initial_status: u32,
-    recheck_status: u32,
-    curr_gen: u32,
-    prev_gen: u32,
-) -> Phase2Action {
-    if initial_status & VIRTIO_CONFIG_S_FEATURES_OK != 0 {
-        return Phase2Action::Done;
-    }
-    if curr_gen == prev_gen {
-        return Phase2Action::Wait;
-    }
-    if recheck_status & VIRTIO_CONFIG_S_FEATURES_OK != 0 {
-        return Phase2Action::Done;
-    }
-    Phase2Action::BumpFeatures {
-        next_gen: curr_gen.wrapping_add(1),
-    }
-}
-
-/// Phase 3 decision: queue address exchange. Decoupled from MMIO reads
-/// so tests can pin the wrap-around for invalid queue indices and the
-/// "configure → bump" sequencing.
-#[derive(Debug, PartialEq, Eq)]
-enum Phase3Action {
-    Wait,
-    Skip { next_gen: u32 },
-    Configure { q: usize, next_gen: u32 },
-}
-
-fn phase3_decide(curr_gen: u32, prev_gen: u32, q: usize, num_queues: usize) -> Phase3Action {
-    if curr_gen == prev_gen {
-        return Phase3Action::Wait;
-    }
-    let next_gen = curr_gen.wrapping_add(1);
-    if q >= num_queues {
-        Phase3Action::Skip { next_gen }
+/// Returns `Some(next)` if the guest has written a new value the daemon
+/// hasn't echoed yet; the caller writes `next` back into the register
+/// to release the patched-guest spin. Returns `None` when there's no
+/// new bump to ack, which is the steady state for stock guests.
+///
+/// `wrapping_add(1)` is mandatory: the register is a `u32` and a plain
+/// `+ 1` panics in debug builds when the guest reaches `u32::MAX`
+/// legitimately, *or* when garbage from a concurrent-write race lands
+/// in the read.
+fn echo_sel_generation(curr_gen: u32, last_echoed: u32) -> Option<u32> {
+    if curr_gen == last_echoed {
+        None
     } else {
-        Phase3Action::Configure { q, next_gen }
+        Some(curr_gen.wrapping_add(1))
+    }
+}
+
+/// Has the guest written a new `device_features_sel`? Returns `Some(idx)`
+/// where `idx` is the array index (`& 1`) into [`VirtioDeviceImpl::device_features`]
+/// the daemon should now expose at `device_features`. Returns `None` when
+/// the value matches what we last published, so callers don't issue an
+/// unnecessary MMIO write.
+fn next_features_sel(curr_sel: u32, last_published_sel: u32) -> Option<usize> {
+    if curr_sel == last_published_sel {
+        None
+    } else {
+        Some((curr_sel as usize) & 1)
     }
 }
 
@@ -462,92 +439,163 @@ pub fn run_device(
             }
         }
 
-        // Phase 2: Feature negotiation via sel_generation.
+        // Phase 2: feature negotiation.
         //
-        // sel_generation is shared with Phase 3, so we must be careful not to
-        // consume a queue-setup bump as if it were a feature event. The guest
-        // sets FEATURES_OK between the last feature bump and the first queue
-        // bump; if FEATURES_OK is observed, any outstanding bump belongs to
-        // Phase 3 and we leave it for that loop to handle.
-        let mut prev_gen: u32 = 0;
+        // Two flavors of guest share this loop:
+        // - **Stock** virtio-mmio drivers (upstream Linux without our
+        //   patch, U-Boot DM virtio without #49's patch) write
+        //   `device_features_sel` then immediately read
+        //   `device_features` — no spin-gate. We pre-populate
+        //   `device_features` with `features[0]` so the first read at
+        //   the default `_sel = 0` is correct, then poll `_sel` and
+        //   update `device_features` whenever it changes. The race
+        //   window between the guest's `_sel` write and `_features`
+        //   read is shorter than the daemon's busy-poll cadence on
+        //   real hardware (#50); on Blackhole, uncached MMIO reads
+        //   from the L2CPU side are slower than our PCIe round-trip.
+        // - **Patched** drivers (our kernel + U-Boot tree) additionally
+        //   bump `sel_generation = prev + 1` after each register write
+        //   and spin until the daemon echoes a different value. We
+        //   keep echoing those bumps so patched drivers terminate
+        //   their spin — but we no longer *require* a bump to do
+        //   feature work, so a stock driver is no longer fatally
+        //   stuck here.
+        //
+        // No `usleep` in this loop: tight polling is the only way the
+        // daemon catches the stock-driver `_sel → _features` window
+        // before the guest's read returns. The loop terminates when
+        // the guest sets `FEATURES_OK`, which it does within a
+        // microsecond after the second feature read on every guest
+        // we've measured.
+        unsafe {
+            // Pre-populate so the first stock-guest read sees a
+            // coherent value (sel=0 is the post-zeroing default).
+            ptr::write_volatile(regs.device_features, features[0]);
+        }
+        let mut last_published_sel: u32 = 0;
+        let mut last_echoed_gen: u32 = 0;
         while !exit_flag.load(Ordering::Relaxed) {
-            let initial_status = unsafe { ptr::read_volatile(regs.status) };
-            let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
-            // Re-check status only when the gen changed; phase2_decide
-            // ignores the recheck input otherwise. Reading early would
-            // cost an extra MMIO load per spin while the guest hasn't
-            // moved.
-            let recheck_status = if curr_gen != prev_gen {
-                unsafe { ptr::read_volatile(regs.status) }
-            } else {
-                initial_status
-            };
-            match phase2_decide(initial_status, recheck_status, curr_gen, prev_gen) {
-                Phase2Action::Done => break,
-                Phase2Action::Wait => {}
-                Phase2Action::BumpFeatures { next_gen } => {
-                    let sel = unsafe { ptr::read_volatile(regs.device_features_sel) };
-                    unsafe {
-                        ptr::write_volatile(regs.device_features, features[sel as usize & 1]);
-                        ptr::write_volatile(regs.sel_generation, next_gen);
-                    }
-                    prev_gen = next_gen;
+            if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_FEATURES_OK != 0 {
+                break;
+            }
+            let curr_sel = unsafe { ptr::read_volatile(regs.device_features_sel) };
+            if let Some(idx) = next_features_sel(curr_sel, last_published_sel) {
+                unsafe {
+                    ptr::write_volatile(regs.device_features, features[idx]);
                 }
+                last_published_sel = curr_sel;
+            }
+            let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
+            if let Some(next) = echo_sel_generation(curr_gen, last_echoed_gen) {
+                unsafe {
+                    ptr::write_volatile(regs.sel_generation, next);
+                }
+                last_echoed_gen = next;
             }
         }
+
+        // Phase 3: capture per-queue config as the guest writes it,
+        // then wait for DRIVER_OK.
+        //
+        // The virtio-mmio spec multiplexes `QUEUE_DESC` /
+        // `QUEUE_AVAIL` / `QUEUE_USED` (and `QUEUE_READY`) through
+        // `QUEUE_SEL`: each per-queue register access is implicitly
+        // scoped to the currently-selected queue. Real hardware
+        // demultiplexes per access; we have flat DRAM-backed
+        // registers, so each queue's writes overwrite the previous
+        // queue's values in the same DRAM cell.
+        //
+        // To recover per-queue values without the old `sel_generation`
+        // gate, we poll `QUEUE_SEL`: when the guest moves to the
+        // next queue, the previous queue's writes are complete and
+        // sitting in MMIO — we snapshot them into per-queue daemon
+        // state before the next queue's writes overwrite them.
+        // Tens of microseconds typically pass between
+        // `writel(SEL=next)` and the next queue's first
+        // `writel(DESC_LOW)` (kernel `vring_create_virtqueue` does
+        // memory allocation in between), comfortably wider than the
+        // daemon's PCIe poll cadence.
+        //
+        // We also clear `QUEUE_READY` on every `SEL` transition so
+        // the next queue's "READY must be 0 at start of setup"
+        // check (vm_setup_vq returns -ENOENT otherwise) sees a fresh
+        // register. Patched guests get their `sel_generation` bumps
+        // echoed too so their spin-waits terminate.
+        let mut q_state: Vec<[u64; 3]> = vec![[0u64; 3]; num_queues as usize];
+        let mut last_sel: u32 = 0;
+        let snapshot_current_queue = |q_state: &mut Vec<[u64; 3]>, sel: u32| {
+            let qi = sel as usize;
+            if qi >= q_state.len() {
+                return;
+            }
+            unsafe {
+                q_state[qi][0] = ((ptr::read_volatile(regs.queue_desc_high) as u64) << 32)
+                    | (ptr::read_volatile(regs.queue_desc_low) as u64);
+                q_state[qi][1] = ((ptr::read_volatile(regs.queue_avail_high) as u64) << 32)
+                    | (ptr::read_volatile(regs.queue_avail_low) as u64);
+                q_state[qi][2] = ((ptr::read_volatile(regs.queue_used_high) as u64) << 32)
+                    | (ptr::read_volatile(regs.queue_used_low) as u64);
+            }
+        };
+        while !exit_flag.load(Ordering::Relaxed) {
+            if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_DRIVER_OK != 0 {
+                break;
+            }
+            // Eager `QUEUE_READY` clear: the guest just wrote 1 to
+            // mark the current queue ready, but its first action on
+            // the next queue is `readl(QUEUE_READY)` expecting 0
+            // (vm_setup_vq returns -ENOENT otherwise). Real hardware
+            // demultiplexes through `QUEUE_SEL`; we clear the single
+            // DRAM cell as soon as we see it set so the next queue's
+            // start-of-setup read sees fresh 0.
+            //
+            // Race window between the guest's `writel(QUEUE_READY=1)`
+            // and the next queue's `readl(QUEUE_READY)`: the
+            // kernel/U-Boot returns from `setup_vq`, runs the per-queue
+            // loop body, calls `setup_vq` again, then issues two
+            // MMIO ops (`QUEUE_SEL` write + `QUEUE_READY` read) — on
+            // the order of microseconds, comfortably wider than this
+            // poll loop's PCIe iteration cost. The clear isn't gated
+            // on `QUEUE_SEL` change because the guest may set
+            // `QUEUE_READY=1` and proceed to the next queue's
+            // `QUEUE_SEL` write so quickly that a sel-gated clear
+            // would lose the race.
+            if unsafe { ptr::read_volatile(regs.queue_ready) } != 0 {
+                unsafe {
+                    ptr::write_volatile(regs.queue_ready, 0);
+                }
+            }
+            let curr_sel = unsafe { ptr::read_volatile(regs.queue_select) };
+            if curr_sel != last_sel {
+                // The guest moved to a new queue. The previous
+                // queue's writes (DESC / AVAIL / USED) are still in
+                // MMIO; capture them into our per-queue state before
+                // the next queue's writes overwrite them.
+                snapshot_current_queue(&mut q_state, last_sel);
+                last_sel = curr_sel;
+            }
+            let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
+            if let Some(next) = echo_sel_generation(curr_gen, last_echoed_gen) {
+                unsafe {
+                    ptr::write_volatile(regs.sel_generation, next);
+                }
+                last_echoed_gen = next;
+            }
+        }
+
+        // The guest's last queue setup never had a following SEL
+        // change to trigger the snapshot above — DRIVER_OK was
+        // written instead. Capture it now from whatever the MMIO
+        // still holds for that queue.
+        snapshot_current_queue(&mut q_state, last_sel);
 
         let mut desc = vec![0u64; num_queues as usize];
         let mut avail = vec![0u64; num_queues as usize];
         let mut used = vec![0u64; num_queues as usize];
-
-        // Phase 3: Queue address exchange. Track which queues have been
-        // configured; only break when every queue has been seen. The earlier
-        // version broke on the last queue index, which loses addresses if a
-        // stray sel_generation bump during the Phase 2/3 transition gets
-        // consumed by Phase 2.
-        let mut queues_seen = vec![false; num_queues as usize];
-        while !exit_flag.load(Ordering::Relaxed) {
-            let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
-            unsafe {
-                ptr::write_volatile(regs.queue_ready, 0);
-            }
-            let q = unsafe { ptr::read_volatile(regs.queue_select) } as usize;
-            match phase3_decide(curr_gen, prev_gen, q, num_queues as usize) {
-                Phase3Action::Wait => unsafe {
-                    libc::usleep(1);
-                },
-                Phase3Action::Skip { next_gen } => {
-                    unsafe {
-                        ptr::write_volatile(regs.sel_generation, next_gen);
-                    }
-                    prev_gen = next_gen;
-                    unsafe {
-                        libc::usleep(1);
-                    }
-                }
-                Phase3Action::Configure { q, next_gen } => {
-                    desc[q] = unsafe {
-                        ((ptr::read_volatile(regs.queue_desc_high) as u64) << 32)
-                            | (ptr::read_volatile(regs.queue_desc_low) as u64)
-                    };
-                    avail[q] = unsafe {
-                        ((ptr::read_volatile(regs.queue_avail_high) as u64) << 32)
-                            | (ptr::read_volatile(regs.queue_avail_low) as u64)
-                    };
-                    used[q] = unsafe {
-                        ((ptr::read_volatile(regs.queue_used_high) as u64) << 32)
-                            | (ptr::read_volatile(regs.queue_used_low) as u64)
-                    };
-                    queues_seen[q] = true;
-                    unsafe {
-                        ptr::write_volatile(regs.sel_generation, next_gen);
-                    }
-                    prev_gen = next_gen;
-                    if queues_seen.iter().all(|&b| b) {
-                        break;
-                    }
-                }
-            }
+        for i in 0..num_queues as usize {
+            desc[i] = q_state[i][0];
+            avail[i] = q_state[i][1];
+            used[i] = q_state[i][2];
         }
 
         // Persist the queue addresses so a future server instance can resume.
@@ -557,13 +605,6 @@ pub fn run_device(
                 ptr::write_volatile(base as *mut u64, desc[i]);
                 ptr::write_volatile(base.add(8) as *mut u64, avail[i]);
                 ptr::write_volatile(base.add(16) as *mut u64, used[i]);
-            }
-        }
-
-        // Wait for DRIVER_OK
-        while !exit_flag.load(Ordering::Relaxed) {
-            if unsafe { ptr::read_volatile(regs.status) } & VIRTIO_CONFIG_S_DRIVER_OK != 0 {
-                break;
             }
         }
 
@@ -816,8 +857,6 @@ pub fn run_device(
 mod tests {
     use super::*;
 
-    const FEATURES_OK: u32 = VIRTIO_CONFIG_S_FEATURES_OK;
-
     #[test]
     fn interrupt_kind_routes_to_correct_metric() {
         // Both arms use distinct global statics; pick a fresh idx
@@ -842,75 +881,61 @@ mod tests {
     }
 
     #[test]
-    fn phase2_done_when_initial_status_has_features_ok() {
-        // Initial status already says FEATURES_OK — the recheck and
-        // generation values shouldn't matter.
-        assert_eq!(phase2_decide(FEATURES_OK, 0, 5, 5), Phase2Action::Done);
-        assert_eq!(phase2_decide(FEATURES_OK, 0, 7, 5), Phase2Action::Done);
+    fn echo_sel_generation_skips_when_unchanged() {
+        // Steady state: guest has no new bump for the daemon to ack.
+        // Stock guests sit here permanently (they never write the
+        // register); patched guests sit here between handshake steps.
+        assert_eq!(echo_sel_generation(0, 0), None);
+        assert_eq!(echo_sel_generation(7, 7), None);
     }
 
     #[test]
-    fn phase2_waits_when_gen_unchanged() {
-        // Status not yet FEATURES_OK and gen hasn't moved — keep spinning.
-        assert_eq!(phase2_decide(0, 0, 5, 5), Phase2Action::Wait);
+    fn echo_sel_generation_bumps_normally() {
+        // Patched guest wrote prev+1 (=6); daemon last echoed 5;
+        // daemon now writes 7 to release the spin.
+        assert_eq!(echo_sel_generation(6, 5), Some(7));
     }
 
     #[test]
-    fn phase2_done_when_recheck_status_has_features_ok() {
-        // Initial status was 0 but the guest flipped FEATURES_OK between
-        // our two reads. Don't treat the bump as feature-negotiation — it
-        // belongs to Phase 3.
-        assert_eq!(phase2_decide(0, FEATURES_OK, 6, 5), Phase2Action::Done);
+    fn echo_sel_generation_wraps_at_u32_max() {
+        // Regression guard: the register is a u32; plain `+ 1` panics
+        // in debug builds when the guest reaches u32::MAX legitimately
+        // *or* when garbage from a concurrent-write race lands in the
+        // read. The wrapping_add is the contract.
+        assert_eq!(echo_sel_generation(u32::MAX, 0), Some(0));
     }
 
     #[test]
-    fn phase2_bumps_with_wrap_at_u32_max() {
-        // Regression guard: sel_generation is a u32 MMIO counter; plain
-        // `+ 1` panics in debug builds when it reaches u32::MAX. The
-        // wrapping_add is the contract.
-        assert_eq!(
-            phase2_decide(0, 0, u32::MAX, 0),
-            Phase2Action::BumpFeatures { next_gen: 0 }
-        );
+    fn next_features_sel_skips_when_sel_unchanged() {
+        // Guest hasn't moved the selector; no MMIO write needed and
+        // we don't want to thrash device_features just because the
+        // poll loop ran another iteration.
+        assert_eq!(next_features_sel(0, 0), None);
+        assert_eq!(next_features_sel(1, 1), None);
     }
 
     #[test]
-    fn phase2_bumps_normally_for_low_gen_values() {
-        assert_eq!(
-            phase2_decide(0, 0, 6, 5),
-            Phase2Action::BumpFeatures { next_gen: 7 }
-        );
+    fn next_features_sel_returns_low_index_for_zero() {
+        // Default case: guest selects the low half (bits 0..32).
+        assert_eq!(next_features_sel(0, 1), Some(0));
     }
 
     #[test]
-    fn phase3_waits_when_gen_unchanged() {
-        assert_eq!(phase3_decide(5, 5, 0, 2), Phase3Action::Wait);
+    fn next_features_sel_returns_high_index_for_one() {
+        // Guest selects high half (bits 32..64) — VIRTIO_F_VERSION_1
+        // lives in there for our modern-only devices.
+        assert_eq!(next_features_sel(1, 0), Some(1));
     }
 
     #[test]
-    fn phase3_skips_invalid_queue_idx_with_wrap() {
-        // q out of range: skip this gen, bump regardless. The wrap matters
-        // here too — same u32 counter.
-        assert_eq!(
-            phase3_decide(u32::MAX, 0, 99, 2),
-            Phase3Action::Skip { next_gen: 0 }
-        );
-        assert_eq!(
-            phase3_decide(6, 5, 5, 2),
-            Phase3Action::Skip { next_gen: 7 }
-        );
-    }
-
-    #[test]
-    fn phase3_configures_valid_queue_idx_with_wrap() {
-        assert_eq!(
-            phase3_decide(u32::MAX, 0, 1, 2),
-            Phase3Action::Configure { q: 1, next_gen: 0 }
-        );
-        assert_eq!(
-            phase3_decide(6, 5, 0, 2),
-            Phase3Action::Configure { q: 0, next_gen: 7 }
-        );
+    fn next_features_sel_clamps_unexpected_values_to_one_bit() {
+        // Spec only defines _sel ∈ {0, 1}, but a buggy or hostile
+        // guest could write any u32. We mask to one bit so the
+        // index stays in range of `device_features: [u32; 2]`
+        // and we don't read out-of-bounds.
+        assert_eq!(next_features_sel(2, 1), Some(0));
+        assert_eq!(next_features_sel(3, 0), Some(1));
+        assert_eq!(next_features_sel(0xffff_ffff, 0), Some(1));
     }
 
     #[test]
