@@ -590,6 +590,8 @@ fn dispatch_boot(
         initramfs,
         root_device,
         force_reset_pcie,
+        disk.is_some(),
+        network,
     )
     .map_err(|e| {
         dlog!("[boot l2cpu {}] boot sequence failed: {}", l2cpu_idx, e);
@@ -801,6 +803,8 @@ fn run_boot_sequence(
     initramfs: Option<&str>,
     root_device: &str,
     force_reset_pcie: bool,
+    has_disk: bool,
+    has_network: bool,
 ) -> io::Result<Arc<L2Cpu>> {
     use crate::regs::boot_image;
 
@@ -902,6 +906,34 @@ fn run_boot_sequence(
         rootfs_addr,
     )?;
 
+    // Pre-write virtio MMIO magic + version + device-id for slots that
+    // will get a worker. Without this, fast-init guests like U-Boot
+    // probe MMIO sub-millisecond after reset release and read 0 — the
+    // workers spawn ~50-200ms later and would write the right values
+    // then, but by that time U-Boot has already silently bound zero
+    // virtio_blk children. Linux is tolerant because its virtio probe
+    // sits behind init+initramfs latency. See #46.
+    //
+    // The actual workers re-write these bytes on cold-start (the path
+    // when no stash is present) and the writes are idempotent, so
+    // there's no double-init bug. Doing the pre-write from the daemon
+    // main thread also avoids reordering the worker spawn relative to
+    // reset release, which would invasively touch the slot lifecycle.
+    if has_disk {
+        pre_init_virtio_mmio(
+            &l2cpu,
+            starting_address + memory_size - crate::regs::virtio_mmio::DISK_OFFSET,
+            crate::regs::virtio_mmio::VIRTIO_ID_BLOCK,
+        );
+    }
+    if has_network {
+        pre_init_virtio_mmio(
+            &l2cpu,
+            starting_address + memory_size - crate::regs::virtio_mmio::NET_OFFSET,
+            crate::regs::virtio_mmio::VIRTIO_ID_NET,
+        );
+    }
+
     dlog!("[run_boot l2cpu {}] releasing from reset", l2cpu_idx);
     // reset_x280 goes through SharedChip so the PLL step and the
     // L2CPU_RESET R-M-W serialize against any other boot RPC issuing the
@@ -911,6 +943,33 @@ fn run_boot_sequence(
     boot::configure_prefetchers(&l2cpu);
     dlog!("[run_boot l2cpu {}] run_boot_sequence done", l2cpu_idx);
     Ok(l2cpu)
+}
+
+/// Pre-write the standard virtio-mmio header registers (magic, version,
+/// device-id) for one MMIO slot. Called from `run_boot_sequence` after
+/// boot_l2cpu but before reset release, gated on whether a worker for
+/// that slot will be spawned in `start_initial_workers`. The actual
+/// worker re-writes the same bytes during cold-start handshake.
+///
+/// This is a per-volatile-store helper that doesn't try to do the full
+/// init the worker eventually does — it just gets the header to a state
+/// where a fast guest probe (e.g. U-Boot's DM virtio-mmio bind) sees
+/// the right magic and device-id. See #46.
+fn pre_init_virtio_mmio(l2cpu: &L2Cpu, mmio_addr: u64, device_id: u32) {
+    const VIRTIO_MAGIC: u32 = 0x74726976; // 'v'|'i'<<8|'r'<<16|'t'<<24
+                                          // Standard virtio-mmio register offsets (see virtio 1.2 § 4.2.2).
+    const OFF_MAGIC: u64 = 0x000;
+    const OFF_VERSION: u64 = 0x004;
+    const OFF_DEVICE_ID: u64 = 0x008;
+    dlog!(
+        "[pre_init_virtio l2cpu {}] mmio_addr=0x{:x} device_id={}",
+        l2cpu.idx(),
+        mmio_addr,
+        device_id
+    );
+    l2cpu.write32(mmio_addr + OFF_MAGIC, VIRTIO_MAGIC);
+    l2cpu.write32(mmio_addr + OFF_VERSION, 2); // virtio 1.0+ MMIO
+    l2cpu.write32(mmio_addr + OFF_DEVICE_ID, device_id);
 }
 
 /// Build the runtime slot on top of an already-constructed `L2Cpu`. All

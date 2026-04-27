@@ -100,6 +100,11 @@ pub mod virtio_mmio {
     pub const DISK_IRQ: u32 = 33;
     /// PLIC interrupt for virtio-net.
     pub const NET_IRQ: u32 = 32;
+
+    /// VirtIO `device_id` value for the block device (block = 2).
+    pub const VIRTIO_ID_BLOCK: u32 = 2;
+    /// VirtIO `device_id` value for the network device (net = 1).
+    pub const VIRTIO_ID_NET: u32 = 1;
 }
 
 /// Slirp host-side port allocation for SSH forwarding to the guest.
