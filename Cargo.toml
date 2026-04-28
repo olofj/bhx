@@ -7,6 +7,13 @@ license = "MIT"
 [features]
 default = ["slirp"]
 slirp = [] # Links libvdeslirp/libslirp for network device support
+# Route the L2CPU's virtio-mmio reg windows through a Tensix tile
+# running the M3 BRISC firmware (#69) instead of the host-buffer
+# DMA path (#64). Off by default for M4 (#70) — flips on once the
+# daemon-side bridge in M5 (#71) is also wired up. Toggling the flag
+# rebuilds the daemon; you can run both paths side-by-side by
+# rebuilding without the flag.
+virtio-engine = []
 
 [dependencies]
 libc = "0.2"

@@ -25,6 +25,21 @@ block the push and require an immediate follow-up commit. Skipping
 `cargo fmt` locally has been the most common cause of red CI on this
 project — don't skip it.
 
+When touching code under a non-default Cargo feature (currently
+`virtio-engine` for the #66 Tensix-engine work), also run clippy
+and test with the feature on:
+
+```bash
+cargo clippy --all-targets --features virtio-engine -- -D warnings
+cargo test --features virtio-engine
+```
+
+The default-feature gates above don't exercise feature-gated code;
+silent regressions sit dormant until someone opts in. Run the
+feature-on form whenever you change code in `src/tensix_engine.rs`,
+`src/daemon/mod.rs`'s engine getter, or any `#[cfg(feature =
+"virtio-engine")]` block.
+
 Ambition does not mean scope creep. Stay ruthless about simplicity:
 - Don't invent abstractions for hypothetical future needs.
 - Don't add code the task doesn't require.

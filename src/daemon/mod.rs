@@ -148,6 +148,13 @@ pub struct DaemonState {
     /// if they ever need chip-wide register access. See
     /// <https://github.com/olofj/tt-bh-rust/issues/1>.
     pub shared_chip: Arc<SharedChip>,
+    /// Tensix tile reserved for the M3+ virtio-mmio engine (#69). One
+    /// tile serves all four L2CPUs on the card. Brought up lazily on
+    /// the first boot under the `virtio-engine` feature flag —
+    /// `None` until then, and unconditionally `None` when the flag is
+    /// off. `Mutex` so concurrent boots serialize the bring-up
+    /// (only the first one runs the firmware load + reset release).
+    pub tensix_engine: Mutex<Option<Arc<crate::tensix_engine::TensixEngine>>>,
     /// Set by the shutdown handler to make the accept loop exit.
     pub shutdown: Arc<AtomicBool>,
 }
@@ -174,8 +181,28 @@ impl DaemonState {
                 AtomicBool::new(false),
             ],
             shared_chip,
+            tensix_engine: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Lazy getter for the Tensix virtio engine. First call brings
+    /// up the tile (picks via M2, loads M3 firmware, releases BRISC);
+    /// subsequent calls return the cached `Arc`. Only useful when
+    /// the `virtio-engine` feature is enabled — without it, callers
+    /// should not invoke this (use the host-buffer #64 path instead).
+    #[cfg(feature = "virtio-engine")]
+    pub fn get_or_bring_up_tensix_engine(
+        &self,
+    ) -> std::io::Result<Arc<crate::tensix_engine::TensixEngine>> {
+        let mut guard = self.tensix_engine.lock().unwrap();
+        if let Some(eng) = guard.as_ref() {
+            return Ok(Arc::clone(eng));
+        }
+        let eng = crate::tensix_engine::TensixEngine::bring_up(self.card, &self.shared_chip)?;
+        let arc = Arc::new(eng);
+        *guard = Some(Arc::clone(&arc));
+        Ok(arc)
     }
 }
 

@@ -28,6 +28,7 @@ mod shared_chip;
 mod slirp_ffi;
 mod telemetry;
 mod tensix;
+mod tensix_engine;
 mod tensix_tile;
 mod tlb;
 mod virtio;
