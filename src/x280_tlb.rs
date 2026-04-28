@@ -36,15 +36,12 @@ pub const SMALL_TLB_WINDOW_SIZE: u64 = 1u64 << SMALL_TLB_WINDOW_SHIFT;
 pub const PCIE_TILE_X: u32 = 19;
 pub const PCIE_TILE_Y: u32 = 24;
 
-/// Per-L2CPU small-TLB slot allocations for the host-side virtio
-/// devices in #64. Each L2CPU has its own 224-slot table, so these
-/// indices are independent across cores; we centralise the
-/// assignment here so the constants are easy to spot when adding a
-/// new device to the host-buffer path.
-pub const RNG_TLB_SLOT: usize = 0;
-pub const NET_TLB_SLOT: usize = 1;
-pub const DISK_TLB_SLOT: usize = 2;
-pub const CONSOLE_TLB_SLOT: usize = 3;
+/// Per-L2CPU small-TLB slot allocation for the shared virtio MMIO
+/// buffer in #64. One TLB window covers all four virtio devices on
+/// the L2CPU (rng/net/disk/console), each device occupying a 4 KiB
+/// sub-region. Each L2CPU has its own 224-slot table, so this
+/// index is independent across cores.
+pub const SHARED_TLB_SLOT: usize = 0;
 
 /// Program one small (2 MiB) x280 TLB window for unicast access to a
 /// single NoC tile.

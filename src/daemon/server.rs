@@ -639,46 +639,42 @@ fn dispatch_boot(
         l2cpu_idx
     );
 
-    // Resolve each migrated device's MMIO backing and stash its
-    // buffer so it outlives the worker. Chip-DRAM is the historical
-    // path; host-buffer (#64) is selected when `run_boot_sequence`
-    // allocated one.
-    let rng_backing = match &arts.rng_buf {
-        Some(buf) => crate::virtio::MmioBacking::Host {
-            va: buf.as_ptr() as usize,
-        },
-        None => crate::virtio::MmioBacking::ChipDram {
-            region_offset: crate::regs::virtio_mmio::RNG_OFFSET,
-        },
+    // Resolve each migrated device's MMIO backing from the shared
+    // host-MMIO buffer (or fall back to chip-DRAM if no host buffer
+    // was allocated for this boot — which today only happens when
+    // every device is disabled). One iATU region + one x280 small
+    // TLB cover all four sub-regions; each device's daemon-side VA
+    // is `buf.as_ptr() + index * 4096`.
+    let host_va_for = |index: usize| -> Option<usize> {
+        arts.virtio_host_mmio
+            .as_ref()
+            .map(|m| m.device_va(index) as usize)
     };
-    let net_backing = match &arts.net_buf {
-        Some(buf) => crate::virtio::MmioBacking::Host {
-            va: buf.as_ptr() as usize,
-        },
-        None => crate::virtio::MmioBacking::ChipDram {
-            region_offset: crate::regs::virtio_mmio::NET_OFFSET,
-        },
+    let backing_for = |index: usize, chip_offset: u64| -> crate::virtio::MmioBacking {
+        match host_va_for(index) {
+            Some(va) => crate::virtio::MmioBacking::Host { va },
+            None => crate::virtio::MmioBacking::ChipDram {
+                region_offset: chip_offset,
+            },
+        }
     };
-    let disk_backing = match &arts.disk_buf {
-        Some(buf) => crate::virtio::MmioBacking::Host {
-            va: buf.as_ptr() as usize,
-        },
-        None => crate::virtio::MmioBacking::ChipDram {
-            region_offset: crate::regs::virtio_mmio::DISK_OFFSET,
-        },
-    };
-    let console_backing = match &arts.console_buf {
-        Some(buf) => crate::virtio::MmioBacking::Host {
-            va: buf.as_ptr() as usize,
-        },
-        None => crate::virtio::MmioBacking::ChipDram {
-            region_offset: crate::regs::virtio_mmio::CONSOLE_OFFSET,
-        },
-    };
-    slot.virtio_rng_buf = arts.rng_buf;
-    slot.virtio_net_buf = arts.net_buf;
-    slot.virtio_disk_buf = arts.disk_buf;
-    slot.virtio_console_buf = arts.console_buf;
+    let rng_backing = backing_for(
+        crate::host_buf::RNG_INDEX,
+        crate::regs::virtio_mmio::RNG_OFFSET,
+    );
+    let net_backing = backing_for(
+        crate::host_buf::NET_INDEX,
+        crate::regs::virtio_mmio::NET_OFFSET,
+    );
+    let disk_backing = backing_for(
+        crate::host_buf::DISK_INDEX,
+        crate::regs::virtio_mmio::DISK_OFFSET,
+    );
+    let console_backing = backing_for(
+        crate::host_buf::CONSOLE_INDEX,
+        crate::regs::virtio_mmio::CONSOLE_OFFSET,
+    );
+    slot.virtio_host_mmio = arts.virtio_host_mmio;
 
     start_initial_workers(
         &mut slot,
@@ -987,19 +983,17 @@ fn start_rng_worker(
 }
 
 /// Output of `run_boot_sequence`. The L2Cpu is what every later step in
-/// dispatch_boot drives off of. The optional buffers are `Some` exactly
-/// when this boot allocated a host-side MMIO buffer for that device
-/// (see #64); each buffer's `noc_address` and `as_ptr()` were already
-/// used during this sequence to program an x280 small TLB and patch
-/// the DTB, but the daemon needs to keep the buffer alive for the
-/// worker's lifetime. dispatch_boot stashes them in the matching
-/// `slot.virtio_*_buf` field.
+/// dispatch_boot drives off of. `virtio_host_mmio` is the shared
+/// host-side MMIO buffer (#64) covering whichever subset of
+/// rng/net/disk/console were configured to live on host RAM for this
+/// boot — already used during this sequence to program one outbound
+/// iATU region + one x280 small TLB and to patch the DTB with each
+/// sub-region's x280 PA, but the daemon needs to keep the buffer
+/// alive for the workers' lifetime. dispatch_boot stashes it in
+/// `slot.virtio_host_mmio`.
 pub struct BootArtifacts {
     pub l2cpu: Arc<L2Cpu>,
-    pub rng_buf: Option<crate::host_buf::HostDmaBuf>,
-    pub net_buf: Option<crate::host_buf::HostDmaBuf>,
-    pub disk_buf: Option<crate::host_buf::HostDmaBuf>,
-    pub console_buf: Option<crate::host_buf::HostDmaBuf>,
+    pub virtio_host_mmio: Option<crate::host_buf::VirtioHostMmio>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1108,96 +1102,108 @@ fn run_boot_sequence(
     // multi-queue race — virtio_net, the only multi-queue device that
     // matters today, was already known to bind reliably when block
     // probes after net so we keep DISK last.
-    let mut virtio_nodes: Vec<crate::boot::VirtioMmioNode> = Vec::with_capacity(4);
+    let mut virtio_nodes: Vec<crate::boot::VirtioMmioNode> = Vec::with_capacity(8);
 
-    // Allocate one DMA-coherent buffer + program one x280 small TLB
-    // for `device_id`, pre-init the standard register window, and add
-    // a DTB node pointing at the resulting x280 PA. Returns the
-    // owning `HostDmaBuf` so the caller stashes it in the slot.
-    let mut alloc_host_mmio = |buf_index: u8,
-                           tlb_slot: usize,
-                           device_id: u32,
-                           irq: u32,
-                           label: &str|
-     -> io::Result<crate::host_buf::HostDmaBuf> {
-        let buf = crate::host_buf::HostDmaBuf::allocate(l2cpu.fd(), 4096, buf_index)
+    // One shared 16 KiB host buffer per L2CPU, partitioned into 4 KiB
+    // sub-regions, one per virtio device. Cuts iATU outbound usage
+    // from up-to-4-per-L2CPU (16/16 chip-wide and brittle) to one
+    // per L2CPU (4/16, with room to grow). One x280 small TLB window
+    // covers every device; the kernel sees each device at a distinct
+    // 4 KiB-aligned x280 PA. See `host_buf::VirtioHostMmio`.
+    let any_host_device = has_rng || has_network || has_disk || has_console;
+    let virtio_host_mmio: Option<crate::host_buf::VirtioHostMmio> = if any_host_device {
+        let total_size =
+            crate::host_buf::SUB_REGION_SIZE * crate::host_buf::SUB_REGION_COUNT;
+        let buf = crate::host_buf::HostDmaBuf::allocate(l2cpu.fd(), total_size, 0x40)
             .map_err(|e| {
                 dlog!(
-                    "[run_boot l2cpu {}] HostDmaBuf::allocate for {} failed: {}",
+                    "[run_boot l2cpu {}] HostDmaBuf::allocate for shared virtio mmio failed: {}",
                     l2cpu_idx,
-                    label,
                     e
                 );
                 e
             })?;
-        let x280_pa = crate::x280_tlb::program_small_tlb_unicast(
+        let x280_base = crate::x280_tlb::program_small_tlb_unicast(
             &l2cpu,
-            tlb_slot,
+            crate::x280_tlb::SHARED_TLB_SLOT,
             crate::x280_tlb::PCIE_TILE_X,
             crate::x280_tlb::PCIE_TILE_Y,
             buf.noc_address,
         );
         dlog!(
-            "[run_boot l2cpu {}] {} host buffer: noc={:#x} x280_pa={:#x} host_va={:p}",
+            "[run_boot l2cpu {}] shared virtio mmio: noc={:#x} x280_base={:#x} host_va={:p} ({} bytes, {} sub-regions)",
             l2cpu_idx,
-            label,
             buf.noc_address,
-            x280_pa,
-            buf.as_ptr()
+            x280_base,
+            buf.as_ptr(),
+            total_size,
+            crate::host_buf::SUB_REGION_COUNT,
         );
-        pre_init_virtio_mmio_host(buf.as_ptr(), device_id);
-        virtio_nodes.push(crate::boot::VirtioMmioNode {
-            addr: x280_pa,
-            size: 4096,
-            irq,
-        });
-        Ok(buf)
-    };
 
-    let rng_buf: Option<crate::host_buf::HostDmaBuf> = if has_rng {
-        Some(alloc_host_mmio(
-            0x40,
-            crate::x280_tlb::RNG_TLB_SLOT,
+        // Sub-region helper: pre-init the device's 4 KiB sub-region
+        // (zero + magic + version + …), record its x280 PA, push a
+        // DTB node so the kernel's virtio-mmio probe sees it. Each
+        // sub-region's x280 PA sits at `x280_base + i*4096`; each
+        // device's daemon-side VA is `buf.as_ptr() + i*4096`.
+        let sub_size = crate::host_buf::SUB_REGION_SIZE as u64;
+        let mut device_x280_pa = [0u64; 4];
+        let mut configure = |index: usize,
+                             enabled: bool,
+                             device_id: u32,
+                             irq: u32,
+                             label: &str| {
+            let pa = x280_base + (index as u64) * sub_size;
+            device_x280_pa[index] = pa;
+            if enabled {
+                let va = unsafe {
+                    buf.as_ptr().add(index * crate::host_buf::SUB_REGION_SIZE as usize)
+                };
+                pre_init_virtio_mmio_host(va, device_id);
+                virtio_nodes.push(crate::boot::VirtioMmioNode {
+                    addr: pa,
+                    size: sub_size,
+                    irq,
+                });
+                dlog!(
+                    "[run_boot l2cpu {}]   {}: x280_pa={:#x}",
+                    l2cpu_idx,
+                    label,
+                    pa
+                );
+            }
+        };
+        configure(
+            crate::host_buf::RNG_INDEX,
+            has_rng,
             crate::regs::virtio_mmio::VIRTIO_ID_ENTROPY,
             crate::regs::virtio_mmio::RNG_IRQ,
             "rng",
-        )?)
-    } else {
-        None
-    };
-
-    let net_buf: Option<crate::host_buf::HostDmaBuf> = if has_network {
-        Some(alloc_host_mmio(
-            0x41,
-            crate::x280_tlb::NET_TLB_SLOT,
+        );
+        configure(
+            crate::host_buf::NET_INDEX,
+            has_network,
             crate::regs::virtio_mmio::VIRTIO_ID_NET,
             crate::regs::virtio_mmio::NET_IRQ,
             "net",
-        )?)
-    } else {
-        None
-    };
-
-    let disk_buf: Option<crate::host_buf::HostDmaBuf> = if has_disk {
-        Some(alloc_host_mmio(
-            0x42,
-            crate::x280_tlb::DISK_TLB_SLOT,
+        );
+        configure(
+            crate::host_buf::DISK_INDEX,
+            has_disk,
             crate::regs::virtio_mmio::VIRTIO_ID_BLOCK,
             crate::regs::virtio_mmio::DISK_IRQ,
             "disk",
-        )?)
-    } else {
-        None
-    };
-
-    let console_buf: Option<crate::host_buf::HostDmaBuf> = if has_console {
-        Some(alloc_host_mmio(
-            0x43,
-            crate::x280_tlb::CONSOLE_TLB_SLOT,
+        );
+        configure(
+            crate::host_buf::CONSOLE_INDEX,
+            has_console,
             crate::regs::virtio_mmio::VIRTIO_ID_CONSOLE,
             crate::regs::virtio_mmio::CONSOLE_IRQ,
             "console",
-        )?)
+        );
+        Some(crate::host_buf::VirtioHostMmio {
+            buf,
+            device_x280_pa,
+        })
     } else {
         None
     };
@@ -1304,10 +1310,7 @@ fn run_boot_sequence(
     );
     Ok(BootArtifacts {
         l2cpu,
-        rng_buf,
-        net_buf,
-        disk_buf,
-        console_buf,
+        virtio_host_mmio,
     })
 }
 
@@ -1504,13 +1507,10 @@ fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlo
             description: format!("chip_console l2cpu {}", l2cpu_idx),
         },
         disks: Vec::new(),
-        virtio_disk_buf: None,
         net: None,
-        virtio_net_buf: None,
         virtio_console: None,
-        virtio_console_buf: None,
         virtio_rng: None,
-        virtio_rng_buf: None,
+        virtio_host_mmio: None,
         started: Instant::now(),
     })
 }

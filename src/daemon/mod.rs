@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use crate::host_buf::HostDmaBuf;
+use crate::host_buf::VirtioHostMmio;
 use crate::l2cpu::L2Cpu;
 use crate::shared_chip::SharedChip;
 use crate::virtio::interrupt::InterruptController;
@@ -68,39 +68,25 @@ pub struct L2CpuSlot {
     pub console_input_tx: Sender<u8>,
     pub console_worker: WorkerHandle,
     pub disks: Vec<DiskWorker>,
-    /// Host-side DMA buffer backing the boot-time virtio-block MMIO
-    /// control plane (#64 phase 3). `Some` only when the boot
-    /// allocated one (i.e. `-d <path>` was passed); the post-boot
-    /// `add-disk` RPC stays on chip-DRAM and ignores this field.
-    pub virtio_disk_buf: Option<HostDmaBuf>,
     pub net: Option<WorkerHandle>,
-    /// Host-side DMA buffer backing virtio-net's MMIO control plane
-    /// (#64 phase 2). Same lifetime contract as `virtio_rng_buf`:
-    /// joined-then-dropped via `shutdown`. The vring + packet payloads
-    /// stay in chip DRAM (per `L2Cpu::get_memory_ptr`); only the
-    /// control registers move here.
-    pub virtio_net_buf: Option<HostDmaBuf>,
     /// virtio-console worker (#51). When `Some`, kernel sees a
     /// virtio-mmio device with id=3 in the third virtio slot. Operator
     /// keystrokes are fanned out to both this and `console_input_tx`
     /// in `client_reader_main`; whichever HVC driver the kernel
     /// activates as its console absorbs them.
     pub virtio_console: Option<VirtioConsoleSlot>,
-    /// Host-side DMA buffer backing virtio-console's MMIO control
-    /// plane (#64 phase 3). `Some` only when boot-time
-    /// `--virtio-console` was set; the post-boot `add-console` RPC
-    /// stays on chip-DRAM.
-    pub virtio_console_buf: Option<HostDmaBuf>,
     /// virtio-rng worker (#62). Provides entropy to the guest. Required
     /// to satisfy `EFI_RNG_PROTOCOL` on the U-Boot+GRUB+shim chained-boot
     /// path; useful as plain `/dev/random` backing on direct-kernel paths.
     pub virtio_rng: Option<WorkerHandle>,
-    /// Host-side DMA buffer backing virtio-rng's MMIO control plane (#64).
-    /// `Some` iff `virtio_rng` is using the host-buffer path; held here so
-    /// the buffer (and its iATU + x280 TLB programming) outlives the
-    /// worker thread. Drop order: workers are joined in `shutdown` before
-    /// the slot is dropped, which then drops this buffer's `munmap`.
-    pub virtio_rng_buf: Option<HostDmaBuf>,
+    /// Shared host-side DMA buffer backing every host-buffer-migrated
+    /// virtio device's MMIO control plane on this L2CPU (#64). One iATU
+    /// region + one x280 small TLB window for all four devices, partitioned
+    /// into 4 KiB sub-regions. `Some` whenever any host-buffer-migrated
+    /// device is up; held here so the buffer outlives the workers. Drop
+    /// order: workers are joined in `shutdown` before the slot is
+    /// dropped, which then drops this buffer's munmap.
+    pub virtio_host_mmio: Option<VirtioHostMmio>,
     /// Wall-clock instant the slot was installed. Drives
     /// `tt_bh_l2cpu_uptime_seconds`. Set once at construction; never
     /// updated.
