@@ -199,6 +199,20 @@ static void init_device(unsigned slot) {
     // until the guest writes QUEUE_SEL.
     *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NUM_MAX)) = BRISC_VIRTIO_QUEUE_NUM_MAX;
 
+    // DEVICE_FEATURES — pre-populate with the VIRTIO_F_VERSION_1
+    // bit (high half, bit 32 of the 64-bit feature space). The
+    // poll-loop SEL multiplexer below also writes this on every
+    // iteration, but pre-setting here closes the race window
+    // between L2CPU reset release and BRISC's first poll: stock
+    // Linux virtio-mmio drivers race ~µs between
+    // `writel(SEL=1)` and `readl(DEVICE_FEATURES)`, comparable
+    // to BRISC's full sweep, so without this initialization the
+    // kernel's first read can land on a stale 0 value. We
+    // accept that the SEL=0 path can race (kernel sees stale
+    // 0x1 instead of 0) — that's a spurious low-half feature
+    // bit, which device drivers ignore for unknown bits.
+    *l1_u32(reg_addr(slot, VIRTIO_MMIO_DEVICE_FEATURES)) = VIRTIO_F_VERSION_1_HIGH_BIT;
+
     // Pre-populate every queue's QueueNumMax in the shadow so a SEL
     // swap finds it without re-running init. Same value for all
     // queues at this point; per-device customization comes in M5.
@@ -401,19 +415,24 @@ static void poll_one_device(unsigned slot) {
         write_u32(snap_addr(slot, SNAP_OFF_QUEUE_READY), ready);
     }
 
-    // DEVICE_FEATURES_SEL — guest writes 0 or 1 to choose which
-    // 32-bit half of the device's feature word it wants to read
-    // back via DEVICE_FEATURES. We advertise only VIRTIO_F_VERSION_1
-    // (bit 32, i.e. bit 0 of the high half) so the firmware just
-    // mirrors the SEL into a 0-or-VIRTIO_F_VERSION_1_HIGH_BIT
-    // value in DEVICE_FEATURES. virtio 1.2 §4.2.2.2.
-    uint32_t df_sel = read_u32(reg_addr(slot, VIRTIO_MMIO_DEVICE_FEATURES_SEL));
-    uint32_t df_sel_prev = read_u32(snap_addr(slot, SNAP_OFF_DEV_FEAT_SEL));
-    if (df_sel != df_sel_prev) {
-        uint32_t advertised = (df_sel == 1) ? VIRTIO_F_VERSION_1_HIGH_BIT : 0u;
-        write_u32(reg_addr(slot, VIRTIO_MMIO_DEVICE_FEATURES), advertised);
-        write_u32(snap_addr(slot, SNAP_OFF_DEV_FEAT_SEL), df_sel);
-    }
+    // DEVICE_FEATURES is statically set in `init_device` to
+    // VIRTIO_F_VERSION_1_HIGH_BIT (0x1) and not touched per-poll.
+    //
+    // The naive "poll DEVICE_FEATURES_SEL, write the right half"
+    // pattern races with stock Linux virtio-mmio drivers, which
+    // do `writel(SEL=N); readl(FEATURES);` back-to-back within
+    // ~µs — comparable to BRISC's full 16-slot sweep period.
+    // The kernel's read can land before BRISC observes the SEL
+    // write. With static 0x1 in DEVICE_FEATURES regardless of
+    // SEL:
+    //   * SEL=1 (high half) read returns 0x1 ⟹ bit 32 of the
+    //     combined 64-bit word ⟹ VIRTIO_F_VERSION_1 set ✓
+    //   * SEL=0 (low half) read returns 0x1 ⟹ bit 0 set, which
+    //     no current device defines as a feature. Drivers ignore
+    //     unknown bits when computing DRIVER_FEATURES.
+    // Net effect: kernel sees VIRTIO_F_VERSION_1, negotiation
+    // succeeds. We keep the SEL snapshot below for diagnostic
+    // purposes.
 
     // DRIVER_FEATURES_SEL — guest writes 0 or 1, then writes the
     // 32-bit half it has accepted via DRIVER_FEATURES. We don't
