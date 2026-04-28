@@ -337,4 +337,99 @@ mod tests {
         let b = pick_virtio_engine_tile(&t).unwrap();
         assert_eq!(a, b);
     }
+
+    #[test]
+    fn pick_with_only_one_working_col() {
+        // Untranslated, only bit 7 set ⟹ NOC0 col 10 only. Picker
+        // takes the bottom-right corner of that single column.
+        let t = telem(0, 1u32 << 7, false);
+        let picked = pick_virtio_engine_tile(&t).unwrap();
+        assert_eq!(picked.x, 10);
+        assert_eq!(picked.y, 11);
+    }
+
+    #[test]
+    fn pick_picks_first_harvested_row_not_last() {
+        // Two harvested rows: bits 0 and 9 → rows 2 and 11. The
+        // picker prefers the FIRST harvested row (lowest Y) for
+        // determinism. tt-metal compute is steered away from
+        // harvested rows regardless of which one we pick, so the
+        // tie-break is just to be reproducible.
+        let t = telem((1 << 0) | (1 << 9), 0x3FFF, false);
+        let picked = pick_virtio_engine_tile(&t).unwrap();
+        assert_eq!(picked.y, 2);
+        assert_eq!(picked.x, 16);
+        assert_eq!(picked.reason, PickReason::HarvestedRowCorner);
+    }
+
+    #[test]
+    fn pick_output_is_always_in_decoded_working_cols() {
+        // Property test: across a sweep of plausible (harvest,
+        // col_mask, translation) tuples, the picker's chosen X is
+        // a member of the working-cols set. (And similarly for Y in
+        // the no-row-harvest case.)
+        for col_mask in [0x0001u32, 0x0fff, 0x1fff, 0x3fff, 0xa55a, 0x1234] {
+            for trans in [true, false] {
+                for harvest in [0u32, 1u32 << 0, 1u32 << 5, 0x55, 0x12] {
+                    let t = telem(harvest, col_mask, trans);
+                    let cols = working_tensix_cols(col_mask, trans);
+                    let rows = working_tensix_rows(harvest);
+                    if cols.is_empty() || rows.is_empty() {
+                        // Picker errors; nothing to check.
+                        assert!(pick_virtio_engine_tile(&t).is_err());
+                        continue;
+                    }
+                    let picked = pick_virtio_engine_tile(&t).unwrap();
+                    assert!(
+                        cols.contains(&picked.x),
+                        "picker x={} not in working cols {:?} for col_mask={:#x} trans={}",
+                        picked.x,
+                        cols,
+                        col_mask,
+                        trans
+                    );
+                    let harvested = harvested_tensix_rows(harvest);
+                    if !harvested.is_empty() {
+                        assert!(
+                            harvested.contains(&picked.y),
+                            "picker y={} not in harvested rows {:?} for harvest={:#x}",
+                            picked.y,
+                            harvested,
+                            harvest
+                        );
+                    } else {
+                        assert!(
+                            rows.contains(&picked.y),
+                            "picker y={} not in working rows for harvest={:#x}",
+                            picked.y,
+                            harvest
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn working_cols_match_count_ones_in_translated_mode() {
+        // Property test: for every plausible translated count, the
+        // working-cols list has exactly `min(count, 14)` entries.
+        for count in 0..=14u32 {
+            let mask = if count == 32 {
+                u32::MAX
+            } else {
+                (1u32 << count).wrapping_sub(1)
+            };
+            let cols = working_tensix_cols(mask, true);
+            assert_eq!(
+                cols.len() as u32,
+                count,
+                "count {} mask {:#x} produced {} cols, expected {}",
+                count,
+                mask,
+                cols.len(),
+                count
+            );
+        }
+    }
 }
