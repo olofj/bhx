@@ -112,6 +112,14 @@ static inline unsigned brisc_virtio_slot(unsigned l2cpu_idx, unsigned device_idx
 #define VIRTIO_MMIO_VENDOR_ID           0x00c  // R: any
 #define VIRTIO_MMIO_DEVICE_FEATURES     0x010  // R
 #define VIRTIO_MMIO_DEVICE_FEATURES_SEL 0x014  // W
+// 0x018: VIRTIO_MMIO_SW_IMPL — daemon-private, set to 1 to tell the
+// patched kernel "this is a software virtio implementation; use the
+// sel_generation handshake at 0x01c to wait for SEL writes to land
+// before reading multiplexed regs." Without it the kernel hits the
+// SEL race that motivated #58/#61/#63/#65 and surfaces probe -ENOENT
+// on virtio_net's queue 1 setup.
+#define VIRTIO_MMIO_SW_IMPL             0x018  // RW (daemon-private)
+#define VIRTIO_MMIO_SEL_GENERATION      0x01c  // RW (handshake counter)
 #define VIRTIO_MMIO_DRIVER_FEATURES     0x020  // W
 #define VIRTIO_MMIO_DRIVER_FEATURES_SEL 0x024  // W
 #define VIRTIO_MMIO_QUEUE_SEL           0x030  // W

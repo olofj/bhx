@@ -710,10 +710,9 @@ fn dispatch_boot(
         // for a registered slot, the poller looks up the entry,
         // walks the descriptor chain via
         // `process_one_chain_for_queue`, and fires the PLIC IRQ.
-        // Currently wires rng + blk; net + console need their
-        // VirtioDeviceImpl constructors lifted out of the
-        // host-buffer worker spawn path.
-        let _ = (network, extra_fwd, console);
+        // Wires rng, blk, net; console still pending (it needs the
+        // ConsoleHub TX/RX bridge that the legacy worker provides).
+        let _ = console;
         let _ = (rng_backing, net_backing, disk_backing, console_backing);
         let engine_for_init = state.tensix_engine.lock().unwrap().clone();
         if let (Some(poller), Some(engine)) =
@@ -795,6 +794,34 @@ fn dispatch_boot(
                     ),
                 }
             }
+            dlog!(
+                "[run_boot l2cpu {}] virtio-engine: net check (network={}, slirp_compiled={})",
+                l2cpu_idx,
+                network,
+                cfg!(feature = "slirp")
+            );
+            #[cfg(feature = "slirp")]
+            if network {
+                let ssh_port = crate::regs::slirp::ssh_port(state.card, l2cpu_idx);
+                let mut forwards = vec![(ssh_port, 22u16)];
+                forwards.extend(extra_fwd.iter().copied());
+                match crate::virtio::network::VirtioNet::new(&forwards, l2cpu_idx) {
+                    Ok(net) => register(
+                        dev_slot(crate::virtio_engine::DEV_NET),
+                        Box::new(net),
+                        crate::regs::virtio_mmio::NET_IRQ,
+                        crate::virtio::InterruptKind::Net,
+                        "net",
+                    ),
+                    Err(e) => dlog!(
+                        "[run_boot l2cpu {}] virtio-engine: VirtioNet::new failed: {}",
+                        l2cpu_idx,
+                        e
+                    ),
+                }
+            }
+            #[cfg(not(feature = "slirp"))]
+            let _ = extra_fwd;
         } else {
             dlog!(
                 "[run_boot l2cpu {}] virtio-engine: engine + kick poller not up — \

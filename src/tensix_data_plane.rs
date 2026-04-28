@@ -211,20 +211,14 @@ fn run_poll_loop(
             let queue_idx = (raw[0] >> 16) as u16;
             let seq = raw[1];
             let epoch = raw[2];
-            crate::dlog!(
-                "[kick-poller] seq={} slot={} queue={} epoch={}",
-                seq,
-                slot,
-                queue_idx,
-                epoch
-            );
-            // M5.5b: dispatch to the registered (slot, queue)
-            // device handler. Reads the per-queue desc/avail/used
-            // pointers from BRISC L1 shadow (firmware shadows guest
-            // writes via the per-queue snapshot extension), walks
-            // the chain over guest DRAM via the L2CPU's memory
-            // mapping, calls the device's `process_queue_*` hooks,
-            // writes used-ring entries, fires the PLIC IRQ.
+            let _ = (seq, epoch); // currently unused; preserved in case we add per-kick metrics
+                                  // M5.5b: dispatch to the registered (slot, queue)
+                                  // device handler. Reads the per-queue desc/avail/used
+                                  // pointers from BRISC L1 shadow (firmware shadows guest
+                                  // writes via the per-queue snapshot extension), walks
+                                  // the chain over guest DRAM via the L2CPU's memory
+                                  // mapping, calls the device's `process_queue_*` hooks,
+                                  // writes used-ring entries, fires the PLIC IRQ.
             let mut map = registry.lock().unwrap();
             if let Some(reg) = map.get_mut(&(slot as u32)) {
                 let posted = dispatch_chain(&engine, reg, queue_idx);
@@ -254,6 +248,33 @@ fn run_poll_loop(
             engine.set_kick_consumer_seq(consumer);
             last_active = std::time::Instant::now();
         }
+
+        // Net RX path: nothing on the BRISC kick ring fires when a
+        // libslirp-delivered packet arrives, because the guest never
+        // notifies us for RX (it just refills the ring). We poll
+        // every registered net device's RX queue here — `queue_has_data`
+        // returns true only when slirp has bytes to read, so the
+        // dispatch is a no-op on idle queues. Same FAST/SLOW/IDLE
+        // adaptive cadence as the kick path.
+        let mut net_drained = false;
+        {
+            let mut map = registry.lock().unwrap();
+            for (slot, reg) in map.iter_mut() {
+                if !matches!(reg.interrupt_kind, InterruptKind::Net) {
+                    continue;
+                }
+                let posted = dispatch_chain(&engine, reg, 0);
+                if posted {
+                    let used_idx = read_used_idx(reg, 0);
+                    engine.push_completion(*slot as u16, 0, used_idx);
+                    net_drained = true;
+                }
+            }
+        }
+        if net_drained {
+            last_active = std::time::Instant::now();
+        }
+
         stats.poll_iterations.fetch_add(1, Ordering::Relaxed);
 
         let idle = last_active.elapsed();
@@ -338,17 +359,10 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
     let used_addr = ((used_hi as u64) << 32) | used_lo as u64;
 
     if desc_addr == 0 || avail_addr == 0 || used_addr == 0 {
-        // Queue not yet configured. Guest hasn't written the
-        // pointers yet — drop this kick.
-        crate::dlog!(
-            "[kick-poller]   slot {} queue {} not yet configured (desc/avail/used = \
-             {:#x}/{:#x}/{:#x}), dropping",
-            reg.slot,
-            queue_idx,
-            desc_addr,
-            avail_addr,
-            used_addr
-        );
+        // Queue not yet configured — guest hasn't published the
+        // shadow pointers yet. Drop the kick silently; otherwise the
+        // RX-side polling loop spams this for every idle iteration
+        // while net's queue 0 is unconfigured.
         return false;
     }
     if queue_num == 0 || queue_num > u16::MAX as u32 {
@@ -375,9 +389,15 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
         |addr: u64, size: u64| -> bool { addr >= starting && addr.saturating_add(size) <= mem_end };
     if !in_range(desc_addr, 16) || !in_range(avail_addr, 4) || !in_range(used_addr, 4) {
         crate::dlog!(
-            "[kick-poller]   slot {} queue {} pointers out of L2CPU memory range, dropping",
+            "[kick-poller]   slot {} queue {} pointers out of L2CPU memory range \
+             (desc={:#x} avail={:#x} used={:#x}, range=[{:#x},{:#x})), dropping",
             reg.slot,
-            queue_idx
+            queue_idx,
+            desc_addr,
+            avail_addr,
+            used_addr,
+            starting,
+            mem_end,
         );
         return false;
     }

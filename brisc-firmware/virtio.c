@@ -39,7 +39,7 @@
 // Firmware version, inspected via the stats page. Bump for any
 // wire-protocol change between daemon ↔ BRISC. Format: 0xAABBCCDD
 // where AA=major, BB=minor, CC=patch, DD=reserved/build.
-#define BRISC_VIRTIO_FW_VERSION 0x00050001u  // M5 (#71), build 0001
+#define BRISC_VIRTIO_FW_VERSION 0x00050002u  // M5 (#71), build 0002 — adds SW_IMPL/sel_gen echo
 
 #define FENCE_W() __asm__ volatile("fence w, w" ::: "memory")
 
@@ -111,6 +111,7 @@
 #define SNAP_OFF_DEV_FEAT_SEL     0x2c
 #define SNAP_OFF_DRV_FEAT_SEL     0x30
 #define SNAP_OFF_DRV_FEAT         0x34
+#define SNAP_OFF_SEL_GEN_ECHO     0x38
 
 static inline volatile uint32_t *l1_u32(uintptr_t addr) {
     return (volatile uint32_t *)addr;
@@ -218,6 +219,16 @@ static void init_device(unsigned slot) {
     // on the zeroed reg file. Guest writes any queue index
     // (including 0) → next poll sees value != -1 → kick fires.
     *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NOTIFY)) = 0xFFFFFFFFu;
+
+    // SW_IMPL=1 tells the patched kernel "this is a software
+    // virtio backend; use the sel_generation handshake at 0x01c
+    // before reading SEL-multiplexed regs." Without it stock
+    // Linux's vm_setup_vq writes QUEUE_SEL=1 and immediately reads
+    // QUEUE_READY — if BRISC's poll hasn't yet swapped the visible
+    // reg file to queue 1's shadow (which still says READY=1 from
+    // queue 0's setup), the kernel sees "queue already up" and
+    // returns -ENOENT on virtio_net's TX queue.
+    *l1_u32(reg_addr(slot, VIRTIO_MMIO_SW_IMPL)) = 1u;
 
     // Pre-populate every queue's QueueNumMax in the shadow so a SEL
     // swap finds it without re-running init. Same value for all
@@ -421,13 +432,25 @@ static void poll_one_device(unsigned slot) {
         write_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NOTIFY), 0xFFFFFFFFu);
     }
 
-    // QUEUE_READY — RW. The guest writes after configuring desc /
-    // avail / used; we persist to shadow.
+    // QUEUE_READY — RW. Persist any non-zero write to shadow, then
+    // clear the visible reg back to 0. The legacy host-buffer path
+    // (src/virtio/mod.rs in the SEL/READY handshake) does the exact
+    // same eager clear: the kernel's vm_setup_vq for queue N+1 starts
+    // with `writel(QUEUE_SEL=N+1); readl(QUEUE_READY)` expecting 0 —
+    // but the visible reg still holds queue N's READY=1 from the
+    // immediately-prior setup. Without clearing, the kernel sees 1
+    // and bails with -ENOENT ("Queue shouldn't already be set up").
+    // Snapshot diff alone isn't enough: the kernel writes 1 once,
+    // we'd see the change and persist, but the visible reg keeps the
+    // 1 forever until something resets it. By zeroing on every poll
+    // (regardless of snapshot state), we keep the visible reg clean
+    // for the next vm_setup_vq cycle and rely on shadow for the
+    // "is this queue ready?" question that dispatch_chain asks.
     uint32_t ready = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY));
-    uint32_t ready_prev = read_u32(snap_addr(slot, SNAP_OFF_QUEUE_READY));
-    if (ready != ready_prev) {
+    if (ready != 0) {
         handle_queue_ready_change(slot, sel, ready);
-        write_u32(snap_addr(slot, SNAP_OFF_QUEUE_READY), ready);
+        *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY)) = 0;
+        FENCE_W();
     }
 
     // DEVICE_FEATURES is statically set in `init_device` to
@@ -473,28 +496,52 @@ static void poll_one_device(unsigned slot) {
     // read accurate per-queue state without racing the SEL
     // multiplexer.
     if (sel < BRISC_VIRTIO_MAX_QUEUES) {
+        // Per-queue setup: blind-capture every iteration into
+        // shadow[sel]. The earlier snapshot-diff approach broke for
+        // virtio-net's TX setup, where queue 1's DESC_HIGH is the
+        // same 0x40 word the kernel wrote for queue 0 — `v != prev`
+        // never fired, queue 1's shadow stayed at 0, and dispatch
+        // saw a desc address with the high half missing
+        // ("pointers out of L2CPU memory range").
+        //
+        // Blind-capture is safe AFTER the SEL handler above: that
+        // write-from-shadow happens before this loop, so on a fresh
+        // SEL change we either capture stale shadow values (a
+        // no-op; we just wrote them to visible) or freshly-written
+        // kernel values (the setup we want). Either way the shadow
+        // for the current sel converges to the kernel's intent
+        // within one or two poll iterations.
         struct queue_field {
             unsigned mmio_off;
-            unsigned snap_off;
             unsigned shadow_off;
         };
         static const struct queue_field FIELDS[] = {
-            {VIRTIO_MMIO_QUEUE_NUM,         SNAP_OFF_QUEUE_NUM, SHADOW_Q_OFF_NUM},
-            {VIRTIO_MMIO_QUEUE_DESC_LOW,    SNAP_OFF_DESC_LO,   SHADOW_Q_OFF_DESC_LO},
-            {VIRTIO_MMIO_QUEUE_DESC_HIGH,   SNAP_OFF_DESC_HI,   SHADOW_Q_OFF_DESC_HI},
-            {VIRTIO_MMIO_QUEUE_DRIVER_LOW,  SNAP_OFF_DRIVER_LO, SHADOW_Q_OFF_DRIVER_LO},
-            {VIRTIO_MMIO_QUEUE_DRIVER_HIGH, SNAP_OFF_DRIVER_HI, SHADOW_Q_OFF_DRIVER_HI},
-            {VIRTIO_MMIO_QUEUE_DEVICE_LOW,  SNAP_OFF_DEVICE_LO, SHADOW_Q_OFF_DEVICE_LO},
-            {VIRTIO_MMIO_QUEUE_DEVICE_HIGH, SNAP_OFF_DEVICE_HI, SHADOW_Q_OFF_DEVICE_HI},
+            {VIRTIO_MMIO_QUEUE_NUM,         SHADOW_Q_OFF_NUM},
+            {VIRTIO_MMIO_QUEUE_DESC_LOW,    SHADOW_Q_OFF_DESC_LO},
+            {VIRTIO_MMIO_QUEUE_DESC_HIGH,   SHADOW_Q_OFF_DESC_HI},
+            {VIRTIO_MMIO_QUEUE_DRIVER_LOW,  SHADOW_Q_OFF_DRIVER_LO},
+            {VIRTIO_MMIO_QUEUE_DRIVER_HIGH, SHADOW_Q_OFF_DRIVER_HI},
+            {VIRTIO_MMIO_QUEUE_DEVICE_LOW,  SHADOW_Q_OFF_DEVICE_LO},
+            {VIRTIO_MMIO_QUEUE_DEVICE_HIGH, SHADOW_Q_OFF_DEVICE_HI},
         };
         for (unsigned f = 0; f < sizeof(FIELDS) / sizeof(FIELDS[0]); f++) {
             uint32_t v = read_u32(reg_addr(slot, FIELDS[f].mmio_off));
-            uint32_t prev = read_u32(snap_addr(slot, FIELDS[f].snap_off));
-            if (v != prev) {
-                *l1_u32(shadow_queue_addr(slot, sel, FIELDS[f].shadow_off)) = v;
-                write_u32(snap_addr(slot, FIELDS[f].snap_off), v);
-            }
+            *l1_u32(shadow_queue_addr(slot, sel, FIELDS[f].shadow_off)) = v;
         }
+    }
+
+    // sel_generation handshake — done last so any SEL/SEL-multiplexed
+    // register update above has already taken effect by the time the
+    // guest sees the echo. The patched kernel writes (prev+1) and
+    // spins until it reads back something different; we ack by writing
+    // (curr+1), which is guaranteed to differ. See `echo_sel_generation`
+    // in src/virtio/mod.rs for the matching legacy-path helper.
+    uint32_t curr_gen = read_u32(reg_addr(slot, VIRTIO_MMIO_SEL_GENERATION));
+    uint32_t last_echoed = read_u32(snap_addr(slot, SNAP_OFF_SEL_GEN_ECHO));
+    if (curr_gen != last_echoed) {
+        uint32_t next = curr_gen + 1u;
+        write_u32(reg_addr(slot, VIRTIO_MMIO_SEL_GENERATION), next);
+        write_u32(snap_addr(slot, SNAP_OFF_SEL_GEN_ECHO), next);
     }
 }
 
