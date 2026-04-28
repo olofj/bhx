@@ -8,6 +8,7 @@ pub mod console;
 pub mod interrupt;
 #[cfg(feature = "slirp")]
 pub mod network;
+pub mod rng;
 
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,6 +94,7 @@ pub enum InterruptKind {
     Block,
     Net,
     Console,
+    Rng,
 }
 
 /// Bump the per-kind interrupt counter at index `idx`. Pulled out of
@@ -105,6 +107,7 @@ pub(crate) fn bump_interrupt_metric(kind: InterruptKind, idx: u8) {
         InterruptKind::Console => crate::daemon::metrics::CONSOLE_INTERRUPTS_TOTAL
             .at(idx)
             .inc(),
+        InterruptKind::Rng => crate::daemon::metrics::RNG_INTERRUPTS_TOTAL.at(idx).inc(),
     }
 }
 
@@ -988,6 +991,7 @@ pub fn run_device(
                 InterruptKind::Block => crate::daemon::metrics::WorkerKind::VirtioBlk,
                 InterruptKind::Net => crate::daemon::metrics::WorkerKind::VirtioNet,
                 InterruptKind::Console => crate::daemon::metrics::WorkerKind::VirtioConsole,
+                InterruptKind::Rng => crate::daemon::metrics::WorkerKind::VirtioRng,
             };
             let idx_u8 = l2cpu.idx() as u8;
             crate::daemon::metrics::WORKER_POLL_ITERATIONS_TOTAL

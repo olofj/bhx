@@ -64,6 +64,7 @@ pub fn boot(
     disk: Option<String>,
     network: bool,
     console: bool,
+    rng: bool,
     force: bool,
 ) -> io::Result<()> {
     write_frame(
@@ -79,6 +80,7 @@ pub fn boot(
             disk,
             network,
             console,
+            rng,
             force,
         },
     )?;

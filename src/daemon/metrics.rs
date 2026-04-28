@@ -318,6 +318,7 @@ pub enum WorkerKind {
     VirtioBlk,
     VirtioNet,
     VirtioConsole,
+    VirtioRng,
     ChipConsole,
 }
 impl WorkerKind {
@@ -326,6 +327,7 @@ impl WorkerKind {
             WorkerKind::VirtioBlk => "virtio_blk",
             WorkerKind::VirtioNet => "virtio_net",
             WorkerKind::VirtioConsole => "virtio_console",
+            WorkerKind::VirtioRng => "virtio_rng",
             WorkerKind::ChipConsole => "chip_console",
         }
     }
@@ -334,6 +336,7 @@ impl WorkerKind {
             WorkerKind::VirtioBlk,
             WorkerKind::VirtioNet,
             WorkerKind::VirtioConsole,
+            WorkerKind::VirtioRng,
             WorkerKind::ChipConsole,
         ]
     }
@@ -342,7 +345,8 @@ impl WorkerKind {
             WorkerKind::VirtioBlk => 0,
             WorkerKind::VirtioNet => 1,
             WorkerKind::VirtioConsole => 2,
-            WorkerKind::ChipConsole => 3,
+            WorkerKind::VirtioRng => 3,
+            WorkerKind::ChipConsole => 4,
         }
     }
 }
@@ -361,16 +365,16 @@ pub fn classify_tier(elapsed: Duration, fast_window: Duration, idle_window: Dura
     }
 }
 
-/// 3D counter: `[worker][idx][tier]`. 4 × 4 × 3 = 48 cells per metric.
+/// 3D counter: `[worker][idx][tier]`. 5 × 4 × 3 = 60 cells per metric.
 /// Indexed by `at(WorkerKind, idx: u8, Tier)`. Both keying enums have
 /// stable `name()` strings the renderer uses verbatim.
 pub struct WorkerTierCounter {
-    values: [[[Counter; 3]; 4]; 4],
+    values: [[[Counter; 3]; 4]; 5],
 }
 impl WorkerTierCounter {
     pub const fn new() -> Self {
         Self {
-            values: [const { [const { [const { Counter::new() }; 3] }; 4] }; 4],
+            values: [const { [const { [const { Counter::new() }; 3] }; 4] }; 5],
         }
     }
     pub fn at(&self, worker: WorkerKind, idx: u8, tier: Tier) -> &Counter {
@@ -591,6 +595,10 @@ pub static NET_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
 /// virtio-console interrupt count per L2CPU. Bumped from the console
 /// worker's `run_device` loop. See #51.
 pub static CONSOLE_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
+
+/// virtio-rng interrupt count per L2CPU. Bumped from the rng worker's
+/// `run_device` loop. See #62.
+pub static RNG_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
 
 // --- Worker poll loop ---
 

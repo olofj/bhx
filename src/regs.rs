@@ -86,7 +86,7 @@ pub mod boot_image {
 pub mod virtio_mmio {
     /// Total reservation at the top of an L2CPU's DRAM for the four
     /// `virtio,mmio` regions (4 × 2 MiB plus padding).
-    pub const RESERVED_SIZE: u64 = 0x60_0000;
+    pub const RESERVED_SIZE: u64 = 0x80_0000;
     /// Per-device MMIO region size (2 MiB).
     pub const MMIO_SLOT_SIZE: u64 = 0x20_0000;
 
@@ -98,6 +98,11 @@ pub mod virtio_mmio {
     /// `boot::modify_dtb`'s `i = 0..4` loop, paired with IRQ 31. See
     /// #51 for rationale.
     pub const CONSOLE_OFFSET: u64 = 3 * MMIO_SLOT_SIZE;
+    /// RNG device region offset: 8 MiB before `mem_end`. Slot 4 in
+    /// `boot::modify_dtb`'s `i = 0..4` loop, paired with IRQ 30.
+    /// Required for the AlmaLinux EFI shim's `EFI_RNG_PROTOCOL`
+    /// during the U-Boot+GRUB+shim chained-boot path. See #62.
+    pub const RNG_OFFSET: u64 = 4 * MMIO_SLOT_SIZE;
 
     /// PLIC interrupt for virtio-disk. DTB ties together as
     /// `virtio@<addr> { interrupts = <DISK_IRQ>; }`.
@@ -106,6 +111,8 @@ pub mod virtio_mmio {
     pub const NET_IRQ: u32 = 32;
     /// PLIC interrupt for virtio-console.
     pub const CONSOLE_IRQ: u32 = 31;
+    /// PLIC interrupt for virtio-rng.
+    pub const RNG_IRQ: u32 = 30;
 
     /// VirtIO `device_id` value for the block device (block = 2).
     pub const VIRTIO_ID_BLOCK: u32 = 2;
@@ -114,6 +121,9 @@ pub mod virtio_mmio {
     /// VirtIO `device_id` value for the console device (console = 3).
     /// virtio 1.2 §5.3.
     pub const VIRTIO_ID_CONSOLE: u32 = 3;
+    /// VirtIO `device_id` value for the entropy/RNG device (rng = 4).
+    /// virtio 1.2 §5.4.
+    pub const VIRTIO_ID_ENTROPY: u32 = 4;
 }
 
 /// Slirp host-side port allocation for SSH forwarding to the guest.
@@ -176,6 +186,13 @@ mod tests {
         assert!(virtio_mmio::CONSOLE_OFFSET != virtio_mmio::DISK_OFFSET);
         assert!(virtio_mmio::CONSOLE_OFFSET != virtio_mmio::NET_OFFSET);
         assert!(virtio_mmio::CONSOLE_IRQ == virtio_mmio::DISK_IRQ - 2);
+        // RNG gets slot index 3 (last slot the DTB walk produces).
+        assert!(virtio_mmio::RNG_OFFSET == 4 * virtio_mmio::MMIO_SLOT_SIZE);
+        assert!(virtio_mmio::RNG_OFFSET <= virtio_mmio::RESERVED_SIZE);
+        assert!(virtio_mmio::RNG_OFFSET != virtio_mmio::DISK_OFFSET);
+        assert!(virtio_mmio::RNG_OFFSET != virtio_mmio::NET_OFFSET);
+        assert!(virtio_mmio::RNG_OFFSET != virtio_mmio::CONSOLE_OFFSET);
+        assert!(virtio_mmio::RNG_IRQ == virtio_mmio::DISK_IRQ - 3);
     };
 
     // Compile-time invariants on the boot-image layout: each must be

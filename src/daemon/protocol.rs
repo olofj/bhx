@@ -55,6 +55,13 @@ pub enum Request {
         /// false path. See #51.
         #[serde(default)]
         console: bool,
+        /// Attach a virtio-rng device alongside the boot. U-Boot's
+        /// EFI loader needs this to install `EFI_RNG_PROTOCOL`,
+        /// which the AlmaLinux EFI shim requires to chainload GRUB.
+        /// Older clients without this field hit `serde(default)` =
+        /// false. See #62.
+        #[serde(default)]
+        rng: bool,
         /// If true and a slot already exists for this L2CPU, the daemon
         /// tears it down (stop workers, drop L2Cpu) before re-imaging.
         /// Default false → duplicate boots are rejected with an error.
@@ -299,6 +306,7 @@ mod tests {
             disk: None,
             network: false,
             console: false,
+            rng: false,
             force: false,
         };
         let mut buf = Vec::new();
@@ -327,6 +335,7 @@ mod tests {
             disk: Some("debian.raw".into()),
             network: false,
             console: false,
+            rng: false,
             force: false,
         };
         let mut buf = Vec::new();
@@ -453,6 +462,7 @@ mod tests {
                 disk: None,
                 network: false,
                 console: false,
+                rng: false,
                 force,
             };
             let mut buf = Vec::new();

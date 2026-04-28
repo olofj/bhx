@@ -74,6 +74,10 @@ pub struct L2CpuSlot {
     /// in `client_reader_main`; whichever HVC driver the kernel
     /// activates as its console absorbs them.
     pub virtio_console: Option<VirtioConsoleSlot>,
+    /// virtio-rng worker (#62). Provides entropy to the guest. Required
+    /// to satisfy `EFI_RNG_PROTOCOL` on the U-Boot+GRUB+shim chained-boot
+    /// path; useful as plain `/dev/random` backing on direct-kernel paths.
+    pub virtio_rng: Option<WorkerHandle>,
     /// Wall-clock instant the slot was installed. Drives
     /// `tt_bh_l2cpu_uptime_seconds`. Set once at construction; never
     /// updated.
@@ -106,6 +110,9 @@ impl L2CpuSlot {
         }
         if let Some(vc) = self.virtio_console {
             vc.worker.stop_and_join();
+        }
+        if let Some(rng) = self.virtio_rng {
+            rng.stop_and_join();
         }
         self.console_worker.stop_and_join();
         // Arc<L2Cpu> and Arc<InterruptController> drop here when the last

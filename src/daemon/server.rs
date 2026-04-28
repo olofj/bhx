@@ -38,7 +38,7 @@ use crate::virtio::network;
 // re-export under the legacy short names so the dispatch code reads cleanly.
 use crate::regs::virtio_mmio::{
     CONSOLE_IRQ as CONSOLE_INT, CONSOLE_OFFSET as CONSOLE_MMIO, DISK_IRQ as DISK_INT,
-    DISK_OFFSET as DISK_MMIO,
+    DISK_OFFSET as DISK_MMIO, RNG_IRQ as RNG_INT, RNG_OFFSET as RNG_MMIO,
 };
 #[cfg(feature = "slirp")]
 use crate::regs::virtio_mmio::{NET_IRQ as NET_INT, NET_OFFSET as NET_MMIO};
@@ -296,6 +296,7 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             disk,
             network,
             console,
+            rng,
             force,
         } => dispatch_boot(
             &sock,
@@ -310,6 +311,7 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             disk,
             network,
             console,
+            rng,
             force,
         ),
         Request::AttachConsole { l2cpu, mode } => {
@@ -564,6 +566,7 @@ fn dispatch_boot(
     disk: Option<String>,
     network: bool,
     console: bool,
+    rng: bool,
     force: bool,
 ) -> crate::Result<()> {
     // U-Boot mode reads kernel + initrd from disk at runtime, so the
@@ -578,8 +581,8 @@ fn dispatch_boot(
         initramfs
     };
     dlog!(
-        "[boot l2cpu {}] dispatch_boot entry: opensbi={} payload={:?} dtb={} initramfs={:?} root={} force_reset_pcie={} disk={:?} network={} force={}",
-        l2cpu_idx, opensbi, payload, dtb, initramfs, root_device, force_reset_pcie, disk, network, force
+        "[boot l2cpu {}] dispatch_boot entry: opensbi={} payload={:?} dtb={} initramfs={:?} root={} force_reset_pcie={} disk={:?} network={} console={} rng={} force={}",
+        l2cpu_idx, opensbi, payload, dtb, initramfs, root_device, force_reset_pcie, disk, network, console, rng, force
     );
     validate_l2cpu(l2cpu_idx)?;
     handle_existing_slot(state, l2cpu_idx, force).map_err(crate::Error::slot_state)?;
@@ -603,6 +606,7 @@ fn dispatch_boot(
         disk.is_some(),
         network,
         console,
+        rng,
     )
     .map_err(|e| {
         dlog!("[boot l2cpu {}] boot sequence failed: {}", l2cpu_idx, e);
@@ -635,7 +639,7 @@ fn dispatch_boot(
         l2cpu_idx
     );
 
-    start_initial_workers(&mut slot, state.card, l2cpu_idx, disk, network, console)
+    start_initial_workers(&mut slot, state.card, l2cpu_idx, disk, network, console, rng)
         .map_err(crate::Error::slot_state)?;
     // Workers are now in Phase 1 polling for the DRIVER bit. Release the
     // L2CPU from reset so the kernel's virtio probe runs against a
@@ -679,6 +683,7 @@ fn handle_existing_slot(
 /// VFS mount at ~0.137s and has no retry. Three sequential RPCs
 /// (boot + add-disk + add-net) lose that race; bundling them keeps the
 /// worker threads up within a few ms of L2CPU reset release.
+#[allow(clippy::too_many_arguments)]
 fn start_initial_workers(
     slot: &mut L2CpuSlot,
     card: u32,
@@ -686,6 +691,7 @@ fn start_initial_workers(
     disk: Option<String>,
     network: bool,
     console: bool,
+    rng: bool,
 ) -> Result<(), String> {
     if let Some(path) = disk {
         dlog!(
@@ -730,6 +736,13 @@ fn start_initial_workers(
                 e
             );
             format!("start console worker failed: {}", e)
+        })?;
+    }
+    if rng {
+        dlog!("[boot l2cpu {}] spawning virtio-rng worker", l2cpu_idx);
+        start_rng_worker(slot).map_err(|e| {
+            dlog!("[boot l2cpu {}] start_rng_worker failed: {}", l2cpu_idx, e);
+            format!("start rng worker failed: {}", e)
         })?;
     }
     Ok(())
@@ -859,6 +872,29 @@ fn start_console_worker(slot: &mut L2CpuSlot) -> io::Result<()> {
     Ok(())
 }
 
+/// Spawn the virtio-rng worker (#62). The worker fills any guest
+/// write-only descriptor with kernel entropy. Required for the
+/// AlmaLinux EFI shim's `EFI_RNG_PROTOCOL` on the U-Boot+GRUB+shim
+/// chained-boot path; harmless extra entropy source on other paths.
+/// Idempotent guard via the slot's `virtio_rng: Option<...>`: caller
+/// checks that.
+fn start_rng_worker(slot: &mut L2CpuSlot) -> io::Result<()> {
+    let exit = Arc::new(AtomicBool::new(false));
+    let l2cpu = slot.l2cpu.clone();
+    let interrupt = slot.interrupt.clone();
+    let exit_thread = exit.clone();
+    let idx = slot.idx;
+    let t = thread::spawn(move || {
+        crate::virtio::rng::rng_main(l2cpu, interrupt, RNG_INT, RNG_MMIO, exit_thread);
+    });
+    slot.virtio_rng = Some(WorkerHandle {
+        exit,
+        thread: Some(t),
+        description: format!("virtio-rng l2cpu {}", idx),
+    });
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_boot_sequence(
     state: &Arc<DaemonState>,
@@ -872,6 +908,7 @@ fn run_boot_sequence(
     has_disk: bool,
     has_network: bool,
     has_console: bool,
+    has_rng: bool,
 ) -> io::Result<Arc<L2Cpu>> {
     use crate::regs::boot_image;
 
@@ -1005,6 +1042,13 @@ fn run_boot_sequence(
             &l2cpu,
             starting_address + memory_size - crate::regs::virtio_mmio::CONSOLE_OFFSET,
             crate::regs::virtio_mmio::VIRTIO_ID_CONSOLE,
+        );
+    }
+    if has_rng {
+        pre_init_virtio_mmio(
+            &l2cpu,
+            starting_address + memory_size - crate::regs::virtio_mmio::RNG_OFFSET,
+            crate::regs::virtio_mmio::VIRTIO_ID_ENTROPY,
         );
     }
 
@@ -1171,6 +1215,7 @@ fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlo
         disks: Vec::new(),
         net: None,
         virtio_console: None,
+        virtio_rng: None,
         started: Instant::now(),
     })
 }

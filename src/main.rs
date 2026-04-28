@@ -120,6 +120,16 @@ enum Commands {
         /// not enabled in upstream-portable distro kernels). See #51.
         #[arg(long = "virtio-console")]
         virtio_console: bool,
+        /// Skip attaching virtio-rng. By default the daemon brings up
+        /// virtio-rng alongside the boot — U-Boot's EFI loader needs it
+        /// to install `EFI_RNG_PROTOCOL`, which the AlmaLinux EFI shim
+        /// queries during signature verification (without it the shim
+        /// stalls before chainloading GRUB). It's also harmless on
+        /// direct-kernel boots (extra thread, satisfies guest
+        /// /dev/random). Pass this if you want to bisect a virtio-rng
+        /// regression. See #62.
+        #[arg(long = "no-virtio-rng")]
+        no_virtio_rng: bool,
     },
     /// Attach a terminal to a booted L2CPU's console via the daemon.
     Connect {
@@ -369,6 +379,7 @@ fn main() -> std::process::ExitCode {
             force_reset_pcie,
             force,
             virtio_console,
+            no_virtio_rng,
         }) => {
             let disk = resolve_disk_path(
                 cli.disk,
@@ -397,6 +408,7 @@ fn main() -> std::process::ExitCode {
                 disk,
                 cli.network,
                 virtio_console,
+                !no_virtio_rng,
                 force,
             )
         }
@@ -545,6 +557,7 @@ fn run_boot_client(
     disk: Option<String>,
     network: bool,
     console: bool,
+    rng: bool,
     force: bool,
 ) -> std::io::Result<()> {
     // Bundle disk + network into the Boot RPC so the virtio workers come up
@@ -579,6 +592,7 @@ fn run_boot_client(
         disk,
         network,
         console,
+        rng,
         force,
     )
 }
