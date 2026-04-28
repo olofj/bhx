@@ -55,6 +55,8 @@
 #define STATS_OFF_NOTIFY_EVENTS   0x018  // count of QUEUE_NOTIFY write events
 #define STATS_OFF_READY_EVENTS    0x01c  // count of QUEUE_READY write events
 #define STATS_OFF_LAST_NOTIFY     0x020  // last (slot << 16 | queue_idx)
+#define STATS_OFF_COMPL_EVENTS    0x024  // count of completion entries consumed
+#define STATS_OFF_LAST_COMPL      0x028  // last (slot << 16 | queue_idx) consumed
 
 #define STATS_MAGIC_LOADED        0x0000B155u
 
@@ -319,6 +321,26 @@ static void handle_status_change(unsigned slot, uint32_t status, uint32_t prev) 
     inc_stat(STATS_OFF_STATUS_CHANGES);
 }
 
+// Drain the completion ring (daemon → BRISC). Each entry tells us
+// "slot S queue Q has a new used_idx; please IRQ the L2CPU." In
+// this M5 first cut we only record the event in stats; the actual
+// PLIC IRQ to the L2CPU stays daemon-driven (the NIU register
+// dance for BRISC-side NoC writes lands in a follow-up).
+static void poll_completion_ring(void) {
+    uint32_t producer = read_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_PRODUCER_SEQ));
+    uint32_t consumer = read_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_CONSUMER_SEQ));
+    while (consumer != producer) {
+        uint32_t idx = consumer & (COMPL_RING_ENTRIES - 1u);
+        uintptr_t entry = ctrl_addr(CTRL_OFF_COMPL_RING + idx * COMPL_ENTRY_SIZE);
+        uint32_t slot_q = *l1_u32(entry);  // [15:0] slot, [31:16] queue
+        // Stash for diagnostics; same packed format as LAST_NOTIFY.
+        *l1_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_LAST_COMPL) = slot_q;
+        inc_stat(STATS_OFF_COMPL_EVENTS);
+        consumer += 1u;
+    }
+    write_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_CONSUMER_SEQ), consumer);
+}
+
 // ----- Main poll loop -----
 
 static void poll_one_device(unsigned slot) {
@@ -424,6 +446,7 @@ void main(void) {
         for (unsigned slot = 0; slot < BRISC_VIRTIO_NUM_SLOTS; slot++) {
             poll_one_device(slot);
         }
+        poll_completion_ring();
         heartbeat += 1u;
         // Don't fence on every iteration — heartbeat is observed at
         // human timescales (debug status), so once per ~1024 sweeps

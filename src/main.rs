@@ -1160,8 +1160,8 @@ fn run_tensix_virtio(card: u32, x: u16, y: u16) -> std::io::Result<()> {
     // M5 (#71) kick-ring path: drive QUEUE_NOTIFY=2 on slot 5,
     // expect the kick ring's producer_seq to advance and the entry
     // at the new ring index to record (slot=5, queue_idx=2).
+    use tensix_proto as proto;
     {
-        use tensix_proto as proto;
         eprintln!("[tensix-virtio] driving QUEUE_NOTIFY=2 on slot 5 (L2CPU 1 net)");
         let slot5_notify = ve::slot_regs_base(5) + ve::MMIO_QUEUE_NOTIFY;
         let producer_addr =
@@ -1200,6 +1200,53 @@ fn run_tensix_virtio(card: u32, x: u16, y: u16) -> std::io::Result<()> {
                 );
                 errors += 1;
             }
+        }
+    }
+
+    // M5 (#71) completion-ring path: write a CompletionEntry into
+    // L1 at the next producer index, bump producer_seq, then poll
+    // the firmware's `compl_events` stat to confirm BRISC consumed
+    // the entry. This exercises the daemon→BRISC half of the
+    // bridge.
+    {
+        eprintln!("[tensix-virtio] driving completion entry on slot 7 (L2CPU 1 rng)");
+        let producer_addr =
+            proto::CTRL_BASE + proto::CTRL_OFF_COMPL_RING_HDR + proto::COMPL_HDR_OFF_PRODUCER_SEQ;
+        let compl_events_addr = ve::STATS_BASE + ve::STATS_OFF_COMPL_EVENTS;
+        let last_compl_addr = ve::STATS_BASE + ve::STATS_OFF_LAST_COMPL;
+        let before_compl = tile.read_l1_u32(compl_events_addr);
+        let producer_before = tile.read_l1_u32(producer_addr);
+        let idx = producer_before % proto::COMPL_RING_ENTRIES;
+        let entry_off =
+            proto::CTRL_BASE + proto::CTRL_OFF_COMPL_RING + idx * proto::COMPL_ENTRY_SIZE;
+        // CompletionEntry: slot=7 (low 16), queue_idx=0 (high 16)
+        // packed into a single u32 — same packed format the
+        // firmware reads for kicks. Queue 0 happens to be the
+        // numeric value, but we write it explicitly via shifts so
+        // future tweaks (queue=1, queue=N) don't have to remember
+        // the layout.
+        let expected = 7u32; // (slot=7, queue=0) packs to just 7.
+        tile.write_l1_u32(entry_off, expected);
+        tile.write_l1_u32(entry_off + 4, 42); // used_idx
+        tile.write_l1_u32(producer_addr, producer_before.wrapping_add(1));
+        sleep(Duration::from_millis(5));
+        let after_compl = tile.read_l1_u32(compl_events_addr);
+        let last_compl = tile.read_l1_u32(last_compl_addr);
+        if after_compl > before_compl && last_compl == expected {
+            eprintln!(
+                "  compl_events advanced ({} → {}), last_compl=({}, {}) — \
+                 COMPLETION PATH PASS",
+                before_compl,
+                after_compl,
+                (last_compl & 0xFFFF) as u16,
+                (last_compl >> 16) as u16
+            );
+        } else {
+            eprintln!(
+                "  COMPLETION PATH FAIL: compl_events {} → {}, last_compl={:#010x}",
+                before_compl, after_compl, last_compl
+            );
+            errors += 1;
         }
     }
 
