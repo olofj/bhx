@@ -44,6 +44,7 @@ Grouped by purpose, with seccomp policy intent.
 | `recvfrom`, `sendto`, `sendmsg` | wire-format JSON + SCM\_RIGHTS console fd |
 | `socket(AF_UNIX,…)`, `socket(AF_INET,SOCK_STREAM,…)` | control sock + slirp's TCP forward listener |
 | `bind`, `listen` | same — slirp listens on `127.0.0.1:<ssh_port>` |
+| `connect` | libslirp's TCP NAT path opens a host-side socket per guest-initiated outbound flow. Without this, guest TCP fails with ENETUNREACH (libslirp catches the EPERM in `tcp_fconnect` and synthesizes ICMP unreachable). The original audit only traced inbound SSH-forward, which uses `accept` not `connect`, so this got missed — see #65. |
 | `getrandom` | random bytes (slirp's TCP ISN, log timestamps) |
 | `ioctl` with magic `0xfa` | tt-kmd: ALLOCATE_TLB / FREE_TLB / CONFIGURE_TLB / RESET_DEVICE / GET_DEVICE_INFO. See `src/kmd.rs` |
 | `ioctl(_, FIONBIO, …)` | nonblocking unix socket setup |
@@ -67,7 +68,6 @@ These show up only during binary load + `daemon start` setup. Sandbox is install
 | Syscall | Why |
 |---------|-----|
 | `fork`, `vfork` | We're past the fork point. clone3 with CLONE_THREAD is what we use |
-| `connect` | **Zero** in the trace. Slirp accepts inbound only; daemon has no outbound networking |
 | `chroot`, `pivot_root`, `mount`, `unshare`, `setns` | Container-escape primitives |
 | `ptrace` | Debug-injection primitive |
 | `setuid`, `setgid`, `setresuid`, `setresgid` | Privilege change. Daemon runs as the operator's UID; staying there is the contract |
@@ -132,7 +132,7 @@ The issue listed `dup3` for fd ops; trace shows `fcntl` (`F_DUPFD_CLOEXEC` style
 
 The issue's `pipe2` is right — we use it for ctrlc's signal-handling pipe.
 
-`socket` / `bind` / `listen` weren't on the issue's whitelist but are required for slirp's TCP forwarder. Add them. `connect` stays blocked.
+`socket` / `bind` / `listen` / `connect` weren't on the issue's whitelist but are required for slirp's TCP forwarder. The first three for inbound NAT (host listens, accepts a host-side connect, forwards into the guest); `connect` for outbound NAT (libslirp opens a host-side TCP socket per guest-initiated flow). The original triage only noticed the inbound surface, which is why `connect` was wrongly flagged as "zero in the trace" — see #65.
 
 ## Implementation
 

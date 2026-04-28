@@ -270,9 +270,17 @@ mod imp {
             libc::SYS_sendto,
             libc::SYS_sendmsg,
             libc::SYS_shutdown,
-            // Note: SYS_connect deliberately excluded.
+            // libslirp's TCP NAT path calls connect(2) to open a host-side
+            // socket for every guest-initiated outbound TCP flow. Without
+            // this, guest-side wget/curl/iperf3 fail with ENETUNREACH —
+            // libslirp catches the EPERM in tcp_fconnect and synthesizes
+            // an ICMP unreachable back to the guest (#65). Inbound NAT
+            // (the SSH-forward listener) doesn't need connect because
+            // it accepts host-side and forwards into the guest virtio,
+            // which is how the original sandbox audit missed this.
+            libc::SYS_connect,
             // --- ioctl (allowed unconditionally — the dangerous
-            //     surface is `connect`/`bpf`/etc., not ioctl on the
+            //     surface is `bpf`/`ptrace`/etc., not ioctl on the
             //     fds we already hold) ---
             libc::SYS_ioctl,
             // --- signal handling (SIGPIPE to NOSIGPIPE etc.; allowed
