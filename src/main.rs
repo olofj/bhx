@@ -26,7 +26,9 @@ mod regs;
 mod shared_chip;
 #[cfg(feature = "slirp")]
 mod slirp_ffi;
+mod telemetry;
 mod tensix;
+mod tensix_tile;
 mod tlb;
 mod virtio;
 mod x280_tlb;
@@ -338,19 +340,35 @@ enum DebugAction {
     /// and incrementing counter. PASS when the counter advances
     /// across `--duration` seconds. Issue #67.
     TensixHello {
-        /// Tensix tile X coordinate (NoC0 logical). Functional workers
-        /// on Blackhole live in x=1..7 and x=10..16.
+        /// Tensix tile X coordinate (NoC0 logical). When omitted, the
+        /// M2 picker chooses one based on the chip's harvest mask.
+        /// Functional workers on Blackhole live in x=1..7 and 10..16.
         #[arg(long)]
-        x: u16,
-        /// Tensix tile Y coordinate (NoC0 logical). Functional workers
-        /// on Blackhole live in y=2..11.
+        x: Option<u16>,
+        /// Tensix tile Y coordinate. Same defaulting behavior as `--x`.
+        /// Functional workers on Blackhole live in y=2..11.
         #[arg(long)]
-        y: u16,
+        y: Option<u16>,
         /// Number of seconds to poll the counter for. The host samples
         /// once per second.
         #[arg(long, default_value_t = 5)]
         duration: u32,
     },
+    /// Dump the ARC firmware telemetry table — prints the three M2
+    /// picker inputs (HarvestingState, EnabledTensixCol,
+    /// NocTranslation) and the decoded set of working Tensix tile
+    /// coordinates. Useful for confirming the picker on a new chip
+    /// or diagnosing harvest-related anomalies. Issues #68, #75.
+    TelemetryDump {
+        /// Print every telemetry tag entry (~60 rows) instead of just
+        /// the picker-relevant subset.
+        #[arg(long)]
+        all_tags: bool,
+    },
+    /// Print the tile coordinate the picker would reserve for the
+    /// virtio-mmio engine on this chip. Pure decode — does not touch
+    /// the tile. Issue #68.
+    PickTile,
 }
 
 #[derive(Subcommand)]
@@ -665,7 +683,10 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
     // pointing at mmaps of that core. Refuse write ops when the daemon
     // is up; read ops warn and proceed.
     let daemon_up = daemon::lifetime::is_running(card);
-    let writes_chip = !matches!(action, DebugAction::ReadResetReg);
+    let writes_chip = !matches!(
+        action,
+        DebugAction::ReadResetReg | DebugAction::TelemetryDump { .. } | DebugAction::PickTile,
+    );
     if daemon_up && writes_chip {
         return Err(std::io::Error::other(format!(
             "daemon is running for card {} — refusing to write chip state from outside the daemon \
@@ -709,14 +730,114 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
         DebugAction::AssertReset => toggle_reset_bit(&chip, l2cpu, false),
         DebugAction::DeassertReset => toggle_reset_bit(&chip, l2cpu, true),
         DebugAction::TensixHello { x, y, duration } => {
-            // SharedChip is opened above for the daemon-running check;
-            // we drop it here because TensixTile opens its own fd.
-            // Holding two fds onto the same card is fine, but we don't
-            // need it.
+            // Resolve any unspecified coord via the M2 picker before
+            // dropping the SharedChip — the picker reads telemetry
+            // through it.
+            let (x, y) = resolve_tensix_coords(&chip, x, y)?;
             drop(chip);
             run_tensix_hello(card, x, y, duration)
         }
+        DebugAction::TelemetryDump { all_tags } => run_telemetry_dump(&chip, all_tags),
+        DebugAction::PickTile => run_pick_tile(&chip),
     }
+}
+
+/// Resolve `(x, y)` from the CLI: pass-through if both are present,
+/// fall back to the M2 picker otherwise. If only one is given we
+/// still call the picker so the user gets a clear "explain why" path
+/// — half-overrides are too easy to misuse otherwise.
+fn resolve_tensix_coords(
+    chip: &shared_chip::SharedChip,
+    x: Option<u16>,
+    y: Option<u16>,
+) -> std::io::Result<(u16, u16)> {
+    if let (Some(x), Some(y)) = (x, y) {
+        return Ok((x, y));
+    }
+    let telem = telemetry::read_telemetry(chip)
+        .map_err(|e| std::io::Error::other(format!("read telemetry: {}", e)))?;
+    let picked = tensix_tile::pick_virtio_engine_tile(&telem)
+        .map_err(|e| std::io::Error::other(format!("pick tile: {}", e)))?;
+    eprintln!(
+        "[tensix-hello] picker chose ({}, {}) [{:?}]",
+        picked.x, picked.y, picked.reason
+    );
+    Ok((picked.x, picked.y))
+}
+
+fn run_telemetry_dump(chip: &shared_chip::SharedChip, all_tags: bool) -> std::io::Result<()> {
+    let table_addr = chip.axi_read32(telemetry::ARC_TELEMETRY_PTR_ADDR);
+    println!(
+        "SCRATCH_RAM[13] @ {:#010x} = {:#010x} (telemetry table base)",
+        telemetry::ARC_TELEMETRY_PTR_ADDR,
+        table_addr
+    );
+    let telem = telemetry::read_telemetry(chip)
+        .map_err(|e| std::io::Error::other(format!("read telemetry: {}", e)))?;
+    println!(
+        "telemetry: version={:#010x} entry_count={}",
+        telem.version, telem.entry_count
+    );
+    println!("  HarvestingState     = {:#010x}", telem.harvesting_state);
+    println!(
+        "  EnabledTensixCol    = {:#010x} ({} cols set)",
+        telem.enabled_tensix_col,
+        telem.enabled_tensix_col.count_ones()
+    );
+    println!(
+        "  NocTranslation      = {} ({})",
+        if telem.noc_translation_enabled { 1 } else { 0 },
+        if telem.noc_translation_enabled {
+            "translated"
+        } else {
+            "untranslated"
+        }
+    );
+    println!("  BoardId             = {:#018x}", telem.board_id);
+    println!("  AsicId              = {:#010x}", telem.asic_id);
+    println!("  AsicLocation        = {}", telem.asic_location);
+    println!("  EnabledEth          = {:#010x}", telem.enabled_eth);
+    println!("  EnabledGddr         = {:#010x}", telem.enabled_gddr);
+    println!("  EnabledL2Cpu        = {:#010x}", telem.enabled_l2cpu);
+
+    let cols =
+        tensix_tile::working_tensix_cols(telem.enabled_tensix_col, telem.noc_translation_enabled);
+    let rows = tensix_tile::working_tensix_rows(telem.harvesting_state);
+    println!(
+        "decoded working set ({} cols × {} rows):",
+        cols.len(),
+        rows.len()
+    );
+    println!("  cols: {:?}", cols);
+    println!("  rows: {:?}", rows);
+    let harvested_rows = tensix_tile::harvested_tensix_rows(telem.harvesting_state);
+    if !harvested_rows.is_empty() {
+        println!("  harvested rows: {:?}", harvested_rows);
+    }
+    match tensix_tile::pick_virtio_engine_tile(&telem) {
+        Ok(p) => println!("  picker would choose: ({}, {}) [{:?}]", p.x, p.y, p.reason),
+        Err(e) => println!("  picker would error: {}", e),
+    }
+
+    if all_tags {
+        println!("--- all telemetry entries ---");
+        for e in &telem.entries {
+            println!(
+                "  tag={:>3}  offset={:>3}  data={:#010x}",
+                e.tag, e.offset, e.data
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_pick_tile(chip: &shared_chip::SharedChip) -> std::io::Result<()> {
+    let telem = telemetry::read_telemetry(chip)
+        .map_err(|e| std::io::Error::other(format!("read telemetry: {}", e)))?;
+    let picked = tensix_tile::pick_virtio_engine_tile(&telem)
+        .map_err(|e| std::io::Error::other(format!("pick tile: {}", e)))?;
+    println!("{} {} ({:?})", picked.x, picked.y, picked.reason);
+    Ok(())
 }
 
 fn run_tensix_hello(card: u32, x: u16, y: u16, duration: u32) -> std::io::Result<()> {

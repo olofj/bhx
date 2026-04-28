@@ -59,20 +59,35 @@ const AXI_WINDOW_SIZE: u64 = 0x20_0000;
 /// `L2CPU_RESET` lives in the reset unit at this AXI address.
 const L2CPU_RESET_ADDR: u64 = 0x8003_0014;
 
-/// fd + persistent TLB window that may be rebuilt across a PCIe reset.
-/// Field order matters: `window` must drop before `fd` because the window's
-/// `Drop` issues `FREE_TLB` via the ioctl on `fd`. We use `ManuallyDrop<
-/// TlbWindow>` + an explicit `Drop` impl so the order is "drop window, then
-/// close fd" regardless of what Rust's default field drop order would do.
+/// ARC CSM RAM is at AXI `0x1000_0000` on tile (8,0). The ARC firmware
+/// telemetry table lives somewhere in here (its base address is read
+/// from `SCRATCH_RAM[13]`). `tt-kmd/telemetry.h::ARC_CSM_SIZE` is
+/// `1<<19` = 512 KiB, so a single 2 MiB TLB window covers it with
+/// margin. Used by `csm_read32` for the M2 (#68) telemetry walk.
+const CSM_WINDOW_BASE: u64 = 0x1000_0000;
+const CSM_WINDOW_SIZE: u64 = 0x20_0000;
+
+/// fd + persistent TLB windows that may be rebuilt across a PCIe reset.
+///
+/// Field order matters: both windows must drop before `fd` because their
+/// `Drop` impls issue `FREE_TLB` ioctls on `fd`. We use `ManuallyDrop` +
+/// an explicit `Drop` impl so the order is "drop windows, then close
+/// fd" regardless of Rust's default field-drop order.
 struct Inner {
-    window: ManuallyDrop<TlbWindow>,
+    /// 2 MiB AXI window over `0x8000_0000+` — PLL, reset unit, scratch,
+    /// MSI FIFO, all the things accessed via short MMIO-like addresses.
+    axi_window: ManuallyDrop<TlbWindow>,
+    /// 2 MiB CSM window over `0x1000_0000+` — ARC firmware RAM, where
+    /// the telemetry table lives.
+    csm_window: ManuallyDrop<TlbWindow>,
     fd: RawFd,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
         unsafe {
-            ManuallyDrop::drop(&mut self.window);
+            ManuallyDrop::drop(&mut self.csm_window);
+            ManuallyDrop::drop(&mut self.axi_window);
             libc::close(self.fd);
         }
     }
@@ -125,7 +140,7 @@ impl SharedChip {
 
     fn open_inner(card: u32) -> io::Result<Inner> {
         let fd = kmd::open_device(card)?;
-        let window = match TlbWindow::new_2m(fd, AXI_TILE_X, AXI_TILE_Y, AXI_WINDOW_BASE) {
+        let axi_window = match TlbWindow::new_2m(fd, AXI_TILE_X, AXI_TILE_Y, AXI_WINDOW_BASE) {
             Ok(w) => w,
             Err(e) => {
                 unsafe {
@@ -134,13 +149,24 @@ impl SharedChip {
                 return Err(e);
             }
         };
+        let csm_window = match TlbWindow::new_2m(fd, AXI_TILE_X, AXI_TILE_Y, CSM_WINDOW_BASE) {
+            Ok(w) => w,
+            Err(e) => {
+                drop(axi_window);
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(e);
+            }
+        };
         Ok(Inner {
-            window: ManuallyDrop::new(window),
+            axi_window: ManuallyDrop::new(axi_window),
+            csm_window: ManuallyDrop::new(csm_window),
             fd,
         })
     }
 
-    fn window_offset(addr: u64) -> u64 {
+    fn axi_window_offset(addr: u64) -> u64 {
         let range = AXI_WINDOW_BASE..AXI_WINDOW_BASE + AXI_WINDOW_SIZE;
         assert!(
             range.contains(&addr),
@@ -152,22 +178,45 @@ impl SharedChip {
         addr - AXI_WINDOW_BASE
     }
 
+    fn csm_window_offset(addr: u64) -> u64 {
+        let range = CSM_WINDOW_BASE..CSM_WINDOW_BASE + CSM_WINDOW_SIZE;
+        assert!(
+            range.contains(&addr),
+            "SharedChip: addr 0x{:x} outside CSM window [0x{:x}..0x{:x})",
+            addr,
+            range.start,
+            range.end,
+        );
+        addr - CSM_WINDOW_BASE
+    }
+
     /// Single-register u32 read. No `seq_lock` — the MMIO bus gives
     /// single-copy atomicity for aligned u32 reads, and a stale value from a
     /// concurrent writer is fine for a pure read.
     pub fn axi_read32(&self, addr: u64) -> u32 {
-        let off = Self::window_offset(addr);
+        let off = Self::axi_window_offset(addr);
         let guard = self.inner.read().unwrap();
         let inner = guard.as_ref().expect("SharedChip used while rotating fd");
-        inner.window.read32(off)
+        inner.axi_window.read32(off)
     }
 
     /// Single-register u32 write. Same lock story as `axi_read32`.
     pub fn axi_write32(&self, addr: u64, value: u32) {
-        let off = Self::window_offset(addr);
+        let off = Self::axi_window_offset(addr);
         let guard = self.inner.read().unwrap();
         let inner = guard.as_ref().expect("SharedChip used while rotating fd");
-        inner.window.write32(off, value);
+        inner.axi_window.write32(off, value);
+    }
+
+    /// Read a u32 from ARC CSM (the firmware's RAM, used for the
+    /// telemetry table — see `src/telemetry.rs` and #75 for context).
+    /// The address must lie within `[0x1000_0000, 0x1020_0000)`. A pure
+    /// read; same lock story as `axi_read32`.
+    pub fn csm_read32(&self, addr: u64) -> u32 {
+        let off = Self::csm_window_offset(addr);
+        let guard = self.inner.read().unwrap();
+        let inner = guard.as_ref().expect("SharedChip used while rotating fd");
+        inner.csm_window.read32(off)
     }
 
     /// Probe whether L2CPU `idx`'s release bit is set. Pure read; no
@@ -259,30 +308,56 @@ mod tests {
     use super::*;
 
     // Layout invariants — if these ever change, the assertions in
-    // `window_offset` (and any hand-tuned addresses) stop being valid.
-    // Compile-time because all inputs are `const`.
+    // `axi_window_offset` / `csm_window_offset` (and any hand-tuned
+    // addresses) stop being valid. Compile-time because all inputs are
+    // `const`.
     const _: () = {
+        // PLL register, reset register live inside the AXI window.
         assert!(AXI_WINDOW_BASE <= 0x80020500);
         assert!(0x80020500 < AXI_WINDOW_BASE + AXI_WINDOW_SIZE);
         assert!(AXI_WINDOW_BASE <= L2CPU_RESET_ADDR);
         assert!(L2CPU_RESET_ADDR < AXI_WINDOW_BASE + AXI_WINDOW_SIZE);
+        // The CSM window must cover ARC_CSM_BASE..ARC_CSM_BASE+ARC_CSM_SIZE
+        // (0x10000000..0x10080000, 512 KiB) — the telemetry table can
+        // live anywhere in there.
+        assert!(CSM_WINDOW_BASE == 0x10000000);
+        assert!(CSM_WINDOW_SIZE >= 0x80000);
     };
 
     #[test]
-    fn window_offset_maps_known_addresses() {
-        assert_eq!(SharedChip::window_offset(0x80020500), 0x20500);
-        assert_eq!(SharedChip::window_offset(L2CPU_RESET_ADDR), 0x30014);
+    fn axi_window_offset_maps_known_addresses() {
+        assert_eq!(SharedChip::axi_window_offset(0x80020500), 0x20500);
+        assert_eq!(SharedChip::axi_window_offset(L2CPU_RESET_ADDR), 0x30014);
     }
 
     #[test]
     #[should_panic(expected = "outside AXI window")]
-    fn window_offset_rejects_out_of_range_addr() {
-        SharedChip::window_offset(AXI_WINDOW_BASE + AXI_WINDOW_SIZE);
+    fn axi_window_offset_rejects_out_of_range_addr() {
+        SharedChip::axi_window_offset(AXI_WINDOW_BASE + AXI_WINDOW_SIZE);
     }
 
     #[test]
     #[should_panic(expected = "outside AXI window")]
-    fn window_offset_rejects_below_base() {
-        SharedChip::window_offset(AXI_WINDOW_BASE - 1);
+    fn axi_window_offset_rejects_below_base() {
+        SharedChip::axi_window_offset(AXI_WINDOW_BASE - 1);
+    }
+
+    #[test]
+    fn csm_window_offset_maps_known_addresses() {
+        // ARC_CSM_BASE itself maps to offset 0; one past the end of CSM
+        // (still within the 2 MiB window) is also valid arithmetic, but
+        // the kernel-side CSM check (`is_range_within_csm` in
+        // `tt-kmd/telemetry.h`) bounds at 512 KiB.
+        assert_eq!(SharedChip::csm_window_offset(CSM_WINDOW_BASE), 0);
+        assert_eq!(
+            SharedChip::csm_window_offset(CSM_WINDOW_BASE + 0x434),
+            0x434
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "outside CSM window")]
+    fn csm_window_offset_rejects_out_of_range_addr() {
+        SharedChip::csm_window_offset(CSM_WINDOW_BASE + CSM_WINDOW_SIZE);
     }
 }
