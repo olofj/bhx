@@ -1,0 +1,264 @@
+// SPDX-FileCopyrightText: © 2026 Olof Johansson
+// SPDX-License-Identifier: MIT
+
+//! Tensix tile bring-up — load BRISC firmware, drive soft reset.
+//!
+//! Issue #67 (M1) — foundation for the Tensix-as-virtio-engine
+//! architecture in #66. Establishes "we can run RISC-V code on a
+//! Tensix tile" without doing anything virtio-related yet.
+//!
+//! Per `BlackholeA0/TensixTile/BabyRISCV/README.md`, BabyRISCs fetch
+//! instructions only from L1 — code in BRISC's local 8 KiB at
+//! `0xFFB0_0000` cannot be executed. BRISC's reset PC is `0x0` (per
+//! `BlackholeA0/TensixTile/SoftReset.md`), so a flat firmware binary
+//! starts executing the moment BRISC's soft-reset bit is cleared.
+//!
+//! Memory map of a Tensix tile, from this module's perspective:
+//! ```text
+//!   0x0000_0000 .. 0x0018_0000  shared L1 SRAM (1.5 MiB)
+//!   0xFFB0_0000 .. 0xFFB0_2000  BRISC private data RAM (8 KiB)
+//!   0xFFB1_2000 .. 0xFFB1_3000  per-tile RISC-V debug-regs block
+//!     0xFFB1_21B0                soft-reset register (this file)
+//! ```
+//! Two 2 MiB chip-side TLB windows cover the addresses we touch:
+//! one based at L1 offset 0 for firmware load + status polling, one
+//! based at `0xFFA0_0000` for the soft-reset register.
+
+use std::io;
+use std::mem::ManuallyDrop;
+use std::os::unix::io::RawFd;
+
+use crate::kmd;
+use crate::tlb::TlbWindow;
+
+/// Soft-reset register address (per-tile, NoC-addressable). Bits 11,
+/// 12, 13, 14, 18 control BRISC, TRISC0/1/2, NCRISC respectively.
+/// Source: `BlackholeA0/TensixTile/SoftReset.md`.
+pub const TENSIX_SOFT_RESET_ADDR: u64 = 0xFFB1_21B0;
+
+pub const SOFT_RESET_BRISC: u32 = 1 << 11;
+pub const SOFT_RESET_TRISC0: u32 = 1 << 12;
+pub const SOFT_RESET_TRISC1: u32 = 1 << 13;
+pub const SOFT_RESET_TRISC2: u32 = 1 << 14;
+pub const SOFT_RESET_NCRISC: u32 = 1 << 18;
+
+/// All five baby RISCs in soft reset (idempotent halt). Used as the
+/// pre-firmware-load barrier so an unknown prior tile state can't
+/// race the host's L1 writes.
+pub const SOFT_RESET_ALL: u32 = SOFT_RESET_BRISC
+    | SOFT_RESET_TRISC0
+    | SOFT_RESET_TRISC1
+    | SOFT_RESET_TRISC2
+    | SOFT_RESET_NCRISC;
+
+/// All baby RISCs in reset *except* BRISC. Writing this releases
+/// BRISC; NCRISC and the TRISCs stay halted so they don't fetch
+/// garbage out of L1.
+pub const SOFT_RESET_ALL_EXCEPT_BRISC: u32 = SOFT_RESET_ALL & !SOFT_RESET_BRISC;
+
+/// Tensix L1 size in bytes (per `dev_mem_map.h::MEM_L1_SIZE`).
+pub const TENSIX_L1_SIZE: usize = 1536 * 1024;
+
+/// L1 offsets the M1 hello-world firmware writes. Kept here so
+/// the host poller and the firmware agree without the firmware
+/// having to compile against this crate.
+pub const HELLO_MAGIC_OFFSET: u32 = 0x40;
+pub const HELLO_COUNTER_OFFSET: u32 = 0x44;
+pub const HELLO_MAGIC_VALUE: u32 = 0xA110_C0DE;
+
+/// Hello-world firmware bytes, embedded at compile time. Built by
+/// `build.rs` via `brisc-firmware/Makefile`.
+pub const HELLO_FIRMWARE: &[u8] = include_bytes!(env!("BRISC_HELLO_BIN"));
+
+/// 2 MiB TLB window bases on the chosen tile.
+///
+/// * L1 lives at NoC offset 0 — one 2 MiB window covers the first
+///   2 MiB (which is more than the 1.5 MiB it actually has).
+/// * The RISC-V debug-regs block at `0xFFB1_2000` is reached via a
+///   2 MiB-aligned window based at `0xFFA0_0000` (covers
+///   `[0xFFA0_0000, 0xFFC0_0000)`, includes `0xFFB1_21B0`).
+const TLB_BASE_L1: u64 = 0x0;
+const TLB_BASE_DEBUG_REGS: u64 = 0xFFA0_0000;
+
+/// One Tensix tile, with chip-side TLB windows already wired up to
+/// its L1 and per-tile RISC-V debug-regs block.
+///
+/// Drop order matters: TLB windows free via FREE_TLB ioctl (which
+/// needs the fd open), then we close the fd. `ManuallyDrop` enforces
+/// the ordering regardless of the default field-drop order.
+pub struct TensixTile {
+    pub x: u16,
+    pub y: u16,
+    fd: RawFd,
+    l1_window: ManuallyDrop<TlbWindow>,
+    debug_regs_window: ManuallyDrop<TlbWindow>,
+}
+
+// Safety: the contained TlbWindow holds a raw pointer to PCI BAR
+// MMIO, and that pointer is single-copy-atomic for aligned u32 access
+// per the host bus. We're Send-only (matching `TlbWindow`); no Sync
+// implementation — multi-threaded access requires external sync, just
+// like `SharedChip`.
+unsafe impl Send for TensixTile {}
+
+impl TensixTile {
+    /// Open card `card`, configure two TLB windows on tile `(x, y)`.
+    pub fn new(card: u32, x: u16, y: u16) -> io::Result<Self> {
+        let fd = kmd::open_device(card)?;
+        let l1_window = match TlbWindow::new_2m(fd, x, y, TLB_BASE_L1) {
+            Ok(w) => w,
+            Err(e) => {
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(e);
+            }
+        };
+        let debug_regs_window = match TlbWindow::new_2m(fd, x, y, TLB_BASE_DEBUG_REGS) {
+            Ok(w) => w,
+            Err(e) => {
+                drop(l1_window);
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(e);
+            }
+        };
+        Ok(TensixTile {
+            x,
+            y,
+            fd,
+            l1_window: ManuallyDrop::new(l1_window),
+            debug_regs_window: ManuallyDrop::new(debug_regs_window),
+        })
+    }
+
+    pub fn read_l1_u32(&self, offset: u32) -> u32 {
+        assert!(
+            (offset as usize) + 4 <= TENSIX_L1_SIZE,
+            "L1 read offset 0x{:x} + 4 > L1 size",
+            offset
+        );
+        self.l1_window.read32(offset as u64)
+    }
+
+    pub fn write_l1_u32(&self, offset: u32, value: u32) {
+        assert!(
+            (offset as usize) + 4 <= TENSIX_L1_SIZE,
+            "L1 write offset 0x{:x} + 4 > L1 size",
+            offset
+        );
+        self.l1_window.write32(offset as u64, value);
+    }
+
+    pub fn read_soft_reset(&self) -> u32 {
+        let off = TENSIX_SOFT_RESET_ADDR - TLB_BASE_DEBUG_REGS;
+        self.debug_regs_window.read32(off)
+    }
+
+    pub fn write_soft_reset(&self, value: u32) {
+        let off = TENSIX_SOFT_RESET_ADDR - TLB_BASE_DEBUG_REGS;
+        self.debug_regs_window.write32(off, value);
+    }
+
+    /// Put every BabyRISC on this tile into soft reset and read back
+    /// the register so the write is flushed before any subsequent L1
+    /// access. Idempotent.
+    pub fn assert_all_resets(&self) {
+        self.write_soft_reset(SOFT_RESET_ALL);
+        let _ = self.read_soft_reset();
+    }
+
+    /// Release BRISC from soft reset, keeping NCRISC + TRISCs halted
+    /// so they don't fetch from L1 (where our BRISC firmware lives).
+    /// Reads back to flush the write.
+    pub fn release_brisc_only(&self) {
+        self.write_soft_reset(SOFT_RESET_ALL_EXCEPT_BRISC);
+        let _ = self.read_soft_reset();
+    }
+
+    /// Copy `firmware` bytes into L1 starting at offset 0 using
+    /// 32-bit MMIO writes. Pads with zeros if `firmware.len()` is
+    /// not a multiple of 4.
+    pub fn load_brisc_firmware(&self, firmware: &[u8]) {
+        assert!(
+            firmware.len() <= TENSIX_L1_SIZE,
+            "firmware ({} bytes) exceeds L1 size ({} bytes)",
+            firmware.len(),
+            TENSIX_L1_SIZE
+        );
+        let chunks = firmware.chunks_exact(4);
+        let remainder = chunks.remainder();
+        for (i, chunk) in chunks.clone().enumerate() {
+            let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            self.l1_window.write32((i * 4) as u64, w);
+        }
+        if !remainder.is_empty() {
+            let mut tail = [0u8; 4];
+            tail[..remainder.len()].copy_from_slice(remainder);
+            let w = u32::from_le_bytes(tail);
+            let off = (firmware.len() / 4) * 4;
+            self.l1_window.write32(off as u64, w);
+        }
+    }
+}
+
+impl Drop for TensixTile {
+    fn drop(&mut self) {
+        unsafe {
+            ManuallyDrop::drop(&mut self.debug_regs_window);
+            ManuallyDrop::drop(&mut self.l1_window);
+            libc::close(self.fd);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn soft_reset_all_includes_every_core() {
+        assert_eq!(SOFT_RESET_ALL & SOFT_RESET_BRISC, SOFT_RESET_BRISC);
+        assert_eq!(SOFT_RESET_ALL & SOFT_RESET_TRISC0, SOFT_RESET_TRISC0);
+        assert_eq!(SOFT_RESET_ALL & SOFT_RESET_TRISC1, SOFT_RESET_TRISC1);
+        assert_eq!(SOFT_RESET_ALL & SOFT_RESET_TRISC2, SOFT_RESET_TRISC2);
+        assert_eq!(SOFT_RESET_ALL & SOFT_RESET_NCRISC, SOFT_RESET_NCRISC);
+    }
+
+    #[test]
+    fn release_brisc_clears_only_brisc() {
+        let masked_off = SOFT_RESET_ALL & !SOFT_RESET_ALL_EXCEPT_BRISC;
+        assert_eq!(masked_off, SOFT_RESET_BRISC);
+    }
+
+    // The soft-reset register must land inside the 2 MiB debug-regs
+    // window, otherwise the offset arithmetic in
+    // {read,write}_soft_reset would underflow or read past the
+    // window. Compile-time check — `const { assert!(...) }` fails
+    // the build instead of a test if a future edit breaks the
+    // invariant.
+    const _DEBUG_REGS_WINDOW_INVARIANTS: () = {
+        const TWO_MEG: u64 = 2 * 1024 * 1024;
+        assert!(TENSIX_SOFT_RESET_ADDR >= TLB_BASE_DEBUG_REGS);
+        assert!(TENSIX_SOFT_RESET_ADDR + 4 <= TLB_BASE_DEBUG_REGS + TWO_MEG);
+    };
+
+    #[test]
+    fn hello_firmware_is_nonempty_and_aligned() {
+        // The build script must have produced a non-empty .bin and
+        // the firmware load path assumes 4-byte stride writes are
+        // sufficient (no straddling reads).
+        assert!(!HELLO_FIRMWARE.is_empty());
+        assert!(HELLO_FIRMWARE.len() <= TENSIX_L1_SIZE);
+        // First instruction at offset 0 should be a non-trivial value
+        // (the `j main_entry` jump in start.S, encoded as 0x0800006f).
+        let first_word = u32::from_le_bytes([
+            HELLO_FIRMWARE[0],
+            HELLO_FIRMWARE[1],
+            HELLO_FIRMWARE[2],
+            HELLO_FIRMWARE[3],
+        ]);
+        assert_ne!(first_word, 0, "firmware appears empty (first word is zero)");
+    }
+}

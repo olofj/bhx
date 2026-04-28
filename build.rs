@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
@@ -6,9 +7,59 @@ fn main() {
     // libfdt is always needed for the DTB-patching done by the `boot` subcommand.
     println!("cargo:rustc-link-lib=fdt");
 
+    build_brisc_firmware();
+
     // Only link slirp libraries when the "slirp" feature is enabled.
     // This allows building without libvdeslirp/libslirp for users who
     // only need image/kernel/ramdisk management or console+disk support.
+    build_slirp_size_probe();
+}
+
+/// Build the BRISC hello-world firmware (issue #67, M1) by invoking
+/// `brisc-firmware/Makefile`. The Rust side embeds the resulting
+/// `.bin` via `include_bytes!` and copies it into Tensix tile L1.
+///
+/// The toolchain is the sfpi GCC at `/opt/tenstorrent/sfpi/compiler/bin`
+/// (RV32 newlib cross-compiler shipped with tt-installer). We assume
+/// it's present — the project's runtime requirements already include
+/// the Tenstorrent stack, so anyone able to run the daemon has it.
+/// If it's missing the build fails with a clear error pointing at
+/// the install path.
+fn build_brisc_firmware() {
+    let manifest_dir =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
+    let fw_dir = PathBuf::from(&manifest_dir).join("brisc-firmware");
+
+    // Rebuild whenever any source under brisc-firmware/ changes.
+    for f in ["start.S", "main.c", "link.ld", "Makefile"] {
+        println!("cargo:rerun-if-changed=brisc-firmware/{}", f);
+    }
+
+    let toolchain = "/opt/tenstorrent/sfpi/compiler/bin";
+    if !std::path::Path::new(toolchain).is_dir() {
+        panic!(
+            "sfpi toolchain not found at {}. Install with the Tenstorrent installer \
+             or set the path in brisc-firmware/Makefile (TOOLCHAIN_BIN).",
+            toolchain
+        );
+    }
+
+    let status = Command::new("make")
+        .current_dir(&fw_dir)
+        .arg("all")
+        .status()
+        .expect("invoke make for brisc-firmware");
+    if !status.success() {
+        panic!("brisc-firmware build failed (exit {:?})", status.code());
+    }
+
+    // Surface the artifact path to Rust via env! so src/tensix.rs can
+    // include_bytes!(env!(...)) without hardcoding a relative path.
+    let bin_path = fw_dir.join("build").join("brisc-hello.bin");
+    println!("cargo:rustc-env=BRISC_HELLO_BIN={}", bin_path.display());
+}
+
+fn build_slirp_size_probe() {
     if std::env::var("CARGO_FEATURE_SLIRP").is_ok() {
         println!("cargo:rustc-link-lib=vdeslirp");
         println!("cargo:rustc-link-lib=slirp");

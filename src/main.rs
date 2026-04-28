@@ -26,6 +26,7 @@ mod regs;
 mod shared_chip;
 #[cfg(feature = "slirp")]
 mod slirp_ffi;
+mod tensix;
 mod tlb;
 mod virtio;
 mod x280_tlb;
@@ -332,6 +333,24 @@ enum DebugAction {
     /// register write, no PLL manipulation. Useful to re-start a core that
     /// was held by `assert-reset`.
     DeassertReset,
+    /// Load the M1 hello-world BRISC firmware onto Tensix tile (x, y),
+    /// release BRISC from soft-reset, poll L1 for the magic value
+    /// and incrementing counter. PASS when the counter advances
+    /// across `--duration` seconds. Issue #67.
+    TensixHello {
+        /// Tensix tile X coordinate (NoC0 logical). Functional workers
+        /// on Blackhole live in x=1..7 and x=10..16.
+        #[arg(long)]
+        x: u16,
+        /// Tensix tile Y coordinate (NoC0 logical). Functional workers
+        /// on Blackhole live in y=2..11.
+        #[arg(long)]
+        y: u16,
+        /// Number of seconds to poll the counter for. The host samples
+        /// once per second.
+        #[arg(long, default_value_t = 5)]
+        duration: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -689,6 +708,111 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
         }
         DebugAction::AssertReset => toggle_reset_bit(&chip, l2cpu, false),
         DebugAction::DeassertReset => toggle_reset_bit(&chip, l2cpu, true),
+        DebugAction::TensixHello { x, y, duration } => {
+            // SharedChip is opened above for the daemon-running check;
+            // we drop it here because TensixTile opens its own fd.
+            // Holding two fds onto the same card is fine, but we don't
+            // need it.
+            drop(chip);
+            run_tensix_hello(card, x, y, duration)
+        }
+    }
+}
+
+fn run_tensix_hello(card: u32, x: u16, y: u16, duration: u32) -> std::io::Result<()> {
+    use std::time::{Duration, Instant};
+    use tensix::{
+        TensixTile, HELLO_COUNTER_OFFSET, HELLO_FIRMWARE, HELLO_MAGIC_OFFSET, HELLO_MAGIC_VALUE,
+    };
+
+    eprintln!(
+        "[tensix-hello] tile ({}, {}) on card {}: firmware {} bytes",
+        x,
+        y,
+        card,
+        HELLO_FIRMWARE.len()
+    );
+
+    let tile = TensixTile::new(card, x, y)
+        .map_err(|e| std::io::Error::other(format!("open tile ({}, {}): {}", x, y, e)))?;
+
+    let prior_reset = tile.read_soft_reset();
+    eprintln!(
+        "[tensix-hello] prior soft-reset register: {:#010x}",
+        prior_reset
+    );
+
+    eprintln!("[tensix-hello] asserting all baby-RISC soft resets");
+    tile.assert_all_resets();
+    let after_assert = tile.read_soft_reset();
+    eprintln!(
+        "[tensix-hello] soft-reset after assert: {:#010x}",
+        after_assert
+    );
+
+    eprintln!("[tensix-hello] loading firmware to L1[0]");
+    tile.load_brisc_firmware(HELLO_FIRMWARE);
+
+    // Pre-clear the magic + counter slots so we observe the BRISC
+    // firmware writing them — without this, a stale L1 value would
+    // be indistinguishable from "BRISC ran".
+    tile.write_l1_u32(HELLO_MAGIC_OFFSET, 0);
+    tile.write_l1_u32(HELLO_COUNTER_OFFSET, 0);
+
+    eprintln!("[tensix-hello] releasing BRISC from soft-reset");
+    tile.release_brisc_only();
+    let after_release = tile.read_soft_reset();
+    eprintln!(
+        "[tensix-hello] soft-reset after release: {:#010x}",
+        after_release
+    );
+
+    // Poll once per second for `duration` seconds. The first sample
+    // happens ~1s in, after BRISC has had time to start. We
+    // pre-cleared the counter to zero, so any nonzero value on the
+    // very first sample is also evidence of advancement (otherwise
+    // `--duration 1` could never PASS for a logic-only reason — we'd
+    // have nothing to compare against).
+    let start = Instant::now();
+    let mut last_counter: Option<u32> = None;
+    let mut counter_advanced = false;
+    let mut magic_observed = false;
+    for sec in 1..=duration {
+        std::thread::sleep(Duration::from_secs(1));
+        let magic = tile.read_l1_u32(HELLO_MAGIC_OFFSET);
+        let counter = tile.read_l1_u32(HELLO_COUNTER_OFFSET);
+        let advanced = match last_counter {
+            Some(prev) => counter != prev,
+            None => counter != 0,
+        };
+        eprintln!(
+            "[tensix-hello] t+{}s: magic={:#010x} counter={:#010x}{}",
+            sec,
+            magic,
+            counter,
+            if advanced { " (advanced)" } else { "" }
+        );
+        if magic == HELLO_MAGIC_VALUE {
+            magic_observed = true;
+        }
+        if advanced {
+            counter_advanced = true;
+        }
+        last_counter = Some(counter);
+    }
+    let elapsed = start.elapsed();
+
+    if magic_observed && counter_advanced {
+        eprintln!(
+            "[tensix-hello] PASS: magic + counter both observed after {:.1?}",
+            elapsed
+        );
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "FAIL: magic_observed={}, counter_advanced={} after {:.1?}",
+            magic_observed, counter_advanced, elapsed
+        )))
     }
 }
 
