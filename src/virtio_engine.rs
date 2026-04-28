@@ -63,6 +63,8 @@ pub const MMIO_DEVICE_ID: u32 = 0x008;
 pub const MMIO_VENDOR_ID: u32 = 0x00c;
 pub const MMIO_DEVICE_FEATURES: u32 = 0x010;
 pub const MMIO_DEVICE_FEATURES_SEL: u32 = 0x014;
+pub const MMIO_SW_IMPL: u32 = 0x018;
+pub const MMIO_SEL_GENERATION: u32 = 0x01c;
 pub const MMIO_DRIVER_FEATURES: u32 = 0x020;
 pub const MMIO_DRIVER_FEATURES_SEL: u32 = 0x024;
 pub const MMIO_QUEUE_SEL: u32 = 0x030;
@@ -245,6 +247,7 @@ pub mod sim {
     const SNAP_OFF_QUEUE_SEL: u32 = 0x04;
     const SNAP_OFF_QUEUE_NOTIFY: u32 = 0x08;
     const SNAP_OFF_QUEUE_READY: u32 = 0x0c;
+    const SNAP_OFF_SEL_GEN_ECHO: u32 = 0x38;
 
     fn shadow_addr(slot: u32, off: u32) -> u32 {
         SHADOW_BASE + slot * SHADOW_PER_DEVICE + off
@@ -304,6 +307,9 @@ pub mod sim {
                 .write(base + MMIO_DEVICE_ID, device_id_for_index(dev_idx));
             self.l1.write(base + MMIO_VENDOR_ID, VENDOR_ID);
             self.l1.write(base + MMIO_QUEUE_NUM_MAX, QUEUE_NUM_MAX);
+            // SW_IMPL=1: tell the patched kernel to use the
+            // sel_generation handshake. See virtio.c::init_device.
+            self.l1.write(base + MMIO_SW_IMPL, 1);
         }
 
         fn poll_one_device(&mut self, slot: u32) {
@@ -332,11 +338,43 @@ pub mod sim {
             }
             // QUEUE_READY (uses the *current* SEL after the swap above)
             let sel_after = self.l1.read(base + MMIO_QUEUE_SEL);
+            // Eager clear: persist any non-zero write to shadow then
+            // zero the visible reg, so the next vm_setup_vq cycle
+            // doesn't see stale READY=1 from the previous queue.
+            // Mirrors virtio.c's QUEUE_READY handling.
             let ready = self.l1.read(base + MMIO_QUEUE_READY);
-            let ready_prev = self.l1.read(snap_addr(slot, SNAP_OFF_QUEUE_READY));
-            if ready != ready_prev {
+            if ready != 0 {
                 self.handle_queue_ready_change(slot, sel_after, ready);
-                self.l1.write(snap_addr(slot, SNAP_OFF_QUEUE_READY), ready);
+                self.l1.write(base + MMIO_QUEUE_READY, 0);
+            }
+
+            // Per-queue setup blind capture into shadow[sel] —
+            // mirrors virtio.c's FIELDS loop.
+            if sel_after < 8 {
+                for (mmio_off, shadow_off) in [
+                    (MMIO_QUEUE_NUM, SHADOW_Q_OFF_NUM),
+                    (MMIO_QUEUE_DESC_LOW, SHADOW_Q_OFF_DESC_LO),
+                    (MMIO_QUEUE_DESC_HIGH, SHADOW_Q_OFF_DESC_HI),
+                    (MMIO_QUEUE_DRIVER_LOW, SHADOW_Q_OFF_DRIVER_LO),
+                    (MMIO_QUEUE_DRIVER_HIGH, SHADOW_Q_OFF_DRIVER_HI),
+                    (MMIO_QUEUE_DEVICE_LOW, SHADOW_Q_OFF_DEVICE_LO),
+                    (MMIO_QUEUE_DEVICE_HIGH, SHADOW_Q_OFF_DEVICE_HI),
+                ] {
+                    let v = self.l1.read(base + mmio_off);
+                    self.l1
+                        .write(shadow_queue_addr(slot, sel_after, shadow_off), v);
+                }
+            }
+
+            // sel_generation echo — last so all snapshots above are in
+            // shadow before the kernel's spin-wait sees the bump.
+            // Mirrors virtio.c's curr_gen != last_echoed branch.
+            let curr_gen = self.l1.read(base + MMIO_SEL_GENERATION);
+            let last_echoed = self.l1.read(snap_addr(slot, SNAP_OFF_SEL_GEN_ECHO));
+            if curr_gen != last_echoed {
+                let next = curr_gen.wrapping_add(1);
+                self.l1.write(base + MMIO_SEL_GENERATION, next);
+                self.l1.write(snap_addr(slot, SNAP_OFF_SEL_GEN_ECHO), next);
             }
         }
 
@@ -603,28 +641,109 @@ mod tests {
     }
 
     #[test]
-    fn firmware_queue_ready_zero_clears_shadow_pointers() {
+    fn firmware_queue_ready_eager_clear_keeps_shadow_set() {
+        // The eager-clear behavior the firmware adopted (M5.5e, #71)
+        // makes READY a write-only signal from the kernel: any non-
+        // zero write persists to shadow and the visible reg is
+        // immediately zeroed for the next vm_setup_vq cycle. Verify
+        // that side effect: the kernel sees READY=0 even after
+        // writing 1, but shadow stays at 1 until a STATUS=0 reset.
         let mut sim = VirtioFwSim::new();
         sim.boot();
         let blk = slot(0, DEV_BLK);
         let base = slot_regs_base(blk);
-        // Drive READY=1 then READY=0. The firmware's READY=0 path
-        // should zero the shadow desc/avail/used. We verify
-        // observable side effects via the counter and a SEL=0 swap
-        // (which copies shadow.num back into visible NUM).
         sim.write(base + MMIO_QUEUE_READY, 1);
         sim.step();
         assert_eq!(sim.stat(STATS_OFF_READY_EVENTS), 1);
-        sim.write(base + MMIO_QUEUE_READY, 0);
+        // Visible cleared back to 0 — the next vm_setup_vq guard read
+        // sees 0 and proceeds.
+        assert_eq!(sim.read(base + MMIO_QUEUE_READY), 0);
+        // Shadow still holds 1 — dispatch_chain uses this to know the
+        // queue is configured.
+        assert_eq!(sim.read(shadow_queue_addr(blk, 0, SHADOW_Q_OFF_READY)), 1);
+    }
+
+    #[test]
+    fn firmware_init_sets_sw_impl() {
+        // Without SW_IMPL=1, the patched kernel skips the
+        // sel_generation handshake and hits the SEL→READY race
+        // (#58/#61/#63/#65). Verify init_device plants the bit.
+        let mut sim = VirtioFwSim::new();
+        sim.boot();
+        for slot_idx in 0..NUM_SLOTS {
+            let base = slot_regs_base(slot_idx);
+            assert_eq!(
+                sim.read(base + MMIO_SW_IMPL),
+                1,
+                "slot {} missing SW_IMPL=1",
+                slot_idx
+            );
+        }
+    }
+
+    #[test]
+    fn firmware_sel_generation_echo_increments_on_kernel_bump() {
+        // The kernel writes prev+1 and spins until the daemon writes
+        // back a different value. The firmware's "echo" rule: if
+        // visible.sel_gen != snap.last_echoed, write curr+1 and
+        // update snap. Verify one round-trip.
+        let mut sim = VirtioFwSim::new();
+        sim.boot();
+        let blk = slot(0, DEV_BLK);
+        let base = slot_regs_base(blk);
+        // Kernel writes prev(0)+1 = 1.
+        sim.write(base + MMIO_SEL_GENERATION, 1);
         sim.step();
-        assert_eq!(sim.stat(STATS_OFF_READY_EVENTS), 2);
-        // Re-trigger SEL=0 to read shadow into visible regs and
-        // confirm NUM is zeroed (the READY=0 path zeroes it).
-        sim.write(base + MMIO_QUEUE_SEL, 1);
+        // Firmware echoes 2 — kernel sees != 1 and exits its spin.
+        assert_eq!(sim.read(base + MMIO_SEL_GENERATION), 2);
+        // Idempotent on next step (no kernel write).
         sim.step();
+        assert_eq!(sim.read(base + MMIO_SEL_GENERATION), 2);
+        // Next round: kernel reads 2 as new prev, writes prev+1=3.
+        sim.write(base + MMIO_SEL_GENERATION, 3);
+        sim.step();
+        assert_eq!(sim.read(base + MMIO_SEL_GENERATION), 4);
+    }
+
+    #[test]
+    fn firmware_per_queue_blind_capture_handles_repeated_high_half() {
+        // Regression for the M5.5e bug: snapshot-diff missed queue 1's
+        // DESC_HIGH=0x40 after queue 0 wrote the same 0x40, leaving
+        // queue 1's shadow.DESC_HI=0 and dispatch_chain dropping
+        // virtio-net's TX. The fix is blind capture every iteration.
+        let mut sim = VirtioFwSim::new();
+        sim.boot();
+        let net = slot(0, DEV_NET);
+        let base = slot_regs_base(net);
+        // Queue 0 setup: SEL=0 + DESC_HIGH=0x40
         sim.write(base + MMIO_QUEUE_SEL, 0);
+        sim.write(base + MMIO_QUEUE_DESC_HIGH, 0x40);
+        sim.write(base + MMIO_QUEUE_DESC_LOW, 0x1000);
         sim.step();
-        assert_eq!(sim.read(base + MMIO_QUEUE_NUM), 0);
+        assert_eq!(
+            sim.read(shadow_queue_addr(net, 0, SHADOW_Q_OFF_DESC_HI)),
+            0x40
+        );
+        assert_eq!(
+            sim.read(shadow_queue_addr(net, 0, SHADOW_Q_OFF_DESC_LO)),
+            0x1000
+        );
+        // Queue 1 setup: SEL=1 + DESC_HIGH=0x40 (SAME value as queue 0)
+        // + DESC_LOW=0x2000 (different).
+        sim.write(base + MMIO_QUEUE_SEL, 1);
+        sim.write(base + MMIO_QUEUE_DESC_HIGH, 0x40);
+        sim.write(base + MMIO_QUEUE_DESC_LOW, 0x2000);
+        sim.step();
+        // Both halves must land in queue 1's shadow even though
+        // DESC_HIGH didn't change between the two setups.
+        assert_eq!(
+            sim.read(shadow_queue_addr(net, 1, SHADOW_Q_OFF_DESC_HI)),
+            0x40
+        );
+        assert_eq!(
+            sim.read(shadow_queue_addr(net, 1, SHADOW_Q_OFF_DESC_LO)),
+            0x2000
+        );
     }
 
     #[test]
