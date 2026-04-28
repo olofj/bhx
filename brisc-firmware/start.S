@@ -1,37 +1,25 @@
 // SPDX-FileCopyrightText: © 2026 Olof Johansson
 // SPDX-License-Identifier: MIT
 
-// Hello-world BRISC entry stub for issue #67 (M1).
+// Shared BRISC entry stub for both M1 (hello-world, #67) and M3
+// (virtio-mmio engine, #69) firmware variants.
 //
 // BRISC's reset PC is 0x0 in tile L1 (per
 // `BlackholeA0/TensixTile/SoftReset.md`), so the linker places this
-// section at the very start of L1. The first instruction jumps past
-// the reserved magic+counter slots into `main_entry`, which sets up
-// a tiny stack in BRISC's local data RAM (8 KiB at 0xFFB0_0000) and
-// calls `main()` in `main.c`.
+// section at the very start of L1. We jump past a small zero-padded
+// region into `main_entry`, which sets up a stack in BRISC's local
+// data RAM (8 KiB at 0xFFB0_0000) and calls `main()`.
 //
-// Note: ARC firmware uses the L1[0x10..0x20] scratch range on every
-// tile for power-throttle state, so our magic+counter must NOT be in
-// that range. We put them at L1[0x40..0x48], well past anything ARC
-// or tt-metal touches in a freshly-reset tile.
+// The 0x80-byte zero pad after the entry jump exists so the M1
+// hello-world's two magic+counter slots at L1[0x40, 0x44] (well past
+// ARC firmware's L1[0x10..0x20] scratch region) land in pre-zeroed
+// space. The M3 virtio firmware doesn't touch this range — its
+// register files live at L1[0x10000+] — so the pad is harmless.
 
     .section .text._start, "ax"
     .global  _start
 _start:
-    j        main_entry         // PC=0: jump past the reserved area.
-
-    // Pad up to 0x40 so the magic+counter slots land at fixed offsets.
-    // We stash the magic at 0x40 and the counter at 0x44 so the host
-    // poller knows where to look. main() writes both; we leave them as
-    // zeros in the binary so a fresh load is unambiguously "not yet
-    // run."
-    .org 0x40
-    .global _l1_magic
-_l1_magic:
-    .word    0
-    .global _l1_counter
-_l1_counter:
-    .word    0
+    j        main_entry         // PC=0: jump past the zero-padded area.
 
     // Aligned entry. Anything past here is the actual program.
     .org 0x80

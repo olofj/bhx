@@ -31,6 +31,7 @@ mod tensix;
 mod tensix_tile;
 mod tlb;
 mod virtio;
+mod virtio_engine;
 mod x280_tlb;
 
 // Re-export the structured error type at the crate root so call sites
@@ -369,6 +370,22 @@ enum DebugAction {
     /// virtio-mmio engine on this chip. Pure decode — does not touch
     /// the tile. Issue #68.
     PickTile,
+    /// Load the M3 virtio-mmio engine firmware onto a Tensix tile,
+    /// release BRISC, and smoke-test the register file: verify the
+    /// static MAGIC / VERSION / DEVICE_ID across all 16 slots, drive
+    /// a STATUS write to confirm the state machine, drive a
+    /// QUEUE_SEL change to confirm the multiplexer, and read the
+    /// stats page. Bypasses the daemon. Issue #69.
+    TensixVirtio {
+        /// Tensix tile X coordinate (NoC0 logical). Defaults to the
+        /// M2 picker output.
+        #[arg(long)]
+        x: Option<u16>,
+        /// Tensix tile Y coordinate (NoC0 logical). Same defaulting
+        /// as `--x`.
+        #[arg(long)]
+        y: Option<u16>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -739,6 +756,11 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
         }
         DebugAction::TelemetryDump { all_tags } => run_telemetry_dump(&chip, all_tags),
         DebugAction::PickTile => run_pick_tile(&chip),
+        DebugAction::TensixVirtio { x, y } => {
+            let (x, y) = resolve_tensix_coords(&chip, x, y)?;
+            drop(chip);
+            run_tensix_virtio(card, x, y)
+        }
     }
 }
 
@@ -933,6 +955,163 @@ fn run_tensix_hello(card: u32, x: u16, y: u16, duration: u32) -> std::io::Result
         Err(std::io::Error::other(format!(
             "FAIL: magic_observed={}, counter_advanced={} after {:.1?}",
             magic_observed, counter_advanced, elapsed
+        )))
+    }
+}
+
+/// Smoke-test the M3 (#69) virtio engine: load the firmware on the
+/// chosen Tensix tile, release BRISC, and check the static reg files,
+/// the STATUS state machine, and the QUEUE_SEL multiplexer end-to-
+/// end. Bypasses the daemon (debug path).
+fn run_tensix_virtio(card: u32, x: u16, y: u16) -> std::io::Result<()> {
+    use std::thread::sleep;
+    use std::time::Duration;
+    use tensix::TensixTile;
+    use virtio_engine as ve;
+
+    eprintln!(
+        "[tensix-virtio] tile ({}, {}) on card {}: firmware {} bytes",
+        x,
+        y,
+        card,
+        ve::VIRTIO_FIRMWARE.len()
+    );
+
+    let tile = TensixTile::new(card, x, y)
+        .map_err(|e| std::io::Error::other(format!("open tile ({}, {}): {}", x, y, e)))?;
+
+    eprintln!("[tensix-virtio] asserting all baby-RISC soft resets");
+    tile.assert_all_resets();
+
+    // Wipe the regs region so we don't see leftover state from a
+    // prior firmware load. The firmware will overwrite these slots
+    // on entry; pre-clearing makes "did the firmware run" vs "did
+    // the firmware run AND I'm reading the right addresses"
+    // unambiguous on the smoke checks below.
+    eprintln!("[tensix-virtio] zeroing reg-file region (16 KiB × 16 slots = 64 KiB)");
+    for slot in 0..ve::NUM_SLOTS {
+        let base = ve::slot_regs_base(slot);
+        for off in (0..ve::REGS_PER_DEV).step_by(4) {
+            tile.write_l1_u32(base + off, 0);
+        }
+    }
+
+    eprintln!("[tensix-virtio] loading firmware to L1[0]");
+    tile.load_brisc_firmware(ve::VIRTIO_FIRMWARE);
+
+    eprintln!("[tensix-virtio] releasing BRISC from soft-reset");
+    tile.release_brisc_only();
+
+    // Wait briefly for BRISC to finish the static-init pass over all
+    // 16 slots. At ~64 KiB of stores at ~1 GHz that's microseconds;
+    // 10 ms is hugely generous and avoids any flakiness from a slow
+    // first sweep.
+    sleep(Duration::from_millis(10));
+
+    let mut errors = 0usize;
+    let device_ids = [
+        ve::VIRTIO_ID_BLOCK,
+        ve::VIRTIO_ID_NET,
+        ve::VIRTIO_ID_CONSOLE,
+        ve::VIRTIO_ID_ENTROPY,
+    ];
+    eprintln!("[tensix-virtio] verifying static reg files across all slots");
+    for slot in 0..ve::NUM_SLOTS {
+        let base = ve::slot_regs_base(slot);
+        let dev_idx = (slot % ve::DEVS_PER_L2CPU) as usize;
+        let l2cpu = slot / ve::DEVS_PER_L2CPU;
+        let expected_dev_id = device_ids[dev_idx];
+
+        let magic = tile.read_l1_u32(base + ve::MMIO_MAGIC_VALUE);
+        let version = tile.read_l1_u32(base + ve::MMIO_VERSION);
+        let dev_id = tile.read_l1_u32(base + ve::MMIO_DEVICE_ID);
+        let vendor = tile.read_l1_u32(base + ve::MMIO_VENDOR_ID);
+        let nmax = tile.read_l1_u32(base + ve::MMIO_QUEUE_NUM_MAX);
+
+        let ok = magic == ve::MAGIC
+            && version == ve::VERSION
+            && dev_id == expected_dev_id
+            && vendor == ve::VENDOR_ID
+            && nmax == ve::QUEUE_NUM_MAX;
+        if !ok {
+            errors += 1;
+            eprintln!(
+                "  slot {:2} (L2CPU {} dev {}): MAGIC={:#010x} VERSION={} DEVICE_ID={} \
+                 VENDOR={:#010x} QUEUE_NUM_MAX={} (expected dev_id {}) — FAIL",
+                slot, l2cpu, dev_idx, magic, version, dev_id, vendor, nmax, expected_dev_id
+            );
+        }
+    }
+    if errors == 0 {
+        eprintln!("[tensix-virtio]   16/16 slots show correct static reg state");
+    }
+
+    // Stats page should show the firmware version + magic-loaded.
+    let fw_version = tile.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_VERSION);
+    let stats_magic = tile.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAGIC);
+    eprintln!(
+        "[tensix-virtio] stats: fw_version={:#010x} magic={:#010x}",
+        fw_version, stats_magic
+    );
+    if stats_magic != ve::STATS_MAGIC_LOADED {
+        eprintln!("  stats magic mismatch — BRISC didn't initialize");
+        errors += 1;
+    }
+
+    // STATUS state machine: write ACK, poll for status_changes counter
+    // to bump.
+    eprintln!("[tensix-virtio] driving STATUS write on slot 0");
+    let slot0_status = ve::slot_regs_base(0) + ve::MMIO_STATUS;
+    let status_changes_addr = ve::STATS_BASE + ve::STATS_OFF_STATUS_CHANGES;
+    let before_status = tile.read_l1_u32(status_changes_addr);
+    tile.write_l1_u32(slot0_status, ve::STATUS_ACKNOWLEDGE);
+    sleep(Duration::from_millis(5));
+    let after_status = tile.read_l1_u32(status_changes_addr);
+    if after_status > before_status {
+        eprintln!(
+            "  status_changes counter advanced ({} → {}) — STATUS state machine PASS",
+            before_status, after_status
+        );
+    } else {
+        eprintln!(
+            "  status_changes counter did NOT advance ({} → {}) — STATUS state machine FAIL",
+            before_status, after_status
+        );
+        errors += 1;
+    }
+
+    // QUEUE_SEL multiplexer: write SEL=1 on slot 1 (net device, has 2
+    // queues). The firmware should swap the visible regs and bump
+    // sel_changes.
+    eprintln!("[tensix-virtio] driving QUEUE_SEL=1 on slot 1 (net)");
+    let slot1_sel = ve::slot_regs_base(1) + ve::MMIO_QUEUE_SEL;
+    let sel_changes_addr = ve::STATS_BASE + ve::STATS_OFF_SEL_CHANGES;
+    let before_sel = tile.read_l1_u32(sel_changes_addr);
+    tile.write_l1_u32(slot1_sel, 1);
+    sleep(Duration::from_millis(5));
+    let after_sel = tile.read_l1_u32(sel_changes_addr);
+    let nmax_after_swap = tile.read_l1_u32(ve::slot_regs_base(1) + ve::MMIO_QUEUE_NUM_MAX);
+    if after_sel > before_sel && nmax_after_swap == ve::QUEUE_NUM_MAX {
+        eprintln!(
+            "  sel_changes counter advanced ({} → {}), QUEUE_NUM_MAX after swap = {} \
+             — QUEUE_SEL multiplexer PASS",
+            before_sel, after_sel, nmax_after_swap
+        );
+    } else {
+        eprintln!(
+            "  QUEUE_SEL multiplexer FAIL: sel_changes {} → {}, QUEUE_NUM_MAX = {}",
+            before_sel, after_sel, nmax_after_swap
+        );
+        errors += 1;
+    }
+
+    if errors == 0 {
+        eprintln!("[tensix-virtio] PASS");
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "FAIL: {} subtests failed",
+            errors
         )))
     }
 }

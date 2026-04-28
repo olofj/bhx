@@ -15,32 +15,42 @@ fn main() {
     build_slirp_size_probe();
 }
 
-/// Build the BRISC hello-world firmware (issue #67, M1) by invoking
-/// `brisc-firmware/Makefile`. The Rust side embeds the resulting
-/// `.bin` via `include_bytes!` and copies it into Tensix tile L1.
+/// Build the BRISC firmware variants (#67 M1 hello, #69 M3 virtio)
+/// by invoking `brisc-firmware/Makefile`. The Rust side embeds the
+/// resulting `.bin`s via `include_bytes!` and copies them into a
+/// Tensix tile's L1 over the chip-side TLB.
 ///
 /// The toolchain is the sfpi GCC at `/opt/tenstorrent/sfpi/compiler/bin`
 /// (RV32 newlib cross-compiler shipped with tt-installer). When it's
 /// present we rebuild from source. When it isn't (CI runners,
 /// hardware-free dev hosts), we fall back to the prebuilt
-/// `brisc-firmware/prebuilt/brisc-hello.bin` checked into the repo.
-/// Anyone modifying firmware source must rerun `make` locally and
-/// commit the refreshed prebuilt binary alongside the change.
+/// `brisc-firmware/prebuilt/*.bin` checked into the repo. Anyone
+/// modifying firmware source must rerun `make` locally and commit
+/// the refreshed prebuilt binaries alongside the change.
 fn build_brisc_firmware() {
     let manifest_dir =
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
     let fw_dir = PathBuf::from(&manifest_dir).join("brisc-firmware");
 
     // Rebuild whenever any source under brisc-firmware/ changes, plus
-    // the prebuilt fallback (so a refreshed prebuilt commit triggers
+    // the prebuilt fallbacks (so a refreshed prebuilt commit triggers
     // re-link on toolchain-less hosts).
-    for f in ["start.S", "main.c", "link.ld", "Makefile"] {
+    for f in [
+        "start.S",
+        "hello.c",
+        "virtio.c",
+        "link.ld",
+        "Makefile",
+        "include/virtio_layout.h",
+    ] {
         println!("cargo:rerun-if-changed=brisc-firmware/{}", f);
     }
-    println!("cargo:rerun-if-changed=brisc-firmware/prebuilt/brisc-hello.bin");
+    for f in ["brisc-hello.bin", "brisc-virtio.bin"] {
+        println!("cargo:rerun-if-changed=brisc-firmware/prebuilt/{}", f);
+    }
 
     let toolchain = "/opt/tenstorrent/sfpi/compiler/bin";
-    let bin_path = if std::path::Path::new(toolchain).is_dir() {
+    let (hello_bin, virtio_bin) = if std::path::Path::new(toolchain).is_dir() {
         let status = Command::new("make")
             .current_dir(&fw_dir)
             .arg("all")
@@ -49,23 +59,32 @@ fn build_brisc_firmware() {
         if !status.success() {
             panic!("brisc-firmware build failed (exit {:?})", status.code());
         }
-        fw_dir.join("build").join("brisc-hello.bin")
+        let build = fw_dir.join("build");
+        (
+            build.join("brisc-hello.bin"),
+            build.join("brisc-virtio.bin"),
+        )
     } else {
-        let prebuilt = fw_dir.join("prebuilt").join("brisc-hello.bin");
-        if !prebuilt.is_file() {
-            panic!(
-                "sfpi toolchain not found at {} and prebuilt firmware missing at {}. \
-                 Install the Tenstorrent toolchain or restore the prebuilt binary.",
-                toolchain,
-                prebuilt.display()
-            );
+        let prebuilt = fw_dir.join("prebuilt");
+        let hello = prebuilt.join("brisc-hello.bin");
+        let virtio = prebuilt.join("brisc-virtio.bin");
+        for p in [&hello, &virtio] {
+            if !p.is_file() {
+                panic!(
+                    "sfpi toolchain not found at {} and prebuilt firmware missing at {}. \
+                     Install the Tenstorrent toolchain or restore the prebuilt binary.",
+                    toolchain,
+                    p.display()
+                );
+            }
         }
-        prebuilt
+        (hello, virtio)
     };
 
-    // Surface the artifact path to Rust via env! so src/tensix.rs can
+    // Surface the artifact paths to Rust via env! so src/tensix.rs can
     // include_bytes!(env!(...)) without hardcoding a relative path.
-    println!("cargo:rustc-env=BRISC_HELLO_BIN={}", bin_path.display());
+    println!("cargo:rustc-env=BRISC_HELLO_BIN={}", hello_bin.display());
+    println!("cargo:rustc-env=BRISC_VIRTIO_BIN={}", virtio_bin.display());
 }
 
 fn build_slirp_size_probe() {
