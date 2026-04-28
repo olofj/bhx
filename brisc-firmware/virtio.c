@@ -60,6 +60,12 @@
 
 #define STATS_MAGIC_LOADED        0x0000B155u
 
+// VIRTIO_F_VERSION_1 lives at bit 32 of the 64-bit feature space —
+// bit 0 of the high half. Stock Linux virtio drivers require this
+// bit; M5.5c bumps the firmware to advertise it on a
+// DEVICE_FEATURES_SEL=1 read.
+#define VIRTIO_F_VERSION_1_HIGH_BIT 0x00000001u
+
 // ----- Per-queue shadow state (BRISC-private, L1 + 0x14000) -----
 //
 // One block per device. Each block holds queue-indexed real storage
@@ -102,6 +108,9 @@
 #define SNAP_OFF_DRIVER_HI        0x20
 #define SNAP_OFF_DEVICE_LO        0x24
 #define SNAP_OFF_DEVICE_HI        0x28
+#define SNAP_OFF_DEV_FEAT_SEL     0x2c
+#define SNAP_OFF_DRV_FEAT_SEL     0x30
+#define SNAP_OFF_DRV_FEAT         0x34
 
 static inline volatile uint32_t *l1_u32(uintptr_t addr) {
     return (volatile uint32_t *)addr;
@@ -390,6 +399,36 @@ static void poll_one_device(unsigned slot) {
     if (ready != ready_prev) {
         handle_queue_ready_change(slot, sel, ready);
         write_u32(snap_addr(slot, SNAP_OFF_QUEUE_READY), ready);
+    }
+
+    // DEVICE_FEATURES_SEL — guest writes 0 or 1 to choose which
+    // 32-bit half of the device's feature word it wants to read
+    // back via DEVICE_FEATURES. We advertise only VIRTIO_F_VERSION_1
+    // (bit 32, i.e. bit 0 of the high half) so the firmware just
+    // mirrors the SEL into a 0-or-VIRTIO_F_VERSION_1_HIGH_BIT
+    // value in DEVICE_FEATURES. virtio 1.2 §4.2.2.2.
+    uint32_t df_sel = read_u32(reg_addr(slot, VIRTIO_MMIO_DEVICE_FEATURES_SEL));
+    uint32_t df_sel_prev = read_u32(snap_addr(slot, SNAP_OFF_DEV_FEAT_SEL));
+    if (df_sel != df_sel_prev) {
+        uint32_t advertised = (df_sel == 1) ? VIRTIO_F_VERSION_1_HIGH_BIT : 0u;
+        write_u32(reg_addr(slot, VIRTIO_MMIO_DEVICE_FEATURES), advertised);
+        write_u32(snap_addr(slot, SNAP_OFF_DEV_FEAT_SEL), df_sel);
+    }
+
+    // DRIVER_FEATURES_SEL — guest writes 0 or 1, then writes the
+    // 32-bit half it has accepted via DRIVER_FEATURES. We don't
+    // need to take any visible action (the guest's STATUS=FEATURES_OK
+    // write later confirms negotiation), but we do snapshot the
+    // value so the daemon can read what was negotiated.
+    uint32_t dfd_sel = read_u32(reg_addr(slot, VIRTIO_MMIO_DRIVER_FEATURES_SEL));
+    uint32_t dfd_sel_prev = read_u32(snap_addr(slot, SNAP_OFF_DRV_FEAT_SEL));
+    if (dfd_sel != dfd_sel_prev) {
+        write_u32(snap_addr(slot, SNAP_OFF_DRV_FEAT_SEL), dfd_sel);
+    }
+    uint32_t dfd = read_u32(reg_addr(slot, VIRTIO_MMIO_DRIVER_FEATURES));
+    uint32_t dfd_prev = read_u32(snap_addr(slot, SNAP_OFF_DRV_FEAT));
+    if (dfd != dfd_prev) {
+        write_u32(snap_addr(slot, SNAP_OFF_DRV_FEAT), dfd);
     }
 
     // Per-queue setup registers — QUEUE_NUM + the three address

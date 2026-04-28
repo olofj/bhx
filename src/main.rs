@@ -1291,6 +1291,51 @@ fn run_tensix_virtio(card: u32, x: u16, y: u16) -> std::io::Result<()> {
         }
     }
 
+    // M5.5c firmware extension: feature negotiation. Drive
+    // DEVICE_FEATURES_SEL=1 on slot 0 and read DEVICE_FEATURES
+    // back; expect bit 0 of the high half (VIRTIO_F_VERSION_1).
+    // Without this advertisement the guest's virtio drivers fail
+    // FEATURES_OK negotiation before ever writing QUEUE_NOTIFY.
+    {
+        eprintln!("[tensix-virtio] driving DEVICE_FEATURES_SEL=1 on slot 0");
+        let slot0_dev_feat_sel = ve::slot_regs_base(0) + ve::MMIO_DEVICE_FEATURES_SEL;
+        let slot0_dev_feat = ve::slot_regs_base(0) + ve::MMIO_DEVICE_FEATURES;
+        tile.write_l1_u32(slot0_dev_feat_sel, 1);
+        sleep(Duration::from_millis(5));
+        let advertised = tile.read_l1_u32(slot0_dev_feat);
+        if advertised == 1 {
+            eprintln!(
+                "  DEVICE_FEATURES (high half) = {:#010x} — VIRTIO_F_VERSION_1 advertised \
+                 — FEATURES PASS",
+                advertised
+            );
+        } else {
+            eprintln!(
+                "  FEATURES FAIL: DEVICE_FEATURES (high half) = {:#010x}, expected 1 \
+                 (VIRTIO_F_VERSION_1)",
+                advertised
+            );
+            errors += 1;
+        }
+        // Switch back to low half — DEVICE_FEATURES should now
+        // read 0 (no low-half features advertised).
+        tile.write_l1_u32(slot0_dev_feat_sel, 0);
+        sleep(Duration::from_millis(5));
+        let low_half = tile.read_l1_u32(slot0_dev_feat);
+        if low_half == 0 {
+            eprintln!(
+                "  DEVICE_FEATURES (low half) = {:#010x} — correct",
+                low_half
+            );
+        } else {
+            eprintln!(
+                "  FEATURES FAIL: DEVICE_FEATURES (low half) = {:#010x}, expected 0",
+                low_half
+            );
+            errors += 1;
+        }
+    }
+
     // M5.5b firmware extension: when the guest writes
     // QUEUE_DESC_LOW for the current SEL, BRISC should snapshot it
     // into shadow[slot][sel].SHADOW_Q_OFF_DESC_LO. Drive a write

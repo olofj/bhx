@@ -705,26 +705,50 @@ fn dispatch_boot(
     .map_err(crate::Error::slot_state)?;
     #[cfg(feature = "virtio-engine")]
     {
-        // Suppress unused-variable warnings for the worker arguments
-        // — they're only consumed in the host-buffer path. Logged
-        // for diagnostics so a feature-on boot's request shape is
-        // visible.
+        // Register virtio device handlers with the engine's kick
+        // poller (#71 M5.5c). When the guest writes a QUEUE_NOTIFY
+        // for a registered slot, the poller will look up the entry,
+        // walk the descriptor chain via `process_one_chain_for_queue`,
+        // and fire the PLIC IRQ. M5.5c first cut wires only
+        // virtio-rng; net + blk + console land as follow-ups (each
+        // is a single-line addition once the rng path is verified
+        // end-to-end).
         let _ = (
             disk,
             network,
             extra_fwd,
             console,
-            rng,
             rng_backing,
             net_backing,
             disk_backing,
             console_backing,
         );
-        dlog!(
-            "[run_boot l2cpu {}] virtio-engine path: skipping host-MMIO worker spawn \
-             (Tensix-engine data plane is M5.5+, see #71)",
-            l2cpu_idx
-        );
+        if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
+            if rng {
+                let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
+                    + crate::virtio_engine::DEV_RNG;
+                let entry = crate::tensix_data_plane::RegEntry::new(
+                    slot_idx,
+                    Arc::clone(&slot.l2cpu),
+                    Box::new(crate::virtio::rng::VirtioRng::new()),
+                    Arc::clone(&slot.interrupt),
+                    crate::regs::virtio_mmio::RNG_IRQ,
+                    crate::virtio::InterruptKind::Rng,
+                );
+                poller.register_slot(entry);
+                dlog!(
+                    "[run_boot l2cpu {}] virtio-engine: registered rng on slot {}",
+                    l2cpu_idx,
+                    slot_idx
+                );
+            }
+        } else {
+            dlog!(
+                "[run_boot l2cpu {}] virtio-engine: kick poller not yet up — engine \
+                 wasn't brought up earlier in this boot",
+                l2cpu_idx
+            );
+        }
     }
     // Workers are now in Phase 1 polling for the DRIVER bit. Release the
     // L2CPU from reset so the kernel's virtio probe runs against a
