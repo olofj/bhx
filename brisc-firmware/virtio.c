@@ -213,6 +213,12 @@ static void init_device(unsigned slot) {
     // bit, which device drivers ignore for unknown bits.
     *l1_u32(reg_addr(slot, VIRTIO_MMIO_DEVICE_FEATURES)) = VIRTIO_F_VERSION_1_HIGH_BIT;
 
+    // QUEUE_NOTIFY: clear to sentinel (-1) so the first poll
+    // after init_device doesn't fire a spurious "queue 0" notify
+    // on the zeroed reg file. Guest writes any queue index
+    // (including 0) → next poll sees value != -1 → kick fires.
+    *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NOTIFY)) = 0xFFFFFFFFu;
+
     // Pre-populate every queue's QueueNumMax in the shadow so a SEL
     // swap finds it without re-running init. Same value for all
     // queues at this point; per-device customization comes in M5.
@@ -391,19 +397,28 @@ static void poll_one_device(unsigned slot) {
         write_u32(snap_addr(slot, SNAP_OFF_QUEUE_SEL), sel);
     }
 
-    // QUEUE_NOTIFY — W. The guest writes the queue index here; we
-    // dispatch and (in M5+) signal the daemon. Detect by diff so
-    // back-to-back writes of the same value still both register —
-    // wait, that's wrong; back-to-back writes of the same value
-    // would only fire once with diff detection. For M3 this is fine
-    // (the guest's notify pattern doesn't usually repeat the same
-    // value); M5 should replace this watch with PIC SW_INT to get
-    // exact-once semantics.
+    // QUEUE_NOTIFY — W. The guest writes the queue index here. We
+    // can't use snapshot-diff because the kernel writes the same
+    // queue index repeatedly (queue 0 → queue 0 → ...) and a diff
+    // watcher would only see the first one. Instead, the firmware
+    // CLEARS QUEUE_NOTIFY to a sentinel (-1) after each fire; any
+    // value other than -1 in the visible reg means a guest write
+    // happened. Initial state is set to -1 in `init_device` so a
+    // pristine reg file doesn't fire a spurious zero-queue notify
+    // on first poll.
+    //
+    // Race window: if the guest writes NOTIFY=N, BRISC reads N
+    // (fires), then guest writes NOTIFY=N again before BRISC's
+    // sentinel write lands, BRISC's next poll sees the second N
+    // and fires correctly. If the guest writes NOTIFY=N a third
+    // time within the same BRISC poll iteration, the third one
+    // races with the sentinel write — we accept this rare miss in
+    // exchange for exact-most-of-the-time semantics. Kernel
+    // virtio_blk doesn't burst notifies that tightly in practice.
     uint32_t notify = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NOTIFY));
-    uint32_t notify_prev = read_u32(snap_addr(slot, SNAP_OFF_QUEUE_NOTIFY));
-    if (notify != notify_prev) {
+    if (notify != 0xFFFFFFFFu) {
         handle_queue_notify(slot, notify);
-        write_u32(snap_addr(slot, SNAP_OFF_QUEUE_NOTIFY), notify);
+        write_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NOTIFY), 0xFFFFFFFFu);
     }
 
     // QUEUE_READY — RW. The guest writes after configuring desc /

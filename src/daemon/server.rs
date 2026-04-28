@@ -706,46 +706,99 @@ fn dispatch_boot(
     #[cfg(feature = "virtio-engine")]
     {
         // Register virtio device handlers with the engine's kick
-        // poller (#71 M5.5c). When the guest writes a QUEUE_NOTIFY
-        // for a registered slot, the poller will look up the entry,
-        // walk the descriptor chain via `process_one_chain_for_queue`,
-        // and fire the PLIC IRQ. M5.5c first cut wires only
-        // virtio-rng; net + blk + console land as follow-ups (each
-        // is a single-line addition once the rng path is verified
-        // end-to-end).
-        let _ = (
-            disk,
-            network,
-            extra_fwd,
-            console,
-            rng_backing,
-            net_backing,
-            disk_backing,
-            console_backing,
-        );
-        if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
-            if rng {
-                let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
-                    + crate::virtio_engine::DEV_RNG;
+        // poller (#71 M5.5c). When the guest writes QUEUE_NOTIFY
+        // for a registered slot, the poller looks up the entry,
+        // walks the descriptor chain via
+        // `process_one_chain_for_queue`, and fires the PLIC IRQ.
+        // Currently wires rng + blk; net + console need their
+        // VirtioDeviceImpl constructors lifted out of the
+        // host-buffer worker spawn path.
+        let _ = (network, extra_fwd, console);
+        let _ = (rng_backing, net_backing, disk_backing, console_backing);
+        let engine_for_init = state.tensix_engine.lock().unwrap().clone();
+        if let (Some(poller), Some(engine)) =
+            (state.kick_poller.lock().unwrap().as_ref(), engine_for_init)
+        {
+            // Helper closure: register one device + initialize its
+            // device-specific config space directly into BRISC L1
+            // via the engine's L1 pointer. The existing
+            // `VirtioDeviceImpl::init_config` writes (e.g.)
+            // virtio-blk's capacity at offset 0 of the CONFIG
+            // region; running it once at registration matches what
+            // `virtio::run_device` did at Phase 3 in the legacy
+            // host-buffer path.
+            let dev_slot = |dev_idx: u32| -> u32 {
+                (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU + dev_idx
+            };
+            let register = |slot_idx: u32,
+                            device: Box<dyn crate::virtio::VirtioDeviceImpl + Send>,
+                            irq: u32,
+                            kind: crate::virtio::InterruptKind,
+                            label: &str| {
+                let config_addr = crate::virtio_engine::slot_regs_base(slot_idx)
+                    + crate::virtio_engine::MMIO_CONFIG;
+                let config_ptr = engine.l1_ptr(config_addr);
+                device.init_config(config_ptr);
                 let entry = crate::tensix_data_plane::RegEntry::new(
                     slot_idx,
                     Arc::clone(&slot.l2cpu),
-                    Box::new(crate::virtio::rng::VirtioRng::new()),
+                    device,
                     Arc::clone(&slot.interrupt),
-                    crate::regs::virtio_mmio::RNG_IRQ,
-                    crate::virtio::InterruptKind::Rng,
+                    irq,
+                    kind,
                 );
                 poller.register_slot(entry);
                 dlog!(
-                    "[run_boot l2cpu {}] virtio-engine: registered rng on slot {}",
+                    "[run_boot l2cpu {}] virtio-engine: registered {} on slot {} \
+                         (config @ {:#x})",
                     l2cpu_idx,
-                    slot_idx
+                    label,
+                    slot_idx,
+                    config_addr
                 );
+            };
+            if rng {
+                register(
+                    dev_slot(crate::virtio_engine::DEV_RNG),
+                    Box::<crate::virtio::rng::VirtioRng>::default(),
+                    crate::regs::virtio_mmio::RNG_IRQ,
+                    crate::virtio::InterruptKind::Rng,
+                    "rng",
+                );
+            }
+            if let Some(disk_path) = disk.as_ref() {
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(disk_path)
+                {
+                    Ok(file) => match crate::virtio::block::VirtioBlk::from_file(file, l2cpu_idx) {
+                        Ok(blk) => register(
+                            dev_slot(crate::virtio_engine::DEV_BLK),
+                            Box::new(blk),
+                            crate::regs::virtio_mmio::DISK_IRQ,
+                            crate::virtio::InterruptKind::Block,
+                            "blk",
+                        ),
+                        Err(e) => dlog!(
+                            "[run_boot l2cpu {}] virtio-engine: VirtioBlk::from_file \
+                                 failed: {}",
+                            l2cpu_idx,
+                            e
+                        ),
+                    },
+                    Err(e) => dlog!(
+                        "[run_boot l2cpu {}] virtio-engine: open disk image {} failed: {}",
+                        l2cpu_idx,
+                        disk_path,
+                        e
+                    ),
+                }
             }
         } else {
             dlog!(
-                "[run_boot l2cpu {}] virtio-engine: kick poller not yet up — engine \
-                 wasn't brought up earlier in this boot",
+                "[run_boot l2cpu {}] virtio-engine: engine + kick poller not up — \
+                 skipping device registration",
                 l2cpu_idx
             );
         }
