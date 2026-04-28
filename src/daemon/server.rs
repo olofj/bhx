@@ -1279,6 +1279,22 @@ fn run_boot_sequence(
             "[run_boot l2cpu {}] issuing full board reset (other L2CPUs on this card will see a PCIe blip)",
             l2cpu_idx
         );
+        // Drop the engine + its kick poller before the PCIe LDS reset.
+        // The engine's `TensixTile` holds an open `/dev/tenstorrent/N`
+        // fd; an LDS reset re-enumerates the device, leaving any
+        // pre-reset fds pointing at unmapped BARs. Hanging on the
+        // CONFIG_WRITE ioctl (observed empirically on the bench's
+        // back-to-back daemon-restart path) is the failure mode. Per
+        // the lifetime model "tensix has the same lifetime as the
+        // L2CPUs", a board reset is the natural moment to recycle
+        // the engine — the next cold-boot RPC will bring it up fresh.
+        #[cfg(feature = "virtio-engine")]
+        {
+            // Drop the kick poller first (its thread holds another
+            // Arc<TensixEngine>); KickPoller::drop joins the thread.
+            let _ = state.kick_poller.lock().unwrap().take();
+            let _ = state.tensix_engine.lock().unwrap().take();
+        }
         // SharedChip::reset_board internally drops its fd+window, issues the
         // PCIe LDS reset, and reopens fresh — callers never see stale fd
         // errors across the reset.
