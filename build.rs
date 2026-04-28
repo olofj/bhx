@@ -20,42 +20,51 @@ fn main() {
 /// `.bin` via `include_bytes!` and copies it into Tensix tile L1.
 ///
 /// The toolchain is the sfpi GCC at `/opt/tenstorrent/sfpi/compiler/bin`
-/// (RV32 newlib cross-compiler shipped with tt-installer). We assume
-/// it's present — the project's runtime requirements already include
-/// the Tenstorrent stack, so anyone able to run the daemon has it.
-/// If it's missing the build fails with a clear error pointing at
-/// the install path.
+/// (RV32 newlib cross-compiler shipped with tt-installer). When it's
+/// present we rebuild from source. When it isn't (CI runners,
+/// hardware-free dev hosts), we fall back to the prebuilt
+/// `brisc-firmware/prebuilt/brisc-hello.bin` checked into the repo.
+/// Anyone modifying firmware source must rerun `make` locally and
+/// commit the refreshed prebuilt binary alongside the change.
 fn build_brisc_firmware() {
     let manifest_dir =
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
     let fw_dir = PathBuf::from(&manifest_dir).join("brisc-firmware");
 
-    // Rebuild whenever any source under brisc-firmware/ changes.
+    // Rebuild whenever any source under brisc-firmware/ changes, plus
+    // the prebuilt fallback (so a refreshed prebuilt commit triggers
+    // re-link on toolchain-less hosts).
     for f in ["start.S", "main.c", "link.ld", "Makefile"] {
         println!("cargo:rerun-if-changed=brisc-firmware/{}", f);
     }
+    println!("cargo:rerun-if-changed=brisc-firmware/prebuilt/brisc-hello.bin");
 
     let toolchain = "/opt/tenstorrent/sfpi/compiler/bin";
-    if !std::path::Path::new(toolchain).is_dir() {
-        panic!(
-            "sfpi toolchain not found at {}. Install with the Tenstorrent installer \
-             or set the path in brisc-firmware/Makefile (TOOLCHAIN_BIN).",
-            toolchain
-        );
-    }
-
-    let status = Command::new("make")
-        .current_dir(&fw_dir)
-        .arg("all")
-        .status()
-        .expect("invoke make for brisc-firmware");
-    if !status.success() {
-        panic!("brisc-firmware build failed (exit {:?})", status.code());
-    }
+    let bin_path = if std::path::Path::new(toolchain).is_dir() {
+        let status = Command::new("make")
+            .current_dir(&fw_dir)
+            .arg("all")
+            .status()
+            .expect("invoke make for brisc-firmware");
+        if !status.success() {
+            panic!("brisc-firmware build failed (exit {:?})", status.code());
+        }
+        fw_dir.join("build").join("brisc-hello.bin")
+    } else {
+        let prebuilt = fw_dir.join("prebuilt").join("brisc-hello.bin");
+        if !prebuilt.is_file() {
+            panic!(
+                "sfpi toolchain not found at {} and prebuilt firmware missing at {}. \
+                 Install the Tenstorrent toolchain or restore the prebuilt binary.",
+                toolchain,
+                prebuilt.display()
+            );
+        }
+        prebuilt
+    };
 
     // Surface the artifact path to Rust via env! so src/tensix.rs can
     // include_bytes!(env!(...)) without hardcoding a relative path.
-    let bin_path = fw_dir.join("build").join("brisc-hello.bin");
     println!("cargo:rustc-env=BRISC_HELLO_BIN={}", bin_path.display());
 }
 
