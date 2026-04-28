@@ -132,8 +132,9 @@ pub fn serve(
     }
 
     dlog!("[daemon] shutdown flag set — tearing down L2CPU slots");
-    for slot_mutex in state.l2cpus.iter() {
+    for (i, slot_mutex) in state.l2cpus.iter().enumerate() {
         if let Some(slot) = slot_mutex.lock().unwrap().take() {
+            unregister_engine_slots(&state, i as u8);
             slot.shutdown();
         }
     }
@@ -902,6 +903,7 @@ fn handle_existing_slot(
             "[boot l2cpu {}] --force: tearing down existing slot before re-imaging",
             l2cpu_idx
         );
+        unregister_engine_slots(state, l2cpu_idx);
         prior.shutdown();
         dlog!("[boot l2cpu {}] prior slot torn down", l2cpu_idx);
     }
@@ -2206,6 +2208,33 @@ fn dispatch_remove_console(
 // Stop / Shutdown
 // ---------------------------------------------------------------------------
 
+/// Drop every kick-poller registration for `l2cpu_idx` before the
+/// caller tears down the L2CpuSlot. Without this the poller keeps
+/// holding `Arc<L2Cpu>` for a stale slot — when the operator
+/// re-boots that L2CPU, the now-stale L2Cpu sticks around behind the
+/// scenes and any kick the firmware fires for the new boot still
+/// dispatches against the old memory mmap.
+///
+/// No-op without the engine feature; under `virtio-engine` we ask
+/// the poller to drop entries for slot indices owned by `l2cpu_idx`
+/// (`l2cpu_idx*4 + dev_idx` for `dev_idx` in 0..4 — see
+/// `virtio_engine::DEVS_PER_L2CPU`).
+fn unregister_engine_slots(state: &Arc<DaemonState>, l2cpu_idx: u8) {
+    #[cfg(feature = "virtio-engine")]
+    {
+        if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
+            let base = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU;
+            for dev_idx in 0..crate::virtio_engine::DEVS_PER_L2CPU {
+                poller.unregister_slot(base + dev_idx);
+            }
+        }
+    }
+    #[cfg(not(feature = "virtio-engine"))]
+    {
+        let _ = (state, l2cpu_idx);
+    }
+}
+
 fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) -> crate::Result<()> {
     dlog!("[stop l2cpu {}] dispatch_stop entry", l2cpu_idx);
     validate_l2cpu(l2cpu_idx)?;
@@ -2213,6 +2242,7 @@ fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) -> 
     match taken {
         Some(slot) => {
             dlog!("[stop l2cpu {}] slot taken; joining workers", l2cpu_idx);
+            unregister_engine_slots(state, l2cpu_idx);
             slot.shutdown();
             dlog!("[stop l2cpu {}] workers joined — replying ok", l2cpu_idx);
             reply_ok(sock);
