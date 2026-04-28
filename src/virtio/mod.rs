@@ -670,6 +670,23 @@ pub fn run_device(
                         // the next queue's writes overwrite them.
                         snapshot_current_queue(&mut q_state, last_sel);
                         last_sel = curr_sel;
+                        // Force the just-cleared QUEUE_READY=0 (and any
+                        // earlier clears) to be globally visible BEFORE the
+                        // L2CPU's next readl(QUEUE_READY) for queue N+1's
+                        // setup_vq. Plain write_volatile leaves the 0 in
+                        // the daemon CPU's store buffer for ~10s of cycles,
+                        // which on stock distro kernels (alma 6.12, no
+                        // sel_generation patch) is long enough that the
+                        // L2CPU's PCIe read pulls the stale 1 from queue N's
+                        // writel(READY=1). An mfence (via SeqCst store)
+                        // here drains the store buffer; we only pay it once
+                        // per SEL transition, not on every poll iter, so it
+                        // doesn't ruin the daemon's poll cadence on real
+                        // hot-path workloads.
+                        let queue_ready_atomic = unsafe {
+                            &*(regs.queue_ready as *const std::sync::atomic::AtomicU32)
+                        };
+                        queue_ready_atomic.store(0, std::sync::atomic::Ordering::SeqCst);
                     }
                     let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };
                     if let Some(next) = echo_sel_generation(curr_gen, last_echoed_gen) {
