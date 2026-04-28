@@ -141,6 +141,41 @@ pub struct ConfigureTlb {
     pub output: ConfigureTlbOut,
 }
 
+// --- ALLOCATE_DMA_BUF ---
+// Allocates a DMA-coherent host buffer. With the NOC_DMA flag, tt-kmd also
+// programs an outbound iATU region so the chip-side NoC can reach the buffer
+// at `noc_address`. Returned `mapping_offset` can be passed to mmap() on the
+// device fd to get a userspace pointer to the same physical memory. See #64.
+pub const TENSTORRENT_ALLOCATE_DMA_BUF_NOC_DMA: u8 = 2;
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AllocateDmaBufIn {
+    pub requested_size: u32,
+    pub buf_index: u8,
+    pub flags: u8,
+    pub _reserved0: [u8; 2],
+    pub _reserved1: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AllocateDmaBufOut {
+    pub physical_address: u64,
+    pub mapping_offset: u64,
+    pub size: u32,
+    pub _reserved0: u32,
+    pub noc_address: u64,
+    pub _reserved1: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AllocateDmaBuf {
+    pub input: AllocateDmaBufIn,
+    pub output: AllocateDmaBufOut,
+}
+
 // --- Ioctl number computation ---
 // Linux _IO macro: direction=0 (none), so ioctl nr = (magic << 8) | nr
 
@@ -149,6 +184,7 @@ const fn io(magic: u8, nr: u8) -> u64 {
 }
 
 pub const IOCTL_GET_DEVICE_INFO: u64 = io(TENSTORRENT_IOCTL_MAGIC, 0);
+pub const IOCTL_ALLOCATE_DMA_BUF: u64 = io(TENSTORRENT_IOCTL_MAGIC, 3);
 pub const IOCTL_RESET_DEVICE: u64 = io(TENSTORRENT_IOCTL_MAGIC, 6);
 pub const IOCTL_ALLOCATE_TLB: u64 = io(TENSTORRENT_IOCTL_MAGIC, 11);
 pub const IOCTL_FREE_TLB: u64 = io(TENSTORRENT_IOCTL_MAGIC, 12);
@@ -157,6 +193,7 @@ pub const IOCTL_CONFIGURE_TLB: u64 = io(TENSTORRENT_IOCTL_MAGIC, 13);
 // --- Ioctl wrappers using nix ---
 
 nix::ioctl_readwrite_bad!(ioctl_get_device_info, IOCTL_GET_DEVICE_INFO, GetDeviceInfo);
+nix::ioctl_readwrite_bad!(ioctl_allocate_dma_buf, IOCTL_ALLOCATE_DMA_BUF, AllocateDmaBuf);
 nix::ioctl_readwrite_bad!(ioctl_reset_device, IOCTL_RESET_DEVICE, ResetDevice);
 nix::ioctl_readwrite_bad!(ioctl_allocate_tlb, IOCTL_ALLOCATE_TLB, AllocateTlb);
 nix::ioctl_readwrite_bad!(ioctl_free_tlb, IOCTL_FREE_TLB, FreeTlb);

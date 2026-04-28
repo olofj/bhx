@@ -281,16 +281,15 @@ pub fn disk_main(
     l2cpu: Arc<L2Cpu>,
     interrupt_ctl: Arc<InterruptController>,
     interrupt_number: u32,
-    mmio_region_offset: u64,
+    mmio_backing: virtio::MmioBacking,
     disk_image_path: String,
     disk_image: File,
     exit_flag: Arc<AtomicBool>,
 ) {
     crate::dlog!(
-        "[disk l2cpu {}] worker thread entered (image={}, mmio_offset=0x{:x}, irq={})",
+        "[disk l2cpu {}] worker thread entered (image={}, irq={})",
         l2cpu.idx(),
         disk_image_path,
-        mmio_region_offset,
         interrupt_number
     );
     while !exit_flag.load(Ordering::Relaxed) {
@@ -323,7 +322,7 @@ pub fn disk_main(
             &l2cpu,
             &interrupt_ctl,
             interrupt_number,
-            mmio_region_offset,
+            mmio_backing,
             &exit_flag,
             virtio::InterruptKind::Block,
         );

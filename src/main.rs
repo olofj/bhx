@@ -16,6 +16,7 @@ mod daemon;
 mod error;
 mod fdt_ffi;
 mod fetch;
+mod host_buf;
 mod image;
 mod kernel;
 mod kmd;
@@ -27,6 +28,7 @@ mod shared_chip;
 mod slirp_ffi;
 mod tlb;
 mod virtio;
+mod x280_tlb;
 
 // Re-export the structured error type at the crate root so call sites
 // can write `crate::Result<T>` rather than `crate::error::Result<T>`.

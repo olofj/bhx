@@ -140,18 +140,20 @@ use crate::l2cpu::L2Cpu;
 use crate::virtio::interrupt::InterruptController;
 
 /// Per-L2CPU virtio-rng worker. Hosts a `VirtioRng` and runs
-/// `virtio::run_device` against the dedicated MMIO slot.
+/// `virtio::run_device` against the dedicated MMIO region. The caller
+/// chooses chip-DRAM vs host-buffer placement via `mmio_backing`; for
+/// the host-buffer path the caller is responsible for keeping the
+/// underlying `HostDmaBuf` alive for the duration of this call (#64).
 pub fn rng_main(
     l2cpu: Arc<L2Cpu>,
     interrupt_ctl: Arc<InterruptController>,
     interrupt_number: u32,
-    mmio_region_offset: u64,
+    mmio_backing: crate::virtio::MmioBacking,
     exit_flag: Arc<AtomicBool>,
 ) {
     crate::dlog!(
-        "[rng l2cpu {}] worker thread entered (mmio_offset={:#x}, irq={})",
+        "[rng l2cpu {}] worker thread entered (irq={})",
         l2cpu.idx(),
-        mmio_region_offset,
         interrupt_number
     );
     let mut device = VirtioRng::new();
@@ -160,7 +162,7 @@ pub fn rng_main(
         &l2cpu,
         &interrupt_ctl,
         interrupt_number,
-        mmio_region_offset,
+        mmio_backing,
         &exit_flag,
         crate::virtio::InterruptKind::Rng,
     );

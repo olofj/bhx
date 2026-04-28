@@ -411,14 +411,13 @@ pub fn network_main(
     l2cpu: Arc<L2Cpu>,
     interrupt_ctl: Arc<InterruptController>,
     interrupt_number: u32,
-    mmio_region_offset: u64,
+    mmio_backing: virtio::MmioBacking,
     exit_flag: Arc<AtomicBool>,
 ) {
     let l2cpu_idx = l2cpu.idx();
     crate::dlog!(
-        "[net l2cpu {}] worker thread entered (mmio_offset=0x{:x}, irq={}, forwards={:?})",
+        "[net l2cpu {}] worker thread entered (irq={}, forwards={:?})",
         l2cpu_idx,
-        mmio_region_offset,
         interrupt_number,
         forwards
     );
@@ -439,7 +438,7 @@ pub fn network_main(
             &l2cpu,
             &interrupt_ctl,
             interrupt_number,
-            mmio_region_offset,
+            mmio_backing,
             &exit_flag,
             virtio::InterruptKind::Net,
         );

@@ -211,15 +211,14 @@ pub fn console_main(
     l2cpu: Arc<L2Cpu>,
     interrupt_ctl: Arc<InterruptController>,
     interrupt_number: u32,
-    mmio_region_offset: u64,
+    mmio_backing: crate::virtio::MmioBacking,
     hub: Arc<ConsoleHub>,
     input_buf: Arc<Mutex<VecDeque<u8>>>,
     exit_flag: Arc<AtomicBool>,
 ) {
     crate::dlog!(
-        "[console l2cpu {}] worker thread entered (mmio_offset={:#x}, irq={})",
+        "[console l2cpu {}] worker thread entered (irq={})",
         l2cpu.idx(),
-        mmio_region_offset,
         interrupt_number
     );
     let mut device = VirtioConsole::new(hub, input_buf);
@@ -228,7 +227,7 @@ pub fn console_main(
         &l2cpu,
         &interrupt_ctl,
         interrupt_number,
-        mmio_region_offset,
+        mmio_backing,
         &exit_flag,
         crate::virtio::InterruptKind::Console,
     );

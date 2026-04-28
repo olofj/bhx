@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use crate::host_buf::HostDmaBuf;
 use crate::l2cpu::L2Cpu;
 use crate::shared_chip::SharedChip;
 use crate::virtio::interrupt::InterruptController;
@@ -78,6 +79,12 @@ pub struct L2CpuSlot {
     /// to satisfy `EFI_RNG_PROTOCOL` on the U-Boot+GRUB+shim chained-boot
     /// path; useful as plain `/dev/random` backing on direct-kernel paths.
     pub virtio_rng: Option<WorkerHandle>,
+    /// Host-side DMA buffer backing virtio-rng's MMIO control plane (#64).
+    /// `Some` iff `virtio_rng` is using the host-buffer path; held here so
+    /// the buffer (and its iATU + x280 TLB programming) outlives the
+    /// worker thread. Drop order: workers are joined in `shutdown` before
+    /// the slot is dropped, which then drops this buffer's `munmap`.
+    pub virtio_rng_buf: Option<HostDmaBuf>,
     /// Wall-clock instant the slot was installed. Drives
     /// `tt_bh_l2cpu_uptime_seconds`. Set once at construction; never
     /// updated.

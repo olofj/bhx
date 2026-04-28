@@ -38,7 +38,7 @@ use crate::virtio::network;
 // re-export under the legacy short names so the dispatch code reads cleanly.
 use crate::regs::virtio_mmio::{
     CONSOLE_IRQ as CONSOLE_INT, CONSOLE_OFFSET as CONSOLE_MMIO, DISK_IRQ as DISK_INT,
-    DISK_OFFSET as DISK_MMIO, RNG_IRQ as RNG_INT, RNG_OFFSET as RNG_MMIO,
+    DISK_OFFSET as DISK_MMIO, RNG_IRQ as RNG_INT,
 };
 #[cfg(feature = "slirp")]
 use crate::regs::virtio_mmio::{NET_IRQ as NET_INT, NET_OFFSET as NET_MMIO};
@@ -594,7 +594,7 @@ fn dispatch_boot(
     // proceed in parallel; the same-core case is still serialized by the
     // per-slot `Mutex<Option<L2CpuSlot>>` taken in `handle_existing_slot`.
     dlog!("[boot l2cpu {}] starting boot sequence", l2cpu_idx);
-    let l2cpu = run_boot_sequence(
+    let arts = run_boot_sequence(
         state,
         l2cpu_idx,
         opensbi,
@@ -623,7 +623,7 @@ fn dispatch_boot(
         l2cpu_idx
     );
 
-    let mut slot = make_slot_from_l2cpu(l2cpu, l2cpu_idx).map_err(|e| {
+    let mut slot = make_slot_from_l2cpu(arts.l2cpu, l2cpu_idx).map_err(|e| {
         dlog!(
             "[boot l2cpu {}] make_slot_from_l2cpu failed: {}",
             l2cpu_idx,
@@ -639,8 +639,30 @@ fn dispatch_boot(
         l2cpu_idx
     );
 
-    start_initial_workers(&mut slot, state.card, l2cpu_idx, disk, network, console, rng)
-        .map_err(crate::Error::slot_state)?;
+    // Resolve the RNG worker's MMIO backing and stash the buffer so it
+    // outlives the worker. Chip-DRAM is the historical path; host-buffer
+    // (#64) is selected when `run_boot_sequence` allocated one.
+    let rng_backing = match &arts.rng_buf {
+        Some(buf) => crate::virtio::MmioBacking::Host {
+            va: buf.as_ptr() as usize,
+        },
+        None => crate::virtio::MmioBacking::ChipDram {
+            region_offset: crate::regs::virtio_mmio::RNG_OFFSET,
+        },
+    };
+    slot.virtio_rng_buf = arts.rng_buf;
+
+    start_initial_workers(
+        &mut slot,
+        state.card,
+        l2cpu_idx,
+        disk,
+        network,
+        console,
+        rng,
+        rng_backing,
+    )
+    .map_err(crate::Error::slot_state)?;
     // Workers are now in Phase 1 polling for the DRIVER bit. Release the
     // L2CPU from reset so the kernel's virtio probe runs against a
     // daemon that's already watching MMIO. See `release_l2cpu_from_reset`.
@@ -692,6 +714,7 @@ fn start_initial_workers(
     network: bool,
     console: bool,
     rng: bool,
+    rng_backing: crate::virtio::MmioBacking,
 ) -> Result<(), String> {
     if let Some(path) = disk {
         dlog!(
@@ -739,8 +762,12 @@ fn start_initial_workers(
         })?;
     }
     if rng {
-        dlog!("[boot l2cpu {}] spawning virtio-rng worker", l2cpu_idx);
-        start_rng_worker(slot).map_err(|e| {
+        dlog!(
+            "[boot l2cpu {}] spawning virtio-rng worker (backing={:?})",
+            l2cpu_idx,
+            rng_backing
+        );
+        start_rng_worker(slot, rng_backing).map_err(|e| {
             dlog!("[boot l2cpu {}] start_rng_worker failed: {}", l2cpu_idx, e);
             format!("start rng worker failed: {}", e)
         })?;
@@ -789,7 +816,9 @@ fn start_disk_worker(
             l2cpu,
             interrupt,
             DISK_INT,
-            DISK_MMIO,
+            crate::virtio::MmioBacking::ChipDram {
+                region_offset: DISK_MMIO,
+            },
             path_thread,
             disk_image,
             exit_thread,
@@ -818,7 +847,16 @@ fn start_net_worker(card: u32, slot: &mut L2CpuSlot) -> io::Result<()> {
     // HOST:GUEST` is the path for arbitrary forwards post-boot.
     let forwards = vec![(ssh_port, 22)];
     let t = thread::spawn(move || {
-        network::network_main(forwards, l2cpu, interrupt, NET_INT, NET_MMIO, exit_thread);
+        network::network_main(
+            forwards,
+            l2cpu,
+            interrupt,
+            NET_INT,
+            crate::virtio::MmioBacking::ChipDram {
+                region_offset: NET_MMIO,
+            },
+            exit_thread,
+        );
     });
     slot.net = Some(WorkerHandle {
         exit,
@@ -855,7 +893,9 @@ fn start_console_worker(slot: &mut L2CpuSlot) -> io::Result<()> {
             l2cpu,
             interrupt,
             CONSOLE_INT,
-            CONSOLE_MMIO,
+            crate::virtio::MmioBacking::ChipDram {
+                region_offset: CONSOLE_MMIO,
+            },
             hub,
             input_buf_thread,
             exit_thread,
@@ -872,20 +912,29 @@ fn start_console_worker(slot: &mut L2CpuSlot) -> io::Result<()> {
     Ok(())
 }
 
-/// Spawn the virtio-rng worker (#62). The worker fills any guest
+/// Spawn the virtio-rng worker (#62 / #64). The worker fills any guest
 /// write-only descriptor with kernel entropy. Required for the
 /// AlmaLinux EFI shim's `EFI_RNG_PROTOCOL` on the U-Boot+GRUB+shim
 /// chained-boot path; harmless extra entropy source on other paths.
 /// Idempotent guard via the slot's `virtio_rng: Option<...>`: caller
 /// checks that.
-fn start_rng_worker(slot: &mut L2CpuSlot) -> io::Result<()> {
+///
+/// `mmio_backing` is the resolved control-plane location: chip DRAM for
+/// the historical layout, host buffer for the #64 path. The caller
+/// supplies whichever it set up in `run_boot_sequence`. For the host
+/// path the underlying `HostDmaBuf` lives in `slot.virtio_rng_buf`,
+/// outliving this worker thanks to slot shutdown ordering.
+fn start_rng_worker(
+    slot: &mut L2CpuSlot,
+    mmio_backing: crate::virtio::MmioBacking,
+) -> io::Result<()> {
     let exit = Arc::new(AtomicBool::new(false));
     let l2cpu = slot.l2cpu.clone();
     let interrupt = slot.interrupt.clone();
     let exit_thread = exit.clone();
     let idx = slot.idx;
     let t = thread::spawn(move || {
-        crate::virtio::rng::rng_main(l2cpu, interrupt, RNG_INT, RNG_MMIO, exit_thread);
+        crate::virtio::rng::rng_main(l2cpu, interrupt, RNG_INT, mmio_backing, exit_thread);
     });
     slot.virtio_rng = Some(WorkerHandle {
         exit,
@@ -893,6 +942,18 @@ fn start_rng_worker(slot: &mut L2CpuSlot) -> io::Result<()> {
         description: format!("virtio-rng l2cpu {}", idx),
     });
     Ok(())
+}
+
+/// Output of `run_boot_sequence`. The L2Cpu is what every later step in
+/// dispatch_boot drives off of. `rng_buf` is `Some` exactly when this
+/// boot allocated a host-side virtio-rng MMIO buffer (see #64); the
+/// buffer's `noc_address` and `as_ptr()` were already used during this
+/// sequence to program an x280 small TLB and patch the DTB, but the
+/// daemon needs to keep the buffer alive for the worker's lifetime.
+/// dispatch_boot stashes it in `slot.virtio_rng_buf`.
+pub struct BootArtifacts {
+    pub l2cpu: Arc<L2Cpu>,
+    pub rng_buf: Option<crate::host_buf::HostDmaBuf>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -909,7 +970,7 @@ fn run_boot_sequence(
     has_network: bool,
     has_console: bool,
     has_rng: bool,
-) -> io::Result<Arc<L2Cpu>> {
+) -> io::Result<BootArtifacts> {
     use crate::regs::boot_image;
 
     let card = state.card;
@@ -985,13 +1046,117 @@ fn run_boot_sequence(
             None => boot::BootDevice::Vda(root_device.to_string()),
         }
     };
+    // Build the list of virtio-mmio nodes we'll inject under /soc and
+    // (if has_rng) optionally allocate the host-side RNG buffer +
+    // program an x280 small TLB to bridge it. The buffer's `as_ptr()`
+    // also gets pre-init'd here with the standard register window so a
+    // fast-init guest sees a coherent device the instant the kernel
+    // probes virtio after reset release. See #64 for the full chain.
+    //
+    // Order in this Vec becomes DTB-storage order, which becomes
+    // kernel-probe order. We want it to match what the daemon used to
+    // emit before #64 — host-RNG (if any) first, then any chip-DRAM
+    // slots in ascending address order (RNG-slot < CONSOLE < NET <
+    // DISK in chip DRAM, but RNG is now host-side so the chip-DRAM
+    // sequence starts at CONSOLE). Probe ordering matters for the #61
+    // multi-queue race — virtio_net, the only multi-queue device that
+    // matters today, was already known to bind reliably when block
+    // probes after net so we keep DISK last.
+    let mut virtio_nodes: Vec<crate::boot::VirtioMmioNode> = Vec::with_capacity(4);
+    let rng_buf: Option<crate::host_buf::HostDmaBuf> = if has_rng {
+        use crate::regs::virtio_mmio::RNG_IRQ;
+        // 4 KiB is the standard register window size; we use only
+        // [0x00..0x200) for actual registers, but PAGE_SIZE is the
+        // minimum kmd will allocate.
+        let buf = crate::host_buf::HostDmaBuf::allocate(l2cpu.fd(), 4096, 0x40)
+            .map_err(|e| {
+                dlog!(
+                    "[run_boot l2cpu {}] HostDmaBuf::allocate for rng failed: {}",
+                    l2cpu_idx,
+                    e
+                );
+                e
+            })?;
+        let x280_pa = crate::x280_tlb::program_small_tlb_unicast(
+            &l2cpu,
+            // Reserve TLB slot N for L2CPU N's rng device — keeps the
+            // four cores from clobbering each other's mappings, with
+            // tons of room (224 small slots) for future devices.
+            l2cpu_idx as usize,
+            crate::x280_tlb::PCIE_TILE_X,
+            crate::x280_tlb::PCIE_TILE_Y,
+            buf.noc_address,
+        );
+        dlog!(
+            "[run_boot l2cpu {}] rng host buffer: noc={:#x} x280_pa={:#x} host_va={:p}",
+            l2cpu_idx,
+            buf.noc_address,
+            x280_pa,
+            buf.as_ptr()
+        );
+        // Pre-init the host VA: zero the standard register window, then
+        // publish magic / version / device-id / VIRTIO_F_VERSION_1 high
+        // half / queue_num_max so a fast-init guest sees a coherent
+        // device immediately on the first MMIO read.
+        pre_init_virtio_mmio_host(buf.as_ptr(), crate::regs::virtio_mmio::VIRTIO_ID_ENTROPY);
+        virtio_nodes.push(crate::boot::VirtioMmioNode {
+            addr: x280_pa,
+            size: 4096,
+            irq: RNG_IRQ,
+        });
+        Some(buf)
+    } else {
+        None
+    };
+
+    // Chip-DRAM virtio slots in ascending address order:
+    //   CONSOLE (mem_end - 0x600000) → NET (mem_end - 0x400000) →
+    //   DISK (mem_end - 0x200000)
+    // The order matches the historical pre-#64 layout's effective DTB
+    // ordering, which kept the multi-queue probe race in #61 latent;
+    // a different order made virtio_net fail to probe.
+    {
+        use crate::regs::virtio_mmio::{
+            CONSOLE_IRQ, CONSOLE_OFFSET, DISK_IRQ, DISK_OFFSET, MMIO_SLOT_SIZE, NET_IRQ,
+            NET_OFFSET,
+        };
+        if has_console {
+            virtio_nodes.push(crate::boot::VirtioMmioNode {
+                addr: starting_address + memory_size - CONSOLE_OFFSET,
+                size: MMIO_SLOT_SIZE,
+                irq: CONSOLE_IRQ,
+            });
+        }
+        if has_network {
+            virtio_nodes.push(crate::boot::VirtioMmioNode {
+                addr: starting_address + memory_size - NET_OFFSET,
+                size: MMIO_SLOT_SIZE,
+                irq: NET_IRQ,
+            });
+        }
+        if has_disk {
+            virtio_nodes.push(crate::boot::VirtioMmioNode {
+                addr: starting_address + memory_size - DISK_OFFSET,
+                size: MMIO_SLOT_SIZE,
+                irq: DISK_IRQ,
+            });
+        }
+    }
+
     dlog!(
-        "[run_boot l2cpu {}] patching DTB (memory start=0x{:x} size=0x{:x})",
+        "[run_boot l2cpu {}] patching DTB (memory start=0x{:x} size=0x{:x}, {} virtio nodes)",
         l2cpu_idx,
         starting_address,
-        memory_size
+        memory_size,
+        virtio_nodes.len()
     );
-    let dtb_patched = boot::modify_dtb(&dtb_raw, &boot_device, starting_address, memory_size)?;
+    let dtb_patched = boot::modify_dtb(
+        &dtb_raw,
+        &boot_device,
+        starting_address,
+        memory_size,
+        &virtio_nodes,
+    )?;
 
     let initramfs_pb = initramfs.map(std::path::PathBuf::from);
     dlog!(
@@ -1044,19 +1209,19 @@ fn run_boot_sequence(
             crate::regs::virtio_mmio::VIRTIO_ID_CONSOLE,
         );
     }
-    if has_rng {
-        pre_init_virtio_mmio(
-            &l2cpu,
-            starting_address + memory_size - crate::regs::virtio_mmio::RNG_OFFSET,
-            crate::regs::virtio_mmio::VIRTIO_ID_ENTROPY,
-        );
-    }
+    // Note: virtio-rng's pre-init lives further up next to the host-buffer
+    // allocation — that path writes to the daemon-local mmap (the chip
+    // can't reach it via plain NoC writes anyway, only through the x280
+    // TLB we just programmed).
 
     dlog!(
         "[run_boot l2cpu {}] image+pre_init done; deferring reset release until workers spawn",
         l2cpu_idx
     );
-    Ok(l2cpu)
+    Ok(BootArtifacts {
+        l2cpu,
+        rng_buf,
+    })
 }
 
 /// Release the L2CPU from reset and configure its prefetchers. Called
@@ -1173,6 +1338,45 @@ fn pre_init_virtio_mmio(l2cpu: &L2Cpu, mmio_addr: u64, device_id: u32) {
     );
 }
 
+/// Host-side counterpart to [`pre_init_virtio_mmio`] for #64. Same
+/// register-window initialization, but writes go to a daemon-local
+/// mmap'd address (which the chip later reads through PCIe outbound
+/// iATU + an x280 TLB) instead of through the daemon's TLB onto the
+/// L2CPU tile. Native u32 stores at the mmap'd VA (no PCIe round-trip
+/// from the daemon's side); the kernel sees them as uncached MMIO
+/// reads.
+fn pre_init_virtio_mmio_host(host_va: *mut u8, device_id: u32) {
+    use std::ptr;
+
+    const VIRTIO_MAGIC: u32 = 0x74726976; // 'virt'
+    const OFF_MAGIC: usize = 0x000;
+    const OFF_VERSION: usize = 0x004;
+    const OFF_DEVICE_ID: usize = 0x008;
+    const OFF_DEVICE_FEATURES: usize = 0x010;
+    const OFF_QUEUE_NUM_MAX: usize = 0x034;
+    const OFF_SW_IMPL: usize = 0x018;
+    const VIRTIO_F_VERSION_1_HIGH: u32 = 1;
+    let queue_size_pre: u32 = crate::virtio::QUEUE_SIZE as u32;
+
+    // Zero the standard register window [0x00, 0x200), then write the
+    // initial device-presence values. Same sequencing as the chip-DRAM
+    // pre_init: the worker's cold-start re-writes these idempotently.
+    unsafe {
+        for off in (0..0x200usize).step_by(4) {
+            ptr::write_volatile(host_va.add(off) as *mut u32, 0);
+        }
+        ptr::write_volatile(host_va.add(OFF_MAGIC) as *mut u32, VIRTIO_MAGIC);
+        ptr::write_volatile(host_va.add(OFF_VERSION) as *mut u32, 2);
+        ptr::write_volatile(host_va.add(OFF_DEVICE_ID) as *mut u32, device_id);
+        ptr::write_volatile(
+            host_va.add(OFF_DEVICE_FEATURES) as *mut u32,
+            VIRTIO_F_VERSION_1_HIGH,
+        );
+        ptr::write_volatile(host_va.add(OFF_QUEUE_NUM_MAX) as *mut u32, queue_size_pre);
+        ptr::write_volatile(host_va.add(OFF_SW_IMPL) as *mut u32, 1);
+    }
+}
+
 /// Build the runtime slot on top of an already-constructed `L2Cpu`. All
 /// callers (dispatch_boot, warm-resume) construct the `L2Cpu` themselves
 /// so the chip-touching phase runs exactly once per boot / adoption.
@@ -1216,6 +1420,7 @@ fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlo
         net: None,
         virtio_console: None,
         virtio_rng: None,
+        virtio_rng_buf: None,
         started: Instant::now(),
     })
 }
@@ -1391,7 +1596,9 @@ fn dispatch_add_disk(
             l2cpu,
             interrupt,
             DISK_INT,
-            DISK_MMIO,
+            crate::virtio::MmioBacking::ChipDram {
+                region_offset: DISK_MMIO,
+            },
             path_thread,
             disk_image,
             exit_thread,
@@ -1503,7 +1710,9 @@ fn dispatch_add_net(
             l2cpu,
             interrupt,
             NET_INT,
-            NET_MMIO,
+            crate::virtio::MmioBacking::ChipDram {
+                region_offset: NET_MMIO,
+            },
             exit_thread,
         );
     });

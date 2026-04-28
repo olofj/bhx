@@ -207,6 +207,18 @@ pub enum BootDevice {
     Uboot,
 }
 
+/// One virtio-mmio node to inject under `/soc` in the patched DTB.
+/// `addr` and `size` go into the node's `reg` property; `irq` ties the
+/// node to the PLIC. Order in the input slice doesn't matter; the
+/// nodes are emitted independently. Used to support both chip-DRAM and
+/// host-buffer (#64) virtio-mmio placement in the same kernel boot.
+#[derive(Debug, Clone, Copy)]
+pub struct VirtioMmioNode {
+    pub addr: u64,
+    pub size: u64,
+    pub irq: u32,
+}
+
 /// Patch a DTB to match the layout boot.py produces.
 ///
 /// Adds `/chosen/bootargs`, a `reserved-memory` entry for the virtio MMIO
@@ -218,6 +230,7 @@ pub fn modify_dtb(
     boot_device: &BootDevice,
     mem_start: u64,
     mem_size: u64,
+    virtio_nodes: &[VirtioMmioNode],
 ) -> crate::Result<Vec<u8>> {
     let mem_end = mem_start + mem_size;
     eprintln!(
@@ -314,27 +327,20 @@ pub fn modify_dtb(
         eprintln!("[modify_dtb]   PLIC phandle = {}", plic_phandle);
     }
 
-    {
-        use crate::regs::virtio_mmio::{DISK_IRQ, MMIO_SLOT_SIZE};
-        for i in (0..4u64).rev() {
-            let virtio_addr = mem_end - MMIO_SLOT_SIZE * (i + 1);
-            // Slot 0 (lowest in the reservation) has the largest IRQ
-            // (DISK_IRQ); the four slots descend by IRQ number.
-            let virtio_irq = DISK_IRQ - i as u32;
-            let name = format!("virtio@{:x}", virtio_addr);
-            eprintln!(
-                "[modify_dtb]   adding {} irq={} parent={}",
-                name, virtio_irq, plic_phandle
-            );
-            let node = fdt.add_subnode(soc, &name)?;
-            fdt.setprop_string(node, "compatible", "virtio,mmio")?;
-            let mut reg = Vec::with_capacity(16);
-            reg.extend_from_slice(&virtio_addr.to_be_bytes());
-            reg.extend_from_slice(&MMIO_SLOT_SIZE.to_be_bytes());
-            fdt.setprop(node, "reg", &reg)?;
-            fdt.setprop_u32(node, "interrupts", virtio_irq)?;
-            fdt.setprop_u32(node, "interrupt-parent", plic_phandle)?;
-        }
+    for node_spec in virtio_nodes {
+        let name = format!("virtio@{:x}", node_spec.addr);
+        eprintln!(
+            "[modify_dtb]   adding {} size={:#x} irq={} parent={}",
+            name, node_spec.size, node_spec.irq, plic_phandle
+        );
+        let node = fdt.add_subnode(soc, &name)?;
+        fdt.setprop_string(node, "compatible", "virtio,mmio")?;
+        let mut reg = Vec::with_capacity(16);
+        reg.extend_from_slice(&node_spec.addr.to_be_bytes());
+        reg.extend_from_slice(&node_spec.size.to_be_bytes());
+        fdt.setprop(node, "reg", &reg)?;
+        fdt.setprop_u32(node, "interrupts", node_spec.irq)?;
+        fdt.setprop_u32(node, "interrupt-parent", plic_phandle)?;
     }
 
     let packed = fdt.pack()?;
@@ -389,14 +395,14 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x8000_0000u64; // 2 GiB
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size).unwrap();
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[]).unwrap();
         assert_eq!(read_memory_reg(&out), (mem_start, mem_size));
     }
 
     #[test]
     fn modify_dtb_bootargs_for_vda_root() {
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, 0x4000_3000_0000, 0x1_0000_0000).unwrap();
+        let out = modify_dtb(FIXTURE_DTB, &dev, 0x4000_3000_0000, 0x1_0000_0000, &[]).unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let chosen = fdt.path_offset("/chosen").unwrap().unwrap();
         let args = fdt.getprop(chosen, "bootargs").unwrap();
@@ -416,7 +422,7 @@ mod tests {
             addr: 0x4000_3210_0000,
             len: 4096,
         };
-        let out = modify_dtb(FIXTURE_DTB, &dev, 0x4000_3000_0000, 0x1_0000_0000).unwrap();
+        let out = modify_dtb(FIXTURE_DTB, &dev, 0x4000_3000_0000, 0x1_0000_0000, &[]).unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let chosen = fdt.path_offset("/chosen").unwrap().unwrap();
         let args = fdt.getprop(chosen, "bootargs").unwrap();
@@ -437,7 +443,7 @@ mod tests {
         let expected_base = mem_end - crate::regs::virtio_mmio::RESERVED_SIZE;
 
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size).unwrap();
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[]).unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let res = fdt
             .path_offset("/reserved-memory/memory@4000afa00000")
@@ -455,25 +461,33 @@ mod tests {
     }
 
     #[test]
-    fn modify_dtb_creates_4_virtio_mmio_nodes_with_descending_irqs() {
-        // /soc gets four virtio@<addr> children: addresses descend from
-        // mem_end - MMIO_SLOT_SIZE downwards, IRQs descend from DISK_IRQ.
-        // The node walks i=0..4 -> 4 nodes total.
+    fn modify_dtb_emits_each_virtio_mmio_node_passed_in() {
+        // The chip-DRAM virtio layout used to be hardcoded inside
+        // modify_dtb; #64 generalised it to take a caller-supplied list
+        // so host-side and chip-DRAM placements can coexist in the same
+        // boot. Verify the historical descending-from-mem_end /
+        // descending-IRQ shape still works when the caller passes it.
+        use crate::regs::virtio_mmio::{DISK_IRQ, MMIO_SLOT_SIZE};
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x1_0000_0000u64;
         let mem_end = mem_start + mem_size;
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size).unwrap();
+        let nodes: Vec<VirtioMmioNode> = (0..4u64)
+            .map(|i| VirtioMmioNode {
+                addr: mem_end - MMIO_SLOT_SIZE * (i + 1),
+                size: MMIO_SLOT_SIZE,
+                irq: DISK_IRQ - i as u32,
+            })
+            .collect();
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &nodes).unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
 
-        for i in 0..4u64 {
-            let addr = mem_end - crate::regs::virtio_mmio::MMIO_SLOT_SIZE * (i + 1);
-            let path = format!("/soc/virtio@{:x}", addr);
+        for spec in &nodes {
+            let path = format!("/soc/virtio@{:x}", spec.addr);
             let node = fdt
                 .path_offset(&path)
                 .expect("path_offset shouldn't fail")
                 .unwrap_or_else(|| panic!("missing {}", path));
-            // compatible = "virtio,mmio\0"
             let compat = fdt.getprop(node, "compatible").unwrap();
             assert!(
                 compat.starts_with(b"virtio,mmio"),
@@ -481,12 +495,28 @@ mod tests {
                 path,
                 compat
             );
-            // interrupts is one big-endian u32; verify it descends.
             let irq = fdt.getprop(node, "interrupts").unwrap();
             assert_eq!(irq.len(), 4);
             let irq_val = u32::from_be_bytes(irq.try_into().unwrap());
-            let expected_irq = crate::regs::virtio_mmio::DISK_IRQ - i as u32;
-            assert_eq!(irq_val, expected_irq, "{} irq", path);
+            assert_eq!(irq_val, spec.irq, "{} irq", path);
+        }
+    }
+
+    #[test]
+    fn modify_dtb_with_empty_virtio_nodes_emits_none() {
+        // With #64's host-buffer path, runs that don't have any
+        // chip-DRAM virtio devices configured (e.g. host-RNG-only)
+        // should produce a DTB with no virtio,mmio children under /soc.
+        let mem_start = 0x4000_3000_0000u64;
+        let mem_size = 0x1_0000_0000u64;
+        let dev = BootDevice::Vda("vda".to_string());
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[]).unwrap();
+        let fdt = Fdt::open_into(&out, 0).unwrap();
+        for i in 0..4u64 {
+            let addr = mem_start + mem_size - crate::regs::virtio_mmio::MMIO_SLOT_SIZE * (i + 1);
+            let path = format!("/soc/virtio@{:x}", addr);
+            let r = fdt.path_offset(&path).unwrap();
+            assert!(r.is_none(), "{} should not exist with empty node list", path);
         }
     }
 }

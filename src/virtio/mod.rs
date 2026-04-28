@@ -267,25 +267,62 @@ fn is_warm_restart_candidate(
     existing_magic == expected_magic && existing_dev_id == expected_dev_id && stash_all_valid
 }
 
+/// Where the virtio-mmio control-plane registers live, from the daemon
+/// worker's point of view. The data plane (vring + buffer payloads) is
+/// always in chip DRAM (per `L2Cpu::get_memory_ptr`); only the control
+/// plane varies.
+///
+/// `ChipDram` is the historical / default placement: a 2 MiB region at
+/// the top of L2CPU DRAM, accessed by the daemon through a TLB window
+/// onto the L2CPU tile and by the kernel as cached DRAM. `Host` is the
+/// #64 path: a host coherent buffer reached via PCIe outbound iATU and
+/// an x280 NoC TLB; the daemon accesses it natively (~10 ns/op) and the
+/// kernel sees it as uncached MMIO at an x280 PA window.
+#[derive(Debug, Clone, Copy)]
+pub enum MmioBacking {
+    /// Offset from `mem_end` (= `starting_address + memory_size`) of the
+    /// 2 MiB chip-DRAM region for this device's MMIO. Concretely one of
+    /// the `*_OFFSET` constants in `crate::regs::virtio_mmio`.
+    ChipDram { region_offset: u64 },
+    /// Daemon-side virtual address of a `HostDmaBuf`'s mapping. Caller
+    /// must keep the buffer alive for the duration of `run_device`.
+    Host { va: usize },
+}
+
 /// Run a VirtIO device: setup MMIO, negotiate features, process descriptors.
 pub fn run_device(
     device: &mut dyn VirtioDeviceImpl,
     l2cpu: &L2Cpu,
     interrupt_ctl: &InterruptController,
     interrupt_number: u32,
-    mmio_region_offset: u64,
+    mmio_backing: MmioBacking,
     exit_flag: &AtomicBool,
     interrupt_kind: InterruptKind,
 ) {
     let starting_address = l2cpu.starting_address();
     let memory = l2cpu.get_memory_ptr();
 
-    // Create MMIO window
-    let address = starting_address + l2cpu.memory_size() - mmio_region_offset;
-    let window = l2cpu
-        .get_persistent_2m_window(address)
-        .expect("failed to create MMIO window");
-    let mmio_base = window.get_window();
+    // Resolve the MMIO control-plane base. For `ChipDram`, mint a
+    // persistent 2 MiB TLB window onto the L2CPU tile and use its mapped
+    // ptr; the window is held until `run_device` returns. For `Host`,
+    // the caller already mmap'd a `HostDmaBuf` and handed us a stable
+    // pointer; no chip-side mapping needed for the control plane.
+    let _chip_window;
+    let mmio_base: *mut u8 = match mmio_backing {
+        MmioBacking::ChipDram { region_offset } => {
+            let address = starting_address + l2cpu.memory_size() - region_offset;
+            let window = l2cpu
+                .get_persistent_2m_window(address)
+                .expect("failed to create MMIO window");
+            let p = window.get_window();
+            _chip_window = Some(window);
+            p
+        }
+        MmioBacking::Host { va } => {
+            _chip_window = None;
+            va as *mut u8
+        }
+    };
 
     let num_queues = device.num_queues();
     let mem_end = starting_address + l2cpu.memory_size();
