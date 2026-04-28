@@ -1993,6 +1993,71 @@ fn dispatch_add_disk(
         .ok_or_else(|| crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx)))?;
     let disk_image = validate_add_disk_request(slot.disks.is_empty(), std::path::Path::new(&path))?;
 
+    // Engine path: register a fresh VirtioBlk with the kick poller
+    // and push a stub DiskWorker so `daemon status` reflects the
+    // attach. The kick poller drops kicks for unregistered slots
+    // (#71 M5.5b), so a guest probe before this call simply doesn't
+    // see the device — same effect as the legacy worker not having
+    // started yet. There is no per-device worker thread to spawn;
+    // the kick poller handles dispatch.
+    #[cfg(feature = "virtio-engine")]
+    {
+        if let (Some(poller), Some(engine)) = (
+            state.kick_poller.lock().unwrap().as_ref(),
+            state.tensix_engine.lock().unwrap().clone(),
+        ) {
+            match crate::virtio::block::VirtioBlk::from_file(disk_image, l2cpu_idx) {
+                Ok(blk) => {
+                    let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
+                        + crate::virtio_engine::DEV_BLK;
+                    let config_addr = crate::virtio_engine::slot_regs_base(slot_idx)
+                        + crate::virtio_engine::MMIO_CONFIG;
+                    crate::virtio::VirtioDeviceImpl::init_config(&blk, engine.l1_ptr(config_addr));
+                    let entry = crate::tensix_data_plane::RegEntry::new(
+                        slot_idx,
+                        Arc::clone(&slot.l2cpu),
+                        Box::new(blk),
+                        Arc::clone(&slot.interrupt),
+                        crate::regs::virtio_mmio::DISK_IRQ,
+                        crate::virtio::InterruptKind::Block,
+                    );
+                    poller.register_slot(entry);
+                    slot.disks.push(DiskWorker {
+                        path: path.clone(),
+                        worker: WorkerHandle {
+                            exit: Arc::new(AtomicBool::new(false)),
+                            thread: None,
+                            description: format!("disk l2cpu {} @ {} (engine)", l2cpu_idx, path),
+                        },
+                    });
+                    dlog!(
+                        "[add_disk l2cpu {}] engine: registered blk on slot {} for {}",
+                        l2cpu_idx,
+                        slot_idx,
+                        path
+                    );
+                    reply_ok(sock);
+                    return Ok(());
+                }
+                Err(e) => {
+                    dlog!(
+                        "[add_disk l2cpu {}] engine: VirtioBlk::from_file failed: {}",
+                        l2cpu_idx,
+                        e
+                    );
+                    return Err(crate::Error::slot_state(format!(
+                        "VirtioBlk::from_file({}) failed: {}",
+                        path, e
+                    )));
+                }
+            }
+        }
+        // Engine compiled in but not brought up — fall through to
+        // legacy. In practice every engine boot brings up the engine
+        // lazily through `dispatch_boot`'s `any_host_device` branch,
+        // so this is just defensive.
+    }
+
     let exit = Arc::new(AtomicBool::new(false));
     let l2cpu = slot.l2cpu.clone();
     let interrupt = slot.interrupt.clone();
@@ -2030,6 +2095,17 @@ fn dispatch_remove_disk(
 ) -> crate::Result<()> {
     dlog!("[remove_disk l2cpu {}] dispatch entry", l2cpu_idx);
     validate_l2cpu(l2cpu_idx)?;
+    // Engine path: drop the kick poller's blk registration first so
+    // any in-flight kick lands as a "no registration" drop instead of
+    // a use-after-free against the Box<VirtioBlk> we're about to free.
+    // The legacy worker thread handles its own teardown via the exit
+    // flag in the for-loop below; this is a no-op there.
+    #[cfg(feature = "virtio-engine")]
+    if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
+        let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
+            + crate::virtio_engine::DEV_BLK;
+        poller.unregister_slot(slot_idx);
+    }
     // Take the disks out under the lock, then release and join outside.
     // stop_and_join blocks until the worker's poll loop notices the exit
     // flag (~100 ms worst case); holding the state mutex for that long
@@ -2101,6 +2177,54 @@ fn dispatch_add_net(
         )))?;
     }
 
+    // Engine path: build the VirtioNet directly + register with the
+    // kick poller. No worker thread; the kick poller's RX poll loop
+    // (#71 M5.5e) drives slirp's recv side.
+    #[cfg(feature = "virtio-engine")]
+    {
+        if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
+            match crate::virtio::network::VirtioNet::new(&forwards, l2cpu_idx) {
+                Ok(net) => {
+                    let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
+                        + crate::virtio_engine::DEV_NET;
+                    let entry = crate::tensix_data_plane::RegEntry::new(
+                        slot_idx,
+                        Arc::clone(&slot.l2cpu),
+                        Box::new(net),
+                        Arc::clone(&slot.interrupt),
+                        crate::regs::virtio_mmio::NET_IRQ,
+                        crate::virtio::InterruptKind::Net,
+                    );
+                    poller.register_slot(entry);
+                    slot.net = Some(WorkerHandle {
+                        exit: Arc::new(AtomicBool::new(false)),
+                        thread: None,
+                        description: format!("net l2cpu {} (engine)", l2cpu_idx),
+                    });
+                    dlog!(
+                        "[add_net l2cpu {}] engine: registered net on slot {} (forwards={:?})",
+                        l2cpu_idx,
+                        slot_idx,
+                        forwards
+                    );
+                    reply_ok(sock);
+                    return Ok(());
+                }
+                Err(e) => {
+                    dlog!(
+                        "[add_net l2cpu {}] engine: VirtioNet::new failed: {}",
+                        l2cpu_idx,
+                        e
+                    );
+                    return Err(crate::Error::slot_state(format!(
+                        "VirtioNet::new failed: {}",
+                        e
+                    )));
+                }
+            }
+        }
+    }
+
     let exit = Arc::new(AtomicBool::new(false));
     let l2cpu = slot.l2cpu.clone();
     let interrupt = slot.interrupt.clone();
@@ -2156,6 +2280,15 @@ fn dispatch_remove_net(
 ) -> crate::Result<()> {
     dlog!("[remove_net l2cpu {}] dispatch entry", l2cpu_idx);
     validate_l2cpu(l2cpu_idx)?;
+    // Engine path: drop the kick poller's net registration first
+    // (frees the VirtioNet's slirp connection too via Box drop).
+    // No-op when there's no engine registration for this slot.
+    #[cfg(feature = "virtio-engine")]
+    if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
+        let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
+            + crate::virtio_engine::DEV_NET;
+        poller.unregister_slot(slot_idx);
+    }
     // Take the net handle under the lock, join outside (same reasoning as
     // dispatch_remove_disk).
     let net = {
