@@ -2325,6 +2325,50 @@ fn dispatch_add_console(
     if slot.virtio_console.is_some() {
         return Err(crate::Error::slot_state("virtio-console already attached"));
     }
+
+    // Engine path: build a VirtioConsole + register with the kick
+    // poller; same shape as the boot-time `console` branch in
+    // dispatch_boot. Stub WorkerHandle so the slot teardown path
+    // doesn't need to special-case engine-vs-legacy.
+    #[cfg(feature = "virtio-engine")]
+    {
+        if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
+            let input_buf = Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::with_capacity(crate::virtio::console::RX_BUFFER_CAP),
+            ));
+            let device = crate::virtio::console::VirtioConsole::new(
+                slot.console_hub.clone(),
+                Arc::clone(&input_buf),
+            );
+            let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
+                + crate::virtio_engine::DEV_CONSOLE;
+            let entry = crate::tensix_data_plane::RegEntry::new(
+                slot_idx,
+                Arc::clone(&slot.l2cpu),
+                Box::new(device),
+                Arc::clone(&slot.interrupt),
+                crate::regs::virtio_mmio::CONSOLE_IRQ,
+                crate::virtio::InterruptKind::Console,
+            );
+            poller.register_slot(entry);
+            slot.virtio_console = Some(crate::daemon::VirtioConsoleSlot {
+                worker: WorkerHandle {
+                    exit: Arc::new(AtomicBool::new(false)),
+                    thread: None,
+                    description: format!("virtio-console l2cpu {} (engine)", l2cpu_idx),
+                },
+                input_buf,
+            });
+            dlog!(
+                "[add_console l2cpu {}] engine: registered console on slot {}",
+                l2cpu_idx,
+                slot_idx
+            );
+            reply_ok(sock);
+            return Ok(());
+        }
+    }
+
     start_console_worker(
         slot,
         crate::virtio::MmioBacking::ChipDram {
@@ -2347,6 +2391,14 @@ fn dispatch_remove_console(
 ) -> crate::Result<()> {
     dlog!("[remove_console l2cpu {}] dispatch entry", l2cpu_idx);
     validate_l2cpu(l2cpu_idx)?;
+    // Engine path: drop kick-poller registration first (frees the
+    // VirtioConsole's input_buf reference too).
+    #[cfg(feature = "virtio-engine")]
+    if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
+        let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
+            + crate::virtio_engine::DEV_CONSOLE;
+        poller.unregister_slot(slot_idx);
+    }
     // Take the slot under the lock, join outside.
     let vc = {
         let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
