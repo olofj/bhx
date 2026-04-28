@@ -108,38 +108,18 @@ def measure_tcp_egress(g: GuestSession, host_port: int, duration: int) -> float:
             server.kill()
 
 
-def measure_tcp_ingress(
-    g: GuestSession, card: int, l2cpu: int, port: int, duration: int
-) -> float:
+def measure_tcp_ingress(g: GuestSession, port: int, duration: int) -> float:
     """Host connects to 127.0.0.1:port → slirp NAT → guest's
-    iperf3 -s on `port`. Uses `add-net --fwd HOST:GUEST` (#37) for
-    the slirp forward; restarts net to install the new fwd cleanly.
+    iperf3 -s on `port`. The slirp forward is installed at cold-boot
+    via `boot --fwd HOST:GUEST` (caller's responsibility) — see the
+    docstring on `boot()` in `lib.py` for why hot-add doesn't work.
     """
-    note(f"tcp_ingress: re-attaching net with --fwd {port}:{port}")
-    subprocess.run(
-        [BINARY, "remove-net", "-t", str(card), "-l", str(l2cpu)],
-        capture_output=True,
-    )
-    r = subprocess.run(
-        [
-            BINARY,
-            "add-net",
-            "-t",
-            str(card),
-            "-l",
-            str(l2cpu),
-            "--fwd",
-            f"{port}:{port}",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if r.returncode != 0:
-        fail(f"add-net --fwd failed: {r.stderr}")
-
     # Start guest-side iperf3 -s in the background; -1 makes it serve
-    # exactly one connection then exit cleanly.
-    g.send(f"iperf3 -s -1 -p {port} >/dev/null 2>&1 &\n".encode())
+    # exactly one connection then exit cleanly. -B 10.0.2.15 forces
+    # IPv4 bind so slirp's IPv4 NAT lands on the right socket
+    # (busybox iperf3 otherwise binds IPv6-any, which slirp's IPv4
+    # NAT can't deliver to).
+    g.send(f"iperf3 -s -1 -p {port} -B 10.0.2.15 >/dev/null 2>&1 &\n".encode())
     time.sleep(2)
 
     note(f"tcp_ingress: running iperf3 -c 127.0.0.1:{port} for {duration}s")
@@ -226,7 +206,15 @@ def main() -> int:
         daemon_start(args.card)
         time.sleep(1)
         note(f"cold boot l2cpu {args.l2cpu} with rootfs={rootfs}")
-        boot(args.card, args.l2cpu, rootfs, network=True)
+        # Install the ingress forward at cold-boot (see lib.py:boot()
+        # for why post-boot add-net doesn't work on buildroot).
+        boot(
+            args.card,
+            args.l2cpu,
+            rootfs,
+            network=True,
+            fwd=[(args.ingress_port, args.ingress_port)],
+        )
         wait_for_running(args.card, args.l2cpu, timeout_s=60)
         # Wait for guest userspace + DHCP to come up before slirp
         # routing makes sense.
@@ -239,9 +227,7 @@ def main() -> int:
             BenchResult("net", "tcp_egress_30s.bandwidth_mbps", mbps, "MB/s")
         )
 
-        mbps = measure_tcp_ingress(
-            g, args.card, args.l2cpu, args.ingress_port, args.duration
-        )
+        mbps = measure_tcp_ingress(g, args.ingress_port, args.duration)
         results.append(
             BenchResult("net", "tcp_ingress_30s.bandwidth_mbps", mbps, "MB/s")
         )

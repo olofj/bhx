@@ -48,6 +48,18 @@ pub enum Request {
         disk: Option<String>,
         #[serde(default)]
         network: bool,
+        /// Extra TCP forwards installed in the slirp config at boot
+        /// time, on top of the implicit SSH forward. Same shape as
+        /// `AddNet::extra_fwd` — `(host_port, guest_port)` pairs.
+        /// Needed because hot-add via `add-net` recreates the slirp
+        /// instance, which the buildroot guest kernel can't rebind to
+        /// (virtio_net is built-in, no module reload). The bench's
+        /// ingress measurement requires the forward to be present
+        /// from cold-boot, so the guest's binding never gets torn
+        /// down. Older clients that omit the field deserialize to an
+        /// empty Vec via `#[serde(default)]`.
+        #[serde(default)]
+        extra_fwd: Vec<(u16, u16)>,
         /// Attach a virtio-console device alongside the boot. Stock
         /// distro kernels with `CONFIG_VIRTIO_CONSOLE` register this
         /// as `/dev/hvc0` and direct their console to it. Older
@@ -305,6 +317,7 @@ mod tests {
             force_reset_pcie: false,
             disk: None,
             network: false,
+            extra_fwd: vec![],
             console: false,
             rng: false,
             force: false,
@@ -334,6 +347,7 @@ mod tests {
             force_reset_pcie: false,
             disk: Some("debian.raw".into()),
             network: false,
+            extra_fwd: vec![],
             console: false,
             rng: false,
             force: false,
@@ -461,6 +475,7 @@ mod tests {
                 force_reset_pcie: false,
                 disk: None,
                 network: false,
+                extra_fwd: vec![],
                 console: false,
                 rng: false,
                 force,

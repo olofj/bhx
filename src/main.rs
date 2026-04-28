@@ -132,6 +132,15 @@ enum Commands {
         /// regression. See #62.
         #[arg(long = "no-virtio-rng")]
         no_virtio_rng: bool,
+        /// Additional TCP port forwards as `HOST:GUEST` pairs, installed
+        /// at boot time on top of the implicit SSH forward. Repeatable:
+        /// `--fwd 5201:5201 --fwd 8080:80`. Same as `add-net --fwd`,
+        /// but applied at cold-boot so the guest's virtio_net binding
+        /// never has to migrate to a hot-added device — needed for the
+        /// net bench's ingress measurement against buildroot kernels
+        /// that don't auto-rebind built-in virtio_net after teardown.
+        #[arg(long = "fwd", value_parser = parse_fwd_pair)]
+        fwd: Vec<(u16, u16)>,
     },
     /// Attach a terminal to a booted L2CPU's console via the daemon.
     Connect {
@@ -382,6 +391,7 @@ fn main() -> std::process::ExitCode {
             force,
             virtio_console,
             no_virtio_rng,
+            fwd,
         }) => {
             let disk = resolve_disk_path(
                 cli.disk,
@@ -409,6 +419,7 @@ fn main() -> std::process::ExitCode {
                 force_reset_pcie,
                 disk,
                 cli.network,
+                fwd,
                 virtio_console,
                 !no_virtio_rng,
                 force,
@@ -558,6 +569,7 @@ fn run_boot_client(
     force_reset_pcie: bool,
     disk: Option<String>,
     network: bool,
+    extra_fwd: Vec<(u16, u16)>,
     console: bool,
     rng: bool,
     force: bool,
@@ -593,6 +605,7 @@ fn run_boot_client(
         force_reset_pcie,
         disk,
         network,
+        extra_fwd,
         console,
         rng,
         force,

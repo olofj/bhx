@@ -295,6 +295,7 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             force_reset_pcie,
             disk,
             network,
+            extra_fwd,
             console,
             rng,
             force,
@@ -310,6 +311,7 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             force_reset_pcie,
             disk,
             network,
+            extra_fwd,
             console,
             rng,
             force,
@@ -565,6 +567,7 @@ fn dispatch_boot(
     force_reset_pcie: bool,
     disk: Option<String>,
     network: bool,
+    extra_fwd: Vec<(u16, u16)>,
     console: bool,
     rng: bool,
     force: bool,
@@ -682,6 +685,7 @@ fn dispatch_boot(
         l2cpu_idx,
         disk,
         network,
+        extra_fwd,
         console,
         rng,
         rng_backing,
@@ -739,6 +743,7 @@ fn start_initial_workers(
     l2cpu_idx: u8,
     disk: Option<String>,
     network: bool,
+    extra_fwd: Vec<(u16, u16)>,
     console: bool,
     rng: bool,
     rng_backing: crate::virtio::MmioBacking,
@@ -780,7 +785,7 @@ fn start_initial_workers(
             l2cpu_idx,
             net_backing
         );
-        start_net_worker(card, slot, net_backing).map_err(|e| {
+        start_net_worker(card, slot, net_backing, extra_fwd).map_err(|e| {
             dlog!("[boot l2cpu {}] start_net_worker failed: {}", l2cpu_idx, e);
             format!("start net worker failed: {}", e)
         })?;
@@ -878,6 +883,7 @@ fn start_net_worker(
     card: u32,
     slot: &mut L2CpuSlot,
     mmio_backing: crate::virtio::MmioBacking,
+    extra_fwd: Vec<(u16, u16)>,
 ) -> io::Result<()> {
     let exit = Arc::new(AtomicBool::new(false));
     let l2cpu = slot.l2cpu.clone();
@@ -885,9 +891,12 @@ fn start_net_worker(
     let exit_thread = exit.clone();
     let idx = slot.idx;
     let ssh_port = crate::regs::slirp::ssh_port(card, idx);
-    // Boot-path default: just the SSH forward. `add-net --fwd
-    // HOST:GUEST` is the path for arbitrary forwards post-boot.
-    let forwards = vec![(ssh_port, 22)];
+    // Boot-path forwards: implicit SSH + any `--fwd HOST:GUEST` the
+    // operator passed. Hot-add via `add-net --fwd` still works post-
+    // boot but recreates the slirp instance, which the buildroot
+    // kernel can't rebind to (built-in virtio_net, no module reload).
+    let mut forwards = vec![(ssh_port, 22)];
+    forwards.extend(extra_fwd);
     let t = thread::spawn(move || {
         network::network_main(forwards, l2cpu, interrupt, NET_INT, mmio_backing, exit_thread);
     });
@@ -904,6 +913,7 @@ fn start_net_worker(
     _card: u32,
     _slot: &mut L2CpuSlot,
     _mmio_backing: crate::virtio::MmioBacking,
+    _extra_fwd: Vec<(u16, u16)>,
 ) -> io::Result<()> {
     Err(io::Error::other("daemon built without the slirp feature"))
 }

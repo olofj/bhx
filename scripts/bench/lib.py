@@ -137,7 +137,13 @@ def setup_bench_disk(src: Path, dest: Path, target_mib: int = 1024) -> Path:
     return dest
 
 
-def boot(card: int, l2cpu: int, rootfs: Path, network: bool = True) -> None:
+def boot(
+    card: int,
+    l2cpu: int,
+    rootfs: Path,
+    network: bool = True,
+    fwd: list[tuple[int, int]] | None = None,
+) -> None:
     """Cold-boot l2cpu N with the given rootfs. --no-console because we
     open our own `connect` separately.
 
@@ -146,6 +152,13 @@ def boot(card: int, l2cpu: int, rootfs: Path, network: bool = True) -> None:
     and `run_all.sh` cd's into `scripts/bench/` where those symlinks
     don't exist. The artifacts live at the project root (symlinks
     pointing at `../tt-bh-linux/`).
+
+    `fwd` is `[(host_port, guest_port), ...]` extra TCP forwards on
+    top of the implicit SSH forward. Wired in at cold-boot rather
+    than via post-boot `add-net --fwd` because the buildroot kernel
+    has virtio_net built in and can't rebind to a hot-replaced
+    device — the ingress benchmark needs the forward present from
+    the start.
     """
     args = [
         BINARY,
@@ -171,6 +184,9 @@ def boot(card: int, l2cpu: int, rootfs: Path, network: bool = True) -> None:
     ]
     if network:
         args.append("-n")
+    if fwd:
+        for host, guest in fwd:
+            args.extend(["--fwd", f"{host}:{guest}"])
     subprocess.run(args, check=True, timeout=120)
 
 

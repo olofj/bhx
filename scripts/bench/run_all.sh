@@ -55,9 +55,10 @@ echo "benchmark,metric,value,unit" > "$run_csv"
 run_bench() {
     local name="$1"
     local script="$2"
+    shift 2
     local per_csv="$out_dir/${name}-${ts}.csv"
     note "running ${name} -> ${per_csv}"
-    if ! python3 "$script" --csv "$per_csv"; then
+    if ! python3 "$script" --csv "$per_csv" "$@"; then
         note "${name} FAILED"
         return 1
     fi
@@ -67,10 +68,12 @@ run_bench() {
 
 # Order: disk first (most stable target), console second (relies on
 # `connect` which is well-tested), net last (needs iperf3 + slirp).
+# Default iperf3 port 5201 is held by the system iperf3.service on
+# the dev VM; route net.py to free ports.
 overall_rc=0
 run_bench "disk" "./disk.py" || overall_rc=$?
 run_bench "console" "./console.py" || overall_rc=$?
-run_bench "net" "./net.py" || overall_rc=$?
+run_bench "net" "./net.py" --host-port 16201 --ingress-port 16202 || overall_rc=$?
 
 note "combined results -> $run_csv ($(wc -l < "$run_csv") lines)"
 
