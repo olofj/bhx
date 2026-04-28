@@ -46,7 +46,7 @@ const VIRTIO_CONFIG_S_FEATURES_OK: u32 = 8;
 const VIRTIO_CONFIG_S_DRIVER_OK: u32 = 4;
 
 // VirtIO ring descriptor flags
-const VRING_DESC_F_NEXT: u16 = 1;
+pub(crate) const VRING_DESC_F_NEXT: u16 = 1;
 
 // VirtIO magic value
 const VIRTIO_MAGIC: u32 = 0x74726976; // 'v' | 'i'<<8 | 'r'<<16 | 't'<<24
@@ -54,35 +54,35 @@ const VIRTIO_MAGIC: u32 = 0x74726976; // 'v' | 'i'<<8 | 'r'<<16 | 't'<<24
 /// VirtIO ring descriptor.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct VringDesc {
-    addr: u64,
-    len: u32,
-    flags: u16,
-    next: u16,
+pub(crate) struct VringDesc {
+    pub addr: u64,
+    pub len: u32,
+    pub flags: u16,
+    pub next: u16,
 }
 
 /// VirtIO available ring.
 #[repr(C)]
-struct VringAvail {
-    flags: u16,
-    idx: u16,
-    ring: [u16; 0], // flexible array
+pub(crate) struct VringAvail {
+    pub flags: u16,
+    pub idx: u16,
+    pub ring: [u16; 0], // flexible array
 }
 
 /// VirtIO used ring element.
 #[repr(C)]
 #[derive(Default)]
-struct VringUsedElem {
-    id: u32,
-    len: u32,
+pub(crate) struct VringUsedElem {
+    pub id: u32,
+    pub len: u32,
 }
 
 /// VirtIO used ring.
 #[repr(C)]
-struct VringUsed {
-    flags: u16,
-    idx: u16,
-    ring: [VringUsedElem; 0], // flexible array
+pub(crate) struct VringUsed {
+    pub flags: u16,
+    pub idx: u16,
+    pub ring: [VringUsedElem; 0], // flexible array
 }
 
 /// Discriminator for the per-device interrupt counters in
