@@ -822,6 +822,46 @@ fn dispatch_boot(
             }
             #[cfg(not(feature = "slirp"))]
             let _ = extra_fwd;
+            if console {
+                // virtio-console wants two halves: the device side
+                // (registered with the kick poller for TX/RX) and a
+                // VirtioConsoleSlot on the per-L2CPU slot so the
+                // attach-console RPC + the input-fanout in
+                // dispatch_attach_console can find the input_buf.
+                // Same shape as `start_virtio_console` for the legacy
+                // host-buffer path; the only difference is we skip
+                // spawning a worker (the kick poller handles dispatch).
+                let input_buf = Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::with_capacity(
+                        crate::virtio::console::RX_BUFFER_CAP,
+                    ),
+                ));
+                let device = crate::virtio::console::VirtioConsole::new(
+                    slot.console_hub.clone(),
+                    Arc::clone(&input_buf),
+                );
+                register(
+                    dev_slot(crate::virtio_engine::DEV_CONSOLE),
+                    Box::new(device),
+                    crate::regs::virtio_mmio::CONSOLE_IRQ,
+                    crate::virtio::InterruptKind::Console,
+                    "console",
+                );
+                slot.virtio_console = Some(crate::daemon::VirtioConsoleSlot {
+                    // Stub WorkerHandle — the engine path doesn't
+                    // spawn a per-device worker; the kick poller
+                    // handles dispatch. Keeping the slot field
+                    // populated lets the rest of the daemon (attach,
+                    // shutdown, status) treat the engine path
+                    // identically to the legacy host-buffer path.
+                    worker: WorkerHandle {
+                        exit: Arc::new(AtomicBool::new(false)),
+                        thread: None,
+                        description: format!("virtio-console l2cpu {} (engine)", l2cpu_idx),
+                    },
+                    input_buf,
+                });
+            }
         } else {
             dlog!(
                 "[run_boot l2cpu {}] virtio-engine: engine + kick poller not up — \

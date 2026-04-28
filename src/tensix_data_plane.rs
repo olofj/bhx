@@ -249,29 +249,33 @@ fn run_poll_loop(
             last_active = std::time::Instant::now();
         }
 
-        // Net RX path: nothing on the BRISC kick ring fires when a
-        // libslirp-delivered packet arrives, because the guest never
-        // notifies us for RX (it just refills the ring). We poll
-        // every registered net device's RX queue here — `queue_has_data`
-        // returns true only when slirp has bytes to read, so the
-        // dispatch is a no-op on idle queues. Same FAST/SLOW/IDLE
-        // adaptive cadence as the kick path.
-        let mut net_drained = false;
+        // Async RX path: net (libslirp delivers packets) and console
+        // (operator keystrokes via input_buf) don't get a guest kick
+        // when their backing source has data. We poll their RX queues
+        // here — `queue_has_data` (per-device, called inside
+        // `process_one_chain_for_queue`) returns true only when the
+        // backing source has bytes, so the dispatch is a no-op on
+        // idle queues. Same FAST/SLOW/IDLE adaptive cadence as the
+        // kick path.
+        let mut rx_drained = false;
         {
             let mut map = registry.lock().unwrap();
             for (slot, reg) in map.iter_mut() {
-                if !matches!(reg.interrupt_kind, InterruptKind::Net) {
+                if !matches!(
+                    reg.interrupt_kind,
+                    InterruptKind::Net | InterruptKind::Console
+                ) {
                     continue;
                 }
                 let posted = dispatch_chain(&engine, reg, 0);
                 if posted {
                     let used_idx = read_used_idx(reg, 0);
                     engine.push_completion(*slot as u16, 0, used_idx);
-                    net_drained = true;
+                    rx_drained = true;
                 }
             }
         }
-        if net_drained {
+        if rx_drained {
             last_active = std::time::Instant::now();
         }
 
