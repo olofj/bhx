@@ -33,12 +33,13 @@
 
 #include <stdint.h>
 
+#include "tensix_proto.h"
 #include "virtio_layout.h"
 
 // Firmware version, inspected via the stats page. Bump for any
 // wire-protocol change between daemon ↔ BRISC. Format: 0xAABBCCDD
 // where AA=major, BB=minor, CC=patch, DD=reserved/build.
-#define BRISC_VIRTIO_FW_VERSION 0x00030001u  // M3, build 0001
+#define BRISC_VIRTIO_FW_VERSION 0x00050001u  // M5 (#71), build 0001
 
 #define FENCE_W() __asm__ volatile("fence w, w" ::: "memory")
 
@@ -259,28 +260,61 @@ static void handle_queue_ready_change(unsigned slot, uint32_t sel, uint32_t read
     inc_stat(STATS_OFF_READY_EVENTS);
 }
 
-// Guest wrote QUEUE_NOTIFY=q. Record the (slot, q) tuple in the stats
-// page so the daemon can pick it up. M5 will replace this with a
-// proper signalling primitive (likely a NoC write to a daemon-side
-// DMA buffer or PIC SW_INT poke from the daemon side); for M3 the
-// stats-page record is enough to verify the path end-to-end.
+// ----- M5 (#71) wire-protocol helpers -----
+
+static inline uintptr_t ctrl_addr(unsigned off) {
+    return (uintptr_t)(CTRL_BASE + off);
+}
+
+// Per-slot epoch — bumped on STATUS=0 reset so kicks pre-dating the
+// reset can be filtered out by the daemon. BRISC-private; lives in
+// the shadow region.
+static inline uintptr_t epoch_addr(unsigned slot) {
+    return shadow_addr(slot, SNAP_BASE_OFF + 0x10);
+}
+
+// Append one KickEntry to the L1 kick ring and bump the producer
+// counter. The daemon polls `producer_seq` via the chip-side TLB
+// and drains entries in `[consumer_seq..producer_seq)`. Same SPSC
+// pattern as a virtio split virtqueue, but with the ring in BRISC
+// L1 rather than guest DRAM.
+static void kick_ring_push(unsigned slot, uint32_t queue_idx) {
+    uint32_t seq = read_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_PRODUCER_SEQ));
+    uint32_t epoch = read_u32(epoch_addr(slot));
+    uint32_t idx = seq & (KICK_RING_ENTRIES - 1u);
+    uintptr_t entry = ctrl_addr(CTRL_OFF_KICK_RING + idx * KICK_ENTRY_SIZE);
+    *l1_u32(entry + KICK_ENTRY_OFF_SLOT) = ((uint32_t)slot & 0xFFFFu) | ((queue_idx & 0xFFFFu) << 16);
+    *l1_u32(entry + KICK_ENTRY_OFF_SEQ) = seq;
+    *l1_u32(entry + KICK_ENTRY_OFF_EPOCH) = epoch;
+    FENCE_W();
+    // Bump the producer AFTER the entry is fully written so a
+    // racing daemon read either misses the entry entirely or sees
+    // it in a consistent state.
+    write_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_PRODUCER_SEQ), seq + 1u);
+}
+
+// Guest wrote QUEUE_NOTIFY=q. Append a KickEntry to the kick ring so
+// the daemon's poll loop wakes up and drains the device's avail
+// ring. Also records (slot, q) in the stats page for diagnostics.
 static void handle_queue_notify(unsigned slot, uint32_t q) {
     *l1_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_LAST_NOTIFY) =
         ((uint32_t)slot << 16) | (q & 0xFFFFu);
-    FENCE_W();
+    kick_ring_push(slot, q);
     inc_stat(STATS_OFF_NOTIFY_EVENTS);
 }
 
 // Guest wrote STATUS. If 0, the device is being reset — wipe the per-
-// device state and reinitialize the read-only regs. Otherwise just
-// echo the new value back into the visible reg (already there from
-// the guest's write — this just records that we've seen it) and bump
-// the stat. M5+ will hook DRIVER_OK / FAILED transitions to the
-// data-plane bridge.
+// device state, reinitialize the read-only regs, and bump the per-
+// slot epoch so any kicks recorded for the previous incarnation are
+// filterable on the daemon side.
 static void handle_status_change(unsigned slot, uint32_t status, uint32_t prev) {
     (void)prev;
     if (status == 0) {
+        uint32_t e = read_u32(epoch_addr(slot));
         init_device(slot);
+        // init_device wipes the shadow region, including epoch — so
+        // re-establish it after.
+        write_u32(epoch_addr(slot), e + 1u);
     }
     inc_stat(STATS_OFF_STATUS_CHANGES);
 }
@@ -330,11 +364,60 @@ static void poll_one_device(unsigned slot) {
     }
 }
 
+// ----- M5 (#71) handshake -----
+
+// Initialize the control-plane region: zero the hello/hello-ack/
+// kick-ring/compl-ring slots, then publish ring sizes. Daemon must
+// not write its hello until BRISC has done this — but in practice
+// the daemon waits for the M3 stats-magic before issuing hello, and
+// stats-magic is published only after `init_proto`, so the
+// ordering is enforced by construction.
+static void init_proto(void) {
+    for (unsigned off = 0; off < CTRL_SIZE; off += 4) {
+        *l1_u32(ctrl_addr(off)) = 0;
+    }
+    *l1_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_RING_ENTRIES)) = KICK_RING_ENTRIES;
+    *l1_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_RING_ENTRIES)) = COMPL_RING_ENTRIES;
+    FENCE_W();
+}
+
+// Wait for the daemon to write a hello with the magic + protocol
+// version, then write a hello-ack reflecting our protocol +
+// firmware versions. This is one-shot (we don't re-handshake on
+// device reset — the daemon does the engine bring-up once per
+// daemon lifetime).
+static void wait_for_hello_and_ack(void) {
+    for (;;) {
+        uint32_t magic = read_u32(ctrl_addr(CTRL_OFF_HELLO + HELLO_OFF_MAGIC));
+        if (magic == HELLO_MAGIC) {
+            break;
+        }
+    }
+    // Read the daemon's protocol version (we don't act on it yet —
+    // the daemon checks our version in its own handshake), then
+    // publish hello-ack.
+    (void)read_u32(ctrl_addr(CTRL_OFF_HELLO + HELLO_OFF_PROTOCOL_VERSION));
+    *l1_u32(ctrl_addr(CTRL_OFF_HELLO_ACK + HELLO_ACK_OFF_PROTOCOL_VERSION)) = TENSIX_PROTOCOL_VERSION;
+    *l1_u32(ctrl_addr(CTRL_OFF_HELLO_ACK + HELLO_ACK_OFF_FIRMWARE_VERSION)) = BRISC_VIRTIO_FW_VERSION;
+    FENCE_W();
+    // Magic last — daemon polls for this transitioning non-zero.
+    write_u32(ctrl_addr(CTRL_OFF_HELLO_ACK + HELLO_ACK_OFF_MAGIC), HELLO_ACK_MAGIC);
+}
+
 void main(void) {
     init_stats();
+    init_proto();
     for (unsigned slot = 0; slot < BRISC_VIRTIO_NUM_SLOTS; slot++) {
         init_device(slot);
     }
+
+    // Block on the daemon's hello before entering the steady-state
+    // poll loop. Without this, a guest could (in theory) start
+    // probing before the daemon has agreed on the protocol version
+    // — the L1 reg files are already initialized by init_device, so
+    // the device looks valid, but the kick FIFO would have no
+    // consumer.
+    wait_for_hello_and_ack();
 
     uint32_t heartbeat = 0;
     for (;;) {

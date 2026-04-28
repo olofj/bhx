@@ -29,6 +29,7 @@ mod slirp_ffi;
 mod telemetry;
 mod tensix;
 mod tensix_engine;
+mod tensix_proto;
 mod tensix_tile;
 mod tlb;
 mod virtio;
@@ -1009,6 +1010,56 @@ fn run_tensix_virtio(card: u32, x: u16, y: u16) -> std::io::Result<()> {
     // first sweep.
     sleep(Duration::from_millis(10));
 
+    // M5 (#71) handshake. Firmware blocks for hello before entering
+    // the steady-state poll loop, so without this every subsequent
+    // check below would hang.
+    eprintln!("[tensix-virtio] M5 handshake: writing hello, polling hello-ack");
+    {
+        use tensix_proto as proto;
+        tile.write_l1_u32(
+            proto::CTRL_BASE + proto::CTRL_OFF_HELLO + proto::HELLO_OFF_PROTOCOL_VERSION,
+            proto::PROTOCOL_VERSION,
+        );
+        tile.write_l1_u32(
+            proto::CTRL_BASE + proto::CTRL_OFF_HELLO + proto::HELLO_OFF_MAGIC,
+            proto::HELLO_MAGIC,
+        );
+        let timeout = Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        loop {
+            let m = tile.read_l1_u32(
+                proto::CTRL_BASE + proto::CTRL_OFF_HELLO_ACK + proto::HELLO_ACK_OFF_MAGIC,
+            );
+            if m == proto::HELLO_ACK_MAGIC {
+                break;
+            }
+            if started.elapsed() > timeout {
+                return Err(std::io::Error::other(format!(
+                    "M5 hello-ack timeout after {:?} (got {:#010x})",
+                    timeout, m
+                )));
+            }
+            sleep(Duration::from_millis(1));
+        }
+        let proto_v = tile.read_l1_u32(
+            proto::CTRL_BASE + proto::CTRL_OFF_HELLO_ACK + proto::HELLO_ACK_OFF_PROTOCOL_VERSION,
+        );
+        let fw_v = tile.read_l1_u32(
+            proto::CTRL_BASE + proto::CTRL_OFF_HELLO_ACK + proto::HELLO_ACK_OFF_FIRMWARE_VERSION,
+        );
+        eprintln!(
+            "[tensix-virtio]   hello-ack: protocol_version={}, firmware_version={:#010x}",
+            proto_v, fw_v
+        );
+        if proto_v != proto::PROTOCOL_VERSION {
+            return Err(std::io::Error::other(format!(
+                "M5 protocol version mismatch: daemon expects {}, firmware reported {}",
+                proto::PROTOCOL_VERSION,
+                proto_v
+            )));
+        }
+    }
+
     let mut errors = 0usize;
     let device_ids = [
         ve::VIRTIO_ID_BLOCK,
@@ -1104,6 +1155,52 @@ fn run_tensix_virtio(card: u32, x: u16, y: u16) -> std::io::Result<()> {
             before_sel, after_sel, nmax_after_swap
         );
         errors += 1;
+    }
+
+    // M5 (#71) kick-ring path: drive QUEUE_NOTIFY=2 on slot 5,
+    // expect the kick ring's producer_seq to advance and the entry
+    // at the new ring index to record (slot=5, queue_idx=2).
+    {
+        use tensix_proto as proto;
+        eprintln!("[tensix-virtio] driving QUEUE_NOTIFY=2 on slot 5 (L2CPU 1 net)");
+        let slot5_notify = ve::slot_regs_base(5) + ve::MMIO_QUEUE_NOTIFY;
+        let producer_addr =
+            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_PRODUCER_SEQ;
+        let before_seq = tile.read_l1_u32(producer_addr);
+        tile.write_l1_u32(slot5_notify, 2);
+        sleep(Duration::from_millis(5));
+        let after_seq = tile.read_l1_u32(producer_addr);
+        if after_seq != before_seq.wrapping_add(1) {
+            eprintln!(
+                "  kick ring did NOT advance: producer_seq {} → {} (expected +1)",
+                before_seq, after_seq
+            );
+            errors += 1;
+        } else {
+            // Read the entry at index `before_seq % KICK_RING_ENTRIES`
+            // and verify it records the (slot, queue_idx) we wrote.
+            let idx = before_seq % proto::KICK_RING_ENTRIES;
+            let entry_off =
+                proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING + idx * proto::KICK_ENTRY_SIZE;
+            let slot_field = tile.read_l1_u32(entry_off);
+            let entry_seq = tile.read_l1_u32(entry_off + 4);
+            let recorded_slot = (slot_field & 0xFFFF) as u16;
+            let recorded_queue = (slot_field >> 16) as u16;
+            if recorded_slot == 5 && recorded_queue == 2 && entry_seq == before_seq {
+                eprintln!(
+                    "  kick ring advanced to seq {}, entry[{}] = (slot={}, queue={}) — \
+                     KICK PATH PASS",
+                    after_seq, idx, recorded_slot, recorded_queue
+                );
+            } else {
+                eprintln!(
+                    "  kick ring entry mismatch: idx={} recorded (slot={}, queue={}, seq={}), \
+                     expected (slot=5, queue=2, seq={})",
+                    idx, recorded_slot, recorded_queue, entry_seq, before_seq
+                );
+                errors += 1;
+            }
+        }
     }
 
     if errors == 0 {

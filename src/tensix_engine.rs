@@ -27,14 +27,16 @@ use std::io;
 use crate::shared_chip::SharedChip;
 use crate::telemetry;
 use crate::tensix::TensixTile;
+use crate::tensix_proto as proto;
 use crate::tensix_tile;
 use crate::virtio_engine as ve;
 
 /// Reservation of one Tensix tile for the virtio-mmio engine.
 ///
 /// Holds the open `TensixTile` (so its TLBs stay alive for the
-/// daemon's lifetime), the picker output coords, and the cached
-/// translated coords needed for L2CPU TLB programming.
+/// daemon's lifetime), the picker output coords, the cached
+/// translated coords needed for L2CPU TLB programming, and the
+/// firmware version returned by the M5 handshake.
 pub struct TensixEngine {
     tile: TensixTile,
     /// NOC0-logical (x, y) — what the M2 picker returned. Used in
@@ -45,6 +47,12 @@ pub struct TensixEngine {
     /// expects (per `tensix_tile::noc0_to_translated_tensix`).
     pub translated_x: u16,
     pub translated_y: u16,
+    /// Firmware version reported in the M5 handshake's hello-ack.
+    pub firmware_version: u32,
+    /// Protocol version reported in the same hello-ack. Always
+    /// matches `proto::PROTOCOL_VERSION` post-bring-up — bring-up
+    /// fails fast on mismatch.
+    pub protocol_version: u32,
 }
 
 // Safety: same story as `SharedChip`. The contained `TensixTile`
@@ -128,15 +136,21 @@ impl TensixEngine {
             )));
         }
 
+        // M5 (#71) handshake. BRISC blocks in `wait_for_hello_and_ack`
+        // until we send hello, so this also gates the firmware's
+        // entry into the steady-state poll loop.
+        let (firmware_version, protocol_version) = run_handshake(&tile, picked.x, picked.y)?;
+
         eprintln!(
             "[tensix-engine] up on card {} tile NOC0 ({}, {}), translated ({}, {}); \
-             firmware version {:#010x}",
+             firmware version {:#010x}, protocol version {}",
             card,
             picked.x,
             picked.y,
             translated_x,
             translated_y,
-            tile.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_VERSION),
+            firmware_version,
+            protocol_version,
         );
 
         Ok(TensixEngine {
@@ -145,14 +159,50 @@ impl TensixEngine {
             noc0_y: picked.y,
             translated_x,
             translated_y,
+            firmware_version,
+            protocol_version,
         })
     }
 
-    /// Read the firmware's reported version word. Useful for the
-    /// daemon-side compatibility check in M5 (#71).
-    pub fn firmware_version(&self) -> u32 {
+    /// Read the firmware version reported in the stats page. The
+    /// handshake-time version is cached on `self.firmware_version`;
+    /// this getter is useful only if you want to read it again (e.g.
+    /// after the firmware is reloaded mid-daemon, which we don't
+    /// currently support).
+    pub fn read_firmware_version(&self) -> u32 {
         self.tile
             .read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_VERSION)
+    }
+
+    /// Snapshot of the kick ring header. Diagnostic; the actual
+    /// data-plane consumer in M5+ will read producer_seq in a tight
+    /// loop and consume entries.
+    pub fn kick_ring_header(&self) -> (u32, u32, u32) {
+        let producer = self.tile.read_l1_u32(
+            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_PRODUCER_SEQ,
+        );
+        let consumer = self.tile.read_l1_u32(
+            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_CONSUMER_SEQ,
+        );
+        let entries = self.tile.read_l1_u32(
+            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_RING_ENTRIES,
+        );
+        (producer, consumer, entries)
+    }
+
+    /// Read one kick entry by ring index (`producer_seq` modulo the
+    /// ring-entries count). Returns the raw 4 u32s; the M5 consumer
+    /// in the daemon parses them via `tensix_proto::KickEntry`.
+    pub fn read_kick_entry(&self, idx: u32) -> [u32; 4] {
+        let off = proto::CTRL_BASE
+            + proto::CTRL_OFF_KICK_RING
+            + (idx % proto::KICK_RING_ENTRIES) * proto::KICK_ENTRY_SIZE;
+        [
+            self.tile.read_l1_u32(off),
+            self.tile.read_l1_u32(off + 4),
+            self.tile.read_l1_u32(off + 8),
+            self.tile.read_l1_u32(off + 12),
+        ]
     }
 
     /// Read the cumulative QUEUE_NOTIFY event count. Diagnostic only.
@@ -180,6 +230,70 @@ impl TensixEngine {
             noc_addr,
         )
     }
+}
+
+/// M5 (#71) handshake. After firmware is loaded and BRISC released,
+/// BRISC blocks in `wait_for_hello_and_ack` polling for the hello
+/// magic. We write protocol version + magic-last; BRISC sees magic,
+/// reads version, writes hello-ack with its protocol+firmware
+/// versions + ack-magic. We poll for ack-magic with a timeout.
+///
+/// Returns `(firmware_version, protocol_version)` from the ack.
+/// Errors on protocol mismatch or timeout.
+fn run_handshake(tile: &TensixTile, picked_x: u16, picked_y: u16) -> io::Result<(u32, u32)> {
+    use std::time::{Duration, Instant};
+
+    // Write hello: protocol version, then magic last so a partial
+    // write never tricks BRISC into responding.
+    tile.write_l1_u32(
+        proto::CTRL_BASE + proto::CTRL_OFF_HELLO + proto::HELLO_OFF_PROTOCOL_VERSION,
+        proto::PROTOCOL_VERSION,
+    );
+    tile.write_l1_u32(
+        proto::CTRL_BASE + proto::CTRL_OFF_HELLO + proto::HELLO_OFF_MAGIC,
+        proto::HELLO_MAGIC,
+    );
+
+    // Poll for hello-ack magic. Generous timeout — bring-up is a
+    // one-shot pass; we'd rather wait a few hundred ms than fail
+    // spuriously on a slow-firing first iteration of BRISC's poll
+    // loop.
+    let timeout = Duration::from_millis(500);
+    let started = Instant::now();
+    loop {
+        let magic = tile
+            .read_l1_u32(proto::CTRL_BASE + proto::CTRL_OFF_HELLO_ACK + proto::HELLO_ACK_OFF_MAGIC);
+        if magic == proto::HELLO_ACK_MAGIC {
+            break;
+        }
+        if started.elapsed() > timeout {
+            return Err(io::Error::other(format!(
+                "M5 handshake: BRISC on tile ({}, {}) did not respond to hello \
+                 within {:?} (last ack magic: {:#010x}, expected {:#010x})",
+                picked_x,
+                picked_y,
+                timeout,
+                magic,
+                proto::HELLO_ACK_MAGIC
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let protocol_version = tile.read_l1_u32(
+        proto::CTRL_BASE + proto::CTRL_OFF_HELLO_ACK + proto::HELLO_ACK_OFF_PROTOCOL_VERSION,
+    );
+    let firmware_version = tile.read_l1_u32(
+        proto::CTRL_BASE + proto::CTRL_OFF_HELLO_ACK + proto::HELLO_ACK_OFF_FIRMWARE_VERSION,
+    );
+    if protocol_version != proto::PROTOCOL_VERSION {
+        return Err(io::Error::other(format!(
+            "M5 handshake: protocol version mismatch — daemon expected {}, \
+             firmware reported {}. Rebuild brisc-firmware to match.",
+            proto::PROTOCOL_VERSION,
+            protocol_version
+        )));
+    }
+    Ok((firmware_version, protocol_version))
 }
 
 #[cfg(test)]
