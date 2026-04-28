@@ -228,6 +228,7 @@ pub(crate) fn process_one_chain_for_queue(
     device: &mut dyn VirtioDeviceImpl,
     queue_idx: u32,
     queue_header_size: u64,
+    queue_num: u16,
     starting_address: u64,
     mem_end: u64,
     memory: *mut u8,
@@ -241,9 +242,17 @@ pub(crate) fn process_one_chain_for_queue(
         return false;
     }
 
+    // The kernel allocates `queue_num` entries each in desc / avail.ring /
+    // used.ring (a power-of-two ≤ QUEUE_NUM_MAX). All ring indexing must
+    // wrap by `queue_num`, not the host-side QUEUE_SIZE constant — when
+    // they disagreed (engine path advertises 64 while QUEUE_SIZE=16384),
+    // we read avail.ring[80] past the kernel's allocation and surfaced
+    // garbage `id` values in used entries, tripping the kernel's
+    // "id N is not a head!" guard in virtqueue_get_buf_ctx_split.
+    let qn = queue_num as usize;
     let desc_idx_first = unsafe {
         let ring_ptr = (*avail_q).ring.as_ptr();
-        ptr::read_volatile(ring_ptr.add((*processed % QUEUE_SIZE) as usize))
+        ptr::read_volatile(ring_ptr.add((*processed as usize) % qn))
     };
     let mut desc_idx = desc_idx_first;
 
@@ -252,19 +261,19 @@ pub(crate) fn process_one_chain_for_queue(
     let mut steps: u16 = 0;
 
     loop {
-        // Cycle detection: a valid chain can visit at most QUEUE_SIZE
+        // Cycle detection: a valid chain can visit at most queue_num
         // descriptors.
-        if steps >= QUEUE_SIZE {
+        if steps >= queue_num {
             eprintln!(
                 "virtio: descriptor chain exceeded {} steps, breaking",
-                QUEUE_SIZE
+                queue_num
             );
             chain_valid = false;
             break;
         }
         steps += 1;
 
-        let d = unsafe { ptr::read_volatile(desc_q.add((desc_idx % QUEUE_SIZE) as usize)) };
+        let d = unsafe { ptr::read_volatile(desc_q.add((desc_idx as usize) % qn)) };
 
         // Validate descriptor address is within L2CPU memory.
         // Use checked arithmetic to prevent overflow bypassing the check.
@@ -311,7 +320,7 @@ pub(crate) fn process_one_chain_for_queue(
         let used_idx = unsafe { ptr::read_volatile(&(*used_q).idx) };
         unsafe {
             let ring_ptr = (*used_q).ring.as_mut_ptr();
-            let elem = ring_ptr.add((used_idx % QUEUE_SIZE) as usize);
+            let elem = ring_ptr.add((used_idx as usize) % qn);
             ptr::write_volatile(&mut (*elem).id, desc_idx_first as u32);
             ptr::write_volatile(&mut (*elem).len, num_bytes_written as u32);
         }
@@ -1003,6 +1012,7 @@ pub fn run_device(
                     device,
                     queue_idx,
                     queue_header_size,
+                    QUEUE_SIZE,
                     starting_address,
                     mem_end,
                     memory,

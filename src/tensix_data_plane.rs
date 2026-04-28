@@ -325,6 +325,13 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
         qi,
         ve::SHADOW_Q_OFF_DEVICE_HI,
     ));
+    // BRISC firmware mirrors the kernel's QUEUE_NUM write into the
+    // per-queue shadow on each poll iteration (see
+    // brisc-firmware/virtio.c::poll_one_device's FIELDS table). Use
+    // this for ring wrapping in process_one_chain_for_queue — the
+    // kernel allocates rings sized exactly `queue_num`, so any other
+    // wrap value reads / writes past the kernel's allocation.
+    let queue_num = engine.read_l1_u32(ve::shadow_queue_addr(reg.slot, qi, ve::SHADOW_Q_OFF_NUM));
 
     let desc_addr = ((desc_hi as u64) << 32) | desc_lo as u64;
     let avail_addr = ((avail_hi as u64) << 32) | avail_lo as u64;
@@ -344,6 +351,19 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
         );
         return false;
     }
+    if queue_num == 0 || queue_num > u16::MAX as u32 {
+        // Kernel hasn't published QUEUE_NUM yet, or it published
+        // something larger than u16. Either way we can't index the
+        // ring; drop the kick.
+        crate::dlog!(
+            "[kick-poller]   slot {} queue {} bad queue_num={}, dropping",
+            reg.slot,
+            queue_idx,
+            queue_num
+        );
+        return false;
+    }
+    let queue_num = queue_num as u16;
 
     // Convert guest physical addresses to host pointers via the
     // L2CPU's memory mmap. Same arithmetic as
@@ -366,18 +386,32 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
     let used_q = unsafe { memory.add((used_addr - starting) as usize) as *mut VringUsed };
 
     let queue_header_size = reg.device.queue_header_size();
-    let posted = process_one_chain_for_queue(
-        desc_q,
-        avail_q,
-        used_q,
-        &mut reg.processed[queue_idx as usize],
-        reg.device.as_mut(),
-        queue_idx as u32,
-        queue_header_size,
-        starting,
-        mem_end,
-        memory,
-    );
+    // Drain the avail ring fully — the kernel batches multiple chains
+    // behind a single QUEUE_NOTIFY (each kick covers everything the
+    // driver has queued so far). With one chain processed per kick,
+    // we'd leak (avail.idx - processed) chains and stall on the next
+    // batch. One IRQ per drain at the end is enough; the kernel's
+    // virtblk_done loops over completions anyway.
+    let mut posted = false;
+    loop {
+        let one = process_one_chain_for_queue(
+            desc_q,
+            avail_q,
+            used_q,
+            &mut reg.processed[queue_idx as usize],
+            reg.device.as_mut(),
+            queue_idx as u32,
+            queue_header_size,
+            queue_num,
+            starting,
+            mem_end,
+            memory,
+        );
+        if !one {
+            break;
+        }
+        posted = true;
+    }
 
     if posted {
         // Fire the PLIC IRQ via the existing per-L2CPU
