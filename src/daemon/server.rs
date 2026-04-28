@@ -679,6 +679,15 @@ fn dispatch_boot(
     );
     slot.virtio_host_mmio = arts.virtio_host_mmio;
 
+    // Under the `virtio-engine` feature (#66/M4 #70), skip the
+    // host-MMIO worker spawn — those workers read/write the
+    // virtio-mmio register file via the host-side DMA buffer, which
+    // we don't allocate under this feature. The Tensix-engine
+    // data-plane workers (kick-ring driven, walking the guest's
+    // avail/desc/used rings via the existing TLB-mediated path) are
+    // M5.5+ work; until they land, a feature-on boot brings the
+    // engine + TLB + DTB up but does not actually serve traffic.
+    #[cfg(not(feature = "virtio-engine"))]
     start_initial_workers(
         &mut slot,
         state.card,
@@ -694,6 +703,29 @@ fn dispatch_boot(
         console_backing,
     )
     .map_err(crate::Error::slot_state)?;
+    #[cfg(feature = "virtio-engine")]
+    {
+        // Suppress unused-variable warnings for the worker arguments
+        // — they're only consumed in the host-buffer path. Logged
+        // for diagnostics so a feature-on boot's request shape is
+        // visible.
+        let _ = (
+            disk,
+            network,
+            extra_fwd,
+            console,
+            rng,
+            rng_backing,
+            net_backing,
+            disk_backing,
+            console_backing,
+        );
+        dlog!(
+            "[run_boot l2cpu {}] virtio-engine path: skipping host-MMIO worker spawn \
+             (Tensix-engine data plane is M5.5+, see #71)",
+            l2cpu_idx
+        );
+    }
     // Workers are now in Phase 1 polling for the DRIVER bit. Release the
     // L2CPU from reset so the kernel's virtio probe runs against a
     // daemon that's already watching MMIO. See `release_l2cpu_from_reset`.
@@ -1141,6 +1173,92 @@ fn run_boot_sequence(
     // covers every device; the kernel sees each device at a distinct
     // 4 KiB-aligned x280 PA. See `host_buf::VirtioHostMmio`.
     let any_host_device = has_rng || has_network || has_disk || has_console;
+
+    // Under the `virtio-engine` feature (#66/M4 #70), the L2CPU's
+    // virtio-mmio reg windows point at the Tensix engine's L1 instead
+    // of a host-buffer DMA region. The engine is brought up lazily —
+    // first feature-on boot triggers the firmware load + handshake,
+    // subsequent boots reuse the same Arc<TensixEngine>.
+    //
+    // We still set `virtio_host_mmio = None` because the per-device
+    // host-buffer pre_init isn't relevant (BRISC's M3 firmware
+    // populates the reg files itself), and start_initial_workers is
+    // skipped under this feature in the caller — the daemon-side
+    // data plane that walks the Tensix-side reg files is M5.5+.
+    #[cfg(feature = "virtio-engine")]
+    let virtio_host_mmio: Option<crate::host_buf::VirtioHostMmio> = {
+        if any_host_device {
+            let engine = state.get_or_bring_up_tensix_engine().map_err(|e| {
+                dlog!(
+                    "[run_boot l2cpu {}] tensix engine bring-up failed: {}",
+                    l2cpu_idx,
+                    e
+                );
+                e
+            })?;
+            let x280_base = engine.program_l2cpu_tlb(&l2cpu, l2cpu_idx as u32);
+            dlog!(
+                "[run_boot l2cpu {}] virtio-engine: L2CPU TLB → tensix tile NOC0 ({}, {}) \
+                 translated ({}, {}); per-L2CPU window x280_base={:#x}",
+                l2cpu_idx,
+                engine.noc0_x,
+                engine.noc0_y,
+                engine.translated_x,
+                engine.translated_y,
+                x280_base
+            );
+            // Per-device DTB nodes: each device's reg file sits at
+            // `x280_base + dev_idx * REGS_PER_DEV`, where dev_idx
+            // follows the M3 firmware's BRISC_VIRTIO_DEV_* ordering
+            // (blk=0, net=1, console=2, rng=3). MMIO size =
+            // REGS_PER_DEV (4 KiB) per virtio 1.2 §4.2.2.
+            let regs_per_dev = crate::virtio_engine::REGS_PER_DEV as u64;
+            let mut emit = |dev_idx: u32, enabled: bool, irq: u32, label: &str| {
+                if !enabled {
+                    return;
+                }
+                let pa = x280_base + (dev_idx as u64) * regs_per_dev;
+                virtio_nodes.push(crate::boot::VirtioMmioNode {
+                    addr: pa,
+                    size: regs_per_dev,
+                    irq,
+                });
+                dlog!(
+                    "[run_boot l2cpu {}]   {}: x280_pa={:#x} (tensix-engine)",
+                    l2cpu_idx,
+                    label,
+                    pa
+                );
+            };
+            emit(
+                crate::virtio_engine::DEV_BLK,
+                has_disk,
+                crate::regs::virtio_mmio::DISK_IRQ,
+                "disk",
+            );
+            emit(
+                crate::virtio_engine::DEV_NET,
+                has_network,
+                crate::regs::virtio_mmio::NET_IRQ,
+                "net",
+            );
+            emit(
+                crate::virtio_engine::DEV_CONSOLE,
+                has_console,
+                crate::regs::virtio_mmio::CONSOLE_IRQ,
+                "console",
+            );
+            emit(
+                crate::virtio_engine::DEV_RNG,
+                has_rng,
+                crate::regs::virtio_mmio::RNG_IRQ,
+                "rng",
+            );
+        }
+        None
+    };
+
+    #[cfg(not(feature = "virtio-engine"))]
     let virtio_host_mmio: Option<crate::host_buf::VirtioHostMmio> = if any_host_device {
         let total_size = crate::host_buf::SUB_REGION_SIZE * crate::host_buf::SUB_REGION_COUNT;
         let buf =
