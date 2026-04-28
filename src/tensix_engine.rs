@@ -252,6 +252,16 @@ impl TensixEngine {
         self.tile.write_l1_u32(addr, value);
     }
 
+    /// Host VA pointing at L1 byte `addr`. Used by paths that need a
+    /// raw `*mut u32` into the reg file — notably
+    /// `InterruptController::set_interrupt`, which RMWs
+    /// `MMIO_INTERRUPT_STATUS` before kicking the PLIC. The pointer
+    /// is valid as long as the engine (and its `TensixTile`) is
+    /// alive.
+    pub fn l1_ptr(&self, addr: u32) -> *mut u8 {
+        self.tile.l1_ptr(addr)
+    }
+
     /// Append a CompletionEntry to the L1 completion ring and bump
     /// producer_seq. Called from the data-plane worker after writing
     /// a used-ring entry, so BRISC's poll loop wakes up and (in a

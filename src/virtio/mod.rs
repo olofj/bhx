@@ -200,6 +200,132 @@ impl MmioRegs {
 
 pub(crate) const QUEUE_SIZE: u16 = 16384;
 
+/// Process at most one descriptor chain on `queue_idx`'s avail
+/// ring. Mirrors the per-queue body of `run_device`'s main loop —
+/// extracted so the M5.5b kick-driven path
+/// (`crate::tensix_data_plane`) can share the descriptor-walk
+/// logic instead of duplicating ~80 lines.
+///
+/// Returns `true` if a chain was processed and the caller should
+/// fire a PLIC IRQ. Returns `false` if the queue had no new entry,
+/// the device declined to handle it (`queue_has_data` returned
+/// `false`), or the chain was malformed (descriptor address out of
+/// range, cycle detected). On a malformed chain, `processed` is
+/// still advanced so we don't get stuck retrying it.
+///
+/// # Safety
+/// Caller must ensure `desc_q`, `avail_q`, `used_q` point to valid
+/// VringDesc/Avail/Used arrays of `QUEUE_SIZE` elements that the
+/// guest has set up via virtio queue config. `memory` must be the
+/// guest's L2CPU memory mmap base; `[starting_address, mem_end)`
+/// must enclose every valid descriptor addr.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_one_chain_for_queue(
+    desc_q: *mut VringDesc,
+    avail_q: *mut VringAvail,
+    used_q: *mut VringUsed,
+    processed: &mut u16,
+    device: &mut dyn VirtioDeviceImpl,
+    queue_idx: u32,
+    queue_header_size: u64,
+    starting_address: u64,
+    mem_end: u64,
+    memory: *mut u8,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    std::sync::atomic::fence(Ordering::SeqCst);
+    let avail_idx = unsafe { ptr::read_volatile(&(*avail_q).idx) };
+
+    if *processed == avail_idx || !device.queue_has_data(queue_idx) {
+        return false;
+    }
+
+    let desc_idx_first = unsafe {
+        let ring_ptr = (*avail_q).ring.as_ptr();
+        ptr::read_volatile(ring_ptr.add((*processed % QUEUE_SIZE) as usize))
+    };
+    let mut desc_idx = desc_idx_first;
+
+    let mut num_bytes_written: u64 = 0;
+    let mut chain_valid = true;
+    let mut steps: u16 = 0;
+
+    loop {
+        // Cycle detection: a valid chain can visit at most QUEUE_SIZE
+        // descriptors.
+        if steps >= QUEUE_SIZE {
+            eprintln!(
+                "virtio: descriptor chain exceeded {} steps, breaking",
+                QUEUE_SIZE
+            );
+            chain_valid = false;
+            break;
+        }
+        steps += 1;
+
+        let d = unsafe { ptr::read_volatile(desc_q.add((desc_idx % QUEUE_SIZE) as usize)) };
+
+        // Validate descriptor address is within L2CPU memory.
+        // Use checked arithmetic to prevent overflow bypassing the check.
+        let addr_end = d.addr.checked_add(d.len as u64);
+        if d.addr < starting_address
+            || d.addr >= mem_end
+            || addr_end.is_none()
+            || addr_end.unwrap() > mem_end
+        {
+            eprintln!(
+                "virtio: descriptor addr {:#x} len {} outside memory [{:#x}, {:#x}), \
+                 skipping chain",
+                d.addr, d.len, starting_address, mem_end
+            );
+            chain_valid = false;
+            break;
+        }
+        let addr = unsafe { memory.add((d.addr - starting_address) as usize) };
+
+        if d.flags & VRING_DESC_F_NEXT != 0 {
+            if num_bytes_written < queue_header_size {
+                device.process_queue_start(queue_idx, addr, d.len as u64);
+            } else {
+                device.process_queue_data(queue_idx, addr, d.len as u64);
+            }
+            num_bytes_written += d.len as u64;
+            desc_idx = d.next;
+        } else {
+            // Last descriptor's actual-bytes-written can be less
+            // than its buffer capacity (e.g. virtio-console RX with
+            // partial input). Device returns the real count;
+            // block/net pass `d.len` through unchanged.
+            let actual = device.process_queue_complete(queue_idx, addr, d.len as u64);
+            num_bytes_written += actual;
+            break;
+        }
+    }
+
+    // Only update the used ring if the entire chain processed
+    // successfully. Posting a partial completion confuses the guest
+    // driver.
+    let mut posted = false;
+    if chain_valid {
+        let used_idx = unsafe { ptr::read_volatile(&(*used_q).idx) };
+        unsafe {
+            let ring_ptr = (*used_q).ring.as_mut_ptr();
+            let elem = ring_ptr.add((used_idx % QUEUE_SIZE) as usize);
+            ptr::write_volatile(&mut (*elem).id, desc_idx_first as u32);
+            ptr::write_volatile(&mut (*elem).len, num_bytes_written as u32);
+        }
+        std::sync::atomic::fence(Ordering::SeqCst);
+        unsafe {
+            ptr::write_volatile(&mut (*used_q).idx, used_idx.wrapping_add(1));
+        }
+        posted = true;
+    }
+
+    *processed = processed.wrapping_add(1);
+    posted
+}
+
 // Warm-restart stash: we persist the per-queue descriptor/avail/used ring
 // addresses in the high half of the MMIO region so a fresh server can resume
 // a guest that's already past virtio init (e.g., after Ctrl-C + reconnect).
@@ -869,102 +995,19 @@ pub fn run_device(
 
             for queue_idx in 0..num_queues {
                 let qi = queue_idx as usize;
-                let desc_q = desc_ptrs[qi];
-                let avail_q = avail_ptrs[qi];
-                let used_q = used_ptrs[qi];
-
-                std::sync::atomic::fence(Ordering::SeqCst);
-
-                let avail_idx = unsafe { ptr::read_volatile(&(*avail_q).idx) };
-                let mut should_set_interrupt = false;
-
-                if processed[qi] != avail_idx && device.queue_has_data(queue_idx) {
-                    let desc_idx_first = unsafe {
-                        let ring_ptr = (*avail_q).ring.as_ptr();
-                        ptr::read_volatile(ring_ptr.add((processed[qi] % QUEUE_SIZE) as usize))
-                    };
-                    let mut desc_idx = desc_idx_first;
-
-                    let mut num_bytes_written: u64 = 0;
-                    let mut chain_valid = true;
-                    let mut steps: u16 = 0;
-
-                    loop {
-                        // Cycle detection: a valid chain can visit at most QUEUE_SIZE descriptors
-                        if steps >= QUEUE_SIZE {
-                            eprintln!(
-                                "virtio: descriptor chain exceeded {} steps, breaking",
-                                QUEUE_SIZE
-                            );
-                            chain_valid = false;
-                            break;
-                        }
-                        steps += 1;
-
-                        let d = unsafe {
-                            ptr::read_volatile(desc_q.add((desc_idx % QUEUE_SIZE) as usize))
-                        };
-
-                        // Validate descriptor address is within L2CPU memory.
-                        // Use checked arithmetic to prevent overflow bypassing the check.
-                        let addr_end = (d.addr).checked_add(d.len as u64);
-                        if d.addr < starting_address
-                            || d.addr >= mem_end
-                            || addr_end.is_none()
-                            || addr_end.unwrap() > mem_end
-                        {
-                            eprintln!(
-                            "virtio: descriptor addr {:#x} len {} outside memory [{:#x}, {:#x}), skipping chain",
-                            d.addr, d.len, starting_address, mem_end
-                        );
-                            chain_valid = false;
-                            break;
-                        }
-                        let addr = unsafe { memory.add((d.addr - starting_address) as usize) };
-
-                        if d.flags & VRING_DESC_F_NEXT != 0 {
-                            if num_bytes_written < queue_header_size {
-                                device.process_queue_start(queue_idx, addr, d.len as u64);
-                            } else {
-                                device.process_queue_data(queue_idx, addr, d.len as u64);
-                            }
-                            num_bytes_written += d.len as u64;
-                            desc_idx = d.next;
-                        } else {
-                            // The last descriptor's actual-bytes-written
-                            // can be less than its buffer capacity (e.g.
-                            // virtio-console RX with partial input). The
-                            // device returns the real count; block/net
-                            // pass `d.len` through unchanged.
-                            let actual =
-                                device.process_queue_complete(queue_idx, addr, d.len as u64);
-                            num_bytes_written += actual;
-                            break;
-                        }
-                    }
-
-                    // Only update the used ring if the entire chain was processed
-                    // successfully. Posting a partial completion confuses the guest driver.
-                    if chain_valid {
-                        should_set_interrupt = true;
-
-                        let used_idx = unsafe { ptr::read_volatile(&(*used_q).idx) };
-                        unsafe {
-                            let ring_ptr = (*used_q).ring.as_mut_ptr();
-                            let elem = ring_ptr.add((used_idx % QUEUE_SIZE) as usize);
-                            ptr::write_volatile(&mut (*elem).id, desc_idx_first as u32);
-                            ptr::write_volatile(&mut (*elem).len, num_bytes_written as u32);
-                        }
-                        std::sync::atomic::fence(Ordering::SeqCst);
-                        unsafe {
-                            ptr::write_volatile(&mut (*used_q).idx, used_idx.wrapping_add(1));
-                        }
-                    }
-
-                    processed[qi] = processed[qi].wrapping_add(1);
-                }
-
-                if should_set_interrupt {
+                let posted = process_one_chain_for_queue(
+                    desc_ptrs[qi],
+                    avail_ptrs[qi],
+                    used_ptrs[qi],
+                    &mut processed[qi],
+                    device,
+                    queue_idx,
+                    queue_header_size,
+                    starting_address,
+                    mem_end,
+                    memory,
+                );
+                if posted {
                     interrupt_ctl.set_interrupt(regs.interrupt_status, interrupt_number);
                     bump_interrupt_metric(interrupt_kind, l2cpu.idx() as u8);
                     did_work = true;

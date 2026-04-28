@@ -30,7 +30,10 @@ use std::time::Duration;
 use crate::l2cpu::L2Cpu;
 use crate::tensix_engine::TensixEngine;
 use crate::virtio::interrupt::InterruptController;
-use crate::virtio::{InterruptKind, VirtioDeviceImpl};
+use crate::virtio::{
+    process_one_chain_for_queue, InterruptKind, VirtioDeviceImpl, VringAvail, VringDesc, VringUsed,
+};
+use crate::virtio_engine as ve;
 
 /// One registered (slot, device) pair the kick poller dispatches to
 /// when a kick arrives. The fields mirror what `virtio::run_device`
@@ -216,40 +219,27 @@ fn run_poll_loop(
                 epoch
             );
             // M5.5b: dispatch to the registered (slot, queue)
-            // device handler if one exists. The handler walks the
-            // guest's avail/desc/used rings and fires the PLIC IRQ
-            // — same shape as `virtio::run_device`'s descriptor
-            // walk, but kick-driven instead of MMIO-polled.
-            //
-            // First cut: registry lookup + diagnostic log only.
-            // The actual descriptor-walk extraction needs
-            // `VringDesc/Avail/Used` made `pub(crate)` (done in
-            // this commit) and a few helpers from
-            // `virtio::run_device` extracted into a shared
-            // `process_one_chain` function — that piece lands
-            // alongside the firmware-side queue-pointer shadow
-            // extension that M5.5b's full implementation needs.
-            let map = registry.lock().unwrap();
-            match map.get(&(slot as u32)) {
-                Some(reg) => {
-                    crate::dlog!(
-                        "[kick-poller]   dispatching to slot {} ({} kind, irq {})",
-                        slot,
-                        reg.interrupt_kind_name(),
-                        reg.interrupt_number,
-                    );
-                    // Future descriptor walk goes here. For now,
-                    // bump a per-registration "would-dispatch"
-                    // counter so a daemon-side test can confirm
-                    // the registry path works. The lock is
-                    // released at the end of this scope.
+            // device handler. Reads the per-queue desc/avail/used
+            // pointers from BRISC L1 shadow (firmware shadows guest
+            // writes via the per-queue snapshot extension), walks
+            // the chain over guest DRAM via the L2CPU's memory
+            // mapping, calls the device's `process_queue_*` hooks,
+            // writes used-ring entries, fires the PLIC IRQ.
+            let mut map = registry.lock().unwrap();
+            if let Some(reg) = map.get_mut(&(slot as u32)) {
+                let posted = dispatch_chain(&engine, reg, queue_idx);
+                if posted {
+                    // Push a completion to BRISC for diagnostics +
+                    // future BRISC-side IRQ dispatch. The PLIC IRQ
+                    // itself is fired daemon-side today.
+                    let used_idx = read_used_idx(reg, queue_idx);
+                    engine.push_completion(slot, queue_idx, used_idx);
                 }
-                None => {
-                    crate::dlog!(
-                        "[kick-poller]   no registration for slot {}, dropping kick",
-                        slot
-                    );
-                }
+            } else {
+                crate::dlog!(
+                    "[kick-poller]   no registration for slot {}, dropping kick",
+                    slot
+                );
             }
             drop(map);
             stats.last_kick_slot_queue.store(
@@ -276,6 +266,151 @@ fn run_poll_loop(
         };
         thread::sleep(sleep);
     }
+}
+
+/// Walk one descriptor chain on `(slot, queue_idx)` via the
+/// existing virtio descriptor processor. Reads per-queue
+/// desc/avail/used pointers from BRISC L1 shadow, maps them into
+/// the L2CPU's memory namespace, calls the device's
+/// `process_queue_*` hooks, writes the used-ring entry, fires the
+/// PLIC IRQ on success. Returns `true` if a chain was posted.
+fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16) -> bool {
+    // Lazily extend `processed` if a kick references a queue index
+    // beyond what the device announced at registration. Out of
+    // bounds shouldn't happen for a well-behaved guest, but a
+    // misbehaving guest shouldn't crash the daemon.
+    if (queue_idx as usize) >= reg.processed.len() {
+        crate::dlog!(
+            "[kick-poller]   slot {} queue {} out of range (have {}), dropping",
+            reg.slot,
+            queue_idx,
+            reg.processed.len()
+        );
+        return false;
+    }
+
+    // Read the four per-queue pointers from BRISC L1 shadow. The
+    // firmware mirrors guest writes to QUEUE_DESC_LOW/HIGH /
+    // QUEUE_DRIVER_LOW/HIGH / QUEUE_DEVICE_LOW/HIGH into here on
+    // each poll iteration, indexed by (slot, current_sel). See
+    // `brisc-firmware/virtio.c::poll_one_device`'s shadow capture.
+    let qi = queue_idx as u32;
+    let desc_lo = engine.read_l1_u32(ve::shadow_queue_addr(
+        reg.slot,
+        qi,
+        ve::SHADOW_Q_OFF_DESC_LO,
+    ));
+    let desc_hi = engine.read_l1_u32(ve::shadow_queue_addr(
+        reg.slot,
+        qi,
+        ve::SHADOW_Q_OFF_DESC_HI,
+    ));
+    let avail_lo = engine.read_l1_u32(ve::shadow_queue_addr(
+        reg.slot,
+        qi,
+        ve::SHADOW_Q_OFF_DRIVER_LO,
+    ));
+    let avail_hi = engine.read_l1_u32(ve::shadow_queue_addr(
+        reg.slot,
+        qi,
+        ve::SHADOW_Q_OFF_DRIVER_HI,
+    ));
+    let used_lo = engine.read_l1_u32(ve::shadow_queue_addr(
+        reg.slot,
+        qi,
+        ve::SHADOW_Q_OFF_DEVICE_LO,
+    ));
+    let used_hi = engine.read_l1_u32(ve::shadow_queue_addr(
+        reg.slot,
+        qi,
+        ve::SHADOW_Q_OFF_DEVICE_HI,
+    ));
+
+    let desc_addr = ((desc_hi as u64) << 32) | desc_lo as u64;
+    let avail_addr = ((avail_hi as u64) << 32) | avail_lo as u64;
+    let used_addr = ((used_hi as u64) << 32) | used_lo as u64;
+
+    if desc_addr == 0 || avail_addr == 0 || used_addr == 0 {
+        // Queue not yet configured. Guest hasn't written the
+        // pointers yet — drop this kick.
+        crate::dlog!(
+            "[kick-poller]   slot {} queue {} not yet configured (desc/avail/used = \
+             {:#x}/{:#x}/{:#x}), dropping",
+            reg.slot,
+            queue_idx,
+            desc_addr,
+            avail_addr,
+            used_addr
+        );
+        return false;
+    }
+
+    // Convert guest physical addresses to host pointers via the
+    // L2CPU's memory mmap. Same arithmetic as
+    // `virtio::run_device`.
+    let starting = reg.l2cpu.starting_address();
+    let mem_end = starting + reg.l2cpu.memory_size();
+    let memory = reg.l2cpu.get_memory_ptr();
+    let in_range =
+        |addr: u64, size: u64| -> bool { addr >= starting && addr.saturating_add(size) <= mem_end };
+    if !in_range(desc_addr, 16) || !in_range(avail_addr, 4) || !in_range(used_addr, 4) {
+        crate::dlog!(
+            "[kick-poller]   slot {} queue {} pointers out of L2CPU memory range, dropping",
+            reg.slot,
+            queue_idx
+        );
+        return false;
+    }
+    let desc_q = unsafe { memory.add((desc_addr - starting) as usize) as *mut VringDesc };
+    let avail_q = unsafe { memory.add((avail_addr - starting) as usize) as *mut VringAvail };
+    let used_q = unsafe { memory.add((used_addr - starting) as usize) as *mut VringUsed };
+
+    let queue_header_size = reg.device.queue_header_size();
+    let posted = process_one_chain_for_queue(
+        desc_q,
+        avail_q,
+        used_q,
+        &mut reg.processed[queue_idx as usize],
+        reg.device.as_mut(),
+        queue_idx as u32,
+        queue_header_size,
+        starting,
+        mem_end,
+        memory,
+    );
+
+    if posted {
+        // Fire the PLIC IRQ via the existing per-L2CPU
+        // InterruptController. This is functionally identical to
+        // what `virtio::run_device` does; we just trigger it
+        // here instead of from a per-device MMIO-poll worker.
+        // (Reading `interrupt_status` from the visible reg file
+        // matches what run_device does for the legacy path; for
+        // the engine path the address is on the Tensix L1 reg
+        // file at the slot's MMIO_INTERRUPT_STATUS offset.)
+        let interrupt_status_addr_l1 = ve::slot_regs_base(reg.slot) + ve::MMIO_INTERRUPT_STATUS;
+        let interrupt_status_ptr = engine.l1_ptr(interrupt_status_addr_l1) as *mut u32;
+        reg.interrupt_ctl
+            .set_interrupt(interrupt_status_ptr, reg.interrupt_number);
+        crate::virtio::bump_interrupt_metric(reg.interrupt_kind, reg.l2cpu.idx() as u8);
+    }
+    posted
+}
+
+/// Read the current `used.idx` for a queue — used so we can record
+/// the latest used-ring head in the completion entry pushed back to
+/// BRISC.
+fn read_used_idx(reg: &RegEntry, queue_idx: u16) -> u32 {
+    let qi = queue_idx as u32;
+    let used_lo = 0u32; // no-op read; the actual used.idx lives in
+                        // guest DRAM and we already advanced it inside
+                        // `process_one_chain_for_queue`. The
+                        // CompletionEntry's used_idx field is
+                        // diagnostic for now, so we just echo the
+                        // queue's ring slot count modulo `processed`.
+    let _ = qi;
+    let _ = used_lo;
+    reg.processed[queue_idx as usize] as u32
 }
 
 #[cfg(test)]

@@ -151,6 +151,20 @@ impl TensixTile {
         self.l1_window.write32(offset as u64, value);
     }
 
+    /// Host VA pointing at L1 byte `offset`. Used by code paths that
+    /// need a raw pointer (e.g. `InterruptController::set_interrupt`,
+    /// which takes `*mut u32`). Caller is responsible for keeping
+    /// the `TensixTile` alive for the lifetime of the returned
+    /// pointer.
+    pub fn l1_ptr(&self, offset: u32) -> *mut u8 {
+        assert!(
+            (offset as usize) < TENSIX_L1_SIZE,
+            "L1 ptr offset 0x{:x} > L1 size",
+            offset
+        );
+        unsafe { self.l1_window.get_window().add(offset as usize) }
+    }
+
     pub fn read_soft_reset(&self) -> u32 {
         let off = TENSIX_SOFT_RESET_ADDR - TLB_BASE_DEBUG_REGS;
         self.debug_regs_window.read32(off)
