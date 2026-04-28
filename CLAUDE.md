@@ -25,20 +25,24 @@ block the push and require an immediate follow-up commit. Skipping
 `cargo fmt` locally has been the most common cause of red CI on this
 project — don't skip it.
 
-When touching code under a non-default Cargo feature (currently
-`virtio-engine` for the #66 Tensix-engine work), also run clippy
-and test with the feature on:
+As of M5.5e (#71) `virtio-engine` is a default feature alongside
+`slirp` — `cargo build` etc. now build the BRISC-engine path. The
+legacy host-buffer path (#64) is still available behind
+`--no-default-features --features slirp` while the soak scripts pin
+against it during the M6 cutover. When you touch host-buffer-only
+code (`src/host_buf.rs`, `start_initial_workers`, the worker spawns
+in `dispatch_add_disk` / `dispatch_add_net` / `dispatch_add_console`,
+or any `#[cfg(not(feature = "virtio-engine"))]` block) also run:
 
 ```bash
-cargo clippy --all-targets --features virtio-engine -- -D warnings
-cargo test --features virtio-engine
+cargo clippy --all-targets --no-default-features --features slirp -- -D warnings
+cargo test --no-default-features --features slirp
 ```
 
-The default-feature gates above don't exercise feature-gated code;
-silent regressions sit dormant until someone opts in. Run the
-feature-on form whenever you change code in `src/tensix_engine.rs`,
-`src/daemon/mod.rs`'s engine getter, or any `#[cfg(feature =
-"virtio-engine")]` block.
+The default gates exercise the engine path; silent regressions on
+the legacy path sit dormant until someone explicitly disables the
+default. Run the legacy-on form whenever you change code only the
+host-buffer path uses.
 
 Ambition does not mean scope creep. Stay ruthless about simplicity:
 - Don't invent abstractions for hypothetical future needs.

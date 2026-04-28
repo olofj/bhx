@@ -5,14 +5,16 @@ edition = "2021"
 license = "MIT"
 
 [features]
-default = ["slirp"]
+default = ["slirp", "virtio-engine"]
 slirp = [] # Links libvdeslirp/libslirp for network device support
 # Route the L2CPU's virtio-mmio reg windows through a Tensix tile
-# running the M3 BRISC firmware (#69) instead of the host-buffer
-# DMA path (#64). Off by default for M4 (#70) — flips on once the
-# daemon-side bridge in M5 (#71) is also wired up. Toggling the flag
-# rebuilds the daemon; you can run both paths side-by-side by
-# rebuilding without the flag.
+# running the BRISC firmware (#69 M3 + #71 M5.5) instead of the
+# host-buffer DMA path (#64). Default-on as of M5.5e — full Linux
+# (block + net + rng + console) boots end-to-end through the engine,
+# closing the SEL multiplexing race that #58/#61/#63/#65 surfaced
+# for the host-buffer path. The legacy host-buffer code is still in
+# the tree behind `--no-default-features --features slirp` so the
+# soak scripts can pin against it during the M6 cutover.
 virtio-engine = []
 
 [dependencies]
