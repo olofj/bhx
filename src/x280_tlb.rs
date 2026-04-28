@@ -43,6 +43,8 @@ pub const PCIE_TILE_Y: u32 = 24;
 /// new device to the host-buffer path.
 pub const RNG_TLB_SLOT: usize = 0;
 pub const NET_TLB_SLOT: usize = 1;
+pub const DISK_TLB_SLOT: usize = 2;
+pub const CONSOLE_TLB_SLOT: usize = 3;
 
 /// Program one small (2 MiB) x280 TLB window for unicast access to a
 /// single NoC tile.

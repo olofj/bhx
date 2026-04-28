@@ -659,8 +659,26 @@ fn dispatch_boot(
             region_offset: crate::regs::virtio_mmio::NET_OFFSET,
         },
     };
+    let disk_backing = match &arts.disk_buf {
+        Some(buf) => crate::virtio::MmioBacking::Host {
+            va: buf.as_ptr() as usize,
+        },
+        None => crate::virtio::MmioBacking::ChipDram {
+            region_offset: crate::regs::virtio_mmio::DISK_OFFSET,
+        },
+    };
+    let console_backing = match &arts.console_buf {
+        Some(buf) => crate::virtio::MmioBacking::Host {
+            va: buf.as_ptr() as usize,
+        },
+        None => crate::virtio::MmioBacking::ChipDram {
+            region_offset: crate::regs::virtio_mmio::CONSOLE_OFFSET,
+        },
+    };
     slot.virtio_rng_buf = arts.rng_buf;
     slot.virtio_net_buf = arts.net_buf;
+    slot.virtio_disk_buf = arts.disk_buf;
+    slot.virtio_console_buf = arts.console_buf;
 
     start_initial_workers(
         &mut slot,
@@ -672,6 +690,8 @@ fn dispatch_boot(
         rng,
         rng_backing,
         net_backing,
+        disk_backing,
+        console_backing,
     )
     .map_err(crate::Error::slot_state)?;
     // Workers are now in Phase 1 polling for the DRIVER bit. Release the
@@ -727,12 +747,15 @@ fn start_initial_workers(
     rng: bool,
     rng_backing: crate::virtio::MmioBacking,
     net_backing: crate::virtio::MmioBacking,
+    disk_backing: crate::virtio::MmioBacking,
+    console_backing: crate::virtio::MmioBacking,
 ) -> Result<(), String> {
     if let Some(path) = disk {
         dlog!(
-            "[boot l2cpu {}] spawning disk worker for {}",
+            "[boot l2cpu {}] spawning disk worker for {} (backing={:?})",
             l2cpu_idx,
-            path
+            path,
+            disk_backing
         );
         // Open the disk image at the trust boundary so the worker
         // operates on the exact inode we vetted, immune to symlink
@@ -750,7 +773,7 @@ fn start_initial_workers(
                 );
                 format!("cannot open disk image {}: {}", path, e)
             })?;
-        start_disk_worker(slot, &path, file).map_err(|e| {
+        start_disk_worker(slot, &path, file, disk_backing).map_err(|e| {
             dlog!("[boot l2cpu {}] start_disk_worker failed: {}", l2cpu_idx, e);
             format!("start disk worker failed: {}", e)
         })?;
@@ -767,8 +790,12 @@ fn start_initial_workers(
         })?;
     }
     if console {
-        dlog!("[boot l2cpu {}] spawning virtio-console worker", l2cpu_idx);
-        start_console_worker(slot).map_err(|e| {
+        dlog!(
+            "[boot l2cpu {}] spawning virtio-console worker (backing={:?})",
+            l2cpu_idx,
+            console_backing
+        );
+        start_console_worker(slot, console_backing).map_err(|e| {
             dlog!(
                 "[boot l2cpu {}] start_console_worker failed: {}",
                 l2cpu_idx,
@@ -821,6 +848,7 @@ fn start_disk_worker(
     slot: &mut L2CpuSlot,
     path: &str,
     disk_image: std::fs::File,
+    mmio_backing: crate::virtio::MmioBacking,
 ) -> io::Result<()> {
     let exit = Arc::new(AtomicBool::new(false));
     let l2cpu = slot.l2cpu.clone();
@@ -832,9 +860,7 @@ fn start_disk_worker(
             l2cpu,
             interrupt,
             DISK_INT,
-            crate::virtio::MmioBacking::ChipDram {
-                region_offset: DISK_MMIO,
-            },
+            mmio_backing,
             path_thread,
             disk_image,
             exit_thread,
@@ -890,7 +916,10 @@ fn start_net_worker(
 /// kernel's TX queue into the console hub and fills RX descriptors
 /// from the per-slot `input_buf`. Idempotent guard via the slot's
 /// existing `virtio_console: Option<...>`: caller checks that.
-fn start_console_worker(slot: &mut L2CpuSlot) -> io::Result<()> {
+fn start_console_worker(
+    slot: &mut L2CpuSlot,
+    mmio_backing: crate::virtio::MmioBacking,
+) -> io::Result<()> {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     let exit = Arc::new(AtomicBool::new(false));
@@ -908,9 +937,7 @@ fn start_console_worker(slot: &mut L2CpuSlot) -> io::Result<()> {
             l2cpu,
             interrupt,
             CONSOLE_INT,
-            crate::virtio::MmioBacking::ChipDram {
-                region_offset: CONSOLE_MMIO,
-            },
+            mmio_backing,
             hub,
             input_buf_thread,
             exit_thread,
@@ -971,6 +998,8 @@ pub struct BootArtifacts {
     pub l2cpu: Arc<L2Cpu>,
     pub rng_buf: Option<crate::host_buf::HostDmaBuf>,
     pub net_buf: Option<crate::host_buf::HostDmaBuf>,
+    pub disk_buf: Option<crate::host_buf::HostDmaBuf>,
+    pub console_buf: Option<crate::host_buf::HostDmaBuf>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1149,6 +1178,30 @@ fn run_boot_sequence(
         None
     };
 
+    let disk_buf: Option<crate::host_buf::HostDmaBuf> = if has_disk {
+        Some(alloc_host_mmio(
+            0x42,
+            crate::x280_tlb::DISK_TLB_SLOT,
+            crate::regs::virtio_mmio::VIRTIO_ID_BLOCK,
+            crate::regs::virtio_mmio::DISK_IRQ,
+            "disk",
+        )?)
+    } else {
+        None
+    };
+
+    let console_buf: Option<crate::host_buf::HostDmaBuf> = if has_console {
+        Some(alloc_host_mmio(
+            0x43,
+            crate::x280_tlb::CONSOLE_TLB_SLOT,
+            crate::regs::virtio_mmio::VIRTIO_ID_CONSOLE,
+            crate::regs::virtio_mmio::CONSOLE_IRQ,
+            "console",
+        )?)
+    } else {
+        None
+    };
+
     // Chip-DRAM virtio slots. Always emit nodes for the historical 4
     // chip-DRAM addresses: even with the host-buffer-backed RNG + NET,
     // the chip-DRAM slots stay in the DTB so `add-disk` / `add-net` /
@@ -1237,24 +1290,13 @@ fn run_boot_sequence(
     // there's no double-init bug. Doing the pre-write from the daemon
     // main thread also avoids reordering the worker spawn relative to
     // reset release, which would invasively touch the slot lifecycle.
-    if has_disk {
-        pre_init_virtio_mmio(
-            &l2cpu,
-            starting_address + memory_size - crate::regs::virtio_mmio::DISK_OFFSET,
-            crate::regs::virtio_mmio::VIRTIO_ID_BLOCK,
-        );
-    }
-    if has_console {
-        pre_init_virtio_mmio(
-            &l2cpu,
-            starting_address + memory_size - crate::regs::virtio_mmio::CONSOLE_OFFSET,
-            crate::regs::virtio_mmio::VIRTIO_ID_CONSOLE,
-        );
-    }
-    // Note: virtio-rng and virtio-net pre-inits happen further up,
-    // next to their host-buffer allocations — those writes go to the
-    // daemon-local mmap (the chip reads them via PCIe outbound iATU +
-    // x280 TLB, not via NoC writes from the daemon).
+    // All four virtio devices' pre-inits (rng / net / disk / console)
+    // happen further up, next to their host-buffer allocations — those
+    // writes go to the daemon-local mmap (the chip reads them via PCIe
+    // outbound iATU + x280 TLB, not via NoC writes from the daemon).
+    // The chip-DRAM virtio nodes that stay in the DTB to keep the
+    // post-boot `add-*` RPCs working are deliberately *not* pre-init'd
+    // here; the kernel sees them as `Wrong magic value` and ignores.
 
     dlog!(
         "[run_boot l2cpu {}] image+pre_init done; deferring reset release until workers spawn",
@@ -1264,6 +1306,8 @@ fn run_boot_sequence(
         l2cpu,
         rng_buf,
         net_buf,
+        disk_buf,
+        console_buf,
     })
 }
 
@@ -1460,9 +1504,11 @@ fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlo
             description: format!("chip_console l2cpu {}", l2cpu_idx),
         },
         disks: Vec::new(),
+        virtio_disk_buf: None,
         net: None,
         virtio_net_buf: None,
         virtio_console: None,
+        virtio_console_buf: None,
         virtio_rng: None,
         virtio_rng_buf: None,
         started: Instant::now(),
@@ -1829,7 +1875,13 @@ fn dispatch_add_console(
     if slot.virtio_console.is_some() {
         return Err(crate::Error::slot_state("virtio-console already attached"));
     }
-    start_console_worker(slot).map_err(crate::Error::io_ctx("start virtio-console worker"))?;
+    start_console_worker(
+        slot,
+        crate::virtio::MmioBacking::ChipDram {
+            region_offset: CONSOLE_MMIO,
+        },
+    )
+    .map_err(crate::Error::io_ctx("start virtio-console worker"))?;
     dlog!(
         "[add_console l2cpu {}] dispatch complete — replying ok",
         l2cpu_idx

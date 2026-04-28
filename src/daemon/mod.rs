@@ -68,6 +68,11 @@ pub struct L2CpuSlot {
     pub console_input_tx: Sender<u8>,
     pub console_worker: WorkerHandle,
     pub disks: Vec<DiskWorker>,
+    /// Host-side DMA buffer backing the boot-time virtio-block MMIO
+    /// control plane (#64 phase 3). `Some` only when the boot
+    /// allocated one (i.e. `-d <path>` was passed); the post-boot
+    /// `add-disk` RPC stays on chip-DRAM and ignores this field.
+    pub virtio_disk_buf: Option<HostDmaBuf>,
     pub net: Option<WorkerHandle>,
     /// Host-side DMA buffer backing virtio-net's MMIO control plane
     /// (#64 phase 2). Same lifetime contract as `virtio_rng_buf`:
@@ -81,6 +86,11 @@ pub struct L2CpuSlot {
     /// in `client_reader_main`; whichever HVC driver the kernel
     /// activates as its console absorbs them.
     pub virtio_console: Option<VirtioConsoleSlot>,
+    /// Host-side DMA buffer backing virtio-console's MMIO control
+    /// plane (#64 phase 3). `Some` only when boot-time
+    /// `--virtio-console` was set; the post-boot `add-console` RPC
+    /// stays on chip-DRAM.
+    pub virtio_console_buf: Option<HostDmaBuf>,
     /// virtio-rng worker (#62). Provides entropy to the guest. Required
     /// to satisfy `EFI_RNG_PROTOCOL` on the U-Boot+GRUB+shim chained-boot
     /// path; useful as plain `/dev/random` backing on direct-kernel paths.
