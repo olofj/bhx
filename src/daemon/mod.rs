@@ -155,6 +155,12 @@ pub struct DaemonState {
     /// off. `Mutex` so concurrent boots serialize the bring-up
     /// (only the first one runs the firmware load + reset release).
     pub tensix_engine: Mutex<Option<Arc<crate::tensix_engine::TensixEngine>>>,
+    /// Daemon-side kick poller (#71 M5.5a). Spawned alongside the
+    /// engine bring-up; consumes the kick ring (BRISC → daemon)
+    /// and (in M5.5b+) dispatches each kick to the relevant
+    /// per-(slot, queue) device handler. Lifetime tied to
+    /// `DaemonState`: dropped on daemon shutdown.
+    pub kick_poller: Mutex<Option<crate::tensix_data_plane::KickPoller>>,
     /// Set by the shutdown handler to make the accept loop exit.
     pub shutdown: Arc<AtomicBool>,
 }
@@ -182,15 +188,17 @@ impl DaemonState {
             ],
             shared_chip,
             tensix_engine: Mutex::new(None),
+            kick_poller: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Lazy getter for the Tensix virtio engine. First call brings
-    /// up the tile (picks via M2, loads M3 firmware, releases BRISC);
-    /// subsequent calls return the cached `Arc`. Only useful when
-    /// the `virtio-engine` feature is enabled — without it, callers
-    /// should not invoke this (use the host-buffer #64 path instead).
+    /// up the tile (picks via M2, loads M3 firmware, releases BRISC),
+    /// then spawns the daemon-side kick poller; subsequent calls
+    /// return the cached `Arc`. Only useful when the `virtio-engine`
+    /// feature is enabled — without it, callers should not invoke
+    /// this (use the host-buffer #64 path instead).
     #[cfg(feature = "virtio-engine")]
     pub fn get_or_bring_up_tensix_engine(
         &self,
@@ -201,6 +209,13 @@ impl DaemonState {
         }
         let eng = crate::tensix_engine::TensixEngine::bring_up(self.card, &self.shared_chip)?;
         let arc = Arc::new(eng);
+        // Spawn the kick poller against the same Arc so it consumes
+        // events the BRISC firmware produces. The poller's thread
+        // holds its own clone of the Arc; the engine outlives the
+        // poller because the poller's drop joins its thread before
+        // releasing the reference.
+        let poller = crate::tensix_data_plane::KickPoller::spawn(Arc::clone(&arc));
+        *self.kick_poller.lock().unwrap() = Some(poller);
         *guard = Some(Arc::clone(&arc));
         Ok(arc)
     }

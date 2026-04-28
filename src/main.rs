@@ -28,6 +28,7 @@ mod shared_chip;
 mod slirp_ffi;
 mod telemetry;
 mod tensix;
+mod tensix_data_plane;
 mod tensix_engine;
 mod tensix_proto;
 mod tensix_tile;
@@ -782,10 +783,14 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
 /// Bring up the Tensix virtio engine via `TensixEngine::bring_up` —
 /// the same code path the daemon will use under the
 /// `virtio-engine` feature. Verifies handshake + protocol version
-/// match end-to-end.
+/// match, then spawns a `KickPoller` and drives a synthetic kick
+/// to prove the daemon-side data plane consumes events end-to-end.
 fn run_tensix_engine(card: u32, chip: &shared_chip::SharedChip) -> std::io::Result<()> {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
     eprintln!("[tensix-engine] bringing up via TensixEngine::bring_up");
-    let engine = tensix_engine::TensixEngine::bring_up(card, chip)?;
+    let engine = Arc::new(tensix_engine::TensixEngine::bring_up(card, chip)?);
     eprintln!(
         "[tensix-engine] PASS: tile NOC0 ({}, {}), translated ({}, {}), \
          firmware_version={:#010x}, protocol_version={}",
@@ -801,6 +806,51 @@ fn run_tensix_engine(card: u32, chip: &shared_chip::SharedChip) -> std::io::Resu
         "[tensix-engine]   kick ring: producer={}, consumer={}, entries={}",
         producer, consumer, entries
     );
+
+    // Spawn the daemon-side kick poller (M5.5a) and verify it
+    // consumes a kick we drive directly. This proves the full path:
+    // host write → BRISC pickup → kick ring push → poller consume.
+    eprintln!("[tensix-engine] spawning kick poller and driving a synthetic kick");
+    let mut poller = tensix_data_plane::KickPoller::spawn(Arc::clone(&engine));
+    let stats = Arc::clone(&poller.stats);
+
+    // Synthetic kick: write QUEUE_NOTIFY=2 on slot 7 (L2CPU 1's
+    // rng device, in the firmware's slot ordering). BRISC sees the
+    // write next sweep, appends a KickEntry, advances producer_seq;
+    // the poller picks it up.
+    let slot7_notify = virtio_engine::slot_regs_base(7) + virtio_engine::MMIO_QUEUE_NOTIFY;
+    let before = stats.kicks_consumed.load(Ordering::Relaxed);
+    engine.write_l1_u32(slot7_notify, 2);
+    // Poller wakes up within a few ms (50 µs FAST sleep + BRISC's
+    // poll latency); 100 ms is generous.
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_millis(100) {
+        if stats.kicks_consumed.load(Ordering::Relaxed) > before {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let after = stats.kicks_consumed.load(Ordering::Relaxed);
+    let last = stats.last_kick_slot_queue.load(Ordering::Relaxed);
+    if after > before {
+        eprintln!(
+            "[tensix-engine]   poller consumed {} kick(s) ({} → {}); \
+             last (slot, queue) = ({}, {}) — KICK POLLER PASS",
+            after - before,
+            before,
+            after,
+            (last >> 16) & 0xFFFF,
+            last & 0xFFFF
+        );
+    } else {
+        poller.shutdown();
+        return Err(std::io::Error::other(format!(
+            "kick poller did not consume our synthetic kick within 100 ms \
+             (kicks_consumed stayed at {})",
+            before
+        )));
+    }
+    poller.shutdown();
     Ok(())
 }
 
