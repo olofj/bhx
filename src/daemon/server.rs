@@ -1496,22 +1496,22 @@ fn run_boot_sequence(
         None
     };
 
-    // Chip-DRAM virtio slots. Always emit nodes for the historical 4
-    // chip-DRAM addresses: even with the host-buffer-backed RNG + NET,
-    // the chip-DRAM slots stay in the DTB so `add-disk` / `add-net` /
-    // `add-console` (which currently always populate the chip-DRAM
-    // slot) keep working post-boot. Order matches the pre-#64 emission
+    // Chip-DRAM virtio slots. Emit only on the legacy host-buffer
+    // path: even with the host-buffer-backed RNG + NET, the chip-DRAM
+    // slots stay in the DTB so `add-disk` / `add-net` / `add-console`
+    // (which currently always populate the chip-DRAM slot) keep
+    // working post-boot. Order matches the pre-#64 emission
     // (RNG-slot, CONSOLE, NET, DISK in ascending address) so the
-    // kernel's probe order — which gates the multi-queue race in #61
-    // — stays where it was.
+    // kernel's probe order — which gated the multi-queue race in
+    // #61 on stock kernels — stays where it was.
     //
-    // Note: with has_network=true we also emit the host-buffer net
-    // node above. Linux sees two virtio_net candidates; the chip-DRAM
-    // one shows up as `Wrong magic value` (we don't pre-init it) and
-    // the host-buffer one is the one that actually binds. The
-    // chip-DRAM-net `Wrong magic` warning is the same noise we
-    // already had for unconfigured slots (#53). Same logic applies to
-    // RNG.
+    // Under `virtio-engine` the engine path emits its own four DTB
+    // nodes (above, at `x280_base + dev_idx*0x1000`), and hot-add
+    // through the chip-DRAM slots isn't supported there yet. Emitting
+    // the chip-DRAM nodes anyway just gives the kernel four
+    // uninitialized MMIO regions and four "Wrong magic value"
+    // warnings at boot.
+    #[cfg(not(feature = "virtio-engine"))]
     {
         use crate::regs::virtio_mmio::{
             CONSOLE_IRQ, CONSOLE_OFFSET, DISK_IRQ, DISK_OFFSET, MMIO_SLOT_SIZE, NET_IRQ,
