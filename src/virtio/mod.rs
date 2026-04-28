@@ -683,9 +683,8 @@ pub fn run_device(
                         // per SEL transition, not on every poll iter, so it
                         // doesn't ruin the daemon's poll cadence on real
                         // hot-path workloads.
-                        let queue_ready_atomic = unsafe {
-                            &*(regs.queue_ready as *const std::sync::atomic::AtomicU32)
-                        };
+                        let queue_ready_atomic =
+                            unsafe { &*(regs.queue_ready as *const std::sync::atomic::AtomicU32) };
                         queue_ready_atomic.store(0, std::sync::atomic::Ordering::SeqCst);
                     }
                     let curr_gen = unsafe { ptr::read_volatile(regs.sel_generation) };

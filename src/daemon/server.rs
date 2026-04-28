@@ -898,7 +898,14 @@ fn start_net_worker(
     let mut forwards = vec![(ssh_port, 22)];
     forwards.extend(extra_fwd);
     let t = thread::spawn(move || {
-        network::network_main(forwards, l2cpu, interrupt, NET_INT, mmio_backing, exit_thread);
+        network::network_main(
+            forwards,
+            l2cpu,
+            interrupt,
+            NET_INT,
+            mmio_backing,
+            exit_thread,
+        );
     });
     slot.net = Some(WorkerHandle {
         exit,
@@ -1135,10 +1142,9 @@ fn run_boot_sequence(
     // 4 KiB-aligned x280 PA. See `host_buf::VirtioHostMmio`.
     let any_host_device = has_rng || has_network || has_disk || has_console;
     let virtio_host_mmio: Option<crate::host_buf::VirtioHostMmio> = if any_host_device {
-        let total_size =
-            crate::host_buf::SUB_REGION_SIZE * crate::host_buf::SUB_REGION_COUNT;
-        let buf = crate::host_buf::HostDmaBuf::allocate(l2cpu.fd(), total_size, 0x40)
-            .map_err(|e| {
+        let total_size = crate::host_buf::SUB_REGION_SIZE * crate::host_buf::SUB_REGION_COUNT;
+        let buf =
+            crate::host_buf::HostDmaBuf::allocate(l2cpu.fd(), total_size, 0x40).map_err(|e| {
                 dlog!(
                     "[run_boot l2cpu {}] HostDmaBuf::allocate for shared virtio mmio failed: {}",
                     l2cpu_idx,
@@ -1170,16 +1176,13 @@ fn run_boot_sequence(
         // device's daemon-side VA is `buf.as_ptr() + i*4096`.
         let sub_size = crate::host_buf::SUB_REGION_SIZE as u64;
         let mut device_x280_pa = [0u64; 4];
-        let mut configure = |index: usize,
-                             enabled: bool,
-                             device_id: u32,
-                             irq: u32,
-                             label: &str| {
+        let mut configure = |index: usize, enabled: bool, device_id: u32, irq: u32, label: &str| {
             let pa = x280_base + (index as u64) * sub_size;
             device_x280_pa[index] = pa;
             if enabled {
                 let va = unsafe {
-                    buf.as_ptr().add(index * crate::host_buf::SUB_REGION_SIZE as usize)
+                    buf.as_ptr()
+                        .add(index * crate::host_buf::SUB_REGION_SIZE as usize)
                 };
                 pre_init_virtio_mmio_host(va, device_id);
                 virtio_nodes.push(crate::boot::VirtioMmioNode {

@@ -8,9 +8,22 @@ high-agency and driven: when a task is done, look for the next real piece
 of work — a loose end, a TODO, a test gap, a rough edge — and keep going.
 Don't propose to "finish for the day," "wrap up here," or "stop and review
 later" as a default. Push through to a genuinely good stopping point:
-everything you touched compiles cleanly, `cargo clippy --all-targets --
--D warnings` is clean, tests pass, and no half-finished work is left
-behind.
+everything you touched compiles cleanly, `cargo fmt --check` is clean,
+`cargo clippy --all-targets -- -D warnings` is clean, tests pass, and
+no half-finished work is left behind.
+
+**Before every commit**, run all three:
+
+```bash
+cargo fmt                              # apply formatting (or --check to verify)
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+CI runs all three as separate gates. `cargo fmt --check` failures will
+block the push and require an immediate follow-up commit. Skipping
+`cargo fmt` locally has been the most common cause of red CI on this
+project — don't skip it.
 
 Ambition does not mean scope creep. Stay ruthless about simplicity:
 - Don't invent abstractions for hypothetical future needs.
@@ -203,9 +216,14 @@ If `tt-smi -r` doesn't recover the card, power-cycle the host.
 cargo build                          # default features (slirp)
 cargo build --no-default-features    # no slirp link
 
+cargo fmt --check                    # CI gate; run `cargo fmt` to fix
 cargo clippy --all-targets -- -D warnings   # must stay clean
 cargo test                           # hardware-free unit tests
 ```
+
+CI runs the same three as separate steps in this exact order. Run all
+three locally before any commit; a `cargo fmt` slip is the easiest way
+to red-light the pipeline.
 
 Unit tests cover: CLI parsing + `absolutize`, daemon `protocol`
 round-trips + SCM_RIGHTS, `console_hub` fan-out + writer election,

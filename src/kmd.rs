@@ -193,7 +193,11 @@ pub const IOCTL_CONFIGURE_TLB: u64 = io(TENSTORRENT_IOCTL_MAGIC, 13);
 // --- Ioctl wrappers using nix ---
 
 nix::ioctl_readwrite_bad!(ioctl_get_device_info, IOCTL_GET_DEVICE_INFO, GetDeviceInfo);
-nix::ioctl_readwrite_bad!(ioctl_allocate_dma_buf, IOCTL_ALLOCATE_DMA_BUF, AllocateDmaBuf);
+nix::ioctl_readwrite_bad!(
+    ioctl_allocate_dma_buf,
+    IOCTL_ALLOCATE_DMA_BUF,
+    AllocateDmaBuf
+);
 nix::ioctl_readwrite_bad!(ioctl_reset_device, IOCTL_RESET_DEVICE, ResetDevice);
 nix::ioctl_readwrite_bad!(ioctl_allocate_tlb, IOCTL_ALLOCATE_TLB, AllocateTlb);
 nix::ioctl_readwrite_bad!(ioctl_free_tlb, IOCTL_FREE_TLB, FreeTlb);

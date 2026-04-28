@@ -205,11 +205,7 @@ pub enum BootDevice {
     /// know where to mount; without it, switch_root drops to an
     /// emergency shell. Used when the operator passes both
     /// `--initramfs` and `--disk` to `boot`.
-    InitramfsAndVda {
-        addr: u64,
-        len: u64,
-        dev: String,
-    },
+    InitramfsAndVda { addr: u64, len: u64, dev: String },
     /// U-Boot is the payload at KERNEL_OFFSET; it discovers root +
     /// initrd at runtime from disk. Daemon-side bootargs is left as a
     /// minimal `console=hvc0` so any kernel U-Boot eventually `booti`s
@@ -278,9 +274,15 @@ pub fn modify_dtb(
         None => fdt.add_subnode(0, "chosen")?,
     };
     let bootargs = match boot_device {
-        BootDevice::Vda(dev) => format!("rw console=hvc0 earlycon=sbi keep_bootcon root=/dev/{}", dev),
+        BootDevice::Vda(dev) => format!(
+            "rw console=hvc0 earlycon=sbi keep_bootcon root=/dev/{}",
+            dev
+        ),
         BootDevice::Initramfs { addr, len } => {
-            format!("rw console=hvc0 earlycon=sbi keep_bootcon initrd=0x{:x},{}", addr, len)
+            format!(
+                "rw console=hvc0 earlycon=sbi keep_bootcon initrd=0x{:x},{}",
+                addr, len
+            )
         }
         BootDevice::InitramfsAndVda { addr, len, dev } => format!(
             "rw console=hvc0 earlycon=sbi keep_bootcon initrd=0x{:x},{} root=/dev/{}",
@@ -531,7 +533,11 @@ mod tests {
             let addr = mem_start + mem_size - crate::regs::virtio_mmio::MMIO_SLOT_SIZE * (i + 1);
             let path = format!("/soc/virtio@{:x}", addr);
             let r = fdt.path_offset(&path).unwrap();
-            assert!(r.is_none(), "{} should not exist with empty node list", path);
+            assert!(
+                r.is_none(),
+                "{} should not exist with empty node list",
+                path
+            );
         }
     }
 }
