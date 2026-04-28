@@ -1291,6 +1291,34 @@ fn run_tensix_virtio(card: u32, x: u16, y: u16) -> std::io::Result<()> {
         }
     }
 
+    // M5.5b firmware extension: when the guest writes
+    // QUEUE_DESC_LOW for the current SEL, BRISC should snapshot it
+    // into shadow[slot][sel].SHADOW_Q_OFF_DESC_LO. Drive a write
+    // on slot 0 (currently SEL=0 by default) and verify the shadow
+    // captures it.
+    {
+        eprintln!("[tensix-virtio] driving QUEUE_DESC_LOW=0xCAFE0001 on slot 0 (SEL=0)");
+        let slot0_desc_lo = ve::slot_regs_base(0) + ve::MMIO_QUEUE_DESC_LOW;
+        let test_val = 0xCAFE_0001u32;
+        tile.write_l1_u32(slot0_desc_lo, test_val);
+        sleep(Duration::from_millis(5));
+        let shadow_addr = ve::shadow_queue_addr(0, 0, ve::SHADOW_Q_OFF_DESC_LO);
+        let captured = tile.read_l1_u32(shadow_addr);
+        if captured == test_val {
+            eprintln!(
+                "  shadow[slot=0, queue=0, DESC_LO] = {:#010x} — QUEUE SHADOW PASS",
+                captured
+            );
+        } else {
+            eprintln!(
+                "  QUEUE SHADOW FAIL: shadow[slot=0, queue=0, DESC_LO] = {:#010x}, \
+                 expected {:#010x}",
+                captured, test_val
+            );
+            errors += 1;
+        }
+    }
+
     // M5 (#71) completion-ring path: write a CompletionEntry into
     // L1 at the next producer index, bump producer_seq, then poll
     // the firmware's `compl_events` stat to confirm BRISC consumed

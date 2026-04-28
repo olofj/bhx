@@ -95,6 +95,13 @@
 #define SNAP_OFF_QUEUE_SEL        0x04
 #define SNAP_OFF_QUEUE_NOTIFY     0x08
 #define SNAP_OFF_QUEUE_READY      0x0c
+#define SNAP_OFF_QUEUE_NUM        0x10
+#define SNAP_OFF_DESC_LO          0x14
+#define SNAP_OFF_DESC_HI          0x18
+#define SNAP_OFF_DRIVER_LO        0x1c
+#define SNAP_OFF_DRIVER_HI        0x20
+#define SNAP_OFF_DEVICE_LO        0x24
+#define SNAP_OFF_DEVICE_HI        0x28
 
 static inline volatile uint32_t *l1_u32(uintptr_t addr) {
     return (volatile uint32_t *)addr;
@@ -383,6 +390,38 @@ static void poll_one_device(unsigned slot) {
     if (ready != ready_prev) {
         handle_queue_ready_change(slot, sel, ready);
         write_u32(snap_addr(slot, SNAP_OFF_QUEUE_READY), ready);
+    }
+
+    // Per-queue setup registers — QUEUE_NUM + the three address
+    // pairs (DESC, DRIVER/AVAIL, DEVICE/USED). The guest writes these
+    // before QUEUE_READY=1 for each queue. We snapshot-diff each
+    // and capture into the shadow row indexed by the currently
+    // selected queue, so the daemon-side data plane (#71 M5.5b) can
+    // read accurate per-queue state without racing the SEL
+    // multiplexer.
+    if (sel < BRISC_VIRTIO_MAX_QUEUES) {
+        struct queue_field {
+            unsigned mmio_off;
+            unsigned snap_off;
+            unsigned shadow_off;
+        };
+        static const struct queue_field FIELDS[] = {
+            {VIRTIO_MMIO_QUEUE_NUM,         SNAP_OFF_QUEUE_NUM, SHADOW_Q_OFF_NUM},
+            {VIRTIO_MMIO_QUEUE_DESC_LOW,    SNAP_OFF_DESC_LO,   SHADOW_Q_OFF_DESC_LO},
+            {VIRTIO_MMIO_QUEUE_DESC_HIGH,   SNAP_OFF_DESC_HI,   SHADOW_Q_OFF_DESC_HI},
+            {VIRTIO_MMIO_QUEUE_DRIVER_LOW,  SNAP_OFF_DRIVER_LO, SHADOW_Q_OFF_DRIVER_LO},
+            {VIRTIO_MMIO_QUEUE_DRIVER_HIGH, SNAP_OFF_DRIVER_HI, SHADOW_Q_OFF_DRIVER_HI},
+            {VIRTIO_MMIO_QUEUE_DEVICE_LOW,  SNAP_OFF_DEVICE_LO, SHADOW_Q_OFF_DEVICE_LO},
+            {VIRTIO_MMIO_QUEUE_DEVICE_HIGH, SNAP_OFF_DEVICE_HI, SHADOW_Q_OFF_DEVICE_HI},
+        };
+        for (unsigned f = 0; f < sizeof(FIELDS) / sizeof(FIELDS[0]); f++) {
+            uint32_t v = read_u32(reg_addr(slot, FIELDS[f].mmio_off));
+            uint32_t prev = read_u32(snap_addr(slot, FIELDS[f].snap_off));
+            if (v != prev) {
+                *l1_u32(shadow_queue_addr(slot, sel, FIELDS[f].shadow_off)) = v;
+                write_u32(snap_addr(slot, FIELDS[f].snap_off), v);
+            }
+        }
     }
 }
 

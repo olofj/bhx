@@ -117,6 +117,32 @@ pub const STATS_OFF_LAST_NOTIFY: u32 = 0x020;
 pub const STATS_OFF_COMPL_EVENTS: u32 = 0x024;
 pub const STATS_OFF_LAST_COMPL: u32 = 0x028;
 
+// ----- Per-queue shadow region (BRISC L1, M5.5b firmware) -----
+//
+// The firmware shadows guest writes to the per-queue setup
+// registers (QUEUE_NUM + DESC/DRIVER/DEVICE addresses) into this
+// region, indexed by `(slot, queue_idx)`. The data plane reads
+// from here on each kick to know which avail/desc/used rings to
+// walk in guest DRAM. These offsets MUST match the C firmware's
+// `SHADOW_Q_OFF_*` constants in `brisc-firmware/virtio.c`.
+
+pub const SHADOW_BASE: u32 = 0x0002_0000;
+pub const SHADOW_PER_DEVICE: u32 = 0x400;
+pub const SHADOW_PER_QUEUE: u32 = 0x40;
+pub const SHADOW_Q_OFF_NUM: u32 = 0x00;
+pub const SHADOW_Q_OFF_READY: u32 = 0x04;
+pub const SHADOW_Q_OFF_DESC_LO: u32 = 0x08;
+pub const SHADOW_Q_OFF_DESC_HI: u32 = 0x0c;
+pub const SHADOW_Q_OFF_DRIVER_LO: u32 = 0x10;
+pub const SHADOW_Q_OFF_DRIVER_HI: u32 = 0x14;
+pub const SHADOW_Q_OFF_DEVICE_LO: u32 = 0x18;
+pub const SHADOW_Q_OFF_DEVICE_HI: u32 = 0x1c;
+
+#[inline]
+pub fn shadow_queue_addr(slot: u32, queue_idx: u32, off: u32) -> u32 {
+    SHADOW_BASE + slot * SHADOW_PER_DEVICE + queue_idx * SHADOW_PER_QUEUE + off
+}
+
 pub const STATS_MAGIC_LOADED: u32 = 0x0000_B155;
 
 // ----- Per-device queue counts (must match firmware constants) -----
