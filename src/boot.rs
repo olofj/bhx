@@ -199,6 +199,17 @@ pub enum BootDevice {
     Vda(String),
     /// `initrd=<addr>,<len>` — no persistent disk, use the in-memory image.
     Initramfs { addr: u64, len: u64 },
+    /// `initrd=<addr>,<len> root=/dev/<dev>` — a distro-style boot:
+    /// kernel + dracut (or similar) initramfs that pivot_root's onto
+    /// the persistent disk. dracut needs `root=` on the cmdline to
+    /// know where to mount; without it, switch_root drops to an
+    /// emergency shell. Used when the operator passes both
+    /// `--initramfs` and `--disk` to `boot`.
+    InitramfsAndVda {
+        addr: u64,
+        len: u64,
+        dev: String,
+    },
     /// U-Boot is the payload at KERNEL_OFFSET; it discovers root +
     /// initrd at runtime from disk. Daemon-side bootargs is left as a
     /// minimal `console=hvc0` so any kernel U-Boot eventually `booti`s
@@ -267,11 +278,15 @@ pub fn modify_dtb(
         None => fdt.add_subnode(0, "chosen")?,
     };
     let bootargs = match boot_device {
-        BootDevice::Vda(dev) => format!("rw console=hvc0 earlycon=sbi root=/dev/{}", dev),
+        BootDevice::Vda(dev) => format!("rw console=hvc0 earlycon=sbi keep_bootcon root=/dev/{}", dev),
         BootDevice::Initramfs { addr, len } => {
-            format!("rw console=hvc0 earlycon=sbi initrd=0x{:x},{}", addr, len)
+            format!("rw console=hvc0 earlycon=sbi keep_bootcon initrd=0x{:x},{}", addr, len)
         }
-        BootDevice::Uboot => "console=hvc0 earlycon=sbi".to_string(),
+        BootDevice::InitramfsAndVda { addr, len, dev } => format!(
+            "rw console=hvc0 earlycon=sbi keep_bootcon initrd=0x{:x},{} root=/dev/{}",
+            addr, len, dev
+        ),
+        BootDevice::Uboot => "console=hvc0 earlycon=sbi keep_bootcon".to_string(),
     };
     eprintln!("[modify_dtb]   bootargs = {:?}", bootargs);
     let mut bootargs_bytes = bootargs.into_bytes();

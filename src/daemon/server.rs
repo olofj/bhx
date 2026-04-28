@@ -1085,15 +1085,28 @@ fn run_boot_sequence(
     let boot_device = if payload.is_uboot() {
         boot::BootDevice::Uboot
     } else {
-        match initramfs {
-            Some(p) => {
+        match (initramfs, has_disk) {
+            (Some(p), true) => {
+                // Distro-style boot: kernel image + dracut initramfs +
+                // real disk. The initramfs is loaded at rootfs_addr,
+                // dracut runs and needs `root=/dev/<dev>` to know what
+                // to pivot_root onto — without it, switch_root drops
+                // to emergency shell.
+                let bytes = boot::read_bin_file(Path::new(p))?;
+                boot::BootDevice::InitramfsAndVda {
+                    addr: rootfs_addr,
+                    len: bytes.len() as u64,
+                    dev: root_device.to_string(),
+                }
+            }
+            (Some(p), false) => {
                 let bytes = boot::read_bin_file(Path::new(p))?;
                 boot::BootDevice::Initramfs {
                     addr: rootfs_addr,
                     len: bytes.len() as u64,
                 }
             }
-            None => boot::BootDevice::Vda(root_device.to_string()),
+            (None, _) => boot::BootDevice::Vda(root_device.to_string()),
         }
     };
     // Build the list of virtio-mmio nodes we'll inject under /soc and
