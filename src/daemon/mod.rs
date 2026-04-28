@@ -69,6 +69,12 @@ pub struct L2CpuSlot {
     pub console_worker: WorkerHandle,
     pub disks: Vec<DiskWorker>,
     pub net: Option<WorkerHandle>,
+    /// Host-side DMA buffer backing virtio-net's MMIO control plane
+    /// (#64 phase 2). Same lifetime contract as `virtio_rng_buf`:
+    /// joined-then-dropped via `shutdown`. The vring + packet payloads
+    /// stay in chip DRAM (per `L2Cpu::get_memory_ptr`); only the
+    /// control registers move here.
+    pub virtio_net_buf: Option<HostDmaBuf>,
     /// virtio-console worker (#51). When `Some`, kernel sees a
     /// virtio-mmio device with id=3 in the third virtio slot. Operator
     /// keystrokes are fanned out to both this and `console_input_tx`
