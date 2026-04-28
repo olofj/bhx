@@ -173,6 +173,81 @@ impl TensixEngine {
         })
     }
 
+    /// Adopt an engine that the previous daemon left running on the
+    /// chip. The Tensix has the same lifetime as the L2CPUs; if some
+    /// L2CPUs are still alive across a daemon restart, the firmware
+    /// on BRISC is also still running, and re-running `bring_up`
+    /// (which halts BRISC and reloads firmware) would tear out the
+    /// running guests' MMIO backend mid-flight.
+    ///
+    /// What this skips relative to `bring_up`:
+    ///   - assert_all_resets / write_l1 zero / load_brisc_firmware
+    ///   - release_brisc_only
+    ///   - run_handshake (firmware is past `wait_for_hello_and_ack`,
+    ///     it's in the steady-state poll loop and won't ack again)
+    ///
+    /// What it still does: pick the same tile (deterministic from
+    /// telemetry), open the TLB-backed `TensixTile`, sanity-check
+    /// the stats magic to confirm the firmware is alive, populate
+    /// the cached versions from the stats page so downstream
+    /// callers can render them in `daemon status`.
+    ///
+    /// Fails if the firmware doesn't have the stats magic — at that
+    /// point the chip has lost firmware and the caller should fall
+    /// back to a cold `bring_up` (which assumes no L2CPU traffic).
+    pub fn adopt_running(card: u32, chip: &SharedChip) -> io::Result<Self> {
+        let telem = telemetry::read_telemetry(chip)
+            .map_err(|e| io::Error::other(format!("read telemetry: {}", e)))?;
+        let picked = tensix_tile::pick_virtio_engine_tile(&telem)
+            .map_err(|e| io::Error::other(format!("pick tile: {}", e)))?;
+        let (translated_x, translated_y) = tensix_tile::noc0_to_translated_tensix(
+            picked.x,
+            picked.y,
+            telem.enabled_tensix_col,
+            telem.noc_translation_enabled,
+        )
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "tile ({}, {}) has no translated form for L2CPU TLB",
+                picked.x, picked.y
+            ))
+        })?;
+        let tile = TensixTile::new(card, picked.x, picked.y).map_err(|e| {
+            io::Error::other(format!(
+                "open tensix tile ({}, {}) on card {}: {}",
+                picked.x, picked.y, card, e
+            ))
+        })?;
+        let stats_magic = tile.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAGIC);
+        if stats_magic != ve::STATS_MAGIC_LOADED {
+            return Err(io::Error::other(format!(
+                "BRISC firmware not running on tile ({}, {}) (stats magic {:#010x}, expected {:#010x}); \
+                 chip lost firmware — caller must cold-`bring_up` instead",
+                picked.x, picked.y, stats_magic, ve::STATS_MAGIC_LOADED
+            )));
+        }
+        let firmware_version = tile.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_VERSION);
+        // We adopt the protocol version from the stats page; in the
+        // current firmware the version isn't separately exposed, so
+        // we conservatively report the protocol version we expect to
+        // see — callers don't currently inspect it post-bring-up.
+        let protocol_version = proto::PROTOCOL_VERSION;
+        eprintln!(
+            "[tensix-engine] adopted running firmware on card {} tile NOC0 ({}, {}); \
+             firmware version {:#010x}",
+            card, picked.x, picked.y, firmware_version,
+        );
+        Ok(TensixEngine {
+            tile,
+            noc0_x: picked.x,
+            noc0_y: picked.y,
+            translated_x,
+            translated_y,
+            firmware_version,
+            protocol_version,
+        })
+    }
+
     /// Read the firmware version reported in the stats page. The
     /// handshake-time version is cached on `self.firmware_version`;
     /// this getter is useful only if you want to read it again (e.g.

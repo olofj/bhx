@@ -188,6 +188,23 @@ fn probe_initial_chip_state(shared: &crate::shared_chip::SharedChip, card: u32) 
 /// guest kernel stays up throughout; virtio descriptor chains re-sync
 /// on the next queue kick once workers come back.
 fn warm_resume_released(state: &Arc<DaemonState>, released: &[u8]) {
+    // Engine path: if any L2CPU is live across the daemon restart,
+    // the BRISC firmware on the engine tile is also live (same chip
+    // lifetime as the L2CPUs). Adopt it before probing per-L2CPU so
+    // a future cold-boot RPC's `get_or_bring_up_tensix_engine` finds
+    // the engine already up and skips `bring_up`'s halt+reload (which
+    // would tear out the running guests' MMIO backend).
+    #[cfg(feature = "virtio-engine")]
+    if !released.is_empty() {
+        match state.adopt_running_tensix_engine() {
+            Ok(()) => dlog!("[warm-resume] adopted running tensix engine"),
+            Err(e) => dlog!(
+                "[warm-resume] adopt_running_tensix_engine failed: {} \
+                 (chip likely lost firmware; next cold boot will reload)",
+                e
+            ),
+        }
+    }
     for &idx in released {
         dlog!("[warm-resume l2cpu {}] probing chip state", idx);
         let l2cpu = match L2Cpu::new(idx as usize, state.card) {

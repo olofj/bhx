@@ -219,6 +219,30 @@ impl DaemonState {
         *guard = Some(Arc::clone(&arc));
         Ok(arc)
     }
+
+    /// Daemon warm-resume: adopt the engine that the previous daemon
+    /// instance left running on the chip, without halting BRISC or
+    /// reloading firmware. Must be called before any cold boot RPC
+    /// (which would otherwise lazily call `bring_up` and clobber the
+    /// running firmware). Idempotent — second call on an already-
+    /// adopted engine is a no-op.
+    ///
+    /// Failure is non-fatal: if the chip has lost firmware (stats
+    /// magic mismatch), this returns Err and the next cold-boot RPC
+    /// will go through `bring_up` as if no warm engine ever existed.
+    #[cfg(feature = "virtio-engine")]
+    pub fn adopt_running_tensix_engine(&self) -> std::io::Result<()> {
+        let mut guard = self.tensix_engine.lock().unwrap();
+        if guard.is_some() {
+            return Ok(());
+        }
+        let eng = crate::tensix_engine::TensixEngine::adopt_running(self.card, &self.shared_chip)?;
+        let arc = Arc::new(eng);
+        let poller = crate::tensix_data_plane::KickPoller::spawn(Arc::clone(&arc));
+        *self.kick_poller.lock().unwrap() = Some(poller);
+        *guard = Some(arc);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
