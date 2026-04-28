@@ -773,13 +773,30 @@ fn dispatch_boot(
                     .open(disk_path)
                 {
                     Ok(file) => match crate::virtio::block::VirtioBlk::from_file(file, l2cpu_idx) {
-                        Ok(blk) => register(
-                            dev_slot(crate::virtio_engine::DEV_BLK),
-                            Box::new(blk),
-                            crate::regs::virtio_mmio::DISK_IRQ,
-                            crate::virtio::InterruptKind::Block,
-                            "blk",
-                        ),
+                        Ok(blk) => {
+                            register(
+                                dev_slot(crate::virtio_engine::DEV_BLK),
+                                Box::new(blk),
+                                crate::regs::virtio_mmio::DISK_IRQ,
+                                crate::virtio::InterruptKind::Block,
+                                "blk",
+                            );
+                            // Stub DiskWorker so `daemon status` shows
+                            // `disk=<path>` instead of `disk=-`. The
+                            // kick poller owns the actual dispatch;
+                            // there is no thread to join.
+                            slot.disks.push(DiskWorker {
+                                path: disk_path.clone(),
+                                worker: WorkerHandle {
+                                    exit: Arc::new(AtomicBool::new(false)),
+                                    thread: None,
+                                    description: format!(
+                                        "disk l2cpu {} @ {} (engine)",
+                                        l2cpu_idx, disk_path
+                                    ),
+                                },
+                            });
+                        }
                         Err(e) => dlog!(
                             "[run_boot l2cpu {}] virtio-engine: VirtioBlk::from_file \
                                  failed: {}",
@@ -807,13 +824,23 @@ fn dispatch_boot(
                 let mut forwards = vec![(ssh_port, 22u16)];
                 forwards.extend(extra_fwd.iter().copied());
                 match crate::virtio::network::VirtioNet::new(&forwards, l2cpu_idx) {
-                    Ok(net) => register(
-                        dev_slot(crate::virtio_engine::DEV_NET),
-                        Box::new(net),
-                        crate::regs::virtio_mmio::NET_IRQ,
-                        crate::virtio::InterruptKind::Net,
-                        "net",
-                    ),
+                    Ok(net) => {
+                        register(
+                            dev_slot(crate::virtio_engine::DEV_NET),
+                            Box::new(net),
+                            crate::regs::virtio_mmio::NET_IRQ,
+                            crate::virtio::InterruptKind::Net,
+                            "net",
+                        );
+                        // Stub net WorkerHandle so `daemon status` shows
+                        // `net=true`. Kick poller owns dispatch (TX) +
+                        // its own RX poll; no thread to join.
+                        slot.net = Some(WorkerHandle {
+                            exit: Arc::new(AtomicBool::new(false)),
+                            thread: None,
+                            description: format!("net l2cpu {} (engine)", l2cpu_idx),
+                        });
+                    }
                     Err(e) => dlog!(
                         "[run_boot l2cpu {}] virtio-engine: VirtioNet::new failed: {}",
                         l2cpu_idx,
