@@ -388,6 +388,15 @@ enum DebugAction {
         #[arg(long)]
         y: Option<u16>,
     },
+    /// Bring up the M5 (#71) Tensix virtio engine via the
+    /// `TensixEngine` module: pick tile, load M3 firmware, release
+    /// BRISC, run the M5 handshake. PASS = handshake completes with
+    /// matching protocol version. This is the same code path the
+    /// daemon will use when the `virtio-engine` feature is enabled
+    /// (M4.3 dispatch_boot integration); running it standalone
+    /// gives an integration check without booting any L2CPU.
+    /// Bypasses the daemon. Issue #71.
+    TensixEngine,
 }
 
 #[derive(Subcommand)]
@@ -706,6 +715,9 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
         action,
         DebugAction::ReadResetReg | DebugAction::TelemetryDump { .. } | DebugAction::PickTile,
     );
+    // TensixEngine bring-up writes to the chip (loads firmware,
+    // drives reset). It belongs in the writes-chip set below.
+    let _ = DebugAction::TensixEngine;
     if daemon_up && writes_chip {
         return Err(std::io::Error::other(format!(
             "daemon is running for card {} — refusing to write chip state from outside the daemon \
@@ -763,7 +775,33 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
             drop(chip);
             run_tensix_virtio(card, x, y)
         }
+        DebugAction::TensixEngine => run_tensix_engine(card, &chip),
     }
+}
+
+/// Bring up the Tensix virtio engine via `TensixEngine::bring_up` —
+/// the same code path the daemon will use under the
+/// `virtio-engine` feature. Verifies handshake + protocol version
+/// match end-to-end.
+fn run_tensix_engine(card: u32, chip: &shared_chip::SharedChip) -> std::io::Result<()> {
+    eprintln!("[tensix-engine] bringing up via TensixEngine::bring_up");
+    let engine = tensix_engine::TensixEngine::bring_up(card, chip)?;
+    eprintln!(
+        "[tensix-engine] PASS: tile NOC0 ({}, {}), translated ({}, {}), \
+         firmware_version={:#010x}, protocol_version={}",
+        engine.noc0_x,
+        engine.noc0_y,
+        engine.translated_x,
+        engine.translated_y,
+        engine.firmware_version,
+        engine.protocol_version,
+    );
+    let (producer, consumer, entries) = engine.kick_ring_header();
+    eprintln!(
+        "[tensix-engine]   kick ring: producer={}, consumer={}, entries={}",
+        producer, consumer, entries
+    );
+    Ok(())
 }
 
 /// Resolve `(x, y)` from the CLI: pass-through if both are present,

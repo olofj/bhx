@@ -120,20 +120,29 @@ impl TensixEngine {
         tile.load_brisc_firmware(ve::VIRTIO_FIRMWARE);
         tile.release_brisc_only();
 
-        // Sanity-poke the firmware: read the magic out of the stats
-        // page. If BRISC didn't run (reset stuck, firmware corrupt,
-        // etc.) we want a clear error here rather than a confused
-        // guest later.
-        let stats_magic = tile.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAGIC);
-        if stats_magic != ve::STATS_MAGIC_LOADED {
-            return Err(io::Error::other(format!(
-                "BRISC firmware on tile ({}, {}) did not initialize \
-                 stats magic (got {:#010x}, expected {:#010x})",
-                picked.x,
-                picked.y,
-                stats_magic,
-                ve::STATS_MAGIC_LOADED
-            )));
+        // Wait for the firmware to publish its stats-page magic.
+        // BRISC runs init_stats + init_proto + init_device × 16
+        // before this is set; at ~64 KiB of stores at ~1 GHz this
+        // is microseconds, but we poll up to 200 ms to keep things
+        // robust against slow first sweeps.
+        let stats_magic_addr = ve::STATS_BASE + ve::STATS_OFF_MAGIC;
+        let started = std::time::Instant::now();
+        loop {
+            let m = tile.read_l1_u32(stats_magic_addr);
+            if m == ve::STATS_MAGIC_LOADED {
+                break;
+            }
+            if started.elapsed() > std::time::Duration::from_millis(200) {
+                return Err(io::Error::other(format!(
+                    "BRISC firmware on tile ({}, {}) did not initialize \
+                     stats magic within 200 ms (got {:#010x}, expected {:#010x})",
+                    picked.x,
+                    picked.y,
+                    m,
+                    ve::STATS_MAGIC_LOADED
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
         // M5 (#71) handshake. BRISC blocks in `wait_for_hello_and_ack`
