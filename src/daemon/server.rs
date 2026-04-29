@@ -521,19 +521,20 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Re
     let mut l2cpus = Vec::new();
     for (idx, slot_mutex) in state.l2cpus.iter().enumerate() {
         let slot = slot_mutex.lock().unwrap();
-        let (st, disk, net, clients) = match slot.as_ref() {
+        let (st, disk, net, virtio_console, clients) = match slot.as_ref() {
             None => {
                 let st = if state.wedged[idx].load(Ordering::Relaxed) {
                     L2CpuState::Wedged
                 } else {
                     L2CpuState::Stopped
                 };
-                (st, None, false, 0)
+                (st, None, false, false, 0)
             }
             Some(s) => (
                 L2CpuState::Running,
                 s.disks.first().map(|d| d.path.clone()),
                 s.net.is_some(),
+                s.virtio_console.is_some(),
                 s.console_hub.client_count() as u32,
             ),
         };
@@ -542,6 +543,7 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Re
             state: st,
             disk,
             net,
+            virtio_console,
             clients,
         });
     }

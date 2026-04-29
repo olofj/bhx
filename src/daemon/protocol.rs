@@ -202,6 +202,11 @@ pub struct L2CpuStatus {
     pub state: L2CpuState,
     pub disk: Option<String>,
     pub net: bool,
+    /// Whether a virtio-console device is attached to this slot
+    /// (#54). `#[serde(default)]` keeps this wire-compatible with
+    /// pre-#54 clients that don't send the field; they get `false`.
+    #[serde(default)]
+    pub virtio_console: bool,
     pub clients: u32,
 }
 
@@ -374,6 +379,7 @@ mod tests {
                 state: L2CpuState::Running,
                 disk: Some("rootfs-0.ext4".into()),
                 net: true,
+                virtio_console: true,
                 clients: 1,
             }],
         });
@@ -384,9 +390,22 @@ mod tests {
             assert_eq!(s.pid, 1234);
             assert_eq!(s.l2cpus.len(), 1);
             assert_eq!(s.l2cpus[0].state, L2CpuState::Running);
+            assert!(s.l2cpus[0].virtio_console);
         } else {
             panic!("wrong variant");
         }
+    }
+
+    #[test]
+    fn status_payload_decodes_pre_54_clients_with_default_virtio_console() {
+        // Wire compatibility: a pre-#54 client sends a StatusPayload
+        // without `virtio_console`. `#[serde(default)]` must default
+        // it to false rather than failing to parse.
+        let json = r#"{"pid":1,"uptime_secs":0,"l2cpus":[
+            {"idx":0,"state":"stopped","disk":null,"net":false,"clients":0}
+        ]}"#;
+        let s: StatusPayload = serde_json::from_str(json).expect("legacy frame must decode");
+        assert!(!s.l2cpus[0].virtio_console);
     }
 
     #[test]

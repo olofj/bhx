@@ -258,9 +258,10 @@ pub fn status(card: u32) -> io::Result<()> {
                 for l in &p.l2cpus {
                     let disk = l.disk.as_deref().unwrap_or("-");
                     let net = if l.net { "y" } else { "-" };
+                    let vc = if l.virtio_console { "y" } else { "-" };
                     println!(
-                        "  l2cpu {}: {:?} disk={} net={} clients={}",
-                        l.idx, l.state, disk, net, l.clients
+                        "  l2cpu {}: {:?} disk={} net={} vconsole={} clients={}",
+                        l.idx, l.state, disk, net, vc, l.clients
                     );
                 }
                 Ok(())
