@@ -53,10 +53,11 @@ jobs:
   audit:
     name: cargo-audit (advisories)
     runs-on: ubuntu-latest
-    # Warn-only initially: a transitive advisory we can't immediately
-    # fix shouldn't block PRs. Once we settle on a triage process, drop
-    # the continue-on-error so an advisory becomes a hard fail.
-    continue-on-error: true
+    # Hard fail: the dep tree is small and a real advisory landing on us
+    # is rare enough to be worth a CI signal rather than silently passing.
+    # If a transitive crate awaits an upstream fix, prefer
+    # `cargo audit --ignore RUSTSEC-YYYY-NNNN` with a comment pointing at
+    # the upstream issue over re-introducing continue-on-error.
     steps:
       - uses: actions/checkout@v6
 
