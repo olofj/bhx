@@ -700,8 +700,37 @@ static void trisc0_uart_feed_push(unsigned l2cpu_idx, uint8_t byte) {
     }
     uint32_t idx = producer & BRISC_UART_FEED_RING_MASK;
     uintptr_t slot_addr = priv + UART_PRIV_OFF_FEED_RING + idx * 4u;
-    *l1_u32(slot_addr) = (uint32_t)byte;
-    FENCE_W();
+    // Tensix LSU quirk (per `BabyRISCV/MemoryOrdering.md`'s mailbox
+    // example): `fence w,w` drains the store queue but doesn't
+    // guarantee writes to different L1 banks are *processed* in
+    // program order. The canonical fix is store, load-back, **consume
+    // the load result** (creating a true data dependency that forces
+    // the LSU to wait for the load to complete, which can only happen
+    // once the prior store has been processed by L1), then store
+    // again.
+    //
+    // Inline asm because plain C `(void)*l1_u32(...)` doesn't express
+    // the consume — GCC's scheduler issues the load but doesn't make
+    // the next store wait for it. We want exactly:
+    //   sw  byte,         0(slot_addr)
+    //   lw  back,         0(slot_addr)
+    //   <use of `back` before next store>
+    //   sw  producer+1,   0(producer_seq_addr)
+    // Consume-the-result trick must be a real instruction, not just an
+    // asm constraint — `__asm__("" :: "r"(back))` doesn't emit code, so
+    // the LSU has nothing to stall on. `addi x0, t, 0` reads `t` and
+    // discards into x0; that real instruction creates the data
+    // dependency the LSU needs to wait for the load to retire (and
+    // therefore for the prior store to be processed by L1) before
+    // moving on to the next store.
+    uint32_t back;
+    __asm__ volatile(
+        "sw   %1, 0(%2)\n\t"
+        "lw   %0, 0(%2)\n\t"
+        "addi x0, %0, 0\n\t"
+        : "=&r"(back)
+        : "r"((uint32_t)byte), "r"(slot_addr)
+        : "memory");
     *l1_u32(priv + UART_PRIV_OFF_FEED_PRODUCER_SEQ) = producer + 1u;
     FENCE_W();
 }
@@ -769,6 +798,12 @@ static void trisc0_uart_poll_one(unsigned l2cpu_idx) {
 // inactive rings either.
 static void brisc_drain_uart_feed_ring_one(unsigned l2cpu_idx) {
     uintptr_t priv = brisc_uart_private_base(l2cpu_idx);
+    // Tensix LSU quirk (per `BabyRISCV/MemoryOrdering.md`'s mailbox
+    // example): without a fence, the L0 data cache may serve a stale
+    // producer-seq value, masking writes TRISC0 has already published.
+    // Flush at the top of every drain so producer_seq + ring[] reads
+    // are guaranteed fresh from L1.
+    __asm__ volatile("fence" ::: "memory");
     uint32_t producer = *l1_u32(priv + UART_PRIV_OFF_FEED_PRODUCER_SEQ);
     uint32_t consumer = *l1_u32(priv + UART_PRIV_OFF_FEED_CONSUMER_SEQ);
     while (consumer != producer) {

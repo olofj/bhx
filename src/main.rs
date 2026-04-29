@@ -876,7 +876,10 @@ fn run_tensix_engine(card: u32, chip: &shared_chip::SharedChip) -> std::io::Resu
             hb_quiet, hb_quiet2
         )));
     }
-    eprintln!("[tensix-engine]   TRISC0 heartbeat held at {} (in reset)", hb_quiet);
+    eprintln!(
+        "[tensix-engine]   TRISC0 heartbeat held at {} (in reset)",
+        hb_quiet
+    );
 
     // Set bit 16 (UART for L2CPU 0) — BRISC must release TRISC0.
     engine.write_active_slots((1u32 << 7) | (1u32 << 16));
