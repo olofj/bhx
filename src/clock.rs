@@ -274,4 +274,38 @@ mod tests {
             "all CNTL5 writes must complete before fbdiv stepping starts"
         );
     }
+
+    #[test]
+    fn set_frequency_to_already_current_target_is_idempotent() {
+        // When the PLL is already at 200 MHz and we ask for 200 MHz
+        // again (e.g. SharedChip::idle_pll called against an idle chip
+        // where reset_x280 already stepped down), no register writes
+        // should be issued, and the final state must match the
+        // expected solution. Pin both: the call is harmless, and the
+        // state is what the chip would expect on the next step-up.
+        let (target_fbdiv, target_postdiv) = frequency_solution(200);
+        let initial_cntl1 = PllCntl1 {
+            refdiv: 0,
+            postdiv: 0,
+            fbdiv: target_fbdiv,
+        }
+        .to_u32();
+        let initial_cntl5 = PllCntl5 {
+            postdiv: target_postdiv,
+        }
+        .to_u32();
+        let mock = MockPll::new(initial_cntl1, initial_cntl5);
+
+        set_frequency(&mock, 200);
+
+        assert!(
+            mock.log.borrow().is_empty(),
+            "expected zero PLL writes at already-target state, got {:?}",
+            mock.log.borrow()
+        );
+        let final_cntl1 = PllCntl1::from_u32(*mock.cntl1.borrow());
+        assert_eq!(final_cntl1.fbdiv, target_fbdiv);
+        let final_cntl5 = PllCntl5::from_u32(*mock.cntl5.borrow());
+        assert_eq!(final_cntl5.postdiv, target_postdiv);
+    }
 }

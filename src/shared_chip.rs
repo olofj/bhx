@@ -253,6 +253,19 @@ impl SharedChip {
     /// PLL step down to 200 MHz → OR-in release bits → PLL step up to 1750
     /// MHz. Holds `seq_lock` for the entire sequence so concurrent callers
     /// serialize rather than stepping the PLL against each other.
+    /// Step the chip-wide L2CPU PLL down to 200 MHz. Caller is
+    /// responsible for ensuring no L2CPU is currently running — the
+    /// daemon checks the slot table before invoking. Holds `seq_lock`
+    /// to serialize against `reset_x280`, so a concurrent boot blocks
+    /// here and then `reset_x280`'s existing 200→1750 step-up brings
+    /// the PLL back when the next L2CPU boots. See #95.
+    pub fn idle_pll(&self) {
+        let _guard = self.seq_lock.lock().unwrap();
+        crate::dlog!("[idle_pll] stepping L2CPU PLL down to 200 MHz (no L2CPU running)");
+        clock::set_frequency(self, 200);
+        crate::dlog!("[idle_pll] done");
+    }
+
     pub fn reset_x280(&self, l2cpu_indices: &[usize]) {
         let _guard = self.seq_lock.lock().unwrap();
 

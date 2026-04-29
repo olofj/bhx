@@ -129,6 +129,10 @@ pub fn serve(
             slot.shutdown();
         }
     }
+    // All slots drained — step the L2CPU PLL down before the daemon
+    // releases its SharedChip. Next daemon's reset_x280 brings it
+    // back up unconditionally (#95).
+    state.maybe_idle_pll();
     // Clean up socket file; pidfile flock is released when our guard drops in
     // the caller (`run_foreground`).
     let _ = std::fs::remove_file(lifetime::socket_path(card));
@@ -1849,6 +1853,10 @@ fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) -> 
                 .disconnect_all_with_reason(&format!("l2cpu {} stopped", l2cpu_idx));
             unregister_engine_slots(state, l2cpu_idx);
             slot.shutdown();
+            // If this was the last booted slot on the card, step the
+            // L2CPU PLL down to its idle setpoint — the next boot's
+            // reset_x280 brings it back up automatically (#95).
+            state.maybe_idle_pll();
             dlog!("[stop l2cpu {}] workers joined — replying ok", l2cpu_idx);
             reply_ok(sock);
             Ok(())

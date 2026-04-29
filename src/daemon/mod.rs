@@ -166,6 +166,18 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
+    /// Step the chip-wide L2CPU PLL down to 200 MHz when no slot is
+    /// currently booted. Call after a teardown that drains the slot
+    /// table — `dispatch_stop`, `boot --force` teardown, daemon
+    /// shutdown loop. The PLL comes back up to 1750 MHz automatically
+    /// on the next boot via `reset_x280`'s existing step-up. See #95.
+    pub fn maybe_idle_pll(&self) {
+        let any_booted = self.l2cpus.iter().any(|m| m.lock().unwrap().is_some());
+        if !any_booted {
+            self.shared_chip.idle_pll();
+        }
+    }
+
     /// Build daemon state with a ready-made `SharedChip`. The server
     /// constructs the `SharedChip` at daemon startup (`SharedChip::new(card)`)
     /// and passes an `Arc` in here; tests pass a placeholder (see
