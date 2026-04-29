@@ -279,7 +279,6 @@ static void handle_queue_sel_change(unsigned slot, uint32_t sel) {
         return;
     }
     uint32_t num   = *l1_u32(shadow_queue_addr(slot, sel, SHADOW_Q_OFF_NUM));
-    uint32_t ready = *l1_u32(shadow_queue_addr(slot, sel, SHADOW_Q_OFF_READY));
 
     // QueueNumMax is always BRISC_VIRTIO_QUEUE_NUM_MAX for queues we
     // support; it's 0 for queues past `num_queues` to tell the guest
@@ -288,7 +287,17 @@ static void handle_queue_sel_change(unsigned slot, uint32_t sel) {
 
     *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NUM_MAX)) = num_max;
     *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NUM))     = num;
-    *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY))   = ready;
+    // Always clear visible QUEUE_READY=0 on SEL change. Stock Linux's
+    // vm_setup_vq for queue N+1 starts with `writel(SEL=N+1);
+    // readl(QUEUE_READY)` expecting 0 — but if we mirror
+    // shadow[N+1].READY (which might legitimately be 1 if a previous
+    // setup left the queue ready), the kernel sees stale 1 and bails
+    // with -ENOENT. The eager clear elsewhere handles the
+    // SAME-SEL-window race; this addresses the SEL-transition window.
+    // Setting READY=0 here is safe: the kernel never reads READY
+    // after writing 1 (only on next vm_setup_vq cycle), and del_vq's
+    // `writel(0); WARN_ON(readl !=0)` sees 0 (= what it just wrote).
+    *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY))   = 0;
     FENCE_W();
 
     inc_stat(STATS_OFF_SEL_CHANGES);
@@ -610,7 +619,16 @@ void main(void) {
 
     uint32_t heartbeat = 0;
     for (;;) {
+        // Only poll slots the daemon has marked active. With one
+        // L2CPU booted, that's 4 of 16 slots — sweep period drops
+        // from ~4µs to ~1µs, narrow enough to reliably win the
+        // SEL→READY race against stock kernels (Alma 10) that
+        // don't have the SW_IMPL handshake.
+        uint32_t active = read_u32(ctrl_addr(CTRL_OFF_ACTIVE_SLOTS));
         for (unsigned slot = 0; slot < BRISC_VIRTIO_NUM_SLOTS; slot++) {
+            if (((active >> slot) & 1u) == 0) {
+                continue;
+            }
             poll_one_device(slot);
         }
         poll_completion_ring();

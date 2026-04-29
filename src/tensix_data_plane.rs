@@ -128,6 +128,12 @@ pub type Registry = Arc<Mutex<HashMap<u32, RegEntry>>>;
 pub struct KickPoller {
     pub stats: Arc<PollerStats>,
     pub registry: Registry,
+    /// Cloned for register/unregister to push the active-slots
+    /// bitmap into BRISC L1 — BRISC uses it to skip non-active
+    /// slots in its sweep. Without this, BRISC polls all 16 slots
+    /// and the per-slot revisit period is ~4µs, slow enough to
+    /// lose the SEL→READY race against stock kernels.
+    engine: Arc<TensixEngine>,
     exit: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
@@ -143,26 +149,45 @@ impl KickPoller {
         let stats_thread = Arc::clone(&stats);
         let registry_thread = Arc::clone(&registry);
         let exit_thread = Arc::clone(&exit);
+        let engine_thread = Arc::clone(&engine);
         let join = thread::Builder::new()
             .name("tensix-kick-poller".to_string())
-            .spawn(move || run_poll_loop(engine, stats_thread, registry_thread, exit_thread))
+            .spawn(move || run_poll_loop(engine_thread, stats_thread, registry_thread, exit_thread))
             .expect("spawn tensix-kick-poller");
         KickPoller {
             stats,
             registry,
+            engine,
             exit,
             join: Some(join),
         }
     }
 
+    /// Recompute the active-slots bitmap from the registry and write
+    /// it into BRISC L1 at CTRL_OFF_ACTIVE_SLOTS. BRISC reads this
+    /// on every sweep iteration; bit `i` set means \"poll slot `i`.\"
+    fn publish_active_mask(&self, map: &HashMap<u32, RegEntry>) {
+        let mut mask: u32 = 0;
+        for &slot in map.keys() {
+            if slot < 32 {
+                mask |= 1u32 << slot;
+            }
+        }
+        self.engine.write_l1_u32(
+            crate::tensix_proto::CTRL_BASE + crate::tensix_proto::CTRL_OFF_ACTIVE_SLOTS,
+            mask,
+        );
+    }
+
     /// Register a (slot, l2cpu, device, interrupt) tuple. Future
     /// kicks for `slot` will dispatch to `entry.device`'s
-    /// VirtioDeviceImpl methods. dispatch_boot calls this under the
-    /// `virtio-engine` feature flag, once per enabled device.
+    /// VirtioDeviceImpl methods. dispatch_boot calls this once per
+    /// enabled device.
     pub fn register_slot(&self, entry: RegEntry) {
         let slot = entry.slot;
         let mut map = self.registry.lock().unwrap();
         map.insert(slot, entry);
+        self.publish_active_mask(&map);
     }
 
     /// Unregister a slot — called when an L2CPU is being torn down
@@ -172,6 +197,7 @@ impl KickPoller {
     pub fn unregister_slot(&self, slot: u32) {
         let mut map = self.registry.lock().unwrap();
         map.remove(&slot);
+        self.publish_active_mask(&map);
     }
 
     /// Signal the thread to exit and join it. Idempotent.

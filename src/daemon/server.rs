@@ -839,6 +839,7 @@ fn dispatch_boot(
     // L2CPU from reset so the kernel's virtio probe runs against a
     // daemon that's already watching MMIO. See `release_l2cpu_from_reset`.
     release_l2cpu_from_reset(state, l2cpu_idx, &slot.l2cpu);
+
     install_slot_and_reply_ok(state, l2cpu_idx, slot, sock);
     Ok(())
 }

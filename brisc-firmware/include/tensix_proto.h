@@ -91,6 +91,14 @@
 #define CTRL_OFF_HELLO            0x0000u
 #define CTRL_OFF_HELLO_ACK        0x0040u
 #define CTRL_OFF_KICK_RING_HDR    0x0080u
+// 16-bit bitmap (low 16 bits used) of active virtio slots. Daemon
+// sets the bit when register_slot is called for that slot, clears
+// when unregister_slot. BRISC's main poll loop skips slots whose
+// bit is 0 — cuts the per-slot sweep cost on a single-L2CPU boot
+// (4 active vs 16 total) so the sweep period drops far enough
+// to reliably win the SEL→READY race against stock kernels that
+// don't have the SW_IMPL handshake.
+#define CTRL_OFF_ACTIVE_SLOTS     0x00C0u
 #define CTRL_OFF_KICK_RING        0x0100u
 #define CTRL_OFF_COMPL_RING_HDR   0x0500u
 #define CTRL_OFF_COMPL_RING       0x0600u

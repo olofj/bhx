@@ -46,6 +46,7 @@ pub const CTRL_SIZE: u32 = 0x0000_1000;
 pub const CTRL_OFF_HELLO: u32 = 0x0000;
 pub const CTRL_OFF_HELLO_ACK: u32 = 0x0040;
 pub const CTRL_OFF_KICK_RING_HDR: u32 = 0x0080;
+pub const CTRL_OFF_ACTIVE_SLOTS: u32 = 0x00C0;
 pub const CTRL_OFF_KICK_RING: u32 = 0x0100;
 pub const CTRL_OFF_COMPL_RING_HDR: u32 = 0x0500;
 pub const CTRL_OFF_COMPL_RING: u32 = 0x0600;
