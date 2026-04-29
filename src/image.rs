@@ -9,8 +9,8 @@
 //!
 //! # Threat model for `Command::new` invocations
 //!
-//! This module shells out to `wget`, `xz`, `unzip`, `qemu-img`, `sfdisk`,
-//! `dd`, `e2fsck`, `resize2fs` by basename — `Command::new("wget")`
+//! This module shells out to `xz`, `unzip`, `qemu-img`, `sfdisk`,
+//! `dd`, `e2fsck`, `resize2fs` by basename — `Command::new("xz")`
 //! resolves via `$PATH`. A malicious `$PATH` (or a shell function
 //! shadowing one of these names) could substitute a different binary.
 //! That's accepted: these helpers run as the operator's own user from
@@ -19,6 +19,9 @@
 //! anything else the operator can. Resolving via `which` once at
 //! startup wouldn't change the threat model — it'd be the same
 //! `which` lookup against the same `$PATH`, just done earlier.
+//!
+//! HTTP downloads themselves go through `crate::fetch::download_to_*`
+//! (native ureq), so the `wget` binary is no longer a runtime dep.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -344,9 +347,9 @@ pub fn pull_image(name: &str, output: Option<&Path>, force_refetch: bool) -> Res
     Ok(final_path)
 }
 
-/// Download a file via wget and run any requested decompression.
+/// Download a file via fetch::download_to and run any requested decompression.
 ///
-/// Layout: wget downloads to `<dir>/<filename>` (the URL's basename),
+/// Layout: download lands at `<dir>/<filename>` (the URL's basename),
 /// using `fetch::download_to` for temp+cleanup. For Xz, we then run
 /// `xz -d` on the downloaded file, which consumes it and leaves
 /// `<filename without .xz>`. For Zip, we unzip into `dir` and locate

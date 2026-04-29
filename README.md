@@ -40,8 +40,9 @@ full bring-up:
   - `libvdeslirp-dev` / `libslirp-dev` (if you want guest networking —
     on by default via the `slirp` Cargo feature; disable with
     `--no-default-features` if you don't need net).
-  - For downloading pre-built rootfs images: `wget`, `xz-utils`,
-    `unzip`, `qemu-utils`, `fdisk`, `e2fsprogs`.
+  - For downloading pre-built rootfs images: `xz-utils`,
+    `unzip`, `qemu-utils`, `fdisk`, `e2fsprogs`. (HTTP downloads
+    themselves are native via the `ureq` crate.)
 
 Build the tool:
 

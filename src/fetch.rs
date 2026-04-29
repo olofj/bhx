@@ -1,26 +1,26 @@
 // SPDX-FileCopyrightText: © 2026 Olof Johansson
 // SPDX-License-Identifier: MIT
 
-//! Shared download helpers used by `image`, `kernel`, and `ramdisk`.
+//! Shared download helpers used by `image` and `ramdisk`.
 //!
 //! Two layers:
 //!
-//! * [`download_to`] is the basic wget-with-temp wrapper. Used directly
-//!   by callers that don't want caching (or that already wrap us with
-//!   their own cache).
+//! * [`download_to`] streams a URL to a temp file (via `ureq`), then
+//!   atomically renames into place. Used directly by callers that don't
+//!   want caching.
 //! * [`download_to_cached`] consults a `<dest>.fetch.json` sidecar and
-//!   skips the body download if a `wget --spider` HEAD against the URL
-//!   shows the upstream's `ETag` / `Last-Modified` matches what the
-//!   sidecar recorded last time.
+//!   skips the body download if a HEAD against the URL shows the
+//!   upstream's `ETag` / `Last-Modified` matches what the sidecar
+//!   recorded last time.
 //!
 //! Decompression / unpacking stays in the call-site modules
-//! (`image.rs`, `kernel.rs`, `ramdisk.rs`); the semantics genuinely
-//! differ per caller (xz keep-input vs not, gunzip in-place, unzip-
-//! into-directory).
+//! (`image.rs`, `ramdisk.rs`); the semantics genuinely differ per
+//! caller (xz keep-input vs not, gunzip in-place, unzip-into-directory).
 
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -37,69 +37,99 @@ pub struct FetchMetadata {
     pub last_modified: Option<String>,
 }
 
-/// Download `url` into `dest_path` via `wget`.
+/// Download `url` into `dest_path` via a streaming HTTP GET.
 ///
-/// Writes to `<dest_path>.downloading` first so a Ctrl-C or wget
-/// failure mid-transfer doesn't leave a half-written file under the
-/// real name. Any pre-existing `.downloading` file from a prior
-/// crashed run is removed before the new wget starts. On wget
-/// success, the temp is renamed to `dest_path` and the path is
-/// returned. On failure, the temp is removed.
+/// Writes to `<dest_path>.downloading` first so a Ctrl-C or transfer
+/// failure mid-flight doesn't leave a half-written file under the real
+/// name. Any pre-existing `.downloading` file from a prior crashed run
+/// is removed before the new GET starts. On success, the temp is
+/// renamed to `dest_path` and the path is returned. On failure, the
+/// temp is removed.
+///
+/// Live progress (bytes received / total / current rate) is written to
+/// stderr; the post-download summary line lands on stderr too so log-
+/// scraping by stdout-only consumers stays unaffected.
 pub fn download_to(url: &str, dest_path: &Path) -> Result<PathBuf> {
     let temp_path = downloading_path(dest_path);
 
     // Stale `.downloading` from a previous crashed run: drop it before
-    // starting wget so the new transfer doesn't append/race with old
-    // bytes. Ignore errors — if the file isn't there, that's fine.
+    // starting the new GET so we don't append/race with old bytes.
     let _ = fs::remove_file(&temp_path);
 
-    eprintln!("  Downloading...");
-    let status = Command::new("wget")
-        .arg("-O")
-        .arg(&temp_path)
-        .arg("--progress=bar:force:noscroll")
-        .arg(url)
-        .status()
-        .map_err(|e| {
-            Error::internal(format!(
-                "Failed to run wget: {}. Install with: apt install wget",
-                e
-            ))
-        })?;
-
-    if !status.success() {
-        let _ = fs::remove_file(&temp_path);
-        return Err(Error::internal("Download failed"));
+    eprintln!("  Downloading {}", url);
+    let started = Instant::now();
+    let mut response = ureq::get(url)
+        .call()
+        .map_err(|e| Error::internal(format!("GET {}: {}", url, e)))?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(Error::internal(format!(
+            "GET {} returned status {}",
+            url, status
+        )));
     }
+    let total = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
 
-    fs::rename(&temp_path, dest_path).map_err(Error::io_ctx("Failed to rename download"))?;
+    let mut file = fs::File::create(&temp_path).map_err(Error::io_ctx("create temp"))?;
+    let mut reader = response.body_mut().as_reader();
+    let mut buf = [0u8; 64 * 1024];
+    let mut got: u64 = 0;
+    let mut last_print = Instant::now();
+    let res = (|| -> Result<()> {
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => return Err(Error::internal(format!("read body: {}", e))),
+            };
+            file.write_all(&buf[..n])
+                .map_err(Error::io_ctx("write temp"))?;
+            got += n as u64;
+            if last_print.elapsed() >= Duration::from_millis(200) {
+                print_progress(got, total, started.elapsed());
+                last_print = Instant::now();
+            }
+        }
+        Ok(())
+    })();
+    drop(reader);
+    if let Err(e) = res {
+        let _ = fs::remove_file(&temp_path);
+        return Err(e);
+    }
+    file.flush().map_err(Error::io_ctx("flush temp"))?;
+    drop(file);
+
+    let elapsed = started.elapsed();
+    fs::rename(&temp_path, dest_path).map_err(Error::io_ctx("rename download"))?;
+
+    // Final newline because the in-place \r progress line doesn't end
+    // with one. Then the summary on its own line.
+    eprintln!();
+    eprintln!(
+        "  Downloaded {} in {} (avg {}/s)",
+        format_bytes(got),
+        format_duration(elapsed),
+        format_bytes(rate_bps(got, elapsed)),
+    );
     Ok(dest_path.to_path_buf())
 }
 
 /// Variant of `download_to` that consults a sidecar metadata file to
-/// skip the wget when the upstream hasn't changed.
+/// skip the GET when the upstream hasn't changed.
 ///
 /// `sidecar_anchor` is the path of the *final* artifact that survives
 /// the caller's pipeline — the sidecar lives at
 /// `<sidecar_anchor>.fetch.json`. For pipelines that do nothing post-
-/// download (raw initrd), `sidecar_anchor == dest_path`. For
-/// pipelines that decompress / unzip / convert (image .ext4, kernel
-/// `Image`, ramdisk .gz/.xz), pass the path the surviving artifact
-/// will end up at — the cache check on the next call looks at that
-/// file's existence + the sidecar, not the long-gone download
-/// intermediate. See #26.
-///
-/// Behavior:
-/// - If `force` is true, the cache check is bypassed and we always
-///   download.
-/// - Else, if the anchor file is missing OR its sidecar is
-///   missing/invalid, we download.
-/// - Else, run `wget --spider` to fetch the upstream's ETag /
-///   Last-Modified. If either field matches the sidecar, skip the
-///   download and return the existing `dest_path`.
-/// - After any successful download, refresh the sidecar (anchored at
-///   `sidecar_anchor`) with the current upstream metadata so the
-///   next call has something to compare against.
+/// download (raw initrd), `sidecar_anchor == dest_path`. For pipelines
+/// that decompress / unzip / convert (image .ext4, ramdisk .gz/.xz),
+/// pass the path the surviving artifact will end up at — the cache
+/// check on the next call looks at that file's existence + the
+/// sidecar, not the long-gone download intermediate. See #26.
 pub fn download_to_cached(
     url: &str,
     dest_path: &Path,
@@ -160,70 +190,95 @@ pub(crate) fn upstream_matches(cached: &FetchMetadata, upstream: &FetchMetadata)
     }
 }
 
-/// Run `wget --spider --server-response <url>` and parse ETag /
-/// Last-Modified out of the response headers. Follows redirects (the
-/// last block of HTTP/1.1 lines is the one whose ETag we care about).
+/// HTTP HEAD against `url` to read ETag / Last-Modified for the
+/// conditional-cache check. ureq follows redirects automatically, so
+/// the headers we read come from the final response.
 fn head_metadata(url: &str) -> Result<FetchMetadata> {
-    let output = Command::new("wget")
-        .arg("--spider")
-        .arg("--server-response")
-        .arg("--tries=1")
-        .arg("--timeout=10")
-        .arg(url)
-        .output()
-        .map_err(|e| Error::internal(format!("Failed to run wget --spider: {}", e)))?;
-    // wget --spider prints headers to stderr regardless of HTTP status.
-    // We don't care if it returned non-zero (some servers 405 a HEAD);
-    // we only want whatever headers it managed to capture.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Ok(parse_wget_headers(&stderr))
+    let response = ureq::head(url)
+        .call()
+        .map_err(|e| Error::internal(format!("HEAD {}: {}", url, e)))?;
+    let headers = response.headers();
+    Ok(FetchMetadata {
+        etag: headers
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        last_modified: headers
+            .get("last-modified")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+    })
 }
 
-/// Parse wget --server-response stderr for the ETag and Last-Modified
-/// of the *last* HTTP response block. wget prefixes each header line
-/// with two spaces; redirect chains print one block per hop.
-pub(crate) fn parse_wget_headers(stderr: &str) -> FetchMetadata {
-    let mut last_etag: Option<String> = None;
-    let mut last_lm: Option<String> = None;
-    let mut block_etag: Option<String> = None;
-    let mut block_lm: Option<String> = None;
-    for raw in stderr.lines() {
-        let line = raw.trim_start();
-        // A new HTTP response block resets the per-block accumulators
-        // — but commit the previous block's findings to "last_*" so
-        // a subsequent block without ETag doesn't lose a redirect's
-        // ETag entirely.
-        if line.starts_with("HTTP/") {
-            if block_etag.is_some() {
-                last_etag = block_etag.take();
-            }
-            if block_lm.is_some() {
-                last_lm = block_lm.take();
-            }
-            continue;
+/// In-place stderr progress line. Overwrites itself with `\r` so the
+/// terminal doesn't scroll a hundred lines per download. With no
+/// content-length, omits the percentage and ETA.
+fn print_progress(got: u64, total: Option<u64>, elapsed: Duration) {
+    let rate = rate_bps(got, elapsed);
+    match total {
+        Some(t) if t > 0 => {
+            let pct = (got as f64 / t as f64 * 100.0).min(100.0);
+            eprint!(
+                "\r  {} / {} ({:.1}%) — {}/s          ",
+                format_bytes(got),
+                format_bytes(t),
+                pct,
+                format_bytes(rate),
+            );
         }
-        if let Some(rest) = line
-            .strip_prefix("ETag: ")
-            .or_else(|| line.strip_prefix("etag: "))
-        {
-            block_etag = Some(rest.trim().to_string());
-        } else if let Some(rest) = line
-            .strip_prefix("Last-Modified: ")
-            .or_else(|| line.strip_prefix("last-modified: "))
-        {
-            block_lm = Some(rest.trim().to_string());
+        _ => {
+            eprint!(
+                "\r  {} — {}/s          ",
+                format_bytes(got),
+                format_bytes(rate),
+            );
         }
     }
-    // Final block's findings.
-    if let Some(e) = block_etag {
-        last_etag = Some(e);
+    let _ = std::io::stderr().flush();
+}
+
+/// Bytes-per-second over `elapsed`; 0 if no time has passed yet.
+fn rate_bps(bytes: u64, elapsed: Duration) -> u64 {
+    let secs = elapsed.as_secs_f64();
+    if secs <= 0.0 {
+        0
+    } else {
+        (bytes as f64 / secs) as u64
     }
-    if let Some(lm) = block_lm {
-        last_lm = Some(lm);
+}
+
+/// Format bytes as IEC binary (KiB / MiB / GiB). Ranges chosen to keep
+/// the printable string tight: 3-4 significant figures.
+fn format_bytes(n: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if n >= GIB {
+        format!("{:.2} GiB", n as f64 / GIB as f64)
+    } else if n >= MIB {
+        format!("{:.1} MiB", n as f64 / MIB as f64)
+    } else if n >= KIB {
+        format!("{:.1} KiB", n as f64 / KIB as f64)
+    } else {
+        format!("{} B", n)
     }
-    FetchMetadata {
-        etag: last_etag,
-        last_modified: last_lm,
+}
+
+/// Format a duration as `Xs`, `XmYs`, or `XhYm`. Tighter than the
+/// stdlib's `{:?}` print and more operator-friendly.
+fn format_duration(d: Duration) -> String {
+    let total = d.as_secs();
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{}h{}m", h, m)
+    } else if m > 0 {
+        format!("{}m{}s", m, s)
+    } else {
+        // Sub-second resolution for short downloads, since most
+        // assets in our `image pull` registry land in 5-15 s.
+        format!("{:.1}s", d.as_secs_f64())
     }
 }
 
@@ -289,66 +344,46 @@ mod tests {
         );
     }
 
-    // ---- header parsing ----
+    // ---- format_bytes ----
 
     #[test]
-    fn parse_wget_headers_extracts_etag_and_last_modified() {
-        let stderr = "
---2026-04-25 10:00:00--  https://example.com/foo.bin
-Resolving example.com (example.com)... 1.2.3.4
-Connecting to example.com|1.2.3.4|:443... connected.
-HTTP request sent, awaiting response...
-  HTTP/1.1 200 OK
-  Last-Modified: Tue, 09 Apr 2024 10:21:54 GMT
-  ETag: \"abc123\"
-  Content-Length: 12345
-";
-        let m = parse_wget_headers(stderr);
-        assert_eq!(m.etag.as_deref(), Some("\"abc123\""));
-        assert_eq!(
-            m.last_modified.as_deref(),
-            Some("Tue, 09 Apr 2024 10:21:54 GMT")
-        );
+    fn format_bytes_handles_each_range() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes(50 * 1024 * 1024), "50.0 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GiB");
+        assert_eq!(format_bytes(2_500_000_000), "2.33 GiB");
+    }
+
+    // ---- format_duration ----
+
+    #[test]
+    fn format_duration_subsecond_returns_one_decimal_seconds() {
+        assert_eq!(format_duration(Duration::from_millis(450)), "0.5s");
+        assert_eq!(format_duration(Duration::from_millis(8500)), "8.5s");
     }
 
     #[test]
-    fn parse_wget_headers_takes_last_block_after_redirect() {
-        // Redirect chain: 301 → 200. The 200 block's ETag is what we
-        // want; the 301 block usually has no ETag but might.
-        let stderr = "
-  HTTP/1.1 301 Moved Permanently
-  Location: https://cdn.example.com/foo.bin
-  ETag: \"redirect-etag\"
-  HTTP/1.1 200 OK
-  ETag: \"final-etag\"
-  Content-Length: 12345
-";
-        let m = parse_wget_headers(stderr);
-        assert_eq!(m.etag.as_deref(), Some("\"final-etag\""));
+    fn format_duration_minutes_and_hours() {
+        assert_eq!(format_duration(Duration::from_secs(75)), "1m15s");
+        assert_eq!(format_duration(Duration::from_secs(3725)), "1h2m");
+    }
+
+    // ---- rate_bps ----
+
+    #[test]
+    fn rate_bps_zero_elapsed_yields_zero() {
+        assert_eq!(rate_bps(1024, Duration::from_secs(0)), 0);
     }
 
     #[test]
-    fn parse_wget_headers_handles_lowercased_header_names() {
-        // RFC 7230 says HTTP header names are case-insensitive; some
-        // CDNs lower-case them.
-        let stderr = "
-  HTTP/1.1 200 OK
-  etag: \"lower\"
-  last-modified: Mon, 01 Jan 2024 00:00:00 GMT
-";
-        let m = parse_wget_headers(stderr);
-        assert_eq!(m.etag.as_deref(), Some("\"lower\""));
-        assert_eq!(
-            m.last_modified.as_deref(),
-            Some("Mon, 01 Jan 2024 00:00:00 GMT")
-        );
-    }
-
-    #[test]
-    fn parse_wget_headers_returns_empty_when_no_headers() {
-        let m = parse_wget_headers("");
-        assert!(m.etag.is_none());
-        assert!(m.last_modified.is_none());
+    fn rate_bps_computes_average() {
+        // 1 MiB over 2 s = 524288 B/s.
+        let half_meg = rate_bps(1024 * 1024, Duration::from_secs(2));
+        assert_eq!(half_meg, 524288);
     }
 
     // ---- upstream_matches ----
@@ -466,24 +501,17 @@ HTTP request sent, awaiting response...
         // The download intermediate's existence shouldn't matter —
         // cache_hit checks the anchor file. With no anchor file
         // present, cache is a miss regardless of what's in the
-        // sidecar. (We can't actually run the network HEAD here,
-        // but the function short-circuits on the anchor.exists()
-        // check before any wget, so this exercises that path.)
+        // sidecar.
         let dir = tempfile::tempdir().unwrap();
         let anchor = dir.path().join("rootfs.ext4");
-        // Sidecar exists but anchor doesn't. (Simulates the bug
-        // pre-#26 would have hit if we were anchoring on the
-        // intermediate.)
         let meta = FetchMetadata {
             etag: Some("\"abc123\"".to_string()),
             last_modified: None,
         };
         write_sidecar(&anchor, &meta).unwrap();
-        // Sanity: sidecar IS present.
         assert!(read_sidecar(&anchor).is_some());
-        // But anchor file is missing.
         assert!(!anchor.exists());
-        // cache_hit must be false: nothing for the operator to use.
+        // Short-circuit on anchor.exists() before any HEAD.
         assert!(!cache_hit("http://nowhere.invalid/x", &anchor));
     }
 
@@ -492,8 +520,7 @@ HTTP request sent, awaiting response...
         // When dest_path and sidecar_anchor differ, the sidecar must
         // be written next to the anchor — so a pipeline that consumes
         // dest (gunzip, unzip, xz -d) leaves the sidecar adjacent to
-        // the *surviving* artifact. Rebuilds of pre-#26 behavior
-        // would write the sidecar next to dest and orphan it.
+        // the *surviving* artifact.
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("rootfs.ext4.xz");
         let anchor = dir.path().join("rootfs.ext4");
@@ -502,10 +529,8 @@ HTTP request sent, awaiting response...
             last_modified: None,
         };
         write_sidecar(&anchor, &meta).unwrap();
-        // Sidecar exists at <anchor>.fetch.json, not <dest>.fetch.json.
         assert!(sidecar_path(&anchor).exists());
         assert!(!sidecar_path(&dest).exists());
-        // And it round-trips back via the anchor.
         assert_eq!(read_sidecar(&anchor).unwrap(), meta);
         assert!(read_sidecar(&dest).is_none());
     }
