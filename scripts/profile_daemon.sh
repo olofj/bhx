@@ -98,7 +98,7 @@ note "daemon start ($BINARY)"
 sleep 0.3
 
 note "cold boot L2CPU $L2CPU (rootfs=$ROOTFS, net=on)"
-timeout 90 "$BINARY" boot -t "$CARD" -l "$L2CPU" -d "$ROOTFS" --no-console -n >/dev/null
+timeout 90 "$BINARY" boot -t "$CARD" -l "$L2CPU" -d "$ROOTFS" -n >/dev/null
 
 DAEMON_PID=$(cat "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/tt-bh-linux/$CARD/pid")
 note "daemon pid=$DAEMON_PID"

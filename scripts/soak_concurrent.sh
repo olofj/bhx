@@ -100,7 +100,7 @@ for i in "${CORES[@]}"; do
     (
         set +e
         timeout 90 "$BINARY" boot -t "$CARD" -l "$i" \
-            -d "rootfs-${i}.ext4" -n --no-console \
+            -d "rootfs-${i}.ext4" -n \
             > "$BOOT_STATUS_DIR/boot-${i}.out" 2>&1
         echo $? > "$BOOT_STATUS_DIR/boot-${i}.rc"
     ) &

@@ -111,7 +111,7 @@ time.sleep(0.3)
 
 note(f"cold boot L2CPU {L2CPU} with rootfs={ROOTFS}")
 subprocess.run(
-    [BINARY, "boot", "-t", TTDEVICE, "-l", L2CPU, "-d", ROOTFS, "--no-console"],
+    [BINARY, "boot", "-t", TTDEVICE, "-l", L2CPU, "-d", ROOTFS],
     check=True,
     timeout=90,
 )

@@ -144,8 +144,7 @@ def boot(
     network: bool = True,
     fwd: list[tuple[int, int]] | None = None,
 ) -> None:
-    """Cold-boot l2cpu N with the given rootfs. --no-console because we
-    open our own `connect` separately.
+    """Cold-boot l2cpu N with the given rootfs.
 
     Passes opensbi/kernel/dtb explicitly because `boot`'s defaults
     (`fw_jump.bin` / `Image` / `blackhole-card.dtb`) are cwd-relative,
@@ -175,7 +174,6 @@ def boot(
         str(PROJECT_ROOT / "Image"),
         "--dtb",
         str(PROJECT_ROOT / "blackhole-card.dtb"),
-        "--no-console",
         # --force so a back-to-back bench (disk.py stops the daemon
         # then console.py starts a fresh one + re-boots) doesn't
         # error out on "already booted" from the warm-resume probe

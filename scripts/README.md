@@ -77,7 +77,7 @@ typical 4-way stress run:
 ./target/debug/tt-bh-linux daemon start -t 0 --log-file ./daemon-card0.log
 for i in 0 1 2 3; do
     cp --reflink=auto rootfs.ext4 rootfs-$i.ext4
-    ./target/debug/tt-bh-linux boot -l $i --no-console -d rootfs-$i.ext4
+    ./target/debug/tt-bh-linux boot -l $i -d rootfs-$i.ext4
     until timeout 5 ./target/debug/tt-bh-linux connect -l $i </dev/null 2>/dev/null \
             | grep -q "login:"; do sleep 3; done
 done

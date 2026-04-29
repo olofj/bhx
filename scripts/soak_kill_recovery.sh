@@ -76,7 +76,7 @@ note "daemon start"
 sleep 0.3
 
 note "cold boot L2CPU $L2CPU with disk+net (rootfs=$ROOTFS)"
-timeout 60 "$BINARY" boot -t "$CARD" -l "$L2CPU" -d "$ROOTFS" --no-console -n >/dev/null
+timeout 60 "$BINARY" boot -t "$CARD" -l "$L2CPU" -d "$ROOTFS" -n >/dev/null
 
 # Daemon stores the canonicalized (symlinks-followed) path; match
 # against THAT basename, not $ROOTFS's basename.

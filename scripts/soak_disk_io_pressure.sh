@@ -76,7 +76,7 @@ note "daemon start"
 sleep 0.3
 
 note "cold boot L2CPU $L2CPU with disk (rootfs=$ROOTFS)"
-timeout 60 "$BINARY" boot -t "$CARD" -l "$L2CPU" -d "$ROOTFS" --no-console >/dev/null
+timeout 60 "$BINARY" boot -t "$CARD" -l "$L2CPU" -d "$ROOTFS" >/dev/null
 
 # Give the guest a moment to actually mount the rootfs and start working it.
 # Without this, "I/O pressure" is just the boot-time loader, which doesn't

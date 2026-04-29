@@ -97,7 +97,7 @@ note "daemon start"
 sleep 0.3
 
 note "cold boot L2CPU $L2CPU with disk+net (rootfs=$ROOTFS, ssh fwd port $SSH_PORT)"
-timeout 90 "$BINARY" boot -t "$CARD" -l "$L2CPU" -d "$ROOTFS" --no-console -n >/dev/null
+timeout 90 "$BINARY" boot -t "$CARD" -l "$L2CPU" -d "$ROOTFS" -n >/dev/null
 
 # Daemon stores the canonicalized path; match its basename.
 rootfs_basename=$(basename "$(readlink -f "$ROOTFS")")

@@ -64,7 +64,7 @@ sleep 0.3
 # We immediately remove the disk so the soak loop starts from a known
 # "no disk, no net" state regardless of what `boot` attached.
 note "cold boot L2CPU $L2CPU"
-timeout 60 "$BINARY" boot -t "$CARD" -l "$L2CPU" --no-console >/dev/null
+timeout 60 "$BINARY" boot -t "$CARD" -l "$L2CPU" >/dev/null
 note "clear attached disk (default rootfs was auto-picked up)"
 "$BINARY" remove-disk -t "$CARD" -l "$L2CPU" >/dev/null 2>&1 || true
 
