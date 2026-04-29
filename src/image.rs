@@ -112,37 +112,26 @@ pub const KNOWN_IMAGES: &[KnownImage] = &[
         needs_bootloader: false,
     },
     // ========================================================================
-    // Debian Cloud Images (from cloud.debian.org)
-    // The "nocloud" variant works without cloud-init (has default root login).
-    // The "generic" variant requires cloud-init for initial setup.
+    // Debian 13 — generic cloud image (cloud-init required for first-boot setup).
+    // Note: the upstream `nocloud` variant exists too, but its first-boot service
+    // set wedges on Tenstorrent Blackhole partway through systemd init (issue
+    // observed: kernel + virtio plumbing fine, sshd never reaches listen, no
+    // RCU stalls). The cloud-init variant boots clean to login on the same
+    // hardware, so we expose only that.
     // ========================================================================
     KnownImage {
         name: "debian-13",
-        url: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-nocloud-riscv64.raw",
-        description: "Debian 13 (Trixie) nocloud — official cloud image, no cloud-init needed",
-        aliases: &["debian", "trixie"],
-        format: ImageFormat::RawDisk,
-        compression: Compression::None,
-        default_size: "10G",
-        default_user: "root",
-        default_password: "",
-        cloud_init: false,
-        // Whole disk — boot via U-Boot + EFI which reads GPT and
-        // chainloads /boot/EFI from the ESP partition.
-        extract_partition: false,
-        needs_bootloader: true,
-    },
-    KnownImage {
-        name: "debian-13-cloud",
         url: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-riscv64.raw",
         description: "Debian 13 (Trixie) generic — official cloud image, needs cloud-init",
-        aliases: &["debian-cloud", "trixie-cloud"],
+        aliases: &["debian", "trixie"],
         format: ImageFormat::RawDisk,
         compression: Compression::None,
         default_size: "10G",
         default_user: "",
         default_password: "",
         cloud_init: true,
+        // Whole disk — boot via U-Boot + EFI which reads GPT and
+        // chainloads /boot/EFI from the ESP partition.
         extract_partition: false,
         needs_bootloader: true,
     },
