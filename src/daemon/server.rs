@@ -1104,7 +1104,7 @@ fn run_boot_sequence(
             );
             e
         })?;
-        let x280_base = engine.program_l2cpu_tlb(&l2cpu, l2cpu_idx as u32);
+        let x280_base = engine.program_l2cpu_tlb(&l2cpu, l2cpu_idx as u32)?;
         dlog!(
             "[run_boot l2cpu {}] L2CPU TLB → tensix tile NOC0 ({}, {}) translated \
              ({}, {}); per-L2CPU window x280_base={:#x}",
@@ -1268,7 +1268,7 @@ fn release_l2cpu_from_reset(
     // same sequence.
     state.shared_chip.reset_x280(&[l2cpu_idx as usize])?;
     dlog!("[run_boot l2cpu {}] configuring prefetchers", l2cpu_idx);
-    boot::configure_prefetchers(l2cpu);
+    boot::configure_prefetchers(l2cpu).map_err(crate::Error::io_ctx("configure_prefetchers"))?;
     dlog!("[run_boot l2cpu {}] run_boot_sequence done", l2cpu_idx);
     Ok(())
 }

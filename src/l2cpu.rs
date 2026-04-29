@@ -197,22 +197,27 @@ impl L2Cpu {
     }
 
     /// Create a temporary 2M TLB window and write a 32-bit value.
-    pub fn write32(&self, addr: u64, value: u32) {
+    ///
+    /// Returns `io::Result` instead of panicking on TLB-pool exhaustion
+    /// (`ENOSPC` from tt-kmd's `ALLOCATE_TLB`) — the pool is a finite
+    /// kernel resource and a stressed soak run can plausibly hit it.
+    /// Callers in dispatch handlers propagate via `?` so the daemon
+    /// stays up. (#103)
+    pub fn write32(&self, addr: u64, value: u32) -> std::io::Result<()> {
         // Hold the allocator lock for the whole op so that the window's Drop
         // (which issues FREE_TLB) also happens under the lock — concurrent
         // FREE/ALLOCATE on the same fd would race the driver.
         let _guard = self.alloc_lock.lock().unwrap();
-        let window = TlbWindow::new_2m(self.fd, self.coordinates.x, self.coordinates.y, addr)
-            .expect("failed to create TLB window for write32");
+        let window = TlbWindow::new_2m(self.fd, self.coordinates.x, self.coordinates.y, addr)?;
         window.write32(0, value);
+        Ok(())
     }
 
     /// Create a temporary 2M TLB window and read a 32-bit value.
-    pub fn read32(&self, addr: u64) -> u32 {
+    pub fn read32(&self, addr: u64) -> std::io::Result<u32> {
         let _guard = self.alloc_lock.lock().unwrap();
-        let window = TlbWindow::new_2m(self.fd, self.coordinates.x, self.coordinates.y, addr)
-            .expect("failed to create TLB window for read32");
-        window.read32(0)
+        let window = TlbWindow::new_2m(self.fd, self.coordinates.x, self.coordinates.y, addr)?;
+        Ok(window.read32(0))
     }
 
     /// Create a persistent 2M TLB window at the given address.

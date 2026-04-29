@@ -118,7 +118,7 @@ fn uart_pass(
     let starting_address = l2cpu.starting_address();
     let tile = l2cpu.coordinates();
 
-    let debug_ptr = l2cpu.read32(starting_address + OPENSBI_DEBUG_PTR);
+    let debug_ptr = l2cpu.read32(starting_address + OPENSBI_DEBUG_PTR)?;
     let uart_base = {
         let desc_window = l2cpu.get_persistent_2m_window(starting_address + debug_ptr as u64)?;
         let desc = desc_window.get_window() as *const DebugDescriptor;
@@ -284,7 +284,17 @@ enum UartExit {
 /// daemon start for 4 released cores is well under 100 ms on BH.
 pub fn probe_warm_resume(l2cpu: &L2Cpu) -> bool {
     let starting_address = l2cpu.starting_address();
-    let debug_ptr = l2cpu.read32(starting_address + OPENSBI_DEBUG_PTR);
+    let debug_ptr = match l2cpu.read32(starting_address + OPENSBI_DEBUG_PTR) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::dlog!(
+                "[probe l2cpu {}] read OPENSBI_DEBUG_PTR failed: {} — wedged",
+                l2cpu.idx(),
+                e
+            );
+            return false;
+        }
+    };
 
     let desc_window = match l2cpu.get_persistent_2m_window(starting_address + debug_ptr as u64) {
         Ok(w) => w,

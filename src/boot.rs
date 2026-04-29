@@ -101,8 +101,8 @@ pub fn boot_l2cpu(
         regs_l2cpu::L3_ENABLE_OFFSET
     );
     let l3_enable_addr = regs_l2cpu::L3_CTRL_BASE + regs_l2cpu::L3_ENABLE_OFFSET;
-    l2cpu.write32(l3_enable_addr, regs_l2cpu::L3_ENABLE_VALUE);
-    let l3_readback = l2cpu.read32(l3_enable_addr);
+    l2cpu.write32(l3_enable_addr, regs_l2cpu::L3_ENABLE_VALUE)?;
+    let l3_readback = l2cpu.read32(l3_enable_addr)?;
     crate::dlog!("[boot_l2cpu]   L3 readback: {:#x}", l3_readback);
 
     let opensbi_bytes = read_bin_file(opensbi_path)?;
@@ -157,8 +157,8 @@ pub fn boot_l2cpu(
         reset_vector_1
     );
     for core in 0..4u64 {
-        l2cpu.write32(regs_l2cpu::CONTROL_BASE + core * 8, reset_vector_0);
-        l2cpu.write32(regs_l2cpu::CONTROL_BASE + core * 8 + 4, reset_vector_1);
+        l2cpu.write32(regs_l2cpu::CONTROL_BASE + core * 8, reset_vector_0)?;
+        l2cpu.write32(regs_l2cpu::CONTROL_BASE + core * 8 + 4, reset_vector_1)?;
     }
     crate::dlog!("[boot_l2cpu] L2CPU {} image + vectors loaded", l2cpu_idx);
 
@@ -166,7 +166,7 @@ pub fn boot_l2cpu(
 }
 
 /// Configure L2 prefetchers for a booted L2CPU.
-pub fn configure_prefetchers(l2cpu: &L2Cpu) {
+pub fn configure_prefetchers(l2cpu: &L2Cpu) -> std::io::Result<()> {
     use crate::regs::l2cpu as regs_l2cpu;
 
     let l2cpu_idx = l2cpu.idx();
@@ -186,10 +186,11 @@ pub fn configure_prefetchers(l2cpu: &L2Cpu) {
     );
     for i in 0..regs_l2cpu::L2_PREFETCH_NUM {
         let base = regs_l2cpu::L2_PREFETCH_BASE + i * regs_l2cpu::L2_PREFETCH_STRIDE;
-        l2cpu.write32(base, regs_l2cpu::L2_PREFETCH_CFG_LO);
-        l2cpu.write32(base + 4, regs_l2cpu::L2_PREFETCH_CFG_HI);
+        l2cpu.write32(base, regs_l2cpu::L2_PREFETCH_CFG_LO)?;
+        l2cpu.write32(base + 4, regs_l2cpu::L2_PREFETCH_CFG_HI)?;
     }
     crate::dlog!("[configure_prefetchers] done");
+    Ok(())
 }
 
 /// Boot-device selection for the guest kernel. Controls the `bootargs` value

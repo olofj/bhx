@@ -434,7 +434,11 @@ impl TensixEngine {
     /// The TLB always uses the **uncached aperture** so the L2CPU's
     /// L3 doesn't shadow guest writes (per #66 fragility item 4).
     /// `program_small_tlb_unicast` already uses the UC aperture.
-    pub fn program_l2cpu_tlb(&self, l2cpu: &crate::l2cpu::L2Cpu, l2cpu_idx: u32) -> u64 {
+    pub fn program_l2cpu_tlb(
+        &self,
+        l2cpu: &crate::l2cpu::L2Cpu,
+        l2cpu_idx: u32,
+    ) -> std::io::Result<u64> {
         let noc_addr = ve::l2cpu_window_base(l2cpu_idx) as u64;
         crate::x280_tlb::program_small_tlb_unicast(
             l2cpu,

@@ -63,7 +63,7 @@ pub fn program_small_tlb_unicast(
     target_x: u32,
     target_y: u32,
     noc_addr: u64,
-) -> u64 {
+) -> std::io::Result<u64> {
     assert!(idx < SMALL_TLB_COUNT, "small TLB idx {} out of range", idx);
     let cfg_base = SMALL_TLB_CFG_BASE + (idx as u64) * SMALL_TLB_CFG_STRIDE;
 
@@ -88,10 +88,10 @@ pub fn program_small_tlb_unicast(
 
     // Each cfg slot is 16 bytes: u64 local_offset + u32 lo + u32 hi.
     // Write low 32, high 32 of local_offset, then the two property words.
-    l2cpu.write32(cfg_base, local_offset as u32);
-    l2cpu.write32(cfg_base + 4, (local_offset >> 32) as u32);
-    l2cpu.write32(cfg_base + 8, props_lo);
-    l2cpu.write32(cfg_base + 12, props_hi);
+    l2cpu.write32(cfg_base, local_offset as u32)?;
+    l2cpu.write32(cfg_base + 4, (local_offset >> 32) as u32)?;
+    l2cpu.write32(cfg_base + 8, props_lo)?;
+    l2cpu.write32(cfg_base + 12, props_hi)?;
 
-    SMALL_TLB_WINDOW_BASE_UC + (idx as u64) * SMALL_TLB_WINDOW_SIZE + in_window_offset
+    Ok(SMALL_TLB_WINDOW_BASE_UC + (idx as u64) * SMALL_TLB_WINDOW_SIZE + in_window_offset)
 }
