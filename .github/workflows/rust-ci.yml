@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  check:
+    name: build / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # libfdt-dev: always required (boot::modify_dtb).
+      # libvdeslirp-dev pulls in libslirp-dev as a dependency. The package
+      # is in Ubuntu's `universe` repo and provides the header + .pc file
+      # the build script's pkg-config probe needs. If a future Ubuntu
+      # runner image drops the package, fall back to building from the
+      # vendored libvdeslirp_0.1.1.orig.tar.gz checked into the tree.
+      - name: System deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libfdt-dev libvdeslirp-dev libslirp-dev pkg-config
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo clippy (no default features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: cargo build (default features)
+        run: cargo build --all-targets
+
+      - name: cargo build (no default features)
+        run: cargo build --all-targets --no-default-features
+
+      - name: cargo test (default features)
+        run: cargo test
+
+      - name: cargo test (no default features)
+        run: cargo test --no-default-features
+
+  audit:
+    name: cargo-audit (advisories)
+    runs-on: ubuntu-latest
+    # Warn-only initially: a transitive advisory we can't immediately
+    # fix shouldn't block PRs. Once we settle on a triage process, drop
+    # the continue-on-error so an advisory becomes a hard fail.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: cargo audit
+        run: cargo audit

@@ -59,9 +59,9 @@ default "ask before committing" behavior on this project. Don't batch a
 multi-item request into one giant commit and don't pause to summarize
 between items; the commits are the record.
 
-Rust rewrite of the C++ host tool (`../console/tt-bh-linux`) that runs
-Linux on a Tenstorrent Blackhole card's on-chip SiFive X280 RISC-V cores
-(the "L2CPUs"). This crate does the full stack end-to-end: boots the
+Rust host tool that runs Linux on a Tenstorrent Blackhole card's
+on-chip SiFive X280 RISC-V cores (the "L2CPUs"). This crate does the
+full stack end-to-end: boots the
 L2CPU (reset, OpenSBI + kernel + DTB image load, DTB patching, reset
 vectors, prefetchers), then emulates VirtIO block/network devices and
 serves the OpenSBI virtual-UART console.
@@ -131,8 +131,7 @@ disable with `--no-default-features` if you just need console+disk.
 ## Dependencies (runtime)
 
 - `/dev/tenstorrent/<idx>` — provided by `tt-kmd` (Tenstorrent kernel
-  module). `ls /dev/tenstorrent/` must show at least `0`. A clone of the
-  driver lives at `../tt-kmd` for reference / audit.
+  module). `ls /dev/tenstorrent/` must show at least `0`.
 - `libvdeslirp` / `libslirp` at link time (only with the `slirp`
   feature). See `build.rs` — a `cargo build` compiles a tiny C probe to
   assert `sizeof(SlirpConfig) <= 512`; if that ever fails, bump
@@ -258,15 +257,6 @@ Hardware-gated soak scripts under `scripts/` (see `scripts/README.md`).
 Remaining coverage gaps: `dispatch_boot --force` state machine,
 `dispatch_add_disk` stuck-slot path, clock/tlb/virtio core handshake,
 image/kernel/ramdisk downloaders.
-
-## Useful parent-repo artifacts
-
-- `../rootfs.ext4`, `../fw_jump.bin`, `../Image`, `../blackhole-card.dtb`
-  — default artifacts (typically symlinked into this crate's cwd).
-- `../boot.py` and `../Makefile` predate the Rust daemon — ignore
-  unless touching the C++ tool at `../console/`.
-- `../tt-kmd/` — local clone of the tt-kmd driver source (for concurrency
-  audits and cross-references, e.g. issue #1).
 
 ## Conventions / gotchas
 

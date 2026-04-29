@@ -1,9 +1,7 @@
 # tt-bh-linux-rs
 
 Rust tool for booting and running Linux on the SiFive X280 RISC-V cores
-(L2CPUs) embedded on a Tenstorrent Blackhole card. Replaces the
-Python + C++ pipeline in this repo's parent directory — the `boot.py`
-driver and the C++ `tt-bh-linux` console tool are no longer needed.
+(L2CPUs) embedded on a Tenstorrent Blackhole card.
 
 This crate does the whole flow end-to-end: reset the chip, load
 OpenSBI + Linux kernel + DTB into the L2CPU's DRAM, release it from
@@ -238,10 +236,3 @@ card):
 - **Open design issues**: the GitHub issue tracker at
   <https://github.com/olofj/tt-bh-rust/issues>.
 
-## Relationship to the parent directory
-
-The `../README.md` at the top of this repo describes the original
-Python + C++ pipeline (`../boot.py`, `../console/tt-bh-linux`). That
-stack still works but you don't need it for anything this crate does —
-this Rust tool replaces both halves. The `../Makefile` pre-dates the
-Rust port and still drives the Python/C++ path, not this one.
