@@ -398,6 +398,27 @@ enum DebugAction {
     /// gives an integration check without booting any L2CPU.
     /// Bypasses the daemon. Issue #71.
     TensixEngine,
+    /// Drive a known byte pattern into TRISC0's UART input cell from
+    /// the host (mimicking the L2CPU kernel's `writel(THR, byte) ;
+    /// poll(LSR.THRE)` loop), then read TRISC0's per-L2CPU feed ring
+    /// directly to count exactly how many bytes survived. Bypasses the
+    /// L2CPU entirely so we can localize whether residual M6.1 / #79
+    /// byte loss is on the kernel→THR path or the TRISC0→feed-ring
+    /// path. Bypasses the daemon. Daemon must be stopped first.
+    UartLoopback {
+        /// Number of bytes to send. Default: 1024.
+        #[arg(long, default_value_t = 1024)]
+        count: usize,
+        /// Microseconds to sleep between writes (in addition to the
+        /// THRE-poll wait). 0 = back-to-back as fast as host MMIO will
+        /// allow. Higher values give TRISC0 more time per byte.
+        #[arg(long, default_value_t = 0)]
+        gap_us: u64,
+        /// If set, skip the LSR.THRE poll between writes (post each
+        /// byte and move on). Stress-tests the race window.
+        #[arg(long)]
+        no_lsr_poll: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -777,6 +798,11 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
             run_tensix_virtio(card, x, y)
         }
         DebugAction::TensixEngine => run_tensix_engine(card, &chip),
+        DebugAction::UartLoopback {
+            count,
+            gap_us,
+            no_lsr_poll,
+        } => run_uart_loopback(card, &chip, l2cpu as u8, count, gap_us, no_lsr_poll),
     }
 }
 
@@ -920,6 +946,206 @@ fn run_tensix_engine(card: u32, chip: &shared_chip::SharedChip) -> std::io::Resu
     );
 
     poller.shutdown();
+    Ok(())
+}
+
+/// Host-driven byte-pattern test for the M6.1 (#79) UART path.
+///
+/// Brings up the engine, releases TRISC0 by setting bit 16 of the
+/// active-slots bitmap, then writes a known sequence of bytes into the
+/// THR cell from the host (mimicking what the L2CPU kernel's
+/// `serial8250_console_putchar` would do). Reads TRISC0's per-L2CPU
+/// feed ring in BRISC L1 directly to count exactly how many bytes
+/// landed and in what order — bypasses the daemon, the kernel, and
+/// the L2CPU NoC entirely so we can localize residual byte loss.
+///
+/// Three numbers come out of this:
+///
+///   * **sent**: how many bytes the host wrote to THR.
+///   * **producer-seq**: how many bytes TRISC0 pushed to the feed
+///     ring. `sent - producer_seq` = bytes the kernel→THR path lost
+///     (kernel saw stale THRE=1 and overwrote a byte before TRISC0
+///     could read it, OR TRISC0 missed a byte for some other reason).
+///   * **errors**: how many of the bytes TRISC0 captured don't match
+///     the expected pattern at the position the kick poller delivered
+///     them. Tells us if there's a *content* corruption bug separate
+///     from byte loss.
+fn run_uart_loopback(
+    card: u32,
+    chip: &shared_chip::SharedChip,
+    l2cpu_idx: u8,
+    count: usize,
+    gap_us: u64,
+    no_lsr_poll: bool,
+) -> std::io::Result<()> {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    if l2cpu_idx >= 4 {
+        return Err(std::io::Error::other(format!(
+            "uart-loopback: l2cpu must be 0..3 (got {})",
+            l2cpu_idx
+        )));
+    }
+
+    eprintln!("[uart-loopback] bringing up engine…");
+    let engine = Arc::new(tensix_engine::TensixEngine::bring_up(card, chip)?);
+    eprintln!(
+        "[uart-loopback] engine up: tile NOC0 ({}, {}), firmware {:#010x}, protocol v{}",
+        engine.noc0_x, engine.noc0_y, engine.firmware_version, engine.protocol_version
+    );
+
+    // Set the UART slot's bit so BRISC releases TRISC0. We don't run
+    // a kick poller here — we read the feed ring directly below.
+    let uart_bit = 1u32 << (uart_engine::UART_SLOT_BASE + l2cpu_idx as u16);
+    engine.write_active_slots(uart_bit);
+    // Give BRISC's main loop a beat to observe the bitmap and
+    // release TRISC0, plus TRISC0 a beat to enter its poll loop.
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Verify TRISC0 is alive: heartbeat should advance.
+    let hb0 = engine.trisc0_heartbeat();
+    std::thread::sleep(Duration::from_millis(10));
+    let hb1 = engine.trisc0_heartbeat();
+    if hb1 <= hb0 {
+        return Err(std::io::Error::other(format!(
+            "TRISC0 heartbeat not advancing ({} → {}); refusing to send",
+            hb0, hb1
+        )));
+    }
+    eprintln!("[uart-loopback] TRISC0 alive (heartbeat {} → {})", hb0, hb1);
+
+    // L1 addresses for this UART. reg-shift=2 (4-byte stride per
+    // register) matches the firmware layout in `uart_layout.h`.
+    let uart_base = 0x40000u32 + (l2cpu_idx as u32) * 0x4000;
+    let thr_addr = uart_base; // UART_REG_RBR_THR = 0x00
+    let lsr_addr = uart_base + 0x14; // UART_REG_LSR
+
+    let priv_base = uart_engine::uart_private_base(l2cpu_idx);
+    let producer_addr = priv_base + uart_engine::UART_PRIV_OFF_FEED_PRODUCER_SEQ;
+    let consumer_addr = priv_base + uart_engine::UART_PRIV_OFF_FEED_CONSUMER_SEQ;
+    let drops_addr = priv_base + uart_engine::UART_PRIV_OFF_FEED_DROP_COUNT;
+    let ring_base = priv_base + uart_engine::UART_PRIV_OFF_FEED_RING;
+
+    // Snapshot starting producer/drops so we can compute deltas
+    // (TRISC0 may have produced "noise" bytes during bring-up).
+    let p_start = engine.read_l1_u32(producer_addr);
+    let d_start = engine.read_l1_u32(drops_addr);
+    // Sync the consumer to the producer so the ring entries we read
+    // back later belong to *our* bytes only.
+    engine.write_l1_u32(consumer_addr, p_start);
+
+    // Pattern: cycling 'A'..'P' (16 distinct printable bytes). The
+    // distinct values let us catch reordering or duplicate-byte loss
+    // separately from sheer drop count.
+    let pattern: Vec<u8> = (0..count).map(|i| b'A' + ((i % 16) as u8)).collect();
+
+    eprintln!(
+        "[uart-loopback] sending {} bytes (gap={} µs, lsr_poll={})…",
+        count, gap_us, !no_lsr_poll
+    );
+    let started = std::time::Instant::now();
+    let mut lsr_timeouts = 0u64;
+    for &b in &pattern {
+        if !no_lsr_poll {
+            // Poll LSR.THRE = 1 (bit 5) before writing, exactly like
+            // the kernel's `wait_for_xmitr` loop.
+            let mut tmout = 10_000u32;
+            loop {
+                let lsr = engine.read_l1_u32(lsr_addr);
+                if lsr & 0x20 != 0 {
+                    break;
+                }
+                tmout -= 1;
+                if tmout == 0 {
+                    lsr_timeouts += 1;
+                    break;
+                }
+            }
+        }
+        engine.write_l1_u32(thr_addr, b as u32);
+        if gap_us > 0 {
+            std::thread::sleep(Duration::from_micros(gap_us));
+        }
+    }
+    let elapsed = started.elapsed();
+    eprintln!(
+        "[uart-loopback] sent {} bytes in {:.3} ms ({:.0} B/s); lsr-timeouts: {}",
+        count,
+        elapsed.as_secs_f64() * 1000.0,
+        count as f64 / elapsed.as_secs_f64(),
+        lsr_timeouts,
+    );
+
+    // Give TRISC0 a beat to drain any in-flight reads.
+    std::thread::sleep(Duration::from_millis(50));
+
+    let p_end = engine.read_l1_u32(producer_addr);
+    let d_end = engine.read_l1_u32(drops_addr);
+    let captured = p_end.wrapping_sub(p_start);
+    let drops = d_end.wrapping_sub(d_start);
+    eprintln!(
+        "[uart-loopback] feed ring: producer {} → {} (Δ {}), drops {} → {} (Δ {})",
+        p_start, p_end, captured, d_start, d_end, drops
+    );
+
+    // Read the captured bytes back from the ring and compare to the
+    // expected pattern. We compare position by position — we know
+    // TRISC0 doesn't reorder, so any mismatch means a byte was lost
+    // (kernel→THR race) and the position-N expected byte got eaten.
+    let mask = uart_engine::UART_FEED_RING_ENTRIES - 1;
+    let take = std::cmp::min(captured as usize, count);
+    let mut received = Vec::with_capacity(take);
+    for i in 0..(take as u32) {
+        let idx = (p_start.wrapping_add(i)) & mask;
+        let cell = engine.read_l1_u32(ring_base + idx * 4);
+        received.push((cell & 0xFF) as u8);
+    }
+
+    // Slot-by-slot match: scan received against the pattern,
+    // advancing the pattern index whenever we get a match. Any
+    // skipped pattern slot is a "lost byte." The number of received
+    // bytes that don't fit the pattern even with skips = corruption.
+    let mut pat_i = 0usize;
+    let mut lost_in_stream = 0usize;
+    let mut corrupted = 0usize;
+    for &b in &received {
+        // Find the next pattern position matching this byte.
+        let mut found = false;
+        while pat_i < pattern.len() {
+            if pattern[pat_i] == b {
+                pat_i += 1;
+                found = true;
+                break;
+            }
+            pat_i += 1;
+            lost_in_stream += 1;
+        }
+        if !found {
+            corrupted += 1;
+        }
+    }
+    let lost_at_tail = pattern.len().saturating_sub(pat_i);
+
+    let pct = |n: usize| (n as f64 / count as f64) * 100.0;
+    eprintln!("[uart-loopback] sent     : {}", count);
+    eprintln!(
+        "[uart-loopback] captured : {} ({:.1}% of sent)",
+        captured,
+        pct(captured as usize)
+    );
+    eprintln!("[uart-loopback] dropped  : {}  (feed-ring full)", drops);
+    eprintln!(
+        "[uart-loopback] lost in stream: {}  ({:.1}%)",
+        lost_in_stream,
+        pct(lost_in_stream)
+    );
+    eprintln!("[uart-loopback] lost at tail : {}", lost_at_tail);
+    eprintln!(
+        "[uart-loopback] corrupted (byte didn't match pattern): {}",
+        corrupted
+    );
+
     Ok(())
 }
 

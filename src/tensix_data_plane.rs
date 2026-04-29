@@ -415,15 +415,17 @@ fn run_poll_loop(
                         std::cmp::min(producer.wrapping_sub(local_consumer) as usize, buf.len());
                     for (i, slot) in buf.iter_mut().take(take).enumerate() {
                         let idx = local_consumer.wrapping_add(i as u32) & mask;
-                        let cell = engine
-                            .read_l1_u32(priv_base + uart::UART_PRIV_OFF_FEED_RING + idx * 4);
+                        let cell =
+                            engine.read_l1_u32(priv_base + uart::UART_PRIV_OFF_FEED_RING + idx * 4);
                         *slot = (cell & 0xFF) as u8;
                     }
                     hub.push_chip_output(&buf[..take]);
                     local_consumer = local_consumer.wrapping_add(take as u32);
                 }
-                engine
-                    .write_l1_u32(priv_base + uart::UART_PRIV_OFF_FEED_CONSUMER_SEQ, local_consumer);
+                engine.write_l1_u32(
+                    priv_base + uart::UART_PRIV_OFF_FEED_CONSUMER_SEQ,
+                    local_consumer,
+                );
                 uart_consumer[l2cpu_idx as usize] = local_consumer;
                 last_active = std::time::Instant::now();
             }
