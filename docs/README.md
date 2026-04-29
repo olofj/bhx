@@ -28,5 +28,8 @@ authoritative reference for behavior, this directory is the *why*.
 - [`../third_party/uboot/README.md`](../third_party/uboot/README.md) — the pinned U-Boot build
   used for stock distro images (config fragment, downstream patches,
   reproducibility).
+- [`../third_party/opensbi/README.md`](../third_party/opensbi/README.md) — the pinned OpenSBI
+  build that produces `fw_jump.bin` (the M-mode payload that hands
+  control to the kernel or U-Boot).
 - [`../tests/rootfs/README.md`](../tests/rootfs/README.md) — the
   buildroot test rootfs construction.

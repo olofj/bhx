@@ -116,13 +116,19 @@ brisc-firmware/        # BRISC + TRISC0 firmware for the Tensix virtio engine
 ├── prebuilt/          # checked-in *.bin fallback when sfpi toolchain absent
 └── Makefile           # toolchain at /opt/tenstorrent/sfpi/compiler/bin
 
-third_party/uboot/     # U-Boot S-mode payload for booting stock distro images (#44 + sub-issues)
-├── README.md          # build / pinned config / bumping / reproducibility
-├── Makefile           # download + extract + patch + merge_config.sh + build
-├── bhx.config         # defconfig fragment merged on top of qemu-riscv64_smode_defconfig
-├── patches/           # 3 downstream patches (sel_generation handshake + 2 RISC-V DRAM fixes)
-├── sha256sums         # pinned tarball checksum
-└── u-boot.bin         # (gitignored) symlink the build maintains
+third_party/           # vendored, builds-from-source dependencies
+├── uboot/             # U-Boot S-mode payload for booting stock distro images (#44 + sub-issues)
+│   ├── README.md      # build / pinned config / bumping / reproducibility
+│   ├── Makefile       # download + extract + patch + merge_config.sh + build
+│   ├── bhx.config     # defconfig fragment merged on top of qemu-riscv64_smode_defconfig
+│   ├── patches/       # 3 downstream patches (sel_generation handshake + 2 RISC-V DRAM fixes)
+│   ├── sha256sums     # pinned tarball checksum
+│   └── u-boot.bin     # (gitignored) symlink the build maintains
+└── opensbi/           # OpenSBI M-mode payload — produces fw_jump.bin
+    ├── README.md      # build / pinned version / bumping / reproducibility
+    ├── Makefile       # download + verify + build (PLATFORM=generic, FW_JUMP=y)
+    ├── sha256sums     # pinned tarball checksum
+    └── fw_jump.bin    # (gitignored) symlink the build maintains
 ```
 
 The `slirp` feature is on by default and links `libvdeslirp`+`libslirp`;
