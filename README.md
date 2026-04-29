@@ -1,16 +1,30 @@
 # bhx
 
-Rust tool for booting and running Linux on the SiFive X280 RISC-V cores
-(L2CPUs) embedded on a Tenstorrent Blackhole card.
+*pronounced "bix"*
 
-This crate does the whole flow end-to-end: reset the chip, load
-OpenSBI + Linux kernel + DTB into the L2CPU's DRAM, release it from
-reset, and then emulate virtio-block / virtio-net devices and the
-OpenSBI virtual UART console.
+**Boot Linux on the embedded RISC-V cores inside Tenstorrent Blackhole AI accelerators.**
 
-The tool runs as a **per-card daemon** that owns the chip's resources
-and serves boot / console / disk / net operations to short-lived CLI
-clients (`boot`, `connect`, `add-disk`, ...).
+Each Tenstorrent Blackhole P100/P150 PCIe card carries four SiFive X280
+RISC-V cores ("L2CPUs") sitting alongside the AI compute fabric.
+They're intended for control-plane workloads, but they're regular
+RV64GC cores with their own DRAM and are capable of booting real
+Linux distros end-to-end. `bhx` is the host-side tool that does the
+full bring-up:
+
+- **Cold boot**: PCIe reset, OpenSBI + kernel + DTB image load, reset-
+  vector setup, prefetcher config.
+- **virtio-mmio devices**: block, net (libvdeslirp), console, and rng,
+  emulated from a per-card daemon backed by BRISC firmware on a
+  reserved Tensix tile.
+- **Stock distro support**: U-Boot S-mode payload + EFI-loader chain
+  boots AlmaLinux Kitten 10, Debian generic, Ubuntu 24.04 LTS, Fedora
+  Cloud Base, and similar GPT-partitioned cloud images straight from
+  their published .raw / .qcow2 artifacts. Pre-extracted single-FS
+  rootfs images boot via the patched direct-kernel path.
+- **Operator UX**: a single `bhx` binary that runs as both the
+  per-card daemon (`bhx daemon start`) and a thin RPC client
+  (`bhx boot`, `bhx connect`, `bhx add-disk`, …). Console attach
+  fans out across multiple clients with a 64 KiB scrollback hub.
 
 ## Prerequisites
 
