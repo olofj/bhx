@@ -69,14 +69,6 @@ struct Cli {
     #[arg(short = 'n', long = "network", global = true)]
     network: bool,
 
-    /// Attach the interactive console (default)
-    #[arg(long = "console", global = true, overrides_with = "no_console")]
-    console: bool,
-
-    /// Skip attaching the interactive console
-    #[arg(long = "no-console", global = true, overrides_with = "console")]
-    no_console: bool,
-
     /// Path to cloud-init image (optional)
     #[arg(short = 'c', long = "cloud-init", global = true)]
     cloud_init: Option<String>,
@@ -1992,12 +1984,10 @@ mod tests {
     // --- CLI parsing: defaults -----------------------------------------------
 
     #[test]
-    fn cli_defaults_leave_disk_network_console_off_off_on() {
+    fn cli_defaults_leave_disk_network_off() {
         let cli = parse(&["tt-bh-linux", "connect"]);
         assert_eq!(cli.disk, None);
         assert!(!cli.network);
-        // `console_enabled` is computed as `!no_console`; defaults to true.
-        assert!(!cli.no_console);
     }
 
     // --- --disk / -d ---------------------------------------------------------
@@ -2028,32 +2018,6 @@ mod tests {
         assert!(cli.network);
     }
 
-    // --- --console / --no-console --------------------------------------------
-
-    #[test]
-    fn cli_no_console_disables_console() {
-        let cli = parse(&["tt-bh-linux", "connect", "--no-console"]);
-        assert!(cli.no_console);
-    }
-
-    #[test]
-    fn cli_explicit_console_flag_keeps_console_on() {
-        let cli = parse(&["tt-bh-linux", "connect", "--console"]);
-        assert!(!cli.no_console);
-    }
-
-    #[test]
-    fn cli_console_then_no_console_last_wins_off() {
-        let cli = parse(&["tt-bh-linux", "connect", "--console", "--no-console"]);
-        assert!(cli.no_console);
-    }
-
-    #[test]
-    fn cli_no_console_then_console_last_wins_on() {
-        let cli = parse(&["tt-bh-linux", "connect", "--no-console", "--console"]);
-        assert!(!cli.no_console);
-    }
-
     // --- global flags work on other subcommands & bare invocation ------------
 
     #[test]
@@ -2061,9 +2025,8 @@ mod tests {
         // When no subcommand is given, `main` falls through to
         // run_connect_client (same as the explicit `connect` subcommand);
         // the global flags must still apply.
-        let cli = parse(&["tt-bh-linux", "--no-console", "-n", "-d", "x.ext4"]);
+        let cli = parse(&["tt-bh-linux", "-n", "-d", "x.ext4"]);
         assert!(cli.command.is_none());
-        assert!(cli.no_console);
         assert!(cli.network);
         assert_eq!(cli.disk.as_deref(), Some("x.ext4"));
     }
