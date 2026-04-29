@@ -29,9 +29,28 @@ pub mod terminal;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Instant;
+
+/// Lock a `Mutex` while converting poisoning into a daemon-recoverable
+/// `Internal` error rather than an `unwrap()` panic. Use inside RPC
+/// dispatch handlers so a single panicked worker doesn't bring down
+/// the whole daemon (#104).
+///
+/// Drop impls and signal handlers can't return Result, so they keep
+/// using plain `lock().unwrap()` — when those panic, the daemon is
+/// already on its way out anyway.
+pub trait LockExt<T> {
+    fn lock_or_internal_error(&self) -> crate::Result<MutexGuard<'_, T>>;
+}
+
+impl<T> LockExt<T> for Mutex<T> {
+    fn lock_or_internal_error(&self) -> crate::Result<MutexGuard<'_, T>> {
+        self.lock()
+            .map_err(|_| crate::Error::internal("daemon mutex poisoned (worker thread paniced)"))
+    }
+}
 
 use crate::l2cpu::L2Cpu;
 use crate::shared_chip::SharedChip;
@@ -172,7 +191,14 @@ impl DaemonState {
     /// shutdown loop. The PLL comes back up to 1750 MHz automatically
     /// on the next boot via `reset_x280`'s existing step-up. See #95.
     pub fn maybe_idle_pll(&self) {
-        let any_booted = self.l2cpus.iter().any(|m| m.lock().unwrap().is_some());
+        // Best-effort: if a slot mutex is poisoned the daemon is already
+        // unwinding from a panic, so just skip the PLL step rather than
+        // propagating. Either path leaves the chip in a recoverable state
+        // because the next reset_x280 unconditionally steps the PLL up.
+        let any_booted = self
+            .l2cpus
+            .iter()
+            .any(|m| m.lock().map(|g| g.is_some()).unwrap_or(true));
         if !any_booted {
             self.shared_chip.idle_pll();
         }
@@ -257,6 +283,31 @@ impl DaemonState {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn lock_or_internal_error_yields_internal_when_poisoned() {
+        // Poison a Mutex by panicking inside a `lock()` scope on a
+        // background thread, then verify lock_or_internal_error
+        // surfaces it as crate::Error::Internal rather than panicking
+        // on its own.
+        let m = Arc::new(Mutex::new(0u32));
+        let m2 = Arc::clone(&m);
+        let _ = std::thread::spawn(move || {
+            let _guard = m2.lock().unwrap();
+            panic!("intentional");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        let err = m.lock_or_internal_error().unwrap_err();
+        assert!(matches!(err, crate::Error::Internal(_)));
+    }
+
+    #[test]
+    fn lock_or_internal_error_yields_guard_on_healthy_mutex() {
+        let m = Mutex::new(42u32);
+        let g = m.lock_or_internal_error().unwrap();
+        assert_eq!(*g, 42);
+    }
 
     #[test]
     fn fresh_daemon_state_has_no_slots_and_no_wedged_cores() {

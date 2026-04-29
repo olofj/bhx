@@ -26,7 +26,7 @@ use crate::daemon::protocol::{
     read_frame, send_fd, write_frame, ConsoleMode, L2CpuState, L2CpuStatus, Request, Response,
     StatusPayload,
 };
-use crate::daemon::{DaemonState, DiskWorker, L2CpuSlot, WorkerHandle};
+use crate::daemon::{DaemonState, DiskWorker, L2CpuSlot, LockExt, WorkerHandle};
 use crate::dlog;
 use crate::l2cpu::L2Cpu;
 use crate::virtio::interrupt::InterruptController;
@@ -122,7 +122,7 @@ pub fn serve(
 
     dlog!("[daemon] shutdown flag set — tearing down L2CPU slots");
     for (i, slot_mutex) in state.l2cpus.iter().enumerate() {
-        if let Some(slot) = slot_mutex.lock().unwrap().take() {
+        if let Some(slot) = slot_mutex.lock_or_internal_error()?.take() {
             slot.console_hub
                 .disconnect_all_with_reason("daemon shutting down");
             unregister_engine_slots(&state, i as u8);
@@ -237,6 +237,9 @@ fn warm_resume_released(state: &Arc<DaemonState>, released: &[u8]) {
         );
         match make_slot_from_l2cpu(l2cpu, idx) {
             Ok(slot) => {
+                // Daemon startup; if a slot mutex is already poisoned
+                // here something has gone very wrong — fail loudly via
+                // unwrap rather than silently dropping the warm-resume.
                 *state.l2cpus[idx as usize].lock().unwrap() = Some(slot);
                 state.wedged[idx as usize].store(false, Ordering::Relaxed);
                 crate::daemon::metrics::L2CPU_BOOT_WARM_TOTAL.at(idx).inc();
@@ -536,7 +539,7 @@ fn validate_remove_disk_request(disks_empty: bool) -> Result<(), &'static str> {
 fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Result<()> {
     let mut l2cpus = Vec::new();
     for (idx, slot_mutex) in state.l2cpus.iter().enumerate() {
-        let slot = slot_mutex.lock().unwrap();
+        let slot = slot_mutex.lock_or_internal_error()?;
         let (st, disk, net, virtio_console, clients) = match slot.as_ref() {
             None => {
                 let st = if state.wedged[idx].load(Ordering::Relaxed) {
@@ -677,10 +680,11 @@ fn dispatch_boot(
     // poller looks up the entry, walks the descriptor chain via
     // `process_one_chain_for_queue`, and fires the PLIC IRQ.
     {
-        let engine_for_init = state.tensix_engine.lock().unwrap().clone();
-        if let (Some(poller), Some(engine)) =
-            (state.kick_poller.lock().unwrap().as_ref(), engine_for_init)
-        {
+        let engine_for_init = state.tensix_engine.lock_or_internal_error()?.clone();
+        if let (Some(poller), Some(engine)) = (
+            state.kick_poller.lock_or_internal_error()?.as_ref(),
+            engine_for_init,
+        ) {
             // Helper closure: register one device + initialize its
             // device-specific config space directly into BRISC L1
             // via the engine's L1 pointer. The existing
@@ -876,7 +880,7 @@ fn dispatch_boot(
     // daemon that's already watching MMIO. See `release_l2cpu_from_reset`.
     release_l2cpu_from_reset(state, l2cpu_idx, &slot.l2cpu)?;
 
-    install_slot_and_reply_ok(state, l2cpu_idx, slot, sock);
+    install_slot_and_reply_ok(state, l2cpu_idx, slot, sock)?;
     Ok(())
 }
 
@@ -892,7 +896,9 @@ fn handle_existing_slot(
     force: bool,
 ) -> Result<(), String> {
     let prior = {
-        let mut guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
+        let mut guard = state.l2cpus[l2cpu_idx as usize]
+            .lock_or_internal_error()
+            .map_err(|e| e.to_string())?;
         match decide_boot_slot(guard.is_some(), force, l2cpu_idx) {
             BootSlotDecision::Reject(msg) => return Err(msg),
             BootSlotDecision::Proceed => None,
@@ -923,8 +929,8 @@ fn install_slot_and_reply_ok(
     l2cpu_idx: u8,
     slot: L2CpuSlot,
     sock: &UnixStream,
-) {
-    *state.l2cpus[l2cpu_idx as usize].lock().unwrap() = Some(slot);
+) -> crate::Result<()> {
+    *state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()? = Some(slot);
     state.wedged[l2cpu_idx as usize].store(false, Ordering::Relaxed);
     crate::daemon::metrics::L2CPU_BOOT_COLD_TOTAL
         .at(l2cpu_idx)
@@ -934,6 +940,7 @@ fn install_slot_and_reply_ok(
         l2cpu_idx
     );
     reply_ok(sock);
+    Ok(())
 }
 
 /// Output of `run_boot_sequence`. The L2Cpu is what every later step in
@@ -997,8 +1004,8 @@ fn run_boot_sequence(
         // the engine — the next cold-boot RPC will bring it up fresh.
         // Drop the kick poller first (its thread holds another
         // Arc<TensixEngine>); KickPoller::drop joins the thread.
-        let _ = state.kick_poller.lock().unwrap().take();
-        let _ = state.tensix_engine.lock().unwrap().take();
+        let _ = state.kick_poller.lock_or_internal_error()?.take();
+        let _ = state.tensix_engine.lock_or_internal_error()?.take();
         // SharedChip::reset_board internally drops its fd+window, issues the
         // PCIe LDS reset, and reopens fresh — callers never see stale fd
         // errors across the reset.
@@ -1343,7 +1350,7 @@ fn dispatch_attach_console(
     // virtio-console (`vc_input`) so whichever HVC the kernel ended up
     // using as its console picks them up.
     let (hub, input_tx, vc_input) = {
-        let slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
+        let slot_guard = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
         let slot = slot_guard.as_ref().ok_or_else(|| {
             crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx))
         })?;
@@ -1439,6 +1446,9 @@ fn client_reader_main(
                         }
                     }
                     if let Some(vc) = vc_input.as_ref() {
+                        // Per-client reader thread; if the vc input
+                        // mutex is poisoned the producing worker
+                        // already paniced — let this thread die too.
                         let mut g = vc.lock().unwrap();
                         for &b in &buf[..n] {
                             if g.len() >= crate::virtio::console::RX_BUFFER_CAP {
@@ -1468,7 +1478,7 @@ fn dispatch_add_disk(
     path: String,
 ) -> crate::Result<()> {
     validate_l2cpu(l2cpu_idx)?;
-    let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
+    let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
     let slot = slot_guard
         .as_mut()
         .ok_or_else(|| crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx)))?;
@@ -1484,8 +1494,8 @@ fn dispatch_add_disk(
 
     {
         if let (Some(poller), Some(engine)) = (
-            state.kick_poller.lock().unwrap().as_ref(),
-            state.tensix_engine.lock().unwrap().clone(),
+            state.kick_poller.lock_or_internal_error()?.as_ref(),
+            state.tensix_engine.lock_or_internal_error()?.clone(),
         ) {
             match crate::virtio::block::VirtioBlk::from_file(disk_image, l2cpu_idx) {
                 Ok(blk) => {
@@ -1553,7 +1563,7 @@ fn dispatch_remove_disk(
     // The legacy worker thread handles its own teardown via the exit
     // flag in the for-loop below; this is a no-op there.
 
-    if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
+    if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
         let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
             + crate::virtio_engine::DEV_BLK;
         poller.unregister_slot(slot_idx);
@@ -1563,7 +1573,7 @@ fn dispatch_remove_disk(
     // flag (~100 ms worst case); holding the state mutex for that long
     // would block every other RPC on other L2CPUs.
     let disks = {
-        let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
+        let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
         let slot = slot_guard.as_mut().ok_or_else(|| {
             crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx))
         })?;
@@ -1602,7 +1612,7 @@ fn dispatch_add_net(
         extra_fwd
     );
     validate_l2cpu(l2cpu_idx)?;
-    let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
+    let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
     let slot = slot_guard
         .as_mut()
         .ok_or_else(|| crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx)))?;
@@ -1634,7 +1644,7 @@ fn dispatch_add_net(
     // (#71 M5.5e) drives slirp's recv side.
 
     {
-        if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
+        if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
             match crate::virtio::network::VirtioNet::new(&forwards, state.card, l2cpu_idx) {
                 Ok(net) => {
                     let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
@@ -1706,7 +1716,7 @@ fn dispatch_remove_net(
     // (frees the VirtioNet's slirp connection too via Box drop).
     // No-op when there's no engine registration for this slot.
 
-    if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
+    if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
         let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
             + crate::virtio_engine::DEV_NET;
         poller.unregister_slot(slot_idx);
@@ -1714,7 +1724,7 @@ fn dispatch_remove_net(
     // Take the net handle under the lock, join outside (same reasoning as
     // dispatch_remove_disk).
     let net = {
-        let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
+        let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
         let slot = slot_guard.as_mut().ok_or_else(|| {
             crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx))
         })?;
@@ -1740,7 +1750,7 @@ fn dispatch_add_console(
 ) -> crate::Result<()> {
     dlog!("[add_console l2cpu {}] dispatch entry", l2cpu_idx);
     validate_l2cpu(l2cpu_idx)?;
-    let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
+    let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
     let slot = slot_guard
         .as_mut()
         .ok_or_else(|| crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx)))?;
@@ -1754,7 +1764,7 @@ fn dispatch_add_console(
     // doesn't need to special-case engine-vs-legacy.
 
     {
-        if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
+        if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
             let input_buf = Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::with_capacity(crate::virtio::console::RX_BUFFER_CAP),
             ));
@@ -1806,14 +1816,14 @@ fn dispatch_remove_console(
     // Engine path: drop kick-poller registration first (frees the
     // VirtioConsole's input_buf reference too).
 
-    if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
+    if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
         let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
             + crate::virtio_engine::DEV_CONSOLE;
         poller.unregister_slot(slot_idx);
     }
     // Take the slot under the lock, join outside.
     let vc = {
-        let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock().unwrap();
+        let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
         let slot = slot_guard.as_mut().ok_or_else(|| {
             crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx))
         })?;
@@ -1844,7 +1854,14 @@ fn dispatch_remove_console(
 /// (`l2cpu_idx*4 + dev_idx` for `dev_idx` in 0..4 — see
 /// `virtio_engine::DEVS_PER_L2CPU`).
 fn unregister_engine_slots(state: &Arc<DaemonState>, l2cpu_idx: u8) {
-    if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
+    // Best-effort — called from teardown paths (dispatch_stop,
+    // serve()'s shutdown loop) where a poisoned poller mutex means
+    // the daemon is on its way out anyway. Silently skip in that
+    // case rather than crashing harder.
+    let Ok(poller_guard) = state.kick_poller.lock() else {
+        return;
+    };
+    if let Some(poller) = poller_guard.as_ref() {
         let base = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU;
         for dev_idx in 0..crate::virtio_engine::DEVS_PER_L2CPU {
             poller.unregister_slot(base + dev_idx);
@@ -1856,7 +1873,9 @@ fn unregister_engine_slots(state: &Arc<DaemonState>, l2cpu_idx: u8) {
 fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) -> crate::Result<()> {
     dlog!("[stop l2cpu {}] dispatch_stop entry", l2cpu_idx);
     validate_l2cpu(l2cpu_idx)?;
-    let taken = state.l2cpus[l2cpu_idx as usize].lock().unwrap().take();
+    let taken = state.l2cpus[l2cpu_idx as usize]
+        .lock_or_internal_error()?
+        .take();
     match taken {
         Some(slot) => {
             dlog!("[stop l2cpu {}] slot taken; joining workers", l2cpu_idx);
