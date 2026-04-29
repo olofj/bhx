@@ -129,9 +129,12 @@ third_party/           # vendored, builds-from-source dependencies
 │   ├── Makefile       # download + verify + build (PLATFORM=generic, FW_JUMP=y)
 │   ├── sha256sums     # pinned tarball checksum
 │   └── fw_jump.bin    # (gitignored) symlink the build maintains
-└── dtb/               # Blackhole device tree blob, vendored from tt-bh-linux
-    ├── README.md      # provenance (upstream commit SHAs, license, refresh)
-    └── blackhole-card.dtb  # checked-in binary (~2.7 KB; (GPL-2.0 OR MIT))
+└── dtb/               # Blackhole device tree, vendored from tenstorrent/linux
+    ├── README.md      # provenance (upstream commit SHA, license, bumping)
+    ├── Makefile       # cpp + dtc -> blackhole-card.dtb
+    ├── blackhole-card.dts   # vendored DTS source (Copyright 2025 Tenstorrent AI ULC)
+    ├── blackhole.dtsi       # vendored DTSI source (Copyright 2025 Tenstorrent AI ULC)
+    └── blackhole-card.dtb   # (gitignored) build output
 ```
 
 The `slirp` feature is on by default and links `libvdeslirp`+`libslirp`;
