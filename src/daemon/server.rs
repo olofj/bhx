@@ -29,19 +29,7 @@ use crate::daemon::protocol::{
 use crate::daemon::{DaemonState, DiskWorker, L2CpuSlot, WorkerHandle};
 use crate::dlog;
 use crate::l2cpu::L2Cpu;
-use crate::virtio::block;
 use crate::virtio::interrupt::InterruptController;
-#[cfg(feature = "slirp")]
-use crate::virtio::network;
-
-// VirtIO MMIO offsets and interrupt numbers come from `crate::regs::virtio_mmio`;
-// re-export under the legacy short names so the dispatch code reads cleanly.
-use crate::regs::virtio_mmio::{
-    CONSOLE_IRQ as CONSOLE_INT, CONSOLE_OFFSET as CONSOLE_MMIO, DISK_IRQ as DISK_INT,
-    DISK_OFFSET as DISK_MMIO, RNG_IRQ as RNG_INT,
-};
-#[cfg(feature = "slirp")]
-use crate::regs::virtio_mmio::{NET_IRQ as NET_INT, NET_OFFSET as NET_MMIO};
 
 /// Run the daemon accept loop foreground-style. Returns on SIGTERM / SIGINT
 /// once the shutdown flag has been tripped. Caller is responsible for
@@ -194,7 +182,6 @@ fn warm_resume_released(state: &Arc<DaemonState>, released: &[u8]) {
     // a future cold-boot RPC's `get_or_bring_up_tensix_engine` finds
     // the engine already up and skips `bring_up`'s halt+reload (which
     // would tear out the running guests' MMIO backend).
-    #[cfg(feature = "virtio-engine")]
     if !released.is_empty() {
         match state.adopt_running_tensix_engine() {
             Ok(()) => dlog!("[warm-resume] adopted running tensix engine"),
@@ -660,78 +647,11 @@ fn dispatch_boot(
         l2cpu_idx
     );
 
-    // Resolve each migrated device's MMIO backing from the shared
-    // host-MMIO buffer (or fall back to chip-DRAM if no host buffer
-    // was allocated for this boot — which today only happens when
-    // every device is disabled). One iATU region + one x280 small
-    // TLB cover all four sub-regions; each device's daemon-side VA
-    // is `buf.as_ptr() + index * 4096`.
-    let host_va_for = |index: usize| -> Option<usize> {
-        arts.virtio_host_mmio
-            .as_ref()
-            .map(|m| m.device_va(index) as usize)
-    };
-    let backing_for = |index: usize, chip_offset: u64| -> crate::virtio::MmioBacking {
-        match host_va_for(index) {
-            Some(va) => crate::virtio::MmioBacking::Host { va },
-            None => crate::virtio::MmioBacking::ChipDram {
-                region_offset: chip_offset,
-            },
-        }
-    };
-    let rng_backing = backing_for(
-        crate::host_buf::RNG_INDEX,
-        crate::regs::virtio_mmio::RNG_OFFSET,
-    );
-    let net_backing = backing_for(
-        crate::host_buf::NET_INDEX,
-        crate::regs::virtio_mmio::NET_OFFSET,
-    );
-    let disk_backing = backing_for(
-        crate::host_buf::DISK_INDEX,
-        crate::regs::virtio_mmio::DISK_OFFSET,
-    );
-    let console_backing = backing_for(
-        crate::host_buf::CONSOLE_INDEX,
-        crate::regs::virtio_mmio::CONSOLE_OFFSET,
-    );
-    slot.virtio_host_mmio = arts.virtio_host_mmio;
-
-    // Under the `virtio-engine` feature (#66/M4 #70), skip the
-    // host-MMIO worker spawn — those workers read/write the
-    // virtio-mmio register file via the host-side DMA buffer, which
-    // we don't allocate under this feature. The Tensix-engine
-    // data-plane workers (kick-ring driven, walking the guest's
-    // avail/desc/used rings via the existing TLB-mediated path) are
-    // M5.5+ work; until they land, a feature-on boot brings the
-    // engine + TLB + DTB up but does not actually serve traffic.
-    #[cfg(not(feature = "virtio-engine"))]
-    start_initial_workers(
-        &mut slot,
-        state.card,
-        l2cpu_idx,
-        disk,
-        network,
-        extra_fwd,
-        console,
-        rng,
-        rng_backing,
-        net_backing,
-        disk_backing,
-        console_backing,
-    )
-    .map_err(crate::Error::slot_state)?;
-    #[cfg(feature = "virtio-engine")]
+    // Register virtio device handlers with the engine's kick poller.
+    // When the guest writes QUEUE_NOTIFY for a registered slot, the
+    // poller looks up the entry, walks the descriptor chain via
+    // `process_one_chain_for_queue`, and fires the PLIC IRQ.
     {
-        // Register virtio device handlers with the engine's kick
-        // poller (#71 M5.5c). When the guest writes QUEUE_NOTIFY
-        // for a registered slot, the poller looks up the entry,
-        // walks the descriptor chain via
-        // `process_one_chain_for_queue`, and fires the PLIC IRQ.
-        // Wires rng, blk, net; console still pending (it needs the
-        // ConsoleHub TX/RX bridge that the legacy worker provides).
-        let _ = console;
-        let _ = (rng_backing, net_backing, disk_backing, console_backing);
         let engine_for_init = state.tensix_engine.lock().unwrap().clone();
         if let (Some(poller), Some(engine)) =
             (state.kick_poller.lock().unwrap().as_ref(), engine_for_init)
@@ -954,93 +874,6 @@ fn handle_existing_slot(
     Ok(())
 }
 
-/// Spawn the requested virtio workers *before* replying Ok — kernel hits
-/// VFS mount at ~0.137s and has no retry. Three sequential RPCs
-/// (boot + add-disk + add-net) lose that race; bundling them keeps the
-/// worker threads up within a few ms of L2CPU reset release.
-#[allow(clippy::too_many_arguments)]
-fn start_initial_workers(
-    slot: &mut L2CpuSlot,
-    card: u32,
-    l2cpu_idx: u8,
-    disk: Option<String>,
-    network: bool,
-    extra_fwd: Vec<(u16, u16)>,
-    console: bool,
-    rng: bool,
-    rng_backing: crate::virtio::MmioBacking,
-    net_backing: crate::virtio::MmioBacking,
-    disk_backing: crate::virtio::MmioBacking,
-    console_backing: crate::virtio::MmioBacking,
-) -> Result<(), String> {
-    if let Some(path) = disk {
-        dlog!(
-            "[boot l2cpu {}] spawning disk worker for {} (backing={:?})",
-            l2cpu_idx,
-            path,
-            disk_backing
-        );
-        // Open the disk image at the trust boundary so the worker
-        // operates on the exact inode we vetted, immune to symlink
-        // swaps between dispatch and the worker's mmap call.
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|e| {
-                dlog!(
-                    "[boot l2cpu {}] open disk image {} failed: {}",
-                    l2cpu_idx,
-                    path,
-                    e
-                );
-                format!("cannot open disk image {}: {}", path, e)
-            })?;
-        start_disk_worker(slot, &path, file, disk_backing).map_err(|e| {
-            dlog!("[boot l2cpu {}] start_disk_worker failed: {}", l2cpu_idx, e);
-            format!("start disk worker failed: {}", e)
-        })?;
-    }
-    if network {
-        dlog!(
-            "[boot l2cpu {}] spawning net worker (backing={:?})",
-            l2cpu_idx,
-            net_backing
-        );
-        start_net_worker(card, slot, net_backing, extra_fwd).map_err(|e| {
-            dlog!("[boot l2cpu {}] start_net_worker failed: {}", l2cpu_idx, e);
-            format!("start net worker failed: {}", e)
-        })?;
-    }
-    if console {
-        dlog!(
-            "[boot l2cpu {}] spawning virtio-console worker (backing={:?})",
-            l2cpu_idx,
-            console_backing
-        );
-        start_console_worker(slot, console_backing).map_err(|e| {
-            dlog!(
-                "[boot l2cpu {}] start_console_worker failed: {}",
-                l2cpu_idx,
-                e
-            );
-            format!("start console worker failed: {}", e)
-        })?;
-    }
-    if rng {
-        dlog!(
-            "[boot l2cpu {}] spawning virtio-rng worker (backing={:?})",
-            l2cpu_idx,
-            rng_backing
-        );
-        start_rng_worker(slot, rng_backing).map_err(|e| {
-            dlog!("[boot l2cpu {}] start_rng_worker failed: {}", l2cpu_idx, e);
-            format!("start rng worker failed: {}", e)
-        })?;
-    }
-    Ok(())
-}
-
 /// Park the slot in `DaemonState`, clear any stale `wedged` mark left
 /// over from a prior startup probe (since the cold boot just succeeded
 /// and the core is running with valid magic), and reply Ok to the
@@ -1063,176 +896,10 @@ fn install_slot_and_reply_ok(
     reply_ok(sock);
 }
 
-/// Spawn the disk worker. `disk_image` is an already-open File for the
-/// image — caller (typically `validate_add_disk_request`) opened it
-/// once at the trust boundary and we hand the same handle to the
-/// worker, defending against a path-resolved-twice TOCTOU.
-fn start_disk_worker(
-    slot: &mut L2CpuSlot,
-    path: &str,
-    disk_image: std::fs::File,
-    mmio_backing: crate::virtio::MmioBacking,
-) -> io::Result<()> {
-    let exit = Arc::new(AtomicBool::new(false));
-    let l2cpu = slot.l2cpu.clone();
-    let interrupt = slot.interrupt.clone();
-    let exit_thread = exit.clone();
-    let path_thread = path.to_string();
-    let t = thread::spawn(move || {
-        block::disk_main(
-            l2cpu,
-            interrupt,
-            DISK_INT,
-            mmio_backing,
-            path_thread,
-            disk_image,
-            exit_thread,
-        );
-    });
-    slot.disks.push(DiskWorker {
-        path: path.to_string(),
-        worker: WorkerHandle {
-            exit,
-            thread: Some(t),
-            description: format!("disk l2cpu {} @ {}", slot.idx, path),
-        },
-    });
-    Ok(())
-}
-
-#[cfg(feature = "slirp")]
-fn start_net_worker(
-    card: u32,
-    slot: &mut L2CpuSlot,
-    mmio_backing: crate::virtio::MmioBacking,
-    extra_fwd: Vec<(u16, u16)>,
-) -> io::Result<()> {
-    let exit = Arc::new(AtomicBool::new(false));
-    let l2cpu = slot.l2cpu.clone();
-    let interrupt = slot.interrupt.clone();
-    let exit_thread = exit.clone();
-    let idx = slot.idx;
-    let ssh_port = crate::regs::slirp::ssh_port(card, idx);
-    // Boot-path forwards: implicit SSH + any `--fwd HOST:GUEST` the
-    // operator passed. Hot-add via `add-net --fwd` still works post-
-    // boot but recreates the slirp instance, which the buildroot
-    // kernel can't rebind to (built-in virtio_net, no module reload).
-    let mut forwards = vec![(ssh_port, 22)];
-    forwards.extend(extra_fwd);
-    let t = thread::spawn(move || {
-        network::network_main(
-            forwards,
-            l2cpu,
-            interrupt,
-            NET_INT,
-            mmio_backing,
-            exit_thread,
-        );
-    });
-    slot.net = Some(WorkerHandle {
-        exit,
-        thread: Some(t),
-        description: format!("net l2cpu {}", idx),
-    });
-    Ok(())
-}
-
-#[cfg(not(feature = "slirp"))]
-fn start_net_worker(
-    _card: u32,
-    _slot: &mut L2CpuSlot,
-    _mmio_backing: crate::virtio::MmioBacking,
-    _extra_fwd: Vec<(u16, u16)>,
-) -> io::Result<()> {
-    Err(io::Error::other("daemon built without the slirp feature"))
-}
-
-/// Spawn the virtio-console worker (#51). The worker drains the
-/// kernel's TX queue into the console hub and fills RX descriptors
-/// from the per-slot `input_buf`. Idempotent guard via the slot's
-/// existing `virtio_console: Option<...>`: caller checks that.
-fn start_console_worker(
-    slot: &mut L2CpuSlot,
-    mmio_backing: crate::virtio::MmioBacking,
-) -> io::Result<()> {
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
-    let exit = Arc::new(AtomicBool::new(false));
-    let l2cpu = slot.l2cpu.clone();
-    let interrupt = slot.interrupt.clone();
-    let hub = slot.console_hub.clone();
-    let input_buf = Arc::new(Mutex::new(VecDeque::with_capacity(
-        crate::virtio::console::RX_BUFFER_CAP,
-    )));
-    let input_buf_thread = input_buf.clone();
-    let exit_thread = exit.clone();
-    let idx = slot.idx;
-    let t = thread::spawn(move || {
-        crate::virtio::console::console_main(
-            l2cpu,
-            interrupt,
-            CONSOLE_INT,
-            mmio_backing,
-            hub,
-            input_buf_thread,
-            exit_thread,
-        );
-    });
-    slot.virtio_console = Some(crate::daemon::VirtioConsoleSlot {
-        worker: WorkerHandle {
-            exit,
-            thread: Some(t),
-            description: format!("virtio-console l2cpu {}", idx),
-        },
-        input_buf,
-    });
-    Ok(())
-}
-
-/// Spawn the virtio-rng worker (#62 / #64). The worker fills any guest
-/// write-only descriptor with kernel entropy. Required for the
-/// AlmaLinux EFI shim's `EFI_RNG_PROTOCOL` on the U-Boot+GRUB+shim
-/// chained-boot path; harmless extra entropy source on other paths.
-/// Idempotent guard via the slot's `virtio_rng: Option<...>`: caller
-/// checks that.
-///
-/// `mmio_backing` is the resolved control-plane location: chip DRAM for
-/// the historical layout, host buffer for the #64 path. The caller
-/// supplies whichever it set up in `run_boot_sequence`. For the host
-/// path the underlying `HostDmaBuf` lives in `slot.virtio_rng_buf`,
-/// outliving this worker thanks to slot shutdown ordering.
-fn start_rng_worker(
-    slot: &mut L2CpuSlot,
-    mmio_backing: crate::virtio::MmioBacking,
-) -> io::Result<()> {
-    let exit = Arc::new(AtomicBool::new(false));
-    let l2cpu = slot.l2cpu.clone();
-    let interrupt = slot.interrupt.clone();
-    let exit_thread = exit.clone();
-    let idx = slot.idx;
-    let t = thread::spawn(move || {
-        crate::virtio::rng::rng_main(l2cpu, interrupt, RNG_INT, mmio_backing, exit_thread);
-    });
-    slot.virtio_rng = Some(WorkerHandle {
-        exit,
-        thread: Some(t),
-        description: format!("virtio-rng l2cpu {}", idx),
-    });
-    Ok(())
-}
-
 /// Output of `run_boot_sequence`. The L2Cpu is what every later step in
-/// dispatch_boot drives off of. `virtio_host_mmio` is the shared
-/// host-side MMIO buffer (#64) covering whichever subset of
-/// rng/net/disk/console were configured to live on host RAM for this
-/// boot — already used during this sequence to program one outbound
-/// iATU region + one x280 small TLB and to patch the DTB with each
-/// sub-region's x280 PA, but the daemon needs to keep the buffer
-/// alive for the workers' lifetime. dispatch_boot stashes it in
-/// `slot.virtio_host_mmio`.
+/// dispatch_boot drives off of.
 pub struct BootArtifacts {
     pub l2cpu: Arc<L2Cpu>,
-    pub virtio_host_mmio: Option<crate::host_buf::VirtioHostMmio>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1288,13 +955,10 @@ fn run_boot_sequence(
         // the lifetime model "tensix has the same lifetime as the
         // L2CPUs", a board reset is the natural moment to recycle
         // the engine — the next cold-boot RPC will bring it up fresh.
-        #[cfg(feature = "virtio-engine")]
-        {
-            // Drop the kick poller first (its thread holds another
-            // Arc<TensixEngine>); KickPoller::drop joins the thread.
-            let _ = state.kick_poller.lock().unwrap().take();
-            let _ = state.tensix_engine.lock().unwrap().take();
-        }
+        // Drop the kick poller first (its thread holds another
+        // Arc<TensixEngine>); KickPoller::drop joins the thread.
+        let _ = state.kick_poller.lock().unwrap().take();
+        let _ = state.tensix_engine.lock().unwrap().take();
         // SharedChip::reset_board internally drops its fd+window, issues the
         // PCIe LDS reset, and reopens fresh — callers never see stale fd
         // errors across the reset.
@@ -1372,235 +1036,85 @@ fn run_boot_sequence(
     // probes after net so we keep DISK last.
     let mut virtio_nodes: Vec<crate::boot::VirtioMmioNode> = Vec::with_capacity(8);
 
-    // One shared 16 KiB host buffer per L2CPU, partitioned into 4 KiB
-    // sub-regions, one per virtio device. Cuts iATU outbound usage
-    // from up-to-4-per-L2CPU (16/16 chip-wide and brittle) to one
-    // per L2CPU (4/16, with room to grow). One x280 small TLB window
-    // covers every device; the kernel sees each device at a distinct
-    // 4 KiB-aligned x280 PA. See `host_buf::VirtioHostMmio`.
     let any_host_device = has_rng || has_network || has_disk || has_console;
 
-    // Under the `virtio-engine` feature (#66/M4 #70), the L2CPU's
-    // virtio-mmio reg windows point at the Tensix engine's L1 instead
-    // of a host-buffer DMA region. The engine is brought up lazily —
+    // The L2CPU's virtio-mmio reg windows point at the tensix engine
+    // tile's L1. The engine is brought up lazily —
     // first feature-on boot triggers the firmware load + handshake,
     // subsequent boots reuse the same Arc<TensixEngine>.
     //
-    // We still set `virtio_host_mmio = None` because the per-device
-    // host-buffer pre_init isn't relevant (BRISC's M3 firmware
-    // populates the reg files itself), and start_initial_workers is
-    // skipped under this feature in the caller — the daemon-side
-    // data plane that walks the Tensix-side reg files is M5.5+.
-    #[cfg(feature = "virtio-engine")]
-    let virtio_host_mmio: Option<crate::host_buf::VirtioHostMmio> = {
-        if any_host_device {
-            let engine = state.get_or_bring_up_tensix_engine().map_err(|e| {
-                dlog!(
-                    "[run_boot l2cpu {}] tensix engine bring-up failed: {}",
-                    l2cpu_idx,
-                    e
-                );
-                e
-            })?;
-            let x280_base = engine.program_l2cpu_tlb(&l2cpu, l2cpu_idx as u32);
+    // The L2CPU's virtio-mmio reg windows point at the tensix engine
+    // tile's L1. Engine bring-up is lazy (first-boot triggers
+    // firmware load + handshake; subsequent boots reuse the same
+    // engine) — same Tensix tile serves all 4 L2CPUs on the chip.
+    if any_host_device {
+        let engine = state.get_or_bring_up_tensix_engine().map_err(|e| {
             dlog!(
-                "[run_boot l2cpu {}] virtio-engine: L2CPU TLB → tensix tile NOC0 ({}, {}) \
-                 translated ({}, {}); per-L2CPU window x280_base={:#x}",
+                "[run_boot l2cpu {}] tensix engine bring-up failed: {}",
                 l2cpu_idx,
-                engine.noc0_x,
-                engine.noc0_y,
-                engine.translated_x,
-                engine.translated_y,
-                x280_base
-            );
-            // Per-device DTB nodes: each device's reg file sits at
-            // `x280_base + dev_idx * REGS_PER_DEV`, where dev_idx
-            // follows the M3 firmware's BRISC_VIRTIO_DEV_* ordering
-            // (blk=0, net=1, console=2, rng=3). MMIO size =
-            // REGS_PER_DEV (4 KiB) per virtio 1.2 §4.2.2.
-            let regs_per_dev = crate::virtio_engine::REGS_PER_DEV as u64;
-            let mut emit = |dev_idx: u32, enabled: bool, irq: u32, label: &str| {
-                if !enabled {
-                    return;
-                }
-                let pa = x280_base + (dev_idx as u64) * regs_per_dev;
-                virtio_nodes.push(crate::boot::VirtioMmioNode {
-                    addr: pa,
-                    size: regs_per_dev,
-                    irq,
-                });
-                dlog!(
-                    "[run_boot l2cpu {}]   {}: x280_pa={:#x} (tensix-engine)",
-                    l2cpu_idx,
-                    label,
-                    pa
-                );
-            };
-            emit(
-                crate::virtio_engine::DEV_BLK,
-                has_disk,
-                crate::regs::virtio_mmio::DISK_IRQ,
-                "disk",
-            );
-            emit(
-                crate::virtio_engine::DEV_NET,
-                has_network,
-                crate::regs::virtio_mmio::NET_IRQ,
-                "net",
-            );
-            emit(
-                crate::virtio_engine::DEV_CONSOLE,
-                has_console,
-                crate::regs::virtio_mmio::CONSOLE_IRQ,
-                "console",
-            );
-            emit(
-                crate::virtio_engine::DEV_RNG,
-                has_rng,
-                crate::regs::virtio_mmio::RNG_IRQ,
-                "rng",
-            );
-        }
-        None
-    };
-
-    #[cfg(not(feature = "virtio-engine"))]
-    let virtio_host_mmio: Option<crate::host_buf::VirtioHostMmio> = if any_host_device {
-        let total_size = crate::host_buf::SUB_REGION_SIZE * crate::host_buf::SUB_REGION_COUNT;
-        let buf =
-            crate::host_buf::HostDmaBuf::allocate(l2cpu.fd(), total_size, 0x40).map_err(|e| {
-                dlog!(
-                    "[run_boot l2cpu {}] HostDmaBuf::allocate for shared virtio mmio failed: {}",
-                    l2cpu_idx,
-                    e
-                );
                 e
-            })?;
-        let x280_base = crate::x280_tlb::program_small_tlb_unicast(
-            &l2cpu,
-            crate::x280_tlb::SHARED_TLB_SLOT,
-            crate::x280_tlb::PCIE_TILE_X,
-            crate::x280_tlb::PCIE_TILE_Y,
-            buf.noc_address,
-        );
+            );
+            e
+        })?;
+        let x280_base = engine.program_l2cpu_tlb(&l2cpu, l2cpu_idx as u32);
         dlog!(
-            "[run_boot l2cpu {}] shared virtio mmio: noc={:#x} x280_base={:#x} host_va={:p} ({} bytes, {} sub-regions)",
+            "[run_boot l2cpu {}] L2CPU TLB → tensix tile NOC0 ({}, {}) translated \
+             ({}, {}); per-L2CPU window x280_base={:#x}",
             l2cpu_idx,
-            buf.noc_address,
-            x280_base,
-            buf.as_ptr(),
-            total_size,
-            crate::host_buf::SUB_REGION_COUNT,
+            engine.noc0_x,
+            engine.noc0_y,
+            engine.translated_x,
+            engine.translated_y,
+            x280_base
         );
-
-        // Sub-region helper: pre-init the device's 4 KiB sub-region
-        // (zero + magic + version + …), record its x280 PA, push a
-        // DTB node so the kernel's virtio-mmio probe sees it. Each
-        // sub-region's x280 PA sits at `x280_base + i*4096`; each
-        // device's daemon-side VA is `buf.as_ptr() + i*4096`.
-        let sub_size = crate::host_buf::SUB_REGION_SIZE as u64;
-        let mut device_x280_pa = [0u64; 4];
-        let mut configure = |index: usize, enabled: bool, device_id: u32, irq: u32, label: &str| {
-            let pa = x280_base + (index as u64) * sub_size;
-            device_x280_pa[index] = pa;
-            if enabled {
-                let va = unsafe {
-                    buf.as_ptr()
-                        .add(index * crate::host_buf::SUB_REGION_SIZE as usize)
-                };
-                pre_init_virtio_mmio_host(va, device_id);
-                virtio_nodes.push(crate::boot::VirtioMmioNode {
-                    addr: pa,
-                    size: sub_size,
-                    irq,
-                });
-                dlog!(
-                    "[run_boot l2cpu {}]   {}: x280_pa={:#x}",
-                    l2cpu_idx,
-                    label,
-                    pa
-                );
+        // Per-device DTB nodes: each device's reg file sits at
+        // `x280_base + dev_idx * REGS_PER_DEV`, where dev_idx follows
+        // the BRISC firmware's BRISC_VIRTIO_DEV_* ordering (blk=0,
+        // net=1, console=2, rng=3). MMIO size = REGS_PER_DEV (4 KiB)
+        // per virtio 1.2 §4.2.2.
+        let regs_per_dev = crate::virtio_engine::REGS_PER_DEV as u64;
+        let mut emit = |dev_idx: u32, enabled: bool, irq: u32, label: &str| {
+            if !enabled {
+                return;
             }
+            let pa = x280_base + (dev_idx as u64) * regs_per_dev;
+            virtio_nodes.push(crate::boot::VirtioMmioNode {
+                addr: pa,
+                size: regs_per_dev,
+                irq,
+            });
+            dlog!(
+                "[run_boot l2cpu {}]   {}: x280_pa={:#x}",
+                l2cpu_idx,
+                label,
+                pa
+            );
         };
-        configure(
-            crate::host_buf::RNG_INDEX,
-            has_rng,
-            crate::regs::virtio_mmio::VIRTIO_ID_ENTROPY,
-            crate::regs::virtio_mmio::RNG_IRQ,
-            "rng",
-        );
-        configure(
-            crate::host_buf::NET_INDEX,
-            has_network,
-            crate::regs::virtio_mmio::VIRTIO_ID_NET,
-            crate::regs::virtio_mmio::NET_IRQ,
-            "net",
-        );
-        configure(
-            crate::host_buf::DISK_INDEX,
+        emit(
+            crate::virtio_engine::DEV_BLK,
             has_disk,
-            crate::regs::virtio_mmio::VIRTIO_ID_BLOCK,
             crate::regs::virtio_mmio::DISK_IRQ,
             "disk",
         );
-        configure(
-            crate::host_buf::CONSOLE_INDEX,
+        emit(
+            crate::virtio_engine::DEV_NET,
+            has_network,
+            crate::regs::virtio_mmio::NET_IRQ,
+            "net",
+        );
+        emit(
+            crate::virtio_engine::DEV_CONSOLE,
             has_console,
-            crate::regs::virtio_mmio::VIRTIO_ID_CONSOLE,
             crate::regs::virtio_mmio::CONSOLE_IRQ,
             "console",
         );
-        Some(crate::host_buf::VirtioHostMmio {
-            buf,
-            device_x280_pa,
-        })
-    } else {
-        None
-    };
-
-    // Chip-DRAM virtio slots. Emit only on the legacy host-buffer
-    // path: even with the host-buffer-backed RNG + NET, the chip-DRAM
-    // slots stay in the DTB so `add-disk` / `add-net` / `add-console`
-    // (which currently always populate the chip-DRAM slot) keep
-    // working post-boot. Order matches the pre-#64 emission
-    // (RNG-slot, CONSOLE, NET, DISK in ascending address) so the
-    // kernel's probe order — which gated the multi-queue race in
-    // #61 on stock kernels — stays where it was.
-    //
-    // Under `virtio-engine` the engine path emits its own four DTB
-    // nodes (above, at `x280_base + dev_idx*0x1000`), and hot-add
-    // through the chip-DRAM slots isn't supported there yet. Emitting
-    // the chip-DRAM nodes anyway just gives the kernel four
-    // uninitialized MMIO regions and four "Wrong magic value"
-    // warnings at boot.
-    #[cfg(not(feature = "virtio-engine"))]
-    {
-        use crate::regs::virtio_mmio::{
-            CONSOLE_IRQ, CONSOLE_OFFSET, DISK_IRQ, DISK_OFFSET, MMIO_SLOT_SIZE, NET_IRQ,
-            NET_OFFSET, RNG_IRQ, RNG_OFFSET,
-        };
-        virtio_nodes.push(crate::boot::VirtioMmioNode {
-            addr: starting_address + memory_size - RNG_OFFSET,
-            size: MMIO_SLOT_SIZE,
-            irq: RNG_IRQ,
-        });
-        virtio_nodes.push(crate::boot::VirtioMmioNode {
-            addr: starting_address + memory_size - CONSOLE_OFFSET,
-            size: MMIO_SLOT_SIZE,
-            irq: CONSOLE_IRQ,
-        });
-        virtio_nodes.push(crate::boot::VirtioMmioNode {
-            addr: starting_address + memory_size - NET_OFFSET,
-            size: MMIO_SLOT_SIZE,
-            irq: NET_IRQ,
-        });
-        virtio_nodes.push(crate::boot::VirtioMmioNode {
-            addr: starting_address + memory_size - DISK_OFFSET,
-            size: MMIO_SLOT_SIZE,
-            irq: DISK_IRQ,
-        });
+        emit(
+            crate::virtio_engine::DEV_RNG,
+            has_rng,
+            crate::regs::virtio_mmio::RNG_IRQ,
+            "rng",
+        );
     }
-
     dlog!(
         "[run_boot l2cpu {}] patching DTB (memory start=0x{:x} size=0x{:x}, {} virtio nodes)",
         l2cpu_idx,
@@ -1658,10 +1172,7 @@ fn run_boot_sequence(
         "[run_boot l2cpu {}] image+pre_init done; deferring reset release until workers spawn",
         l2cpu_idx
     );
-    Ok(BootArtifacts {
-        l2cpu,
-        virtio_host_mmio,
-    })
+    Ok(BootArtifacts { l2cpu })
 }
 
 /// Release the L2CPU from reset and configure its prefetchers. Called
@@ -1860,7 +1371,6 @@ fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlo
         net: None,
         virtio_console: None,
         virtio_rng: None,
-        virtio_host_mmio: None,
         started: Instant::now(),
     })
 }
@@ -2033,7 +1543,7 @@ fn dispatch_add_disk(
     // see the device — same effect as the legacy worker not having
     // started yet. There is no per-device worker thread to spawn;
     // the kick poller handles dispatch.
-    #[cfg(feature = "virtio-engine")]
+
     {
         if let (Some(poller), Some(engine)) = (
             state.kick_poller.lock().unwrap().as_ref(),
@@ -2085,40 +1595,11 @@ fn dispatch_add_disk(
                 }
             }
         }
-        // Engine compiled in but not brought up — fall through to
-        // legacy. In practice every engine boot brings up the engine
-        // lazily through `dispatch_boot`'s `any_host_device` branch,
-        // so this is just defensive.
     }
-
-    let exit = Arc::new(AtomicBool::new(false));
-    let l2cpu = slot.l2cpu.clone();
-    let interrupt = slot.interrupt.clone();
-    let exit_thread = exit.clone();
-    let path_thread = path.clone();
-    let t = thread::spawn(move || {
-        block::disk_main(
-            l2cpu,
-            interrupt,
-            DISK_INT,
-            crate::virtio::MmioBacking::ChipDram {
-                region_offset: DISK_MMIO,
-            },
-            path_thread,
-            disk_image,
-            exit_thread,
-        );
-    });
-    slot.disks.push(DiskWorker {
-        path: path.clone(),
-        worker: WorkerHandle {
-            exit,
-            thread: Some(t),
-            description: format!("disk l2cpu {} @ {}", l2cpu_idx, path),
-        },
-    });
-    reply_ok(sock);
-    Ok(())
+    let _ = disk_image; // engine path not brought up
+    Err(crate::Error::slot_state(
+        "tensix engine not yet brought up; cold-boot the L2CPU first",
+    ))
 }
 
 fn dispatch_remove_disk(
@@ -2133,7 +1614,7 @@ fn dispatch_remove_disk(
     // a use-after-free against the Box<VirtioBlk> we're about to free.
     // The legacy worker thread handles its own teardown via the exit
     // flag in the for-loop below; this is a no-op there.
-    #[cfg(feature = "virtio-engine")]
+
     if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
         let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
             + crate::virtio_engine::DEV_BLK;
@@ -2213,7 +1694,7 @@ fn dispatch_add_net(
     // Engine path: build the VirtioNet directly + register with the
     // kick poller. No worker thread; the kick poller's RX poll loop
     // (#71 M5.5e) drives slirp's recv side.
-    #[cfg(feature = "virtio-engine")]
+
     {
         if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
             match crate::virtio::network::VirtioNet::new(&forwards, l2cpu_idx) {
@@ -2257,40 +1738,10 @@ fn dispatch_add_net(
             }
         }
     }
-
-    let exit = Arc::new(AtomicBool::new(false));
-    let l2cpu = slot.l2cpu.clone();
-    let interrupt = slot.interrupt.clone();
-    let exit_thread = exit.clone();
-    dlog!(
-        "[add_net l2cpu {}] spawning network worker thread (forwards={:?})",
-        l2cpu_idx,
-        forwards
-    );
-    let forwards_thread = forwards.clone();
-    let t = thread::spawn(move || {
-        network::network_main(
-            forwards_thread,
-            l2cpu,
-            interrupt,
-            NET_INT,
-            crate::virtio::MmioBacking::ChipDram {
-                region_offset: NET_MMIO,
-            },
-            exit_thread,
-        );
-    });
-    slot.net = Some(WorkerHandle {
-        exit,
-        thread: Some(t),
-        description: format!("net l2cpu {}", l2cpu_idx),
-    });
-    dlog!(
-        "[add_net l2cpu {}] dispatch complete — replying ok",
-        l2cpu_idx
-    );
-    reply_ok(sock);
-    Ok(())
+    let _ = forwards; // engine path not brought up
+    Err(crate::Error::slot_state(
+        "tensix engine not yet brought up; cold-boot the L2CPU first",
+    ))
 }
 
 #[cfg(not(feature = "slirp"))]
@@ -2316,7 +1767,7 @@ fn dispatch_remove_net(
     // Engine path: drop the kick poller's net registration first
     // (frees the VirtioNet's slirp connection too via Box drop).
     // No-op when there's no engine registration for this slot.
-    #[cfg(feature = "virtio-engine")]
+
     if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
         let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
             + crate::virtio_engine::DEV_NET;
@@ -2363,7 +1814,7 @@ fn dispatch_add_console(
     // poller; same shape as the boot-time `console` branch in
     // dispatch_boot. Stub WorkerHandle so the slot teardown path
     // doesn't need to special-case engine-vs-legacy.
-    #[cfg(feature = "virtio-engine")]
+
     {
         if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
             let input_buf = Arc::new(std::sync::Mutex::new(
@@ -2402,19 +1853,9 @@ fn dispatch_add_console(
         }
     }
 
-    start_console_worker(
-        slot,
-        crate::virtio::MmioBacking::ChipDram {
-            region_offset: CONSOLE_MMIO,
-        },
-    )
-    .map_err(crate::Error::io_ctx("start virtio-console worker"))?;
-    dlog!(
-        "[add_console l2cpu {}] dispatch complete — replying ok",
-        l2cpu_idx
-    );
-    reply_ok(sock);
-    Ok(())
+    Err(crate::Error::slot_state(
+        "tensix engine not yet brought up; cold-boot the L2CPU first",
+    ))
 }
 
 fn dispatch_remove_console(
@@ -2426,7 +1867,7 @@ fn dispatch_remove_console(
     validate_l2cpu(l2cpu_idx)?;
     // Engine path: drop kick-poller registration first (frees the
     // VirtioConsole's input_buf reference too).
-    #[cfg(feature = "virtio-engine")]
+
     if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
         let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
             + crate::virtio_engine::DEV_CONSOLE;
@@ -2465,18 +1906,11 @@ fn dispatch_remove_console(
 /// (`l2cpu_idx*4 + dev_idx` for `dev_idx` in 0..4 — see
 /// `virtio_engine::DEVS_PER_L2CPU`).
 fn unregister_engine_slots(state: &Arc<DaemonState>, l2cpu_idx: u8) {
-    #[cfg(feature = "virtio-engine")]
-    {
-        if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
-            let base = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU;
-            for dev_idx in 0..crate::virtio_engine::DEVS_PER_L2CPU {
-                poller.unregister_slot(base + dev_idx);
-            }
+    if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
+        let base = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU;
+        for dev_idx in 0..crate::virtio_engine::DEVS_PER_L2CPU {
+            poller.unregister_slot(base + dev_idx);
         }
-    }
-    #[cfg(not(feature = "virtio-engine"))]
-    {
-        let _ = (state, l2cpu_idx);
     }
 }
 

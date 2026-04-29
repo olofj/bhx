@@ -4,13 +4,9 @@
 //! VirtIO network device implementation using Slirp.
 
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
-use crate::l2cpu::L2Cpu;
 use crate::slirp_ffi::*;
-use crate::virtio::interrupt::InterruptController;
-use crate::virtio::{self, VirtioDeviceImpl};
+use crate::virtio::VirtioDeviceImpl;
 
 const PACKET_SIZE: usize = 1514;
 const VIRTIO_ID_NET: u32 = 1;
@@ -397,52 +393,5 @@ impl VirtioDeviceImpl for VirtioNet {
         } else {
             true
         }
-    }
-}
-
-/// Network device thread main function. `forwards` is the list of
-/// host→guest TCP NAT entries to register at slirp init — typically
-/// `[(ssh_port, 22)]` plus any extras the operator passed via
-/// `add-net --fwd HOST:GUEST`. Keeping chip-topology logic at the call
-/// site lets this thread know nothing about cards or L2CPU indices
-/// beyond the log prefix.
-pub fn network_main(
-    forwards: Vec<(u16, u16)>,
-    l2cpu: Arc<L2Cpu>,
-    interrupt_ctl: Arc<InterruptController>,
-    interrupt_number: u32,
-    mmio_backing: virtio::MmioBacking,
-    exit_flag: Arc<AtomicBool>,
-) {
-    let l2cpu_idx = l2cpu.idx();
-    crate::dlog!(
-        "[net l2cpu {}] worker thread entered (irq={}, forwards={:?})",
-        l2cpu_idx,
-        interrupt_number,
-        forwards
-    );
-    while !exit_flag.load(Ordering::Relaxed) {
-        let mut net = match VirtioNet::new(&forwards, l2cpu_idx as u8) {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!(
-                    "network: failed to initialize slirp user-mode networking: {}",
-                    e
-                );
-                return;
-            }
-        };
-
-        virtio::run_device(
-            &mut net,
-            &l2cpu,
-            &interrupt_ctl,
-            interrupt_number,
-            mmio_backing,
-            &exit_flag,
-            virtio::InterruptKind::Net,
-        );
-
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }

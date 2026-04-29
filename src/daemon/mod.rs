@@ -33,7 +33,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use crate::host_buf::VirtioHostMmio;
 use crate::l2cpu::L2Cpu;
 use crate::shared_chip::SharedChip;
 use crate::virtio::interrupt::InterruptController;
@@ -79,14 +78,6 @@ pub struct L2CpuSlot {
     /// to satisfy `EFI_RNG_PROTOCOL` on the U-Boot+GRUB+shim chained-boot
     /// path; useful as plain `/dev/random` backing on direct-kernel paths.
     pub virtio_rng: Option<WorkerHandle>,
-    /// Shared host-side DMA buffer backing every host-buffer-migrated
-    /// virtio device's MMIO control plane on this L2CPU (#64). One iATU
-    /// region + one x280 small TLB window for all four devices, partitioned
-    /// into 4 KiB sub-regions. `Some` whenever any host-buffer-migrated
-    /// device is up; held here so the buffer outlives the workers. Drop
-    /// order: workers are joined in `shutdown` before the slot is
-    /// dropped, which then drops this buffer's munmap.
-    pub virtio_host_mmio: Option<VirtioHostMmio>,
     /// Wall-clock instant the slot was installed. Drives
     /// `tt_bh_l2cpu_uptime_seconds`. Set once at construction; never
     /// updated.
@@ -196,10 +187,7 @@ impl DaemonState {
     /// Lazy getter for the Tensix virtio engine. First call brings
     /// up the tile (picks via M2, loads M3 firmware, releases BRISC),
     /// then spawns the daemon-side kick poller; subsequent calls
-    /// return the cached `Arc`. Only useful when the `virtio-engine`
-    /// feature is enabled — without it, callers should not invoke
-    /// this (use the host-buffer #64 path instead).
-    #[cfg(feature = "virtio-engine")]
+    /// return the cached `Arc`.
     pub fn get_or_bring_up_tensix_engine(
         &self,
     ) -> std::io::Result<Arc<crate::tensix_engine::TensixEngine>> {
@@ -230,7 +218,6 @@ impl DaemonState {
     /// Failure is non-fatal: if the chip has lost firmware (stats
     /// magic mismatch), this returns Err and the next cold-boot RPC
     /// will go through `bring_up` as if no warm engine ever existed.
-    #[cfg(feature = "virtio-engine")]
     pub fn adopt_running_tensix_engine(&self) -> std::io::Result<()> {
         let mut guard = self.tensix_engine.lock().unwrap();
         if guard.is_some() {

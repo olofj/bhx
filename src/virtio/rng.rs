@@ -129,46 +129,6 @@ fn fill_with_entropy(addr: *mut u8, len: u64) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Worker entry point
-// ---------------------------------------------------------------------------
-
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-
-use crate::l2cpu::L2Cpu;
-use crate::virtio::interrupt::InterruptController;
-
-/// Per-L2CPU virtio-rng worker. Hosts a `VirtioRng` and runs
-/// `virtio::run_device` against the dedicated MMIO region. The caller
-/// chooses chip-DRAM vs host-buffer placement via `mmio_backing`; for
-/// the host-buffer path the caller is responsible for keeping the
-/// underlying `HostDmaBuf` alive for the duration of this call (#64).
-pub fn rng_main(
-    l2cpu: Arc<L2Cpu>,
-    interrupt_ctl: Arc<InterruptController>,
-    interrupt_number: u32,
-    mmio_backing: crate::virtio::MmioBacking,
-    exit_flag: Arc<AtomicBool>,
-) {
-    crate::dlog!(
-        "[rng l2cpu {}] worker thread entered (irq={})",
-        l2cpu.idx(),
-        interrupt_number
-    );
-    let mut device = VirtioRng::new();
-    crate::virtio::run_device(
-        &mut device,
-        &l2cpu,
-        &interrupt_ctl,
-        interrupt_number,
-        mmio_backing,
-        &exit_flag,
-        crate::virtio::InterruptKind::Rng,
-    );
-    crate::dlog!("[rng l2cpu {}] worker thread exited", l2cpu.idx());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

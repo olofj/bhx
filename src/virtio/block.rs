@@ -7,12 +7,8 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
-use crate::l2cpu::L2Cpu;
-use crate::virtio::interrupt::InterruptController;
-use crate::virtio::{self, VirtioDeviceImpl};
+use crate::virtio::VirtioDeviceImpl;
 
 // VirtIO block request types
 const VIRTIO_BLK_T_IN: u32 = 0; // read from disk
@@ -266,67 +262,5 @@ impl VirtioDeviceImpl for VirtioBlk {
         unsafe {
             ptr::write_volatile(&mut (*cfg).capacity, self.num_sectors());
         }
-    }
-}
-
-/// Block device thread main function.
-///
-/// `disk_image` is the operator-vetted File handle (opened during
-/// `dispatch_add_disk`). Holding it for the whole worker lifetime
-/// closes the path-resolved-twice TOCTOU window: the inner loop
-/// re-creates VirtioBlk on each iteration via `try_clone`, so a
-/// symlink swap between iterations can't redirect the daemon at a
-/// different inode. `disk_image_path` is kept for log lines only.
-pub fn disk_main(
-    l2cpu: Arc<L2Cpu>,
-    interrupt_ctl: Arc<InterruptController>,
-    interrupt_number: u32,
-    mmio_backing: virtio::MmioBacking,
-    disk_image_path: String,
-    disk_image: File,
-    exit_flag: Arc<AtomicBool>,
-) {
-    crate::dlog!(
-        "[disk l2cpu {}] worker thread entered (image={}, irq={})",
-        l2cpu.idx(),
-        disk_image_path,
-        interrupt_number
-    );
-    while !exit_flag.load(Ordering::Relaxed) {
-        // Hand a fresh fd-clone to each VirtioBlk so its Drop's munmap
-        // + close is independent of the master `disk_image` File. The
-        // dup is cheap (no actual open() syscall, no path resolution).
-        let cloned = match disk_image.try_clone() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "disk: failed to dup fd for image {}: {}",
-                    disk_image_path, e
-                );
-                return;
-            }
-        };
-        let mut blk = match VirtioBlk::from_file(cloned, l2cpu.idx() as u8) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("disk: failed to open image {}: {}", disk_image_path, e);
-                return;
-            }
-        };
-
-        // Capacity is written by VirtioBlk::init_config inside run_device,
-        // after the cold-start memset. Writing it here would be clobbered.
-
-        virtio::run_device(
-            &mut blk,
-            &l2cpu,
-            &interrupt_ctl,
-            interrupt_number,
-            mmio_backing,
-            &exit_flag,
-            virtio::InterruptKind::Block,
-        );
-
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }

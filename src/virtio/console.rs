@@ -199,41 +199,9 @@ impl VirtioDeviceImpl for VirtioConsole {
 // Worker entry point
 // ---------------------------------------------------------------------------
 
-use std::sync::atomic::AtomicBool;
-
-use crate::l2cpu::L2Cpu;
-use crate::virtio::interrupt::InterruptController;
-
 /// Per-L2CPU virtio-console worker. Hosts a `VirtioConsole` and runs
 /// `virtio::run_device` against the dedicated MMIO slot.
 #[allow(clippy::too_many_arguments)]
-pub fn console_main(
-    l2cpu: Arc<L2Cpu>,
-    interrupt_ctl: Arc<InterruptController>,
-    interrupt_number: u32,
-    mmio_backing: crate::virtio::MmioBacking,
-    hub: Arc<ConsoleHub>,
-    input_buf: Arc<Mutex<VecDeque<u8>>>,
-    exit_flag: Arc<AtomicBool>,
-) {
-    crate::dlog!(
-        "[console l2cpu {}] worker thread entered (irq={})",
-        l2cpu.idx(),
-        interrupt_number
-    );
-    let mut device = VirtioConsole::new(hub, input_buf);
-    crate::virtio::run_device(
-        &mut device,
-        &l2cpu,
-        &interrupt_ctl,
-        interrupt_number,
-        mmio_backing,
-        &exit_flag,
-        crate::virtio::InterruptKind::Console,
-    );
-    crate::dlog!("[console l2cpu {}] worker thread exited", l2cpu.idx());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

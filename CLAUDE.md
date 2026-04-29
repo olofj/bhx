@@ -25,24 +25,12 @@ block the push and require an immediate follow-up commit. Skipping
 `cargo fmt` locally has been the most common cause of red CI on this
 project — don't skip it.
 
-As of M5.5e (#71) `virtio-engine` is a default feature alongside
-`slirp` — `cargo build` etc. now build the BRISC-engine path. The
-legacy host-buffer path (#64) is still available behind
-`--no-default-features --features slirp` while the soak scripts pin
-against it during the M6 cutover. When you touch host-buffer-only
-code (`src/host_buf.rs`, `start_initial_workers`, the worker spawns
-in `dispatch_add_disk` / `dispatch_add_net` / `dispatch_add_console`,
-or any `#[cfg(not(feature = "virtio-engine"))]` block) also run:
-
-```bash
-cargo clippy --all-targets --no-default-features --features slirp -- -D warnings
-cargo test --no-default-features --features slirp
-```
-
-The default gates exercise the engine path; silent regressions on
-the legacy path sit dormant until someone explicitly disables the
-default. Run the legacy-on form whenever you change code only the
-host-buffer path uses.
+As of M6.9 (#71) the legacy host-buffer #64 path is gone — there is
+exactly one virtio control plane: BRISC firmware on a Tensix tile
+serving all four L2CPUs through `process_one_chain_for_queue` in
+`src/virtio/mod.rs`, dispatched from the kick poller in
+`src/tensix_data_plane.rs`. The only remaining feature flag is
+`slirp` (libvdeslirp/libslirp link for virtio-net).
 
 Ambition does not mean scope creep. Stay ruthless about simplicity:
 - Don't invent abstractions for hypothetical future needs.

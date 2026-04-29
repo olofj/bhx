@@ -16,7 +16,6 @@ mod daemon;
 mod error;
 mod fdt_ffi;
 mod fetch;
-mod host_buf;
 mod image;
 mod kernel;
 mod kmd;
