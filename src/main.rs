@@ -80,68 +80,82 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Boot an L2CPU via the daemon (starts the chip + guest; use `connect`
-    /// afterwards to attach a terminal).
+    /// Boot an L2CPU via the daemon.
+    ///
+    /// Starts the chip + guest; use `connect` afterwards to attach a
+    /// terminal.
     Boot {
-        /// Path to OpenSBI binary
+        /// Path to OpenSBI binary.
         #[arg(long, default_value = "fw_jump.bin")]
         opensbi: String,
-        /// Path to a raw Linux Image (default; mutually exclusive with --uboot)
+        /// Path to a raw Linux Image.
+        ///
+        /// Default boot path; mutually exclusive with --uboot.
         #[arg(long, conflicts_with = "uboot")]
         kernel: Option<String>,
-        /// Path to a U-Boot binary (S-mode payload). Mutually exclusive
-        /// with --kernel. In this mode the daemon loads U-Boot at the
-        /// kernel offset and skips initramfs preload — U-Boot reads
-        /// the kernel + initrd from the attached --disk at runtime.
-        /// See #44.
+        /// Path to a U-Boot binary (S-mode payload).
+        ///
+        /// Mutually exclusive with --kernel and --initramfs. In this mode
+        /// the daemon loads U-Boot at the kernel offset and skips
+        /// initramfs preload — U-Boot reads the kernel + initrd from the
+        /// attached --disk at runtime.
         #[arg(long, conflicts_with_all = ["kernel", "initramfs"])]
         uboot: Option<String>,
-        /// Path to device tree blob
+        /// Path to device tree blob.
         #[arg(long, default_value = "blackhole-card.dtb")]
         dtb: String,
-        /// Boot with an initramfs image instead of a virtio-block rootfs
+        /// Boot with an initramfs image instead of a virtio-block rootfs.
         #[arg(long)]
         initramfs: Option<String>,
-        /// Root device name passed to the kernel (ignored when --initramfs is set)
+        /// Root device name passed to the kernel.
+        ///
+        /// Ignored when --initramfs is set.
         #[arg(long, default_value = "vda")]
         root_device: String,
-        /// Always do a full board-level PCIe link reset before booting, even
-        /// if the target L2CPU is already in reset. Disrupts other L2CPUs on
-        /// the same card (they see a PCIe blip), so by default we probe
-        /// `L2CPU_RESET` first and only reset when necessary.
+        /// Force a full PCIe link reset before booting.
+        ///
+        /// Disrupts other L2CPUs on the same card (they see a PCIe
+        /// blip), so by default we probe `L2CPU_RESET` first and only
+        /// reset when necessary.
         #[arg(long)]
         force_reset_pcie: bool,
-        /// If the daemon already has a live slot for this L2CPU, tear it
-        /// down (stop workers, drop mmaps) before re-imaging. Without this,
-        /// a duplicate `boot` returns an error and leaves the prior slot
-        /// untouched. Use when you know you want to re-image a running
-        /// core — e.g. switching rootfs without an explicit `stop` first.
+        /// Tear down any existing slot for this L2CPU before re-imaging.
+        ///
+        /// Without this, a duplicate `boot` returns an error and leaves
+        /// the prior slot untouched. Use when you know you want to
+        /// re-image a running core — e.g. switching rootfs without an
+        /// explicit `stop` first.
         #[arg(long)]
         force: bool,
-        /// Attach a virtio-console device alongside the boot. Stock distro
-        /// kernels with `CONFIG_VIRTIO_CONSOLE` register this as `/dev/hvc0`
-        /// and direct their console output through it instead of the
-        /// OpenSBI debug UART (which often requires `CONFIG_HVC_RISCV_SBI`,
-        /// not enabled in upstream-portable distro kernels). See #51.
+        /// Attach a virtio-console device alongside the boot.
+        ///
+        /// Stock distro kernels with `CONFIG_VIRTIO_CONSOLE` register
+        /// this as `/dev/hvc0` and direct their console output through
+        /// it instead of the OpenSBI debug UART (which often requires
+        /// `CONFIG_HVC_RISCV_SBI`, not enabled in upstream-portable
+        /// distro kernels).
         #[arg(long = "virtio-console")]
         virtio_console: bool,
-        /// Skip attaching virtio-rng. By default the daemon brings up
-        /// virtio-rng alongside the boot — U-Boot's EFI loader needs it
-        /// to install `EFI_RNG_PROTOCOL`, which the AlmaLinux EFI shim
-        /// queries during signature verification (without it the shim
-        /// stalls before chainloading GRUB). It's also harmless on
-        /// direct-kernel boots (extra thread, satisfies guest
-        /// /dev/random). Pass this if you want to bisect a virtio-rng
-        /// regression. See #62.
+        /// Skip attaching virtio-rng.
+        ///
+        /// By default the daemon brings up virtio-rng alongside the
+        /// boot — U-Boot's EFI loader needs it to install
+        /// `EFI_RNG_PROTOCOL`, which the AlmaLinux EFI shim queries
+        /// during signature verification (without it the shim stalls
+        /// before chainloading GRUB). Harmless on direct-kernel boots
+        /// (extra thread, satisfies guest /dev/random). Pass this only
+        /// to bisect a virtio-rng regression.
         #[arg(long = "no-virtio-rng")]
         no_virtio_rng: bool,
-        /// Additional TCP port forwards as `HOST:GUEST` pairs, installed
-        /// at boot time on top of the implicit SSH forward. Repeatable:
-        /// `--fwd 5201:5201 --fwd 8080:80`. Same as `add-net --fwd`,
-        /// but applied at cold-boot so the guest's virtio_net binding
-        /// never has to migrate to a hot-added device — needed for the
-        /// net bench's ingress measurement against buildroot kernels
-        /// that don't auto-rebind built-in virtio_net after teardown.
+        /// TCP port forwards as `HOST:GUEST` pairs (repeatable).
+        ///
+        /// Installed at boot time on top of the implicit SSH forward.
+        /// Repeatable: `--fwd 5201:5201 --fwd 8080:80`. Same as
+        /// `add-net --fwd`, but applied at cold-boot so the guest's
+        /// virtio_net binding doesn't have to migrate to a hot-added
+        /// device — needed for the net bench's ingress measurement
+        /// against buildroot kernels that don't auto-rebind built-in
+        /// virtio_net after teardown.
         #[arg(long = "fwd", value_parser = parse_fwd_pair)]
         fwd: Vec<(u16, u16)>,
     },
@@ -165,17 +179,21 @@ enum Commands {
         /// Path to the disk image (.ext4 / .img).
         path: String,
     },
-    /// Detach the disk from a running L2CPU. Joins the worker thread and
-    /// releases the image file (Phase A: one disk per L2CPU, no selector).
+    /// Detach the disk from a running L2CPU.
+    ///
+    /// Joins the worker thread and releases the image file (Phase A:
+    /// one disk per L2CPU, no selector).
     RemoveDisk,
     /// Attach virtio-net (slirp) to a running L2CPU.
     AddNet {
         /// Override the host-side port forwarded to the guest's :22.
+        ///
         /// Default is the formula-derived per-(card, l2cpu_idx) port —
         /// see `daemon ports` for the mapping.
         #[arg(long)]
         ssh_port: Option<u16>,
-        /// Additional TCP port forwards as `HOST:GUEST` pairs.
+        /// TCP port forwards as `HOST:GUEST` pairs (repeatable).
+        ///
         /// Repeatable: `--fwd 5201:5201 --fwd 8080:80`. Each adds a
         /// slirp `tcp_listen_add` on `127.0.0.1:HOST` forwarding to
         /// `10.0.2.15:GUEST`. The implicit SSH forward (above) stays
@@ -184,15 +202,20 @@ enum Commands {
         #[arg(long = "fwd", value_parser = parse_fwd_pair)]
         fwd: Vec<(u16, u16)>,
     },
-    /// Detach virtio-net from a running L2CPU. Drops libvdeslirp state
-    /// (active TCP/NAT sessions on the guest will reset).
+    /// Detach virtio-net from a running L2CPU.
+    ///
+    /// Drops libvdeslirp state (active TCP/NAT sessions on the guest
+    /// will reset).
     RemoveNet,
-    /// Attach a virtio-console device to a running L2CPU (#51). Stock
-    /// distro kernels with `CONFIG_VIRTIO_CONSOLE` register this as
-    /// `/dev/hvc0`.
+    /// Attach a virtio-console device to a running L2CPU.
+    ///
+    /// Stock distro kernels with `CONFIG_VIRTIO_CONSOLE` register this
+    /// as `/dev/hvc0`.
     AddConsole,
-    /// Detach the virtio-console device from a running L2CPU. Joins the
-    /// worker thread; any in-flight RX descriptors are dropped.
+    /// Detach the virtio-console device from a running L2CPU.
+    ///
+    /// Joins the worker thread; any in-flight RX descriptors are
+    /// dropped.
     RemoveConsole,
     /// Manage disk images
     Image {
@@ -217,25 +240,28 @@ enum DaemonAction {
     Start {
         #[arg(long)]
         foreground: bool,
-        /// Override the log file path (absolute or relative to cwd). Default
-        /// is `$XDG_RUNTIME_DIR/bhx/<card>/log` which lives on tmpfs
-        /// and is lost on host crash — set this to a file in the project
-        /// directory when you need post-mortem logs.
+        /// Override the log file path.
+        ///
+        /// Default is `$XDG_RUNTIME_DIR/bhx/<card>/log` which lives
+        /// on tmpfs and is lost on host crash — set this to a file
+        /// in the project directory when you need post-mortem logs.
         #[arg(long)]
         log_file: Option<String>,
-        /// Disable the seccomp + landlock sandbox. The sandbox is on
-        /// by default — defense-in-depth so a daemon-side bug can't
-        /// pivot to read arbitrary host files or open outbound
-        /// connections. Pass this only when debugging the filter
-        /// itself (e.g. tracking down which syscall is missing from
-        /// the whitelist). Linux only; the flag is accepted but a
-        /// no-op everywhere else. See docs/sandbox-syscalls.md.
+        /// Disable the seccomp + landlock sandbox.
+        ///
+        /// The sandbox is on by default — defense-in-depth so a
+        /// daemon-side bug can't pivot to read arbitrary host files
+        /// or open outbound connections. Pass this only when
+        /// debugging the filter itself (e.g. tracking down which
+        /// syscall is missing from the whitelist). Linux only; the
+        /// flag is accepted but a no-op everywhere else. See
+        /// docs/sandbox-syscalls.md.
         #[arg(long)]
         no_sandbox: bool,
-        /// Bind a Prometheus-style HTTP exporter on
-        /// `127.0.0.1:<port>` and serve `GET /metrics`. Loopback only.
-        /// Off by default; pass an explicit port to enable. See
-        /// `daemon::metrics`.
+        /// Bind a Prometheus exporter on 127.0.0.1:<port>.
+        ///
+        /// Serves `GET /metrics`. Loopback only. Off by default; pass
+        /// an explicit port to enable. See `daemon::metrics`.
         #[arg(long)]
         metrics_port: Option<u16>,
     },
@@ -265,6 +291,7 @@ enum DaemonAction {
         no_follow: bool,
     },
     /// Print the per-L2CPU SSH-forward host ports for the given card.
+    ///
     /// Probes each port to report whether it's currently bindable.
     /// Useful when `add-net` fails with "ssh-forward port N
     /// unavailable" — this command shows which ports are clear.
@@ -301,94 +328,114 @@ enum ImageAction {
 enum DebugAction {
     /// Read the L2CPU_RESET register (0x80030014) and print it.
     ReadResetReg,
-    /// Call `boot::reset_x280` on the given L2CPU (OR-in bit idx+4, bracketed
-    /// by PLL step 1750→200→1750). Safe only when the daemon is not running
-    /// against this card. Use `--l2cpu N` / `-l N`.
+    /// Reset L2CPU N via the OpenSBI bit-toggle + PLL-bracket sequence.
+    ///
+    /// Calls `boot::reset_x280` on the given L2CPU (OR-in bit idx+4,
+    /// bracketed by PLL step 1750→200→1750). Safe only when the daemon
+    /// is not running against this card. Use `--l2cpu N` / `-l N`.
     ResetX280,
-    /// Clear bit idx+4 of L2CPU_RESET — puts the L2CPU *into* reset in-place
-    /// (halts it). Sibling cores keep running. No PLL manipulation.
+    /// Halt L2CPU N in place by clearing its release bit.
+    ///
+    /// Clears bit idx+4 of L2CPU_RESET — puts the L2CPU into reset in
+    /// place. Sibling cores keep running. No PLL manipulation.
     AssertReset,
-    /// Set bit idx+4 of L2CPU_RESET — releases the L2CPU from reset. Pure
-    /// register write, no PLL manipulation. Useful to re-start a core that
-    /// was held by `assert-reset`.
+    /// Release L2CPU N from reset by setting its release bit.
+    ///
+    /// Sets bit idx+4 of L2CPU_RESET — releases the L2CPU from reset.
+    /// Pure register write, no PLL manipulation. Useful to re-start a
+    /// core that was held by `assert-reset`.
     DeassertReset,
-    /// Load the M1 hello-world BRISC firmware onto Tensix tile (x, y),
-    /// release BRISC from soft-reset, poll L1 for the magic value
-    /// and incrementing counter. PASS when the counter advances
-    /// across `--duration` seconds. Issue #67.
+    /// M1 hello-world: load BRISC firmware on Tensix (x, y) and poll L1.
+    ///
+    /// Loads the hello-world BRISC firmware onto Tensix tile (x, y),
+    /// releases BRISC from soft-reset, and polls L1 for the magic
+    /// value and incrementing counter. PASS when the counter advances
+    /// across `--duration` seconds.
     TensixHello {
-        /// Tensix tile X coordinate (NoC0 logical). When omitted, the
-        /// M2 picker chooses one based on the chip's harvest mask.
-        /// Functional workers on Blackhole live in x=1..7 and 10..16.
+        /// Tensix tile X coordinate (NoC0 logical).
+        ///
+        /// When omitted, the M2 picker chooses one based on the chip's
+        /// harvest mask. Functional workers on Blackhole live in
+        /// x=1..7 and 10..16.
         #[arg(long)]
         x: Option<u16>,
-        /// Tensix tile Y coordinate. Same defaulting behavior as `--x`.
-        /// Functional workers on Blackhole live in y=2..11.
+        /// Tensix tile Y coordinate.
+        ///
+        /// Same defaulting behavior as `--x`. Functional workers on
+        /// Blackhole live in y=2..11.
         #[arg(long)]
         y: Option<u16>,
-        /// Number of seconds to poll the counter for. The host samples
-        /// once per second.
+        /// Number of seconds to poll the counter for.
+        ///
+        /// The host samples once per second.
         #[arg(long, default_value_t = 5)]
         duration: u32,
     },
-    /// Dump the ARC firmware telemetry table — prints the three M2
-    /// picker inputs (HarvestingState, EnabledTensixCol,
-    /// NocTranslation) and the decoded set of working Tensix tile
-    /// coordinates. Useful for confirming the picker on a new chip
-    /// or diagnosing harvest-related anomalies. Issues #68, #75.
+    /// Dump the ARC firmware telemetry table.
+    ///
+    /// Prints the three M2 picker inputs (HarvestingState,
+    /// EnabledTensixCol, NocTranslation) and the decoded set of
+    /// working Tensix tile coordinates. Useful for confirming the
+    /// picker on a new chip or diagnosing harvest-related anomalies.
     TelemetryDump {
         /// Print every telemetry tag entry (~60 rows) instead of just
         /// the picker-relevant subset.
         #[arg(long)]
         all_tags: bool,
     },
-    /// Print the tile coordinate the picker would reserve for the
-    /// virtio-mmio engine on this chip. Pure decode — does not touch
-    /// the tile. Issue #68.
+    /// Print the tile the picker would reserve for the virtio engine.
+    ///
+    /// Pure decode — does not touch the tile.
     PickTile,
-    /// Load the M3 virtio-mmio engine firmware onto a Tensix tile,
-    /// release BRISC, and smoke-test the register file: verify the
-    /// static MAGIC / VERSION / DEVICE_ID across all 16 slots, drive
-    /// a STATUS write to confirm the state machine, drive a
-    /// QUEUE_SEL change to confirm the multiplexer, and read the
-    /// stats page. Bypasses the daemon. Issue #69.
+    /// Load the M3 virtio-mmio engine firmware and smoke-test it.
+    ///
+    /// Loads the firmware onto a Tensix tile, releases BRISC, and
+    /// smoke-tests the register file: verify the static MAGIC /
+    /// VERSION / DEVICE_ID across all 16 slots, drive a STATUS write
+    /// to confirm the state machine, drive a QUEUE_SEL change to
+    /// confirm the multiplexer, and read the stats page. Bypasses
+    /// the daemon.
     TensixVirtio {
-        /// Tensix tile X coordinate (NoC0 logical). Defaults to the
-        /// M2 picker output.
+        /// Tensix tile X coordinate (NoC0 logical).
+        ///
+        /// Defaults to the M2 picker output.
         #[arg(long)]
         x: Option<u16>,
-        /// Tensix tile Y coordinate (NoC0 logical). Same defaulting
-        /// as `--x`.
+        /// Tensix tile Y coordinate (NoC0 logical).
+        ///
+        /// Same defaulting as `--x`.
         #[arg(long)]
         y: Option<u16>,
     },
-    /// Bring up the M5 (#71) Tensix virtio engine via the
-    /// `TensixEngine` module: pick tile, load M3 firmware, release
-    /// BRISC, run the M5 handshake. PASS = handshake completes with
-    /// matching protocol version. This is the same code path the
-    /// daemon will use when the `virtio-engine` feature is enabled
-    /// (M4.3 dispatch_boot integration); running it standalone
-    /// gives an integration check without booting any L2CPU.
-    /// Bypasses the daemon. Issue #71.
+    /// Bring up the Tensix virtio engine end-to-end (M5 handshake).
+    ///
+    /// Picks a tile, loads M3 firmware, releases BRISC, and runs the
+    /// M5 handshake. PASS = handshake completes with matching protocol
+    /// version. Same code path the daemon uses when the
+    /// `virtio-engine` feature is enabled; running it standalone gives
+    /// an integration check without booting any L2CPU. Bypasses the
+    /// daemon.
     TensixEngine,
-    /// Drive a known byte pattern into TRISC0's UART input cell from
-    /// the host (mimicking the L2CPU kernel's `writel(THR, byte) ;
-    /// poll(LSR.THRE)` loop), then read TRISC0's per-L2CPU feed ring
-    /// directly to count exactly how many bytes survived. Bypasses the
-    /// L2CPU entirely so we can localize whether residual M6.1 / #79
-    /// byte loss is on the kernel→THR path or the TRISC0→feed-ring
-    /// path. Bypasses the daemon. Daemon must be stopped first.
+    /// Drive a known byte pattern through the TRISC0 UART → feed ring.
+    ///
+    /// Writes from the host into TRISC0's UART input cell (mimicking
+    /// the L2CPU kernel's `writel(THR, byte) ; poll(LSR.THRE)` loop),
+    /// then reads TRISC0's per-L2CPU feed ring directly to count how
+    /// many bytes survived. Bypasses the L2CPU entirely so we can
+    /// localize whether residual byte loss is on the kernel→THR path
+    /// or the TRISC0→feed-ring path. Daemon must be stopped first.
     UartLoopback {
-        /// Number of bytes to send. Default: 1024.
+        /// Number of bytes to send.
         #[arg(long, default_value_t = 1024)]
         count: usize,
-        /// Microseconds to sleep between writes (in addition to the
-        /// THRE-poll wait). 0 = back-to-back as fast as host MMIO will
-        /// allow. Higher values give TRISC0 more time per byte.
+        /// Microseconds to sleep between writes.
+        ///
+        /// In addition to the THRE-poll wait. 0 = back-to-back as fast
+        /// as host MMIO will allow. Higher values give TRISC0 more
+        /// time per byte.
         #[arg(long, default_value_t = 0)]
         gap_us: u64,
-        /// If set, skip the LSR.THRE poll between writes (post each
-        /// byte and move on). Stress-tests the race window.
+        /// Skip the LSR.THRE poll between writes (stress race window).
         #[arg(long)]
         no_lsr_poll: bool,
     },
