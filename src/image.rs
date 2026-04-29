@@ -49,6 +49,73 @@ pub enum Compression {
     Zip,
 }
 
+/// Filesystem detected on an extracted partition. Determines both the
+/// final-path suffix the operator sees and which resize-step tool we
+/// can run on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Filesystem {
+    Ext4,
+    Xfs,
+    Btrfs,
+    /// Filesystem we don't recognize. Land the file as `.img` and let
+    /// the guest grow it on first boot.
+    Unknown,
+}
+
+impl Filesystem {
+    /// Filename suffix matching this filesystem's magic.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Filesystem::Ext4 => "ext4",
+            Filesystem::Xfs => "xfs",
+            Filesystem::Btrfs => "btrfs",
+            Filesystem::Unknown => "img",
+        }
+    }
+}
+
+/// Detect the filesystem inside a single-partition file by reading
+/// the canonical magic bytes:
+///   * ext4: bytes 0x438..0x43A == 0xEF 0x53 (little-endian s_magic in
+///     the superblock at offset 1024).
+///   * xfs:  bytes 0..4 == "XFSB" (the SB_MAGIC at offset 0).
+///   * btrfs: bytes 0x10040..0x10048 == "_BHRfS_M" (the BTRFS_MAGIC at
+///     offset 0x10040, well inside the first 64 KiB).
+///
+/// Reads the relevant ranges only; doesn't care if the file is partial.
+pub fn detect_filesystem(path: &Path) -> Filesystem {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = fs::File::open(path) else {
+        return Filesystem::Unknown;
+    };
+
+    // ext4 superblock magic (16-bit LE at offset 0x438).
+    let mut ext4_buf = [0u8; 2];
+    if f.seek(SeekFrom::Start(0x438)).is_ok()
+        && f.read_exact(&mut ext4_buf).is_ok()
+        && ext4_buf == [0x53, 0xEF]
+    {
+        return Filesystem::Ext4;
+    }
+    // xfs SB_MAGIC ("XFSB") at offset 0.
+    let mut xfs_buf = [0u8; 4];
+    if f.seek(SeekFrom::Start(0)).is_ok()
+        && f.read_exact(&mut xfs_buf).is_ok()
+        && &xfs_buf == b"XFSB"
+    {
+        return Filesystem::Xfs;
+    }
+    // btrfs BTRFS_MAGIC ("_BHRfS_M") at offset 0x10040.
+    let mut btrfs_buf = [0u8; 8];
+    if f.seek(SeekFrom::Start(0x10040)).is_ok()
+        && f.read_exact(&mut btrfs_buf).is_ok()
+        && &btrfs_buf == b"_BHRfS_M"
+    {
+        return Filesystem::Btrfs;
+    }
+    Filesystem::Unknown
+}
+
 /// A known riscv64 image available for download.
 #[derive(Debug, Clone)]
 pub struct KnownImage {
@@ -137,14 +204,31 @@ pub const KNOWN_IMAGES: &[KnownImage] = &[
         cloud_init: true,
     },
     // ========================================================================
-    // Fedora (from dl.fedoraproject.org)
-    // Cloud base images — qcow2 format.
+    // RPM-based cloud images — qcow2 format, cloud-init for first-boot setup.
     // ========================================================================
     KnownImage {
         name: "fedora-42",
         url: "https://dl.fedoraproject.org/pub/alt/risc-v/release/42/Cloud/riscv64/images/Fedora-Cloud-Base-Generic-42.20250911-2251ba41cdd3.riscv64.qcow2",
         description: "Fedora 42 Cloud Base — generic riscv64 cloud image",
         aliases: &["fedora"],
+        format: ImageFormat::Qcow2,
+        compression: Compression::None,
+        default_size: "10G",
+        default_user: "",
+        default_password: "",
+        cloud_init: true,
+    },
+    // AlmaLinux Kitten 10: the community RHEL10 development branch
+    // (downstream of CentOS Stream 10, upstream of AlmaLinux 10 stable).
+    // The mainline AlmaLinux 10 release-train doesn't ship riscv64 yet —
+    // only Kitten does. URL is the moving "-latest" pointer; the
+    // HTTP-conditional cache in fetch.rs (#26) re-pulls only when
+    // upstream's ETag/Last-Modified changes.
+    KnownImage {
+        name: "almalinux-10-kitten",
+        url: "https://repo.almalinux.org/almalinux-kitten/10-kitten/cloud/riscv64/images/AlmaLinux-Kitten-GenericCloud-10-latest.riscv64.qcow2",
+        description: "AlmaLinux Kitten 10 GenericCloud — community RHEL10 dev branch riscv64",
+        aliases: &["almalinux", "alma", "kitten"],
         format: ImageFormat::Qcow2,
         compression: Compression::None,
         default_size: "10G",
@@ -195,46 +279,104 @@ pub fn pull_image(name: &str, output: Option<&Path>, force_refetch: bool) -> Res
     })?;
 
     let dir = image_dir();
-    let final_path = output
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dir.join(format!("{}.ext4", image.name)));
-
-    if final_path.exists() && !force_refetch {
-        eprintln!("Image already exists at {}", final_path.display());
-        eprintln!("Delete it first or pass --refetch if you want to re-download.");
-        return Ok(final_path);
+    // The final path's suffix tracks the actual filesystem we extract,
+    // not "ext4" by convention. If `output` is given, use it verbatim;
+    // otherwise we don't know the suffix yet and drop in the convert
+    // step. For the existence-check short-circuit on a default path,
+    // probe each filesystem suffix we know about.
+    let explicit_output = output.map(PathBuf::from);
+    if let Some(p) = &explicit_output {
+        if p.exists() && !force_refetch {
+            eprintln!("Image already exists at {}", p.display());
+            eprintln!("Delete it first or pass --refetch if you want to re-download.");
+            return Ok(p.clone());
+        }
+    } else {
+        for candidate_suffix in ["ext4", "xfs", "btrfs", "img"] {
+            let candidate = dir.join(format!("{}.{}", image.name, candidate_suffix));
+            if candidate.exists() && !force_refetch {
+                eprintln!("Image already exists at {}", candidate.display());
+                eprintln!("Delete it first or pass --refetch if you want to re-download.");
+                return Ok(candidate);
+            }
+        }
     }
 
     eprintln!("Pulling {} ...", image.name);
     eprintln!("  {}", image.description);
     eprintln!("  URL: {}", image.url);
 
-    // Step 1: Download. Anchor the sidecar at `final_path` (the
-    // .ext4 that survives the convert step) so the cache check
-    // works on a re-pull when the download intermediate is gone.
-    // See #26.
+    // Working path during the conversion: until we know the
+    // filesystem inside, use a `.partition` suffix that doesn't
+    // pretend to be anything specific. Renamed to the right suffix
+    // post-detection.
+    let work_path = explicit_output
+        .clone()
+        .unwrap_or_else(|| dir.join(format!("{}.partition", image.name)));
+
+    // Anchor the HTTP-conditional sidecar at a fstype-agnostic path
+    // (`<name>.fetch.json`) so cache hits work regardless of which
+    // filesystem suffix we end up writing. For an explicit output
+    // path we anchor at the operator-supplied path verbatim — they
+    // own that filename's whole story.
+    let sidecar_anchor = explicit_output
+        .clone()
+        .unwrap_or_else(|| dir.join(image.name));
+
+    // Step 1: Download. See #26 for the cache-anchor reasoning.
     let download_path = download_file(
         image.url,
         &dir,
         image.compression,
-        &final_path,
+        &sidecar_anchor,
         force_refetch,
     )?;
 
-    // Step 2: Convert to ext4 if needed
-    let ext4_path = convert_to_ext4(&download_path, image.format, &final_path)?;
+    // Step 2: Convert / partition-extract.
+    let extracted_path = convert_to_ext4(&download_path, image.format, &work_path)?;
 
-    // Step 3: Resize if configured
+    // Step 3: Detect the actual filesystem and rename if we have a
+    // default output path (operator-supplied paths are kept verbatim
+    // — they asked for it, they get it).
+    let fs = detect_filesystem(&extracted_path);
+    let final_path = if let Some(p) = explicit_output {
+        eprintln!(
+            "  Detected filesystem: {} (output kept at operator-supplied path)",
+            fs.suffix()
+        );
+        p
+    } else {
+        let renamed = dir.join(format!("{}.{}", image.name, fs.suffix()));
+        if renamed != extracted_path {
+            eprintln!(
+                "  Detected filesystem: {} → renaming to {}",
+                fs.suffix(),
+                renamed.display()
+            );
+            fs::rename(&extracted_path, &renamed)
+                .map_err(Error::io_ctx("Failed to rename extracted partition"))?;
+        }
+        renamed
+    };
+
+    // Step 4: Resize if configured. Only ext4 supports offline resize
+    // (e2fsck + resize2fs on a loopback-free file). For other
+    // filesystems we still grow the *file* so the guest sees the
+    // requested capacity, but the filesystem itself stays at its
+    // original extent — the guest grows it on first boot (xfs_growfs
+    // for xfs, btrfs filesystem resize for btrfs; cloud-init's
+    // `growpart` + systemd-growfs handle this automatically on most
+    // distros).
     if !image.default_size.is_empty() {
-        resize_image(&ext4_path, image.default_size)?;
+        resize_image(&final_path, image.default_size, fs)?;
     }
 
     // Clean up intermediate files
-    if download_path != ext4_path && download_path.exists() {
+    if download_path != final_path && download_path.exists() {
         let _ = fs::remove_file(&download_path);
     }
 
-    eprintln!("Image ready: {}", ext4_path.display());
+    eprintln!("Image ready: {}", final_path.display());
     if !image.default_user.is_empty() {
         eprintln!("  Default user: {}", image.default_user);
         if !image.default_password.is_empty() {
@@ -245,7 +387,7 @@ pub fn pull_image(name: &str, output: Option<&Path>, force_refetch: bool) -> Res
         eprintln!("  Cloud-init: supported (use --cloud-init for custom setup)");
     }
 
-    Ok(ext4_path)
+    Ok(final_path)
 }
 
 /// Download a file via wget and run any requested decompression.
@@ -417,30 +559,9 @@ fn extract_root_partition(disk: &Path, output: &Path) -> Result<()> {
         return Err(Error::internal("dd failed to extract partition"));
     }
 
-    // Verify it's a valid ext4 filesystem
-    let fsck_status = Command::new("e2fsck")
-        .args(["-f", "-y"])
-        .arg(output)
-        .status();
-
-    match fsck_status {
-        Ok(s) if s.success() || s.code() == Some(1) => {
-            // Exit code 0 = clean, 1 = errors corrected — both OK
-        }
-        Ok(s) => {
-            eprintln!(
-                "  Warning: e2fsck returned exit code {:?}. The partition may not be ext4.",
-                s.code()
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "  Warning: could not run e2fsck: {}. Install with: apt install e2fsprogs",
-                e
-            );
-        }
-    }
-
+    // No fsck here — `pull_image` detects the filesystem from magic
+    // bytes and runs the right tool (e2fsck for ext4, nothing for
+    // xfs/btrfs which need a mounted FS for offline check anyway).
     Ok(())
 }
 
@@ -479,8 +600,13 @@ fn parse_largest_partition(json: &str) -> Result<(u64, u64)> {
     Ok((best_start, best_size))
 }
 
-/// Resize an ext4 image to the given size.
-fn resize_image(path: &Path, size: &str) -> Result<()> {
+/// Grow the image file to the given size, and (for ext4) grow the
+/// filesystem inside it to match. For non-ext4 filesystems we only
+/// grow the file — the guest extends the filesystem on first boot
+/// (cloud-init's growpart + systemd-growfs do this automatically on
+/// every distro that ships either xfs or btrfs as the cloud-image
+/// rootfs).
+fn resize_image(path: &Path, size: &str, fs_kind: Filesystem) -> Result<()> {
     eprintln!("  Resizing to {}...", size);
 
     // First resize the file
@@ -504,7 +630,17 @@ fn resize_image(path: &Path, size: &str) -> Result<()> {
         }
     }
 
-    // Then resize the filesystem
+    if fs_kind != Filesystem::Ext4 {
+        eprintln!(
+            "  Filesystem is {}; file grown to {} but the FS itself stays at its original \
+             extent. Guest cloud-init / systemd-growfs will expand it on first boot.",
+            fs_kind.suffix(),
+            size
+        );
+        return Ok(());
+    }
+
+    // Then resize the filesystem (ext4 only — see top of fn).
     let status = Command::new("e2fsck").args(["-f", "-y"]).arg(path).status();
     if let Ok(s) = status {
         if !s.success() && s.code() != Some(1) {
@@ -701,5 +837,77 @@ mod tests {
     #[test]
     fn get_known_image_treats_empty_string_as_unknown() {
         assert!(get_known_image("").is_none());
+    }
+
+    #[test]
+    fn get_known_image_finds_almalinux_aliases() {
+        for alias in ["almalinux-10-kitten", "almalinux", "alma", "kitten"] {
+            let img = get_known_image(alias).unwrap_or_else(|| {
+                panic!("alias `{}` should resolve to almalinux-10-kitten", alias)
+            });
+            assert_eq!(
+                img.name, "almalinux-10-kitten",
+                "alias `{}` resolved wrong",
+                alias
+            );
+        }
+    }
+
+    /// Build a dummy file with `bytes` placed at `offset`, padded with
+    /// zeros to at least 0x10100 so all three magic-byte probes
+    /// (ext4 @ 0x438, xfs @ 0, btrfs @ 0x10040) can read past EOF
+    /// without short-read aborting the detector. Filename includes a
+    /// per-call counter so concurrent tests don't share a temp path.
+    fn write_test_image(bytes: &[u8], offset: usize) -> std::path::PathBuf {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "tt-bh-image-test-{}-{}-{}",
+            std::process::id(),
+            offset,
+            id
+        ));
+        let mut buf = vec![0u8; std::cmp::max(0x10100, offset + bytes.len())];
+        buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+        let mut f = std::fs::File::create(&path).expect("create temp image");
+        f.write_all(&buf).expect("write temp image");
+        path
+    }
+
+    #[test]
+    fn detect_filesystem_recognizes_ext4_xfs_btrfs() {
+        // ext4: 0xEF 0x53 little-endian s_magic at offset 0x438.
+        let p_ext4 = write_test_image(&[0x53, 0xEF], 0x438);
+        assert_eq!(detect_filesystem(&p_ext4), Filesystem::Ext4);
+        let _ = std::fs::remove_file(&p_ext4);
+
+        // xfs: "XFSB" at offset 0.
+        let p_xfs = write_test_image(b"XFSB", 0);
+        assert_eq!(detect_filesystem(&p_xfs), Filesystem::Xfs);
+        let _ = std::fs::remove_file(&p_xfs);
+
+        // btrfs: "_BHRfS_M" at offset 0x10040.
+        let p_btrfs = write_test_image(b"_BHRfS_M", 0x10040);
+        assert_eq!(detect_filesystem(&p_btrfs), Filesystem::Btrfs);
+        let _ = std::fs::remove_file(&p_btrfs);
+    }
+
+    #[test]
+    fn detect_filesystem_returns_unknown_for_garbage() {
+        // All zeros — none of the magics match.
+        let p = write_test_image(&[0; 16], 0);
+        assert_eq!(detect_filesystem(&p), Filesystem::Unknown);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn filesystem_suffix_matches_detected_kinds() {
+        assert_eq!(Filesystem::Ext4.suffix(), "ext4");
+        assert_eq!(Filesystem::Xfs.suffix(), "xfs");
+        assert_eq!(Filesystem::Btrfs.suffix(), "btrfs");
+        assert_eq!(Filesystem::Unknown.suffix(), "img");
     }
 }
