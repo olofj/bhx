@@ -209,50 +209,57 @@ impl SharedChip {
     /// Single-register u32 read. No `seq_lock` — the MMIO bus gives
     /// single-copy atomicity for aligned u32 reads, and a stale value from a
     /// concurrent writer is fine for a pure read.
-    pub fn axi_read32(&self, addr: u64) -> u32 {
+    ///
+    /// Returns `Err(Internal)` if the inner fd has been rotated out by a
+    /// concurrent `reset_board` (#102) — callers in dispatch handlers
+    /// propagate via `?` so the daemon stays up.
+    pub fn axi_read32(&self, addr: u64) -> crate::Result<u32> {
         let off = Self::axi_window_offset(addr);
         let guard = self.inner.read().unwrap();
-        let inner = guard.as_ref().expect("SharedChip used while rotating fd");
-        inner.axi_window.read32(off)
+        let inner = guard
+            .as_ref()
+            .ok_or_else(|| crate::Error::internal("SharedChip used while rotating fd"))?;
+        Ok(inner.axi_window.read32(off))
     }
 
     /// Single-register u32 write. Same lock story as `axi_read32`.
-    pub fn axi_write32(&self, addr: u64, value: u32) {
+    pub fn axi_write32(&self, addr: u64, value: u32) -> crate::Result<()> {
         let off = Self::axi_window_offset(addr);
         let guard = self.inner.read().unwrap();
-        let inner = guard.as_ref().expect("SharedChip used while rotating fd");
+        let inner = guard
+            .as_ref()
+            .ok_or_else(|| crate::Error::internal("SharedChip used while rotating fd"))?;
         inner.axi_window.write32(off, value);
+        Ok(())
     }
 
     /// Read a u32 from ARC CSM (the firmware's RAM, used for the
     /// telemetry table — see `src/telemetry.rs` and #75 for context).
     /// The address must lie within `[0x1000_0000, 0x1020_0000)`. A pure
     /// read; same lock story as `axi_read32`.
-    pub fn csm_read32(&self, addr: u64) -> u32 {
+    pub fn csm_read32(&self, addr: u64) -> crate::Result<u32> {
         let off = Self::csm_window_offset(addr);
         let guard = self.inner.read().unwrap();
-        let inner = guard.as_ref().expect("SharedChip used while rotating fd");
-        inner.csm_window.read32(off)
+        let inner = guard
+            .as_ref()
+            .ok_or_else(|| crate::Error::internal("SharedChip used while rotating fd"))?;
+        Ok(inner.csm_window.read32(off))
     }
 
     /// Probe whether L2CPU `idx`'s release bit is set. Pure read; no
     /// `seq_lock`.
-    pub fn l2cpu_is_running(&self, l2cpu_idx: usize) -> bool {
-        let val = self.axi_read32(L2CPU_RESET_ADDR);
+    pub fn l2cpu_is_running(&self, l2cpu_idx: usize) -> crate::Result<bool> {
+        let val = self.axi_read32(L2CPU_RESET_ADDR)?;
         let bit_idx = l2cpu_idx + 4;
-        (val >> bit_idx) & 1 == 1
+        Ok((val >> bit_idx) & 1 == 1)
     }
 
     /// Read `L2CPU_RESET` raw — used by daemon startup probe to report all
     /// four cores' state in one shot.
-    pub fn read_l2cpu_reset(&self) -> u32 {
+    pub fn read_l2cpu_reset(&self) -> crate::Result<u32> {
         self.axi_read32(L2CPU_RESET_ADDR)
     }
 
-    /// Release the given L2CPUs from reset via the OpenSBI sequence:
-    /// PLL step down to 200 MHz → OR-in release bits → PLL step up to 1750
-    /// MHz. Holds `seq_lock` for the entire sequence so concurrent callers
-    /// serialize rather than stepping the PLL against each other.
     /// Step the chip-wide L2CPU PLL down to 200 MHz. Caller is
     /// responsible for ensuring no L2CPU is currently running — the
     /// daemon checks the slot table before invoking. Holds `seq_lock`
@@ -266,13 +273,17 @@ impl SharedChip {
         crate::dlog!("[idle_pll] done");
     }
 
-    pub fn reset_x280(&self, l2cpu_indices: &[usize]) {
+    /// Release the given L2CPUs from reset via the OpenSBI sequence:
+    /// PLL step down to 200 MHz → OR-in release bits → PLL step up to 1750
+    /// MHz. Holds `seq_lock` for the entire sequence so concurrent callers
+    /// serialize rather than stepping the PLL against each other.
+    pub fn reset_x280(&self, l2cpu_indices: &[usize]) -> crate::Result<()> {
         let _guard = self.seq_lock.lock().unwrap();
 
         crate::dlog!("[reset_x280] stepping PLL down to 200 MHz");
         clock::set_frequency(self, 200);
 
-        let reset_val_before = self.axi_read32(L2CPU_RESET_ADDR);
+        let reset_val_before = self.axi_read32(L2CPU_RESET_ADDR)?;
         let mut reset_val = reset_val_before;
         let mut mask: u32 = 0;
         for &idx in l2cpu_indices {
@@ -283,8 +294,8 @@ impl SharedChip {
             "[reset_x280] L2CPU_RESET@0x{:x}: {:#010x} | {:#010x} -> {:#010x} (releasing L2CPU {:?})",
             L2CPU_RESET_ADDR, reset_val_before, mask, reset_val, l2cpu_indices
         );
-        self.axi_write32(L2CPU_RESET_ADDR, reset_val);
-        let reset_val_after = self.axi_read32(L2CPU_RESET_ADDR);
+        self.axi_write32(L2CPU_RESET_ADDR, reset_val)?;
+        let reset_val_after = self.axi_read32(L2CPU_RESET_ADDR)?;
         crate::dlog!(
             "[reset_x280] L2CPU_RESET readback: {:#010x}",
             reset_val_after
@@ -293,6 +304,7 @@ impl SharedChip {
         crate::dlog!("[reset_x280] stepping PLL up to 1750 MHz");
         clock::set_frequency(self, 1750);
         crate::dlog!("[reset_x280] done");
+        Ok(())
     }
 
     /// Full PCIe link reset via tt-kmd's `RESET_DEVICE` ioctl. The
@@ -316,10 +328,17 @@ impl SharedChip {
 
 impl PllAccess for SharedChip {
     fn pll_read32(&self, addr: u64) -> u32 {
+        // PllAccess can't fail from `clock::set_frequency`'s POV; if the
+        // SharedChip is rotating during a PLL step the daemon is in
+        // unrecoverable territory (concurrent reset_board mid-reset_x280,
+        // which #102's invariants rule out). Surface as a clear panic
+        // message rather than threading Result through the trait.
         self.axi_read32(addr)
+            .expect("PllAccess: SharedChip rotating during clock step")
     }
     fn pll_write32(&self, addr: u64, value: u32) {
-        self.axi_write32(addr, value);
+        self.axi_write32(addr, value)
+            .expect("PllAccess: SharedChip rotating during clock step");
     }
 }
 
@@ -379,5 +398,26 @@ mod tests {
     #[should_panic(expected = "outside CSM window")]
     fn csm_window_offset_rejects_out_of_range_addr() {
         SharedChip::csm_window_offset(CSM_WINDOW_BASE + CSM_WINDOW_SIZE);
+    }
+
+    #[test]
+    fn axi_accessors_return_internal_error_during_fd_rotation() {
+        // SharedChip::placeholder leaves `inner: None` — the same
+        // state reset_board uses while it's swapping the fd. Each
+        // accessor must surface that as Internal rather than panic
+        // (#102).
+        let chip = SharedChip::placeholder();
+        let read_err = chip.axi_read32(L2CPU_RESET_ADDR).unwrap_err();
+        assert!(matches!(read_err, crate::Error::Internal(_)));
+        let write_err = chip.axi_write32(L2CPU_RESET_ADDR, 0).unwrap_err();
+        assert!(matches!(write_err, crate::Error::Internal(_)));
+        let csm_err = chip.csm_read32(CSM_WINDOW_BASE).unwrap_err();
+        assert!(matches!(csm_err, crate::Error::Internal(_)));
+
+        // Higher-level helpers propagate the same way.
+        let probe_err = chip.l2cpu_is_running(0).unwrap_err();
+        assert!(matches!(probe_err, crate::Error::Internal(_)));
+        let read_reset_err = chip.read_l2cpu_reset().unwrap_err();
+        assert!(matches!(read_reset_err, crate::Error::Internal(_)));
     }
 }

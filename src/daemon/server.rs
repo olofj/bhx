@@ -147,7 +147,16 @@ pub fn serve(
 /// Safe to call even when the chip is wedged: reading the reset register
 /// is a single AXI read to tile (8,0), no state change.
 fn probe_initial_chip_state(shared: &crate::shared_chip::SharedChip, card: u32) -> Vec<u8> {
-    let val = shared.read_l2cpu_reset();
+    let val = match shared.read_l2cpu_reset() {
+        Ok(v) => v,
+        Err(e) => {
+            dlog!(
+                "[probe] L2CPU_RESET read failed: {}; assuming all cores cold",
+                e
+            );
+            return Vec::new();
+        }
+    };
     dlog!("[probe] L2CPU_RESET={:#010x} (card {})", val, card);
     let mut released = Vec::new();
     for idx in 0..4u8 {
@@ -865,7 +874,7 @@ fn dispatch_boot(
     // Workers are now in Phase 1 polling for the DRIVER bit. Release the
     // L2CPU from reset so the kernel's virtio probe runs against a
     // daemon that's already watching MMIO. See `release_l2cpu_from_reset`.
-    release_l2cpu_from_reset(state, l2cpu_idx, &slot.l2cpu);
+    release_l2cpu_from_reset(state, l2cpu_idx, &slot.l2cpu)?;
 
     install_slot_and_reply_ok(state, l2cpu_idx, slot, sock);
     Ok(())
@@ -962,7 +971,7 @@ fn run_boot_sequence(
     // Pre-reset state check goes through the daemon's SharedChip — one
     // persistent TLB to tile (8,0) for all L2CPUs, so this read can't race
     // with other boots' reads/writes of the same register.
-    let running = state.shared_chip.l2cpu_is_running(l2cpu_idx as usize);
+    let running = state.shared_chip.l2cpu_is_running(l2cpu_idx as usize)?;
     let need_reset = force_reset_pcie || running;
     dlog!(
         "[run_boot l2cpu {}] running={} force_reset_pcie={} need_reset={}",
@@ -1241,15 +1250,20 @@ fn run_boot_sequence(
 /// workers already in Phase 3 polling when this returns, the
 /// guest-side `writel(READY=1)` → next-queue `readl(READY)` race is
 /// reliably won.
-fn release_l2cpu_from_reset(state: &Arc<DaemonState>, l2cpu_idx: u8, l2cpu: &L2Cpu) {
+fn release_l2cpu_from_reset(
+    state: &Arc<DaemonState>,
+    l2cpu_idx: u8,
+    l2cpu: &L2Cpu,
+) -> crate::Result<()> {
     dlog!("[run_boot l2cpu {}] releasing from reset", l2cpu_idx);
     // reset_x280 goes through SharedChip so the PLL step and the
     // L2CPU_RESET R-M-W serialize against any other boot RPC issuing the
     // same sequence.
-    state.shared_chip.reset_x280(&[l2cpu_idx as usize]);
+    state.shared_chip.reset_x280(&[l2cpu_idx as usize])?;
     dlog!("[run_boot l2cpu {}] configuring prefetchers", l2cpu_idx);
     boot::configure_prefetchers(l2cpu);
     dlog!("[run_boot l2cpu {}] run_boot_sequence done", l2cpu_idx);
+    Ok(())
 }
 
 /// Build the runtime slot on top of an already-constructed `L2Cpu`. All

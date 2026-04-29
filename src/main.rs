@@ -928,7 +928,7 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
     match action {
         DebugAction::ReadResetReg => {
             let reg = 0x80030014u64;
-            let val = chip.axi_read32(reg);
+            let val = chip.axi_read32(reg)?;
             println!("L2CPU_RESET@0x{:x} = {:#010x}", reg, val);
             for i in 0..4 {
                 let bit = (val >> (i + 4)) & 1;
@@ -945,7 +945,7 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
                 l2cpu,
                 l2cpu + 4
             );
-            chip.reset_x280(&[l2cpu]);
+            chip.reset_x280(&[l2cpu])?;
             eprintln!("[debug] reset_x280 returned without panic");
             Ok(())
         }
@@ -1349,7 +1349,7 @@ fn resolve_tensix_coords(
 }
 
 fn run_telemetry_dump(chip: &shared_chip::SharedChip, all_tags: bool) -> std::io::Result<()> {
-    let table_addr = chip.axi_read32(telemetry::ARC_TELEMETRY_PTR_ADDR);
+    let table_addr = chip.axi_read32(telemetry::ARC_TELEMETRY_PTR_ADDR)?;
     println!(
         "SCRATCH_RAM[13] @ {:#010x} = {:#010x} (telemetry table base)",
         telemetry::ARC_TELEMETRY_PTR_ADDR,
@@ -1913,7 +1913,7 @@ fn toggle_reset_bit(
     }
     let reg: u64 = 0x80030014;
     let bit = 1u32 << (l2cpu + 4);
-    let before = chip.axi_read32(reg);
+    let before = chip.axi_read32(reg)?;
     let after = if release { before | bit } else { before & !bit };
     eprintln!(
         "[debug] L2CPU_RESET@0x{:x}: {:#010x} -> {:#010x} ({} bit {} for L2CPU {})",
@@ -1924,8 +1924,8 @@ fn toggle_reset_bit(
         l2cpu + 4,
         l2cpu
     );
-    chip.axi_write32(reg, after);
-    let readback = chip.axi_read32(reg);
+    chip.axi_write32(reg, after)?;
+    let readback = chip.axi_read32(reg)?;
     eprintln!("[debug] readback: {:#010x}", readback);
     Ok(())
 }

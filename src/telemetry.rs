@@ -108,6 +108,8 @@ pub enum TelemetryError {
     UnsupportedVersion(u32),
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    SharedChip(#[from] crate::Error),
 }
 
 /// Read the ARC telemetry table from the chip via `SharedChip`.
@@ -118,7 +120,7 @@ pub enum TelemetryError {
 /// 60-ish entries × 8 bytes header + tags + data); the whole walk
 /// completes in one pass with no allocations beyond the result `Vec`.
 pub fn read_telemetry(chip: &SharedChip) -> Result<Telemetry, TelemetryError> {
-    let table_addr = chip.axi_read32(ARC_TELEMETRY_PTR_ADDR);
+    let table_addr = chip.axi_read32(ARC_TELEMETRY_PTR_ADDR)?;
     if table_addr == 0 {
         return Err(TelemetryError::ArcNotReady);
     }
@@ -131,12 +133,12 @@ pub fn read_telemetry(chip: &SharedChip) -> Result<Telemetry, TelemetryError> {
         ));
     }
 
-    let version = chip.csm_read32(table_addr);
+    let version = chip.csm_read32(table_addr)?;
     let major = (version >> 16) & 0xFF;
     if major > 1 {
         return Err(TelemetryError::UnsupportedVersion(version));
     }
-    let entry_count = chip.csm_read32(table_addr + 4);
+    let entry_count = chip.csm_read32(table_addr + 4)?;
 
     // Bound the entry count so a corrupt header can't make us read
     // past CSM. Each entry is 4 bytes for the tag table + 4 bytes
@@ -153,10 +155,10 @@ pub fn read_telemetry(chip: &SharedChip) -> Result<Telemetry, TelemetryError> {
 
     let mut entries = Vec::with_capacity(entry_count as usize);
     for i in 0..entry_count {
-        let entry = chip.csm_read32(tags_base + (i as u64) * 4);
+        let entry = chip.csm_read32(tags_base + (i as u64) * 4)?;
         let tag = (entry & 0xFFFF) as u16;
         let offset = ((entry >> 16) & 0xFFFF) as u16;
-        let data = chip.csm_read32(data_base + (offset as u64) * 4);
+        let data = chip.csm_read32(data_base + (offset as u64) * 4)?;
         entries.push(TelemetryEntry { tag, offset, data });
     }
 
