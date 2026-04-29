@@ -98,7 +98,7 @@ pub const KNOWN_IMAGES: &[KnownImage] = &[
         name: "tt-debian",
         url: "https://github.com/tenstorrent/tt-bh-linux/releases/download/v0.10/tt-bh-disk-image.zip",
         description: "Tenstorrent pre-built Debian riscv64 (recommended, ready to use)",
-        aliases: &["default", "tt"],
+        aliases: &["tt"],
         format: ImageFormat::Ext4, // After unzip, it's a raw ext4 image
         compression: Compression::Zip,
         default_size: "10G",
@@ -123,7 +123,7 @@ pub const KNOWN_IMAGES: &[KnownImage] = &[
         name: "debian-13",
         url: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-riscv64.raw",
         description: "Debian 13 (Trixie) generic — official cloud image, needs cloud-init",
-        aliases: &["debian", "trixie"],
+        aliases: &["default", "debian", "trixie"],
         format: ImageFormat::RawDisk,
         compression: Compression::None,
         default_size: "10G",
