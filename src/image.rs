@@ -678,11 +678,11 @@ fn parse_size(s: &str) -> Result<u64> {
 
 /// Print a table of available images.
 pub fn cmd_list_available() {
-    println!("{:<20} {:<65} {:<10}", "NAME", "DESCRIPTION", "ALIASES");
-    println!("{}", "-".repeat(95));
+    println!("{:<20} {:<75} {:<10}", "NAME", "DESCRIPTION", "ALIASES");
+    println!("{}", "-".repeat(107));
     for img in KNOWN_IMAGES {
         let aliases = img.aliases.join(", ");
-        println!("{:<20} {:<65} {:<10}", img.name, img.description, aliases);
+        println!("{:<20} {:<75} {:<10}", img.name, img.description, aliases);
     }
 }
 
