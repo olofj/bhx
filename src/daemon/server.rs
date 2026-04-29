@@ -760,7 +760,7 @@ fn dispatch_boot(
                 let ssh_port = crate::regs::slirp::ssh_port(state.card, l2cpu_idx);
                 let mut forwards = vec![(ssh_port, 22u16)];
                 forwards.extend(extra_fwd.iter().copied());
-                match crate::virtio::network::VirtioNet::new(&forwards, l2cpu_idx) {
+                match crate::virtio::network::VirtioNet::new(&forwards, state.card, l2cpu_idx) {
                     Ok(net) => {
                         register(
                             dev_slot(crate::virtio_engine::DEV_NET),
@@ -1726,7 +1726,7 @@ fn dispatch_add_net(
 
     {
         if let Some(poller) = state.kick_poller.lock().unwrap().as_ref() {
-            match crate::virtio::network::VirtioNet::new(&forwards, l2cpu_idx) {
+            match crate::virtio::network::VirtioNet::new(&forwards, state.card, l2cpu_idx) {
                 Ok(net) => {
                     let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
                         + crate::virtio_engine::DEV_NET;

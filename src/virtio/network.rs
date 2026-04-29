@@ -10,10 +10,17 @@ use crate::virtio::VirtioDeviceImpl;
 
 const PACKET_SIZE: usize = 1514;
 const VIRTIO_ID_NET: u32 = 1;
-// VirtIO spec 5.1.3: feature bits of virtio-net. We advertise only
-// VIRTIO_F_VERSION_1 (bit 32 — bit 0 of features[1]) and nothing else.
-// In particular we deliberately do NOT advertise VIRTIO_NET_F_CSUM
-// (bit 0 of features[0]). That bit means "device handles packets with
+// VirtIO spec 5.1.3: feature bits of virtio-net. We advertise
+// VIRTIO_NET_F_MAC + VIRTIO_F_VERSION_1 (bit 32 — bit 0 of
+// features[1]) and nothing else.
+//
+// VIRTIO_NET_F_MAC (bit 5 of features[0]): tells the guest the 6-byte
+// `mac` field at config offset 0 is valid. Without it, U-Boot's
+// virtio-net probe loops printing "No valid MAC address found." and
+// Linux falls back to a random MAC that changes every reboot. See #77.
+//
+// We deliberately do NOT advertise VIRTIO_NET_F_CSUM (bit 0 of
+// features[0]). That bit means "device handles packets with
 // partial checksum" — if we claim it, the guest's networking stack
 // flags outbound UDP/TCP with NETIF_F_HW_CSUM and virtio-net sets
 // VIRTIO_NET_HDR_F_NEEDS_CSUM in the vnet header, expecting us to
@@ -23,8 +30,58 @@ const VIRTIO_ID_NET: u32 = 1;
 // the kernel computes ICMP checksums itself regardless of device
 // offload. By advertising no csum offload, the guest stack does the
 // checksum in software and slirp accepts the packets.
+const VIRTIO_NET_F_MAC_BIT: u32 = 1 << 5; // bit 5 of features[0]
 const VIRTIO_F_VERSION_1_BIT: u32 = 1 << 0; // bit 0 of features[1]
 const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+
+/// Derive a stable MAC for a given (card, l2cpu_idx). Locally
+/// administered (bit 1 of byte 0 set) and unicast (bit 0 clear) so
+/// it never collides with a real OUI. Card + L2CPU index encoded in
+/// the lower bytes — distinct on a multi-card host, stable across
+/// daemon restarts on the same chip.
+///
+/// `02:00:CC:CC:LL:00`
+///   byte 0: 0x02 — locally administered, unicast
+///   byte 1: 0x00 — reserved for future use
+///   byte 2: card index low 8 bits
+///   byte 3: card index high 8 bits
+///   byte 4: L2CPU index (0..3)
+///   byte 5: 0x00 — reserved for future use
+pub fn derive_mac(card: u32, l2cpu_idx: u8) -> [u8; 6] {
+    [
+        0x02,
+        0x00,
+        (card & 0xff) as u8,
+        ((card >> 8) & 0xff) as u8,
+        l2cpu_idx,
+        0x00,
+    ]
+}
+
+/// virtio-net config space layout (VirtIO 1.2 §5.1.4). Only `mac` is
+/// populated today (we don't negotiate STATUS / MQ / MTU / SPEED).
+#[repr(C)]
+struct VirtioNetConfig {
+    mac: [u8; 6],
+    status: u16,
+    max_virtqueue_pairs: u16,
+    mtu: u16,
+    speed: u32,
+    duplex: u8,
+}
+
+/// Write a MAC into the device config region. Extracted so it's
+/// testable without standing up a full `VirtioNet` (which requires
+/// libslirp). `config` must point to a buffer at least
+/// `size_of::<VirtioNetConfig>()` bytes long.
+fn write_mac_into_config(mac: &[u8; 6], config: *mut u8) {
+    let cfg = config as *mut VirtioNetConfig;
+    for (i, b) in mac.iter().enumerate() {
+        unsafe {
+            ptr::write_volatile(&mut (*cfg).mac[i], *b);
+        }
+    }
+}
 
 /// Recompute the IPv4 TCP/UDP checksum in place. The guest sets this on
 /// outbound packets when it thinks we negotiated `VIRTIO_NET_F_CSUM` —
@@ -149,6 +206,11 @@ pub struct VirtioNet {
     queue_header_size: u64,
     /// L2CPU index this device serves. Stored only for metric labels.
     l2cpu_idx: u8,
+    /// Stable per-(card, L2CPU) MAC published in config space. See
+    /// [`derive_mac`] for the encoding. Required by `VIRTIO_NET_F_MAC`,
+    /// which we advertise so U-Boot stops spamming "No valid MAC
+    /// address found" and Linux uses a deterministic address (#77).
+    mac: [u8; 6],
 }
 
 unsafe impl Send for VirtioNet {}
@@ -181,7 +243,11 @@ impl VirtioNet {
     ///   `--fwd HOST:GUEST` extras the operator passed.
     /// - `start_net_worker` (the boot-path default) builds
     ///   `[(regs::slirp::ssh_port(card, idx), 22)]`.
-    pub fn new(forwards: &[(u16, u16)], l2cpu_idx: u8) -> std::io::Result<Self> {
+    ///
+    /// `card` + `l2cpu_idx` are used to derive a stable MAC via
+    /// [`derive_mac`] that is published in config space and announced
+    /// via `VIRTIO_NET_F_MAC`.
+    pub fn new(forwards: &[(u16, u16)], card: u32, l2cpu_idx: u8) -> std::io::Result<Self> {
         let mut cfg: SlirpConfig = unsafe { std::mem::zeroed() };
         unsafe { vdeslirp_init(&mut cfg, VDE_INIT_DEFAULT) };
         let slirp = unsafe { vdeslirp_open(&mut cfg) };
@@ -216,6 +282,7 @@ impl VirtioNet {
             tx_offset: 0,
             queue_header_size: std::mem::size_of::<VirtioNetHdrMrgRxbuf>() as u64,
             l2cpu_idx,
+            mac: derive_mac(card, l2cpu_idx),
         })
     }
 }
@@ -231,7 +298,11 @@ impl VirtioDeviceImpl for VirtioNet {
         VIRTIO_ID_NET
     }
     fn device_features(&self) -> [u32; 2] {
-        [0, VIRTIO_F_VERSION_1_BIT]
+        [VIRTIO_NET_F_MAC_BIT, VIRTIO_F_VERSION_1_BIT]
+    }
+
+    fn init_config(&self, config: *mut u8) {
+        write_mac_into_config(&self.mac, config);
     }
 
     fn process_queue_start(&mut self, queue_idx: u32, addr: *mut u8, len: u64) {
@@ -393,5 +464,119 @@ impl VirtioDeviceImpl for VirtioNet {
         } else {
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_mac_encodes_card_and_l2cpu_index() {
+        assert_eq!(
+            derive_mac(0, 0),
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0x00],
+            "card=0,l2cpu=0"
+        );
+        assert_eq!(
+            derive_mac(0, 1),
+            [0x02, 0x00, 0x00, 0x00, 0x01, 0x00],
+            "card=0,l2cpu=1"
+        );
+        assert_eq!(
+            derive_mac(0, 3),
+            [0x02, 0x00, 0x00, 0x00, 0x03, 0x00],
+            "card=0,l2cpu=3"
+        );
+        assert_eq!(
+            derive_mac(1, 0),
+            [0x02, 0x00, 0x01, 0x00, 0x00, 0x00],
+            "card=1,l2cpu=0"
+        );
+        // Card index high byte exercised so a multi-card host with >255
+        // cards (theoretical, but keep the encoding faithful) still
+        // gets a unique MAC.
+        assert_eq!(
+            derive_mac(0x1234, 2),
+            [0x02, 0x00, 0x34, 0x12, 0x02, 0x00],
+            "card=0x1234,l2cpu=2"
+        );
+    }
+
+    #[test]
+    fn derive_mac_is_locally_administered_unicast() {
+        // Locally-administered (bit 1 of byte 0 set) so we never collide
+        // with a real OUI; unicast (bit 0 clear) so the kernel doesn't
+        // treat the device as a broadcast/multicast endpoint.
+        for card in [0u32, 1, 0xff, 0xffff] {
+            for l2cpu in 0u8..4 {
+                let mac = derive_mac(card, l2cpu);
+                assert_ne!(
+                    mac[0] & 0x02,
+                    0,
+                    "locally-administered bit must be set: card={card},l2cpu={l2cpu}"
+                );
+                assert_eq!(
+                    mac[0] & 0x01,
+                    0,
+                    "multicast bit must be clear: card={card},l2cpu={l2cpu}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn derive_mac_distinct_per_l2cpu_on_same_card() {
+        let mut seen = std::collections::HashSet::new();
+        for l2cpu in 0u8..4 {
+            assert!(
+                seen.insert(derive_mac(0, l2cpu)),
+                "MAC must be unique per L2CPU (l2cpu={l2cpu})"
+            );
+        }
+    }
+
+    #[test]
+    fn write_mac_into_config_lands_at_offset_zero() {
+        let mut buf = [0xAAu8; 64];
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x05, 0x00];
+        write_mac_into_config(&mac, buf.as_mut_ptr());
+        assert_eq!(&buf[0..6], &mac, "MAC must land at config offset 0..6");
+        // Bytes after the MAC must be untouched — we don't populate
+        // status / max_virtqueue_pairs / mtu / speed / duplex, so the
+        // surrounding sentinel pattern (0xAA) survives.
+        for (i, b) in buf.iter().enumerate().skip(6) {
+            assert_eq!(*b, 0xAA, "byte {i} must be untouched");
+        }
+    }
+
+    #[test]
+    fn device_features_advertises_mac() {
+        // Bit 5 of features[0] is VIRTIO_NET_F_MAC. Without it U-Boot
+        // refuses to use the interface and Linux falls back to a random
+        // MAC. See #77.
+        assert_ne!(
+            VIRTIO_NET_F_MAC_BIT & (1 << 5),
+            0,
+            "VIRTIO_NET_F_MAC_BIT must encode bit 5 of features[0]"
+        );
+        assert_eq!(VIRTIO_NET_F_MAC_BIT, 1 << 5);
+    }
+
+    #[test]
+    fn virtio_net_config_layout_matches_spec() {
+        // VirtIO 1.2 §5.1.4: mac at offset 0, status at offset 6,
+        // max_virtqueue_pairs at offset 8, mtu at offset 10, speed at
+        // offset 12, duplex at offset 16. Our struct must agree with
+        // the kernel's view; if alignment ever pushes mac off offset 0
+        // the guest reads the wrong bytes.
+        let cfg: VirtioNetConfig = unsafe { std::mem::zeroed() };
+        let base = &cfg as *const _ as usize;
+        assert_eq!(&cfg.mac as *const _ as usize - base, 0);
+        assert_eq!(&cfg.status as *const _ as usize - base, 6);
+        assert_eq!(&cfg.max_virtqueue_pairs as *const _ as usize - base, 8);
+        assert_eq!(&cfg.mtu as *const _ as usize - base, 10);
+        assert_eq!(&cfg.speed as *const _ as usize - base, 12);
+        assert_eq!(&cfg.duplex as *const _ as usize - base, 16);
     }
 }
