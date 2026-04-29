@@ -107,6 +107,22 @@ src/
 └── ramdisk.rs        # download initramfs images — hardware-free
 
 scripts/  (see scripts/README.md)
+
+brisc-firmware/        # BRISC + TRISC0 firmware for the Tensix virtio engine
+├── start.S            # multi-core entry; hart-ID dispatch via reset-PC override
+├── virtio.c           # register-file emulation + UART poll + kick ring + handshake
+├── hello.c            # minimal heartbeat-only firmware (#67 M1 smoke)
+├── include/           # virtio_layout.h, uart_layout.h, tensix_proto.h shared with Rust
+├── prebuilt/          # checked-in *.bin fallback when sfpi toolchain absent
+└── Makefile           # toolchain at /opt/tenstorrent/sfpi/compiler/bin
+
+uboot/                 # U-Boot S-mode payload for booting stock distro images (#44 + sub-issues)
+├── README.md          # build / pinned config / bumping / reproducibility
+├── Makefile           # download + extract + patch + merge_config.sh + build
+├── tt-bh.config       # defconfig fragment merged on top of qemu-riscv64_smode_defconfig
+├── patches/           # 3 downstream patches (sel_generation handshake + 2 RISC-V DRAM fixes)
+├── sha256sums         # pinned tarball checksum
+└── u-boot.bin         # (gitignored) symlink the build maintains
 ```
 
 The `slirp` feature is on by default and links `libvdeslirp`+`libslirp`;
@@ -308,3 +324,15 @@ image/kernel/ramdisk downloaders.
   and `./rootfs.ext4` doesn't exist in the *client's* cwd, no disk is
   attached. Guest will VFS-mount-panic with `root=/dev/vda`. Pass
   `--initramfs` or an explicit `--disk` to avoid.
+- **Two boot modes** (boot.rs `BootDevice` + protocol.rs `BootPayload`):
+  `Kernel(<path>)` jumps OpenSBI straight at a raw `Image` (the legacy
+  default; the daemon also preloads initramfs and patches
+  `/chosen/bootargs` with `root=/dev/<device>`). `Uboot(<path>)` loads
+  `u-boot.bin` at the kernel offset instead and skips both initramfs
+  preload and bootargs injection — U-Boot reads the disk at runtime,
+  finds the ESP, runs the EFI shim+grub chain, loads the actual kernel
+  itself. Each known image entry's `needs_bootloader` field decides
+  which mode the no-`--uboot` boot path defaults to (see
+  `default_boot_payload` in main.rs). `default_uboot_path` prefers
+  `./u-boot.bin` (operator symlink) over `./uboot/u-boot.bin` (in-tree
+  build); see `uboot/README.md` for the build.

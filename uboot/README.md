@@ -13,7 +13,7 @@ target, not the binary.
 ## Build
 
 ```bash
-cd tt-bh-linux-rs/tests/uboot
+cd uboot                 # from the tt-bh-linux-rs project root
 make check-deps          # verifies wget, tar, riscv64-linux-gnu-gcc, bison, flex
 make                     # downloads u-boot-2026.04.tar.bz2, builds u-boot.bin
 ```
@@ -26,11 +26,17 @@ Output: `u-boot.bin` (symlink to the actual file in the source tree).
 ## Use
 
 ```bash
-cd ../..    # back to tt-bh-linux-rs/
+cd ..    # back to tt-bh-linux-rs/
 ./target/debug/tt-bh-linux daemon start -t 0 --log-file ./daemon-card0.log
-./target/debug/tt-bh-linux boot -l 0 --uboot tests/uboot/u-boot.bin
+./target/debug/tt-bh-linux boot -l 0 --uboot uboot/u-boot.bin
 ./target/debug/tt-bh-linux connect -l 0
 ```
+
+When the boot subcommand is called without `--uboot` against a disk
+that maps to a known image with `needs_bootloader: true` (e.g.
+`images/almalinux-10-kitten.img`), it auto-defaults to
+`--uboot u-boot.bin` — i.e. operators can keep the symlink in cwd
+and the disk-detection wiring picks it up.
 
 A successful M1 brings up a `=>` U-Boot prompt within ~10 s of release-
 from-reset. M2 / M3 add disk-attached autoboot.
@@ -65,7 +71,7 @@ fork.
 
 Same workflow as `tests/rootfs/` (#39): the Makefile pins
 `SOURCE_DATE_EPOCH` to the timestamp of the last commit touching
-`tests/uboot/`. Two clean builds from the same commit produce a byte-
+`uboot/`. Two clean builds from the same commit produce a byte-
 identical `u-boot.bin`. Verify:
 
 ```bash
@@ -76,7 +82,7 @@ make distclean && make && sha256sum u-boot.bin   # must match
 ## Layout
 
 ```
-tests/uboot/
+uboot/
 ├── README.md           (this file)
 ├── Makefile            download + build
 ├── tt-bh.config        defconfig fragment merged on top of qemu-riscv64_smode_defconfig

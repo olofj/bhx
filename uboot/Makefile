@@ -35,7 +35,7 @@ FRAGMENT := $(TOPDIR)/tt-bh.config
 # Final blob landed by the build.
 UBOOT_BIN := $(UB_SRCDIR)/u-boot.bin
 # Stable convenience path. The Makefile maintains a symlink here so
-# `tt-bh-linux boot --uboot tests/uboot/u-boot.bin` doesn't need to
+# `tt-bh-linux boot --uboot uboot/u-boot.bin` doesn't need to
 # know the U-Boot version directory name.
 UBOOT_LINK := $(TOPDIR)/u-boot.bin
 
@@ -47,7 +47,7 @@ UBOOT_LINK := $(TOPDIR)/u-boot.bin
 CROSS_COMPILE ?= riscv64-linux-gnu-
 
 # Reproducibility: same workflow as tests/rootfs/. SOURCE_DATE_EPOCH
-# pinned to the most recent commit touching tests/uboot/, anchored at
+# pinned to the most recent commit touching uboot/, anchored at
 # $(TOPDIR) so unrelated commits don't bump the cache; ?= so the env
 # wins for CI-style fixed-epoch builds. See #39.
 SOURCE_DATE_EPOCH ?= $(shell git -C $(TOPDIR) log -1 --format=%ct -- $(TOPDIR) 2>/dev/null || echo 0)
@@ -88,7 +88,7 @@ $(UB_SRCDIR)/Makefile: $(DL_DIR)/$(UBOOT_TARBALL) $(TOPDIR)/patches/serial_sbi_d
 	@# not already present (so re-running this step on an existing
 	@# tree doesn't duplicate.)
 	@grep -q SERIAL_SBI_DM $(UB_SRCDIR)/drivers/serial/Kconfig || \
-		printf '\nconfig SERIAL_SBI_DM\n\tbool "DM serial driver wrapping SBI DBCN"\n\tdepends on DM_SERIAL && RISCV_SMODE\n\thelp\n\t  tt-bh downstream patch — see tests/uboot/patches/serial_sbi_dm.c.\n' >> $(UB_SRCDIR)/drivers/serial/Kconfig
+		printf '\nconfig SERIAL_SBI_DM\n\tbool "DM serial driver wrapping SBI DBCN"\n\tdepends on DM_SERIAL && RISCV_SMODE\n\thelp\n\t  tt-bh downstream patch — see uboot/patches/serial_sbi_dm.c.\n' >> $(UB_SRCDIR)/drivers/serial/Kconfig
 	@grep -q SERIAL_SBI_DM $(UB_SRCDIR)/drivers/serial/Makefile || \
 		echo 'obj-$$(CONFIG_SERIAL_SBI_DM) += serial_sbi_dm.o' >> $(UB_SRCDIR)/drivers/serial/Makefile
 	@# Apply any *.patch files (alphabetical order). The patch tool's

@@ -104,6 +104,52 @@ When you're done:
 ./target/debug/tt-bh-linux daemon stop -t 0
 ```
 
+## Booting stock distro images via U-Boot
+
+`boot --kernel <Image>` (the default with no `--uboot` flag) loads the
+host-provided `Image` into L2CPU DRAM and jumps OpenSBI straight at
+it. That works for the patched buildroot kernel and for
+pipeline-converted single-FS rootfs images, but stock distro cloud
+images (Debian generic, AlmaLinux Kitten, Ubuntu preinstalled-server,
+Fedora Cloud Base) ship as multi-partition disks with an EFI System
+Partition + grub-riscv64-efi + a kernel they install themselves —
+the host's `Image` is the wrong kernel to jump to.
+
+For those, run U-Boot as the S-mode payload and let it walk the disk:
+
+```bash
+# One-time: build U-Boot from source.
+cd uboot && make check-deps && make    # ~5 min cold; idempotent
+cd ..
+
+# Pull a U-Boot-bootable cloud image. The pull pipeline lands a
+# whole-disk `.img` (with GPT + ESP intact) when the known image
+# entry has `needs_bootloader: true`:
+./target/debug/tt-bh-linux image pull almalinux
+
+# Boot it. With no `--kernel` and no `--uboot`, the boot subcommand
+# detects from the disk's basename that this image needs U-Boot and
+# auto-defaults to `--uboot uboot/u-boot.bin`:
+./target/debug/tt-bh-linux boot -l 0 -d images/almalinux-10-kitten.img -n
+
+# Or be explicit:
+./target/debug/tt-bh-linux boot -l 0 \
+    --uboot uboot/u-boot.bin \
+    -d images/almalinux-10-kitten.img -n
+```
+
+OpenSBI hands control to U-Boot, U-Boot reads the GPT, finds the
+ESP, runs `EFI/<distro>/shimriscv64.efi`, shim chainloads grub, grub
+loads the kernel + initrd from `/boot`. End-to-end UEFI on RISC-V.
+
+`cargo run -- image list` annotates each known image's boot path —
+`whole partitioned disk` images go through U-Boot, `single-FS .ext4`
+images go through `--kernel`.
+
+The U-Boot build is documented in `uboot/README.md`: pinned config,
+the three downstream patches we apply (closes #49 plus two RISC-V
+DRAM-init fixes), reproducibility workflow.
+
 ## Common operations
 
 Once an L2CPU is booted, you can reconfigure its devices without
