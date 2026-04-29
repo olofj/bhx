@@ -39,9 +39,9 @@ pub mod l2cpu {
     pub const L2_PREFETCH_STRIDE: u64 = 0x2000;
     /// Number of prefetch engines.
     pub const L2_PREFETCH_NUM: u64 = 4;
-    /// Magic config words written into each prefetcher (firmware-internal,
-    /// inherited from boot.py). Pair: low word at offset 0, high word at
-    /// offset 4.
+    /// Magic config words written into each prefetcher (firmware-internal
+    /// values; inherited from the upstream Tenstorrent reference boot
+    /// flow). Pair: low word at offset 0, high word at offset 4.
     pub const L2_PREFETCH_CFG_LO: u32 = 0x0001_5811;
     pub const L2_PREFETCH_CFG_HI: u32 = 0x0038_c84e;
 }

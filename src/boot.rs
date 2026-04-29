@@ -226,7 +226,8 @@ pub struct VirtioMmioNode {
     pub irq: u32,
 }
 
-/// Patch a DTB to match the layout boot.py produces.
+/// Patch a DTB so the guest kernel sees the per-L2CPU memory range, the
+/// virtio-mmio devices the daemon emulates, and the bootargs / SBI console.
 ///
 /// Adds `/chosen/bootargs`, a `reserved-memory` entry for the virtio MMIO
 /// region, and four virtio MMIO nodes under `/soc`. `mem_end` is computed by
@@ -257,7 +258,8 @@ pub fn modify_dtb(
     // 3 (2 GiB each, with L2CPU 3 starting at 0x4000_b000_0000) leaves the
     // kernel thinking it has 4 GiB and allocating virtio buffers past the
     // end of its DRAM window, which our server then rejects as out-of-range.
-    // boot.py has the same bug — it reads but never writes /memory.
+    // (See #85: the unit name still says `@400030000000` even on L2CPU 3,
+    // which is cosmetic — the kernel reads `reg`, not the unit name.)
     let memory_node = fdt.path_offset("/memory@400030000000")?.ok_or_else(|| {
         crate::Error::fdt("path_offset", "memory@400030000000 node not found in DT")
     })?;
@@ -304,7 +306,7 @@ pub fn modify_dtb(
     fdt.setprop(sbi_console, "compatible", b"riscv,sbi-debug-console\0")?;
     fdt.setprop(chosen, "stdout-path", b"/chosen/sbi-console\0")?;
 
-    // /reserved-memory (create if missing, mirroring boot.py)
+    // /reserved-memory: create if the upstream DTB didn't include one.
     let reserved = match fdt.path_offset("/reserved-memory")? {
         Some(o) => o,
         None => {

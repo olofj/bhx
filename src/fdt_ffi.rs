@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 //! Minimal libfdt FFI bindings — just the functions the boot sequence needs
-//! to mirror the DTB patching that `boot.py` performs via pylibfdt.
+//! to patch the DTB at boot time (memory size, /chosen/bootargs, virtio-mmio
+//! nodes, reserved-memory, sbi-console).
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
