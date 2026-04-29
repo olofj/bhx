@@ -30,7 +30,7 @@
 # Prereqs:
 #   - samply installed: `cargo install samply`
 #   - For `fio` / `soak` scenarios: a buildroot rootfs at
-#     tests/rootfs/rootfs.ext4 (auto-login + fio in target/bin).
+#     third_party/buildroot/rootfs.ext4 (auto-login + fio in target/bin).
 
 set -euo pipefail
 
@@ -75,8 +75,8 @@ fi
 
 # Resolve rootfs (matches the soak scripts' three-tier search).
 if [ -z "${ROOTFS:-}" ]; then
-    if [ -e tests/rootfs/rootfs.ext4 ]; then
-        ROOTFS=tests/rootfs/rootfs.ext4
+    if [ -e third_party/buildroot/rootfs.ext4 ]; then
+        ROOTFS=third_party/buildroot/rootfs.ext4
     elif [ -e rootfs.ext4 ]; then
         ROOTFS=rootfs.ext4
     fi

@@ -42,11 +42,11 @@ UBOOT_LINK := $(TOPDIR)/u-boot.bin
 # Cross-compiler. The Debian package gcc-riscv64-linux-gnu provides this
 # as `riscv64-linux-gnu-`. The buildroot tree's own `riscv64-buildroot-
 # linux-gnu-` works too if you'd rather not install a host package, but
-# requires running `make -C tests/rootfs` first to bring up the
+# requires running `make -C third_party/buildroot` first to bring up the
 # toolchain.
 CROSS_COMPILE ?= riscv64-linux-gnu-
 
-# Reproducibility: same workflow as tests/rootfs/. SOURCE_DATE_EPOCH
+# Reproducibility: same workflow as third_party/buildroot/. SOURCE_DATE_EPOCH
 # pinned to the most recent commit touching third_party/uboot/,
 # anchored at $(TOPDIR) so unrelated commits don't bump the cache;
 # ?= so the env wins for CI-style fixed-epoch builds. See #39.

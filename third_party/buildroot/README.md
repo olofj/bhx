@@ -24,7 +24,7 @@ First build is slow (~20-30 minutes; downloads + builds the toolchain
 from source). Subsequent builds are incremental.
 
 ```bash
-cd bhx/tests/rootfs
+cd bhx/third_party/buildroot
 make check-deps          # verify host tools (build-essential, wget, cpio, ...)
 make                     # produces output/images/rootfs.ext4
 ```
@@ -41,7 +41,7 @@ strip packages; raise it if you add more).
 ```bash
 cd ../..    # back to bhx/
 ./target/debug/bhx daemon start -t 0 --log-file ./daemon-card0.log
-./target/debug/bhx boot -l 0 -d tests/rootfs/output/images/rootfs.ext4 -n
+./target/debug/bhx boot -l 0 -d third_party/buildroot/output/images/rootfs.ext4 -n
 ./target/debug/bhx connect -l 0
 ```
 
@@ -83,7 +83,7 @@ permissions.)
 ## Layout
 
 ```
-tests/rootfs/
+third_party/buildroot/
 ├── README.md                 (this file)
 ├── Makefile                  download buildroot, run defconfig + make
 ├── buildroot.config          our defconfig (collapsed; only non-default lines)
@@ -106,7 +106,7 @@ tests/rootfs/
   downloaded source tarball.
 - `BR2_REPRODUCIBLE=y` is set in `buildroot.config`, and the Makefile
   pins `SOURCE_DATE_EPOCH` to the timestamp of the last commit
-  touching `tests/rootfs/`. Two builds from the same commit produce a
+  touching `third_party/buildroot/`. Two builds from the same commit produce a
   byte-identical `rootfs.ext4`; a different commit (or
   `SOURCE_DATE_EPOCH=N make` from the shell) produces a different but
   equally reproducible image. UUID and ext4 hash_seed are pinned via

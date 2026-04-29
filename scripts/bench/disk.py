@@ -15,7 +15,7 @@ Each profile contributes 3 metrics (bandwidth_mbps, iops,
 latency_p99_us). 9 BenchResult lines total emitted to the CSV
 specified by --csv (default: scripts/bench/results/disk-<ts>.csv).
 
-Pre-reqs: a buildroot rootfs with `fio` (the `tests/rootfs/`
+Pre-reqs: a buildroot rootfs with `fio` (the `third_party/buildroot/`
 buildroot config has it).
 
 Driving the guest is via the same single-`connect` pattern as

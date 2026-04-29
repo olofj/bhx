@@ -34,7 +34,7 @@ python3 scripts/bench/net.py
 ## Prereqs
 
 - A built daemon: `cargo build`.
-- A buildroot rootfs with `fio`, `iperf3`, `dropbear`: `make -C tests/rootfs`
+- A buildroot rootfs with `fio`, `iperf3`, `dropbear`: `make -C third_party/buildroot`
   (one-time, ~30 min cold).
 - Host packages:
   - `e2fsprogs` (`e2fsck` + `resize2fs`) — disk.py grows a rootfs

@@ -85,7 +85,7 @@ These show up only during binary load + `daemon start` setup. Sandbox is install
 <repo>/fw_jump.bin
 <repo>/Image
 <repo>/daemon-card0.log
-<repo>/tests/rootfs/buildroot-2026.02.1/output/images/rootfs.ext2
+<repo>/third_party/buildroot/buildroot-2026.02.1/output/images/rootfs.ext2
 /lib/x86_64-linux-gnu/{libatomic,libc,libfdt,libgcc_s,libglib-2.0,libm,libpcre2-8,libslirp,libvdeslirp}.so.{0,1,6}
 /proc/self/maps
 /run/user/1000/bhx/0/logpath

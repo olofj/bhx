@@ -69,7 +69,7 @@ fork.
 
 ## Reproducibility
 
-Same workflow as `tests/rootfs/` (#39): the Makefile pins
+Same workflow as `third_party/buildroot/` (#39): the Makefile pins
 `SOURCE_DATE_EPOCH` to the timestamp of the last commit touching
 `third_party/uboot/`. Two clean builds from the same commit produce a
 byte-identical `u-boot.bin`. Verify:

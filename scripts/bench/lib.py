@@ -41,7 +41,7 @@ LOG_FILE = os.environ.get(
     "LOG_FILE", str(PROJECT_ROOT / "daemon-card0.log")
 )
 ROOTFS_DEFAULT_PATHS = [
-    PROJECT_ROOT / "tests/rootfs/rootfs.ext4",
+    PROJECT_ROOT / "third_party/buildroot/rootfs.ext4",
     PROJECT_ROOT / "rootfs.ext4",
 ]
 
@@ -56,7 +56,7 @@ def resolve_rootfs() -> Path:
         if cand.exists():
             return cand
     raise FileNotFoundError(
-        "no rootfs available; build tests/rootfs or set ROOTFS=<path>"
+        "no rootfs available; build third_party/buildroot or set ROOTFS=<path>"
     )
 
 

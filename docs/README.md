@@ -33,5 +33,5 @@ authoritative reference for behavior, this directory is the *why*.
   control to the kernel or U-Boot).
 - [`../third_party/dtb/README.md`](../third_party/dtb/README.md) — the vendored
   `blackhole-card.dtb` (provenance, upstream commit SHAs, license).
-- [`../tests/rootfs/README.md`](../tests/rootfs/README.md) — the
+- [`../third_party/buildroot/README.md`](../third_party/buildroot/README.md) — the
   buildroot test rootfs construction.

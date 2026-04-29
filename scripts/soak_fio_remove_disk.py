@@ -55,7 +55,7 @@ args = parser.parse_args()
 
 BINARY = os.environ.get("BINARY", os.path.abspath("./target/debug/bhx"))
 LOG_FILE = os.environ.get("LOG_FILE", os.path.abspath("./daemon-card0.log"))
-ROOTFS_DEFAULT_BUILDROOT = "tests/rootfs/rootfs.ext4"
+ROOTFS_DEFAULT_BUILDROOT = "third_party/buildroot/rootfs.ext4"
 ROOTFS_DEFAULT_LEGACY = "rootfs.ext4"
 ROOTFS = os.environ.get("ROOTFS")
 if not ROOTFS:
@@ -83,7 +83,7 @@ def note(msg: str) -> None:
 if not os.access(BINARY, os.X_OK):
     fail(f"{BINARY} not executable (run cargo build first)")
 if not ROOTFS or not os.path.exists(ROOTFS):
-    fail("no rootfs available; build tests/rootfs or set ROOTFS=<path>")
+    fail("no rootfs available; build third_party/buildroot or set ROOTFS=<path>")
 for f in ("fw_jump.bin", "Image", "blackhole-card.dtb"):
     if not os.path.exists(f):
         fail(f"{f} missing in cwd")

@@ -112,7 +112,7 @@ mod imp {
             ));
         }
         // Parent of cwd: read-only — covers a sibling-of-cwd checkout
-        // pattern (e.g. tests/rootfs/rootfs.ext4 referencing a
+        // pattern (e.g. third_party/buildroot/rootfs.ext4 referencing a
         // buildroot output dir).
         if let Ok(cwd) = std::env::current_dir() {
             if let Some(parent) = cwd.parent() {

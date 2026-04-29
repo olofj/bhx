@@ -40,8 +40,8 @@ note() { echo "[soak] $*"; }
 # Resolve the rootfs path. Priority: ROOTFS env > buildroot test rootfs >
 # ./rootfs.ext4 (the legacy `image pull debian` location).
 if [ -z "${ROOTFS:-}" ]; then
-    if [ -e tests/rootfs/rootfs.ext4 ]; then
-        ROOTFS=tests/rootfs/rootfs.ext4
+    if [ -e third_party/buildroot/rootfs.ext4 ]; then
+        ROOTFS=third_party/buildroot/rootfs.ext4
     elif [ -e rootfs.ext4 ]; then
         ROOTFS=rootfs.ext4
     fi
@@ -55,7 +55,7 @@ trap cleanup EXIT
 # Sanity checks -------------------------------------------------------------
 [ -x "$BINARY" ] || fail "binary $BINARY not executable (run cargo build first)"
 [ -n "${ROOTFS:-}" ] && [ -e "$ROOTFS" ] \
-    || fail "no rootfs available; build tests/rootfs or set ROOTFS=<path>"
+    || fail "no rootfs available; build third_party/buildroot or set ROOTFS=<path>"
 [ -e fw_jump.bin ] || fail "fw_jump.bin missing"
 [ -e Image ] || fail "Image missing"
 [ -e blackhole-card.dtb ] || fail "blackhole-card.dtb missing"
@@ -77,7 +77,7 @@ timeout 60 "$BINARY" boot -t "$CARD" -l "$L2CPU" -d "$ROOTFS" -n >/dev/null
 # sending to the daemon, so the basename in `daemon status` is the
 # basename of the resolved file, not of $ROOTFS. Compute that here so
 # soaks work with both regular files (./rootfs.ext4) and the buildroot
-# symlink (tests/rootfs/rootfs.ext4 -> ...rootfs.ext2).
+# symlink (third_party/buildroot/rootfs.ext4 -> ...rootfs.ext2).
 rootfs_basename=$(basename "$(readlink -f "$ROOTFS")")
 status=$("$BINARY" daemon status -t "$CARD")
 echo "$status" | grep -qE "l2cpu $L2CPU: Running disk=.*$rootfs_basename net=y" \

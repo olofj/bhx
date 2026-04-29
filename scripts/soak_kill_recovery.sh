@@ -49,8 +49,8 @@ note() { echo "[soak] $*"; }
 
 # Resolve rootfs (ROOTFS env > buildroot > legacy ./rootfs.ext4).
 if [ -z "${ROOTFS:-}" ]; then
-    if [ -e tests/rootfs/rootfs.ext4 ]; then
-        ROOTFS=tests/rootfs/rootfs.ext4
+    if [ -e third_party/buildroot/rootfs.ext4 ]; then
+        ROOTFS=third_party/buildroot/rootfs.ext4
     elif [ -e rootfs.ext4 ]; then
         ROOTFS=rootfs.ext4
     fi
@@ -64,7 +64,7 @@ trap cleanup EXIT
 # Sanity checks -------------------------------------------------------------
 [ -x "$BINARY" ] || fail "binary $BINARY not executable (run cargo build first)"
 [ -n "${ROOTFS:-}" ] && [ -e "$ROOTFS" ] \
-    || fail "no rootfs available; build tests/rootfs or set ROOTFS=<path>"
+    || fail "no rootfs available; build third_party/buildroot or set ROOTFS=<path>"
 [ -e fw_jump.bin ] || fail "fw_jump.bin missing"
 [ -e Image ] || fail "Image missing"
 [ -e blackhole-card.dtb ] || fail "blackhole-card.dtb missing"

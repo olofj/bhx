@@ -87,7 +87,7 @@ def measure_roundtrip_latency_us(
     g: GuestSession, iterations: int
 ) -> tuple[float, float, float]:
     """Echo-loop latency. Guest runs the unbuffered `echo-byte` helper
-    (#36 — see tests/rootfs/echo-byte.c); host times each round trip.
+    (#36 — see third_party/buildroot/echo-byte.c); host times each round trip.
 
     Pattern: send a READY marker before invoking echo-byte so we know
     when the guest is actually sitting in read(2). Then per-byte
@@ -127,7 +127,7 @@ def measure_roundtrip_latency_us(
             snap = bytes(g._buf)  # type: ignore[attr-defined]
         if b"BENCH_LAT_NO_HELPER" in snap[before:]:
             raise RuntimeError(
-                "rootfs missing /usr/local/bin/echo-byte — rebuild tests/rootfs (#36)"
+                "rootfs missing /usr/local/bin/echo-byte — rebuild third_party/buildroot (#36)"
             )
         if ready_marker.encode() in snap[before:]:
             break
@@ -206,7 +206,7 @@ def main() -> int:
         results.append(BenchResult("console", "bytes_per_sec_g2h", bps, "B/s"))
 
         # Roundtrip-latency uses the unbuffered `echo-byte` helper
-        # (#36) baked into tests/rootfs by the post-build script.
+        # (#36) baked into third_party/buildroot by the post-build script.
         # If the rootfs is older than #36 it doesn't have the helper
         # — we surface that as SKIP rather than failing the whole
         # bench so existing CI / baseline runs still complete.

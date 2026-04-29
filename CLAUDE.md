@@ -128,12 +128,21 @@ third_party/           # vendored, builds-from-source dependencies
 │   ├── Makefile       # download + verify + build (PLATFORM=generic, FW_JUMP=y)
 │   ├── sha256sums     # pinned tarball checksum
 │   └── fw_jump.bin    # (gitignored) symlink the build maintains
-└── dtb/               # Blackhole device tree, vendored from tenstorrent/linux
-    ├── README.md      # provenance (upstream commit SHA, license, bumping)
-    ├── Makefile       # cpp + dtc -> blackhole-card.dtb
-    ├── blackhole-card.dts   # vendored DTS source (Copyright 2025 Tenstorrent AI ULC)
-    ├── blackhole.dtsi       # vendored DTSI source (Copyright 2025 Tenstorrent AI ULC)
-    └── blackhole-card.dtb   # (gitignored) build output
+├── dtb/               # Blackhole device tree, vendored from tenstorrent/linux
+│   ├── README.md      # provenance (upstream commit SHA, license, bumping)
+│   ├── Makefile       # cpp + dtc -> blackhole-card.dtb
+│   ├── blackhole-card.dts   # vendored DTS source (Copyright 2025 Tenstorrent AI ULC)
+│   ├── blackhole.dtsi       # vendored DTSI source (Copyright 2025 Tenstorrent AI ULC)
+│   └── blackhole-card.dtb   # (gitignored) build output
+└── buildroot/         # Buildroot test rootfs (auto-login, fio/iperf3, used by soaks)
+    ├── README.md      # build / pinned version / overlay / reproducibility
+    ├── Makefile       # download + extract + build
+    ├── buildroot.config     # defconfig fragment
+    ├── overlay/             # /etc/inittab and other fixed-up files
+    ├── post-build.sh        # final rootfs touch-ups
+    ├── echo-byte.c          # tiny test helper baked into target/bin
+    ├── sha256sums           # pinned tarball checksum
+    └── rootfs.ext4    # (gitignored) symlink to output/images/rootfs.ext4
 ```
 
 The `slirp` feature is on by default and links `libvdeslirp`+`libslirp`;

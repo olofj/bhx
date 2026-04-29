@@ -18,7 +18,7 @@ Run them from `bhx/` after `cargo build`.
 | `soak_concurrent.sh`  | Boots all 4 L2CPUs in parallel (each with its own `rootfs-N.ext4`), then runs N iterations of **4-way concurrent** `remove-disk`/`add-disk`/`remove-net`/`add-net` hammering sibling slots in parallel, with a background `daemon status` poller alongside. Chip-wide AXI ops go through `SharedChip::seq_lock`; per-L2CPU NOC traffic goes through each core's own fd. See [issue #1](https://github.com/olofj/bhx/issues/1). |
 | `soak_kill_recovery.sh` | N SIGKILL-the-daemon cycles. After each kill, asserts the next `daemon start` cleans up stale runtime files, the warm-resume probe adopts the still-live L2CPU, and add-disk + add-net re-attach successfully. Targets the dirty-shutdown path that graceful `daemon stop` doesn't exercise. |
 | `soak_disk_io_pressure.sh` | N `remove-disk` calls while the guest is in steady-state I/O (kernel journal + systemd housekeeping). Asserts each remove-disk returns within `TIMEOUT` seconds (default 5; healthy runs are ~300 ms), the daemon survives, and the slot becomes addressable for re-add. Light pressure — the buildroot-only [`soak_fio_remove_disk.py`](#soak_fio_remove_diskpy) drives real fio writes for a stronger version of the same test. |
-| `soak_fio_remove_disk.py` | Like `soak_disk_io_pressure.sh` but drives a real `fio` job inside the guest writing 64 MiB to the rootfs at the moment we yank the disk. Requires the [tests/rootfs](../tests/rootfs/) buildroot rootfs (auto-login + `fio` in target/bin). Drives the virtio-blk descriptor path much harder than the kernel-journal-only version. |
+| `soak_fio_remove_disk.py` | Like `soak_disk_io_pressure.sh` but drives a real `fio` job inside the guest writing 64 MiB to the rootfs at the moment we yank the disk. Requires the [third_party/buildroot](../third_party/buildroot/) buildroot rootfs (auto-login + `fio` in target/bin). Drives the virtio-blk descriptor path much harder than the kernel-journal-only version. |
 | `soak_net_teardown.sh` | N `remove-net` calls while a host-side TCP session is held open against the slirp-forwarded SSH port. Asserts the held connection drops cleanly (no host hang), the daemon survives, and add-net brings the listener back up. Doesn't depend on guest SSH credentials — just exercises the TCP-listener teardown. |
 | `console_roundtrip.py` | End-to-end console I/O stress — logs into the guest via `connect`, puts the tty in raw mode, then roundtrips 64 KiB of base64 text in each direction (guest→host and host→guest) and compares sha256. Validates `chip_console`'s `push_char` / `pop_char` + `ConsoleHub` fan-out under sustained transfers. Auto-detects buildroot (auto-login on `# `) vs Debian (`login:` → `debian\r` → `$ `); silences kernel printk to the console before the test so async kernel messages don't pollute the captured stream. See "Concurrent console roundtrip" below for the 4-way stress form. |
 | `soak_endurance.sh` | Long-running drift soak (default 8 h). Add-disk / remove-disk / add-net / remove-net cycle every `ITER_INTERVAL` seconds, with daemon `RSS` / `VSZ` / open-fd-count captured per-iteration into a CSV. Fails if RSS grows >`RSS_DRIFT_PCT`% (default 25) or fd-count grows >`FD_DRIFT_ABS` (default 10) above the per-uptime baseline. Periodically (`WARM_RESUME_EVERY` iters, default 100) does a daemon stop/start drill so warm-resume gets exercised across thousands of slot mutations. Background `connect` client stays attached the whole run so the chip-console pump path is continuously warm. Catches fd leaks, slow memory growth, slirp state accumulation, u32 counter wraparound — drift that the short soaks miss. |
@@ -37,7 +37,7 @@ All scripts honour:
 - `STATUS_POLL_HZ` — background status poll frequency in `soak_concurrent.sh` (default 20).
 - `TIMEOUT`        — per-step timeout for `soak_disk_io_pressure.sh` and `soak_net_teardown.sh` (default 5 s).
 - `PORT_WAIT`      — max wait for guest sshd to come up in `soak_net_teardown.sh` (default 60 s; bump for slow boots).
-- `ROOTFS`         — disk image to attach. Auto-detected: `tests/rootfs/rootfs.ext4` (the buildroot test image — preferred) → `./rootfs.ext4` (legacy `image pull debian` location). Set explicitly to override.
+- `ROOTFS`         — disk image to attach. Auto-detected: `third_party/buildroot/rootfs.ext4` (the buildroot test image — preferred) → `./rootfs.ext4` (legacy `image pull debian` location). Set explicitly to override.
 
 ## Typical use
 
@@ -94,8 +94,8 @@ wait
 
 Two rootfs flavors are supported, auto-detected from the prompt that
 appears first:
-- **Buildroot** (`tests/rootfs/rootfs.ext4`, recommended for soaks):
-  drops to `# ` immediately, no login. See [tests/rootfs/](../tests/rootfs/).
+- **Buildroot** (`third_party/buildroot/rootfs.ext4`, recommended for soaks):
+  drops to `# ` immediately, no login. See [third_party/buildroot/](../third_party/buildroot/).
 - **Debian** (legacy `image pull debian` flow): needs a `debian` user
   with a passwordless console login.
 

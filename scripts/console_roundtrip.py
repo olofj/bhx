@@ -13,7 +13,7 @@ Prereqs (caller responsibility):
 Auto-detects two rootfs flavors:
   - Debian-style: `login:` prompt → send `debian\\r` → `$ ` prompt.
   - Buildroot-style: auto-logged-in `# ` prompt directly (no login
-    needed, e.g. tests/rootfs/output/.../rootfs.ext4 from #16).
+    needed, e.g. third_party/buildroot/output/.../rootfs.ext4 from #16).
 
 Flow:
   1. Spawn `connect -l N` (default `--mode rw`). Reader thread

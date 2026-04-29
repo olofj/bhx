@@ -40,8 +40,8 @@ note() { echo "[soak] $*"; }
 if [ -z "${DISK_PATH:-}" ]; then
     if [ -n "${ROOTFS:-}" ]; then
         DISK_PATH="$ROOTFS"
-    elif [ -e tests/rootfs/rootfs.ext4 ]; then
-        DISK_PATH=tests/rootfs/rootfs.ext4
+    elif [ -e third_party/buildroot/rootfs.ext4 ]; then
+        DISK_PATH=third_party/buildroot/rootfs.ext4
     else
         DISK_PATH=rootfs.ext4
     fi

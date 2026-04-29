@@ -68,7 +68,7 @@ $(DL_DIR)/$(BUILDROOT_TARBALL):
 	@mv $@.tmp $@
 
 # Reproducibility: pin SOURCE_DATE_EPOCH to the timestamp of the last
-# commit that touched tests/rootfs/. Combined with BR2_REPRODUCIBLE=y
+# commit that touched third_party/buildroot/. Combined with BR2_REPRODUCIBLE=y
 # in buildroot.config this makes rootfs.ext4 byte-identical across
 # rebuilds from the same commit (mkfs.ext4 derives the UUID and inode
 # timestamps from this; gcc honors it for __DATE__/__TIME__). Anchored
