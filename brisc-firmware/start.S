@@ -1,34 +1,82 @@
 // SPDX-FileCopyrightText: © 2026 Olof Johansson
 // SPDX-License-Identifier: MIT
 
-// Shared BRISC entry stub for both M1 (hello-world, #67) and M3
-// (virtio-mmio engine, #69) firmware variants.
+// Multi-core BRISC + TRISC0 entry stub for the M1 hello-world (#67),
+// the M3 (#69) virtio-mmio engine, and the M6.1 (#79) TRISC0-owned
+// UART poll.
 //
-// BRISC's reset PC is 0x0 in tile L1 (per
-// `BlackholeA0/TensixTile/SoftReset.md`), so the linker places this
-// section at the very start of L1. We jump past a small zero-padded
-// region into `main_entry`, which sets up a stack in BRISC's local
-// data RAM (8 KiB at 0xFFB0_0000) and calls `main()`.
+// Core layout:
+//   * BRISC reset PC = 0x0 (per `BlackholeA0/TensixTile/SoftReset.md`).
+//     We jump past a small zero-padded region into `brisc_main_entry`,
+//     set up a stack at the top of BRISC's 8 KiB private RAM, and call
+//     `main()`.
+//   * TRISC0 reset PC is set via the host-programmed override register
+//     `RISCV_DEBUG_REG_TRISC0_RESET_PC` (0xFFB1_2228), enabled by bit 0
+//     of `RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE` (0xFFB1_2234), both
+//     written by the host during engine bring-up. The host reads
+//     `trisc0_reset_entry`'s linker-resolved address from L1[0x4]
+//     (planted as a u32 word below) and writes it to the override.
 //
-// The 0x80-byte zero pad after the entry jump exists so the M1
-// hello-world's two magic+counter slots at L1[0x40, 0x44] (well past
-// ARC firmware's L1[0x10..0x20] scratch region) land in pre-zeroed
-// space. The M3 virtio firmware doesn't touch this range — its
-// register files live at L1[0x10000+] — so the pad is harmless.
+// One binary, two entry points: BRISC and TRISC0 share the same
+// `.text*` sections in L1 (per BabyRISCV README, instructions can only
+// be fetched from L1, not core-local TCM), and which entry runs is
+// determined by which core gets released from soft reset.
+//
+// Why a header word instead of `mhartid`: `mhartid` is read-only zero
+// on every baby RISC (per `BabyRISCV/CSRs.md` — explicitly called out
+// as "non-conformant"). Each core has its own configurable reset PC
+// and that's the hardware mechanism Tensix exposes for distinguishing
+// what code each core runs.
+//
+// The 0x80-byte zero pad past the entry slot exists so the M1 hello-
+// world's magic+counter slots at L1[0x40, 0x44] (well past ARC
+// firmware's L1[0x10..0x20] scratch region) land in pre-zeroed space.
+// The .word at L1[0x4] doesn't conflict with hello's slots.
 
     .section .text._start, "ax"
     .global  _start
 _start:
-    j        main_entry         // PC=0: jump past the zero-padded area.
+    j        brisc_main_entry      // PC=0:   BRISC reset entry
+    .word    trisc0_reset_entry    // PC=4:   TRISC0 reset entry address
+                                   //         (host reads, writes to PC override)
 
     // Aligned entry. Anything past here is the actual program.
     .org 0x80
-main_entry:
+brisc_main_entry:
     // BRISC private data RAM is 8 KiB at 0xFFB0_0000. Stack grows
-    // downward from the top of that range.
+    // downward from the top.
     li       sp, 0xFFB02000
+
+    // Zero BSS. After a tt-smi reset L1 retains whatever was left
+    // by a previous workload, and `objcopy -O binary` doesn't include
+    // BSS bytes — so without an explicit clear, statics like
+    // `trisc0_running` could start non-zero. Word-at-a-time loop;
+    // `_bss_start`/`_bss_end` come from the linker script and are
+    // 4-byte aligned (see `link.ld`).
+    la       t0, _bss_start
+    la       t1, _bss_end
+1:  beq      t0, t1, 2f
+    sw       zero, 0(t0)
+    addi     t0, t0, 4
+    j        1b
+2:
     call     main
-    // main() never returns, but if it did, spin in WFI to halt
-    // cleanly (BRISC supports WFI per the BabyRISCV CSRs doc).
+    // main() never returns, but if it did, spin in WFI to halt.
+1:  wfi
+    j        1b
+
+    .global  trisc0_reset_entry
+trisc0_reset_entry:
+    // TRISC0 private data RAM is 4 KiB at 0xFFB0_0000 (each core sees
+    // its own memory at that base address; the size is per-core — 8
+    // KiB on B/NC, 4 KiB on T0/T1/T2). Stack grows downward from the
+    // top of the 4 KiB region.
+    //
+    // BSS is shared with BRISC and was already zeroed when BRISC
+    // entered main. (TRISC0 is released only after BRISC observes
+    // a non-zero UART_SLOT_MASK in the active-slots bitmap, which
+    // can only happen after the daemon's hello — long past BSS init.)
+    li       sp, 0xFFB01000
+    call     trisc0_main
 1:  wfi
     j        1b

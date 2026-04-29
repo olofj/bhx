@@ -118,6 +118,31 @@ impl TensixEngine {
             }
         }
         tile.load_brisc_firmware(ve::VIRTIO_FIRMWARE);
+
+        // M6.1 (#79): set up TRISC0's reset PC override before BRISC
+        // runs. BRISC drives TRISC0's soft-reset bit from the active-
+        // slots bitmap (UART portion), so all the host has to do is
+        // make sure that whenever BRISC clears bit 12, TRISC0 enters
+        // `trisc0_reset_entry`. The firmware's `start.S` plants the
+        // linker-resolved address at L1[0x4] for us to read here.
+        // TRISC0 stays in soft reset (bit 12 of SOFT_RESET_ALL)
+        // until BRISC releases it; this is intentional — bring-up
+        // doesn't release TRISC0 directly, the firmware does on the
+        // first UART register.
+        let trisc0_pc = tile.read_trisc0_reset_entry();
+        if trisc0_pc == 0 {
+            return Err(io::Error::other(format!(
+                "BRISC firmware on tile ({}, {}) did not plant a \
+                 TRISC0 reset entry address at L1[0x{:x}] — likely a \
+                 firmware/build mismatch",
+                picked.x,
+                picked.y,
+                crate::tensix::TRISC0_RESET_ENTRY_PTR_L1_OFFSET
+            )));
+        }
+        tile.set_trisc0_reset_pc(trisc0_pc);
+        tile.enable_trisc0_reset_pc_override();
+
         tile.release_brisc_only();
 
         // Wait for the firmware to publish its stats-page magic.
@@ -363,6 +388,22 @@ impl TensixEngine {
     pub fn notify_event_count(&self) -> u32 {
         self.tile
             .read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_NOTIFY_EVENTS)
+    }
+
+    /// Read TRISC0's heartbeat (M6.1, #79). Bumped each iteration of
+    /// `trisc0_main`'s loop. Stays at zero while TRISC0 is in soft
+    /// reset; advances rapidly after BRISC clears the reset bit.
+    pub fn trisc0_heartbeat(&self) -> u32 {
+        self.tile
+            .read_l1_u32(crate::uart_engine::trisc0_heartbeat_addr())
+    }
+
+    /// Write the active-slots bitmap directly. Diagnostic — production
+    /// code uses [`crate::tensix_data_plane::KickPoller::register_uart`]
+    /// and friends, which compute the mask from the registries.
+    pub fn write_active_slots(&self, mask: u32) {
+        self.tile
+            .write_l1_u32(proto::CTRL_BASE + proto::CTRL_OFF_ACTIVE_SLOTS, mask);
     }
 
     /// Program one small TLB on the given L2CPU pointing at this

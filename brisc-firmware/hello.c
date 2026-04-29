@@ -54,3 +54,12 @@ void main(void) {
         FENCE_W();
     }
 }
+
+// Hello firmware doesn't release TRISC0, but the shared `start.S`'s
+// trisc0 reset stub references this symbol. If TRISC0 ever ran the
+// hello image, it'd just spin here.
+void trisc0_main(void) {
+    for (;;) {
+        __asm__ volatile("wfi");
+    }
+}

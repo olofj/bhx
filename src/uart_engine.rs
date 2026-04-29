@@ -56,6 +56,23 @@ pub fn uart_pa_from_engine_base(engine_base: u64) -> u64 {
     engine_base + UART_OFFSET_FROM_ENGINE_BASE as u64
 }
 
+// ----- TRISC0 globals (M6.1, #79) — mirror of uart_layout.h -----
+//
+// Single per-tile block past the per-L2CPU UART private region. Used
+// for state that doesn't belong to any one L2CPU: the TRISC0 heartbeat
+// today, more diagnostics later as Phase B/C land.
+
+pub const TRISC0_GLOBAL_BASE: u32 = 0x0005_0400;
+pub const TRISC0_GLOBAL_OFF_HEARTBEAT: u32 = 0x00;
+
+/// L1 address of the TRISC0 heartbeat slot (`bumped each iteration of
+/// `trisc0_main`'s loop). The host reads this through the engine's
+/// `read_l1_u32` to verify TRISC0 is alive.
+#[inline]
+pub fn trisc0_heartbeat_addr() -> u32 {
+    TRISC0_GLOBAL_BASE + TRISC0_GLOBAL_OFF_HEARTBEAT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

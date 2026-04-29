@@ -56,6 +56,32 @@ pub const SOFT_RESET_ALL: u32 = SOFT_RESET_BRISC
 /// garbage out of L1.
 pub const SOFT_RESET_ALL_EXCEPT_BRISC: u32 = SOFT_RESET_ALL & !SOFT_RESET_BRISC;
 
+// ----- Per-core reset PC override (M6.1, #79) -----
+//
+// By default the baby RISCs come out of reset at fixed PCs (BRISC at
+// 0x0, TRISC0 at 0x6000, TRISC1 at 0xA000, TRISC2 at 0xE000, NCRISC at
+// 0x12000 — see `BlackholeA0/TensixTile/SoftReset.md`). For the
+// shared-binary M6.1 layout we keep BRISC's default (0x0) and override
+// TRISC0 to point at `trisc0_reset_entry` in the same firmware image
+// — the host reads the linker-resolved address out of L1[0x4] (planted
+// by `start.S` as `.word trisc0_reset_entry`) and writes it here.
+//
+// Bit 0 of `RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE` enables the
+// override for TRISC0; bits 1 and 2 cover TRISC1/TRISC2 (we don't use
+// those in M6.1).
+
+/// TRISC0 reset PC override value. 32-bit register.
+pub const RISCV_DEBUG_REG_TRISC0_RESET_PC: u64 = 0xFFB1_2228;
+/// Enable bits for the TRISC reset PC override. Bit 0 = TRISC0,
+/// bit 1 = TRISC1, bit 2 = TRISC2. We only set bit 0 in M6.1.
+pub const RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE: u64 = 0xFFB1_2234;
+pub const TRISC_RESET_PC_OVERRIDE_T0: u32 = 1 << 0;
+
+/// L1 offset of the u32 word `start.S` plants holding the linker-
+/// resolved address of `trisc0_reset_entry`. Mirrored by the firmware
+/// header — keep in sync with `start.S` (`.word trisc0_reset_entry`).
+pub const TRISC0_RESET_ENTRY_PTR_L1_OFFSET: u32 = 0x4;
+
 /// Tensix L1 size in bytes (per `dev_mem_map.h::MEM_L1_SIZE`).
 pub const TENSIX_L1_SIZE: usize = 1536 * 1024;
 
@@ -191,6 +217,34 @@ impl TensixTile {
         let _ = self.read_soft_reset();
     }
 
+    /// Program TRISC0's reset PC override register (M6.1, #79). Once
+    /// the override is enabled, releasing TRISC0's soft-reset bit
+    /// jumps to `pc` instead of the default 0x6000. Caller must call
+    /// [`Self::enable_trisc0_reset_pc_override`] separately to flip
+    /// the enable bit.
+    pub fn set_trisc0_reset_pc(&self, pc: u32) {
+        let off = RISCV_DEBUG_REG_TRISC0_RESET_PC - TLB_BASE_DEBUG_REGS;
+        self.debug_regs_window.write32(off, pc);
+    }
+
+    /// Enable the TRISC0 reset-PC override (RMW: set bit 0 of the
+    /// shared TRISC override register, leaving TRISC1/TRISC2 bits
+    /// untouched).
+    pub fn enable_trisc0_reset_pc_override(&self) {
+        let off = RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE - TLB_BASE_DEBUG_REGS;
+        let prev = self.debug_regs_window.read32(off);
+        self.debug_regs_window
+            .write32(off, prev | TRISC_RESET_PC_OVERRIDE_T0);
+    }
+
+    /// Read TRISC0's reset entry-point address out of L1[0x4]. The
+    /// firmware's `start.S` plants the linker-resolved address there
+    /// as a `.word`. The host calls this after `load_brisc_firmware`
+    /// to feed [`Self::set_trisc0_reset_pc`].
+    pub fn read_trisc0_reset_entry(&self) -> u32 {
+        self.read_l1_u32(TRISC0_RESET_ENTRY_PTR_L1_OFFSET)
+    }
+
     /// Copy `firmware` bytes into L1 starting at offset 0 using
     /// 32-bit MMIO writes. Pads with zeros if `firmware.len()` is
     /// not a multiple of 4.
@@ -249,14 +303,27 @@ mod tests {
     // The soft-reset register must land inside the 2 MiB debug-regs
     // window, otherwise the offset arithmetic in
     // {read,write}_soft_reset would underflow or read past the
-    // window. Compile-time check — `const { assert!(...) }` fails
-    // the build instead of a test if a future edit breaks the
-    // invariant.
+    // window. The TRISC0 reset-PC override registers (M6.1, #79) live
+    // in the same range and need the same bound. Compile-time check —
+    // `const { assert!(...) }` fails the build instead of a test if a
+    // future edit breaks the invariant.
     const _DEBUG_REGS_WINDOW_INVARIANTS: () = {
         const TWO_MEG: u64 = 2 * 1024 * 1024;
         assert!(TENSIX_SOFT_RESET_ADDR >= TLB_BASE_DEBUG_REGS);
         assert!(TENSIX_SOFT_RESET_ADDR + 4 <= TLB_BASE_DEBUG_REGS + TWO_MEG);
+        assert!(RISCV_DEBUG_REG_TRISC0_RESET_PC >= TLB_BASE_DEBUG_REGS);
+        assert!(RISCV_DEBUG_REG_TRISC0_RESET_PC + 4 <= TLB_BASE_DEBUG_REGS + TWO_MEG);
+        assert!(RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE >= TLB_BASE_DEBUG_REGS);
+        assert!(RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE + 4 <= TLB_BASE_DEBUG_REGS + TWO_MEG);
     };
+
+    #[test]
+    fn trisc0_reset_pc_override_bit_matches_softreset_md() {
+        // Bit 0 enables TRISC0; bits 1/2 enable TRISC1/TRISC2 (not
+        // used in M6.1). Match the layout in
+        // `BlackholeA0/TensixTile/SoftReset.md`.
+        assert_eq!(TRISC_RESET_PC_OVERRIDE_T0, 0x1);
+    }
 
     #[test]
     fn hello_firmware_is_nonempty_and_aligned() {

@@ -33,7 +33,12 @@ SECTIONS
 
     .rodata : ALIGN(4) { *(.rodata*) } > L1
     .data   : ALIGN(4) { *(.data*) }  > L1
-    .bss    : ALIGN(4) { *(.bss*) *(COMMON) } > L1
+    .bss    : ALIGN(4) {
+        _bss_start = .;
+        *(.bss*) *(COMMON)
+        . = ALIGN(4);
+        _bss_end = .;
+    } > L1
 
     _stack_top = ORIGIN(LOCAL) + LENGTH(LOCAL);
 

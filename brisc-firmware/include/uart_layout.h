@@ -145,4 +145,25 @@ static inline uintptr_t brisc_uart_private_base(unsigned l2cpu_idx) {
 #define BRISC_KICK_UART_SLOT_BASE  16u
 #define BRISC_KICK_UART_NUM_SLOTS  4u
 
+// All 4 UART bits combined — used by BRISC to drive TRISC0's reset
+// lifecycle in M6.1 (#79). If any bit in this mask is set, TRISC0
+// runs (polls UARTs); if all clear, TRISC0 is held in soft reset.
+#define BRISC_UART_SLOT_MASK \
+    (((1u << BRISC_KICK_UART_NUM_SLOTS) - 1u) << BRISC_KICK_UART_SLOT_BASE)
+
+// ----- TRISC0 globals (M6.1, #79) -----
+//
+// TRISC0-private state that doesn't fit the per-L2CPU UART private
+// region's 0x100-byte stride. Single per-tile block right after the
+// last per-L2CPU UART private slot.
+//
+//   0x50400 + 0x00   trisc0 heartbeat   (TRISC0 bumps each loop iter;
+//                                        BRISC + host watch for stalls)
+//   0x50400 + 0x04   trisc0 reserved    (room for stats + diagnostics
+//                                        as Phase B / C land features)
+
+#define BRISC_TRISC0_GLOBAL_BASE       0x00050400u
+#define BRISC_TRISC0_GLOBAL_SIZE       0x00000100u
+#define TRISC0_GLOBAL_OFF_HEARTBEAT    0x00u
+
 #endif  // BRISC_UART_LAYOUT_H

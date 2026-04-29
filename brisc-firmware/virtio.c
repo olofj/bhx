@@ -40,7 +40,13 @@
 // Firmware version, inspected via the stats page. Bump for any
 // wire-protocol change between daemon ↔ BRISC. Format: 0xAABBCCDD
 // where AA=major, BB=minor, CC=patch, DD=reserved/build.
-#define BRISC_VIRTIO_FW_VERSION 0x00060001u  // M6 (#78), build 0001 — adds 16550 UART (TX-only)
+//
+// 0x00060001 — M6 (#78): adds 16550 UART (TX-only) on BRISC poll
+// 0x00060101 — M6.1 (#79): TRISC0 skeleton + active-slots-driven
+//              reset lifecycle (BRISC owns TRISC0's soft-reset bit).
+//              UART poll still on BRISC at this point; Phase B moves
+//              it to TRISC0 and bumps the patch byte.
+#define BRISC_VIRTIO_FW_VERSION 0x00060101u
 
 #define FENCE_W() __asm__ volatile("fence w, w" ::: "memory")
 
@@ -733,6 +739,84 @@ static void uart_poll_devices(uint32_t active_slots) {
     }
 }
 
+// ----- M6.1 (#79) TRISC0 lifecycle (BRISC-owned) -----
+//
+// BRISC asserts/de-asserts TRISC0's soft-reset bit based on the UART
+// portion of the active-slots bitmap. When any of bits 16..19 is set,
+// at least one L2CPU has a UART registered → release TRISC0 → it
+// enters `trisc0_main` (Phase A: heartbeat; Phase B: UART poll). When
+// all clear, re-assert TRISC0's reset → its instruction stream stops
+// mid-instruction (which is fine; no in-flight UART bytes can exist
+// when no UART is registered).
+//
+// The host's `bring_up` programs TRISC0's reset PC override register
+// before `release_brisc_only` so that whenever BRISC clears bit 12
+// here, TRISC0 enters `trisc0_reset_entry` (in `start.S`).
+//
+// Why BRISC instead of the host: ownership cleanup. With this, the
+// daemon never directly touches TRISC0's reset state — TRISC0 is a
+// BRISC-internal implementation detail behind the kick-ring +
+// (Phase B) byte-feed-ring abstraction. The lifecycle is exactly
+// aligned with the bitmap state, which is how an operator already
+// thinks about UART-on-this-L2CPU.
+
+#define TENSIX_SOFT_RESET_ADDR    0xFFB121B0u
+#define SOFT_RESET_TRISC0         (1u << 12)
+
+static int trisc0_running = 0;
+
+// Read-modify-write the soft-reset register from within the tile.
+// The register is per-tile MMIO at 0xFFB121B0, accessible as a regular
+// load/store target from any baby RISC. We preserve all other bits —
+// in particular BRISC's own bit 11 stays clear (otherwise BRISC would
+// halt itself mid-instruction). Read-back flushes the write so the
+// per-core controller observes it on the next clock.
+static void brisc_set_trisc0_reset(int asserted) {
+    volatile uint32_t *reg = (volatile uint32_t *)TENSIX_SOFT_RESET_ADDR;
+    uint32_t v = *reg;
+    if (asserted) {
+        v |= SOFT_RESET_TRISC0;
+    } else {
+        v &= ~SOFT_RESET_TRISC0;
+    }
+    *reg = v;
+    FENCE_W();
+    (void)*reg;
+}
+
+// Drive TRISC0's reset state from the bitmap. Called once per BRISC
+// poll-loop iteration. State edges only — the RMW above is several
+// instructions plus a NoC round-trip, so we don't want to hammer it
+// every sweep when no edge fires.
+static void brisc_drive_trisc0_lifecycle(uint32_t active_slots) {
+    int want_running = (active_slots & BRISC_UART_SLOT_MASK) != 0;
+    if (want_running && !trisc0_running) {
+        brisc_set_trisc0_reset(0);
+        trisc0_running = 1;
+    } else if (!want_running && trisc0_running) {
+        brisc_set_trisc0_reset(1);
+        trisc0_running = 0;
+    }
+}
+
+// ----- TRISC0 entry (M6.1 #79 Phase A) -----
+//
+// Phase A: just bump a heartbeat word in L1 so BRISC + host can
+// observe TRISC0 is alive. Phase B replaces this body with the UART
+// poll loop and the SPSC byte-feed ring producer side; the entry
+// point and stack setup (in `start.S::trisc0_reset_entry`) stays the
+// same.
+void trisc0_main(void) {
+    volatile uint32_t *hb = (volatile uint32_t *)
+        (uintptr_t)(BRISC_TRISC0_GLOBAL_BASE + TRISC0_GLOBAL_OFF_HEARTBEAT);
+    uint32_t c = 0;
+    for (;;) {
+        c += 1u;
+        *hb = c;
+        FENCE_W();
+    }
+}
+
 // ----- M5 (#71) handshake -----
 
 // Initialize the control-plane region: zero the hello/hello-ack/
@@ -805,6 +889,11 @@ void main(void) {
         }
         // UART slots live at 16..19 in the same bitmap; the daemon
         // sets the bit on register-uart and clears on unregister.
+        // M6.1 (#79): BRISC also drives TRISC0's reset lifecycle from
+        // the same mask — TRISC0 runs only while at least one UART is
+        // registered. The UART poll itself stays on BRISC at this
+        // step; Phase B moves it to TRISC0.
+        brisc_drive_trisc0_lifecycle(active);
         uart_poll_devices(active);
         poll_completion_ring();
         heartbeat += 1u;
