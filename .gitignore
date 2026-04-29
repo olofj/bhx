@@ -26,3 +26,4 @@
 
 # Claude Code session state (plans, agent notes).
 /.claude/
+tests/alma/

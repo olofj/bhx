@@ -10,9 +10,14 @@ use std::ptr;
 
 use crate::virtio::VirtioDeviceImpl;
 
-// VirtIO block request types
+// VirtIO block request types (virtio 1.2 §5.2.6).
 const VIRTIO_BLK_T_IN: u32 = 0; // read from disk
 const VIRTIO_BLK_T_OUT: u32 = 1; // write to disk
+                                 // GET_ID returns a 20-byte device serial. AlmaLinux's kernel issues
+                                 // this once at probe time; without a real reply it stalls before
+                                 // mounting the rootfs.
+const VIRTIO_BLK_T_GET_ID: u32 = 8;
+const VIRTIO_BLK_ID_BYTES: usize = 20;
 
 // VirtIO block status bytes (virtio 1.2 §5.2.6). Written into the last
 // descriptor of the chain to tell the guest whether its request
@@ -197,6 +202,21 @@ impl VirtioDeviceImpl for VirtioBlk {
                         self.mapped_data.add(disk_offset as usize),
                         len as usize,
                     );
+                }
+            }
+            VIRTIO_BLK_T_GET_ID => {
+                // Spec: write a 20-byte device serial into the chain's
+                // data descriptor. AlmaLinux issues this at probe; if
+                // we return UNSUPP the kernel stalls before mount_root.
+                // Buildroot ignores the failure, which is why we got
+                // away with leaving it unimplemented.
+                let serial = format!("tt-bh-l2cpu-{:02}", self.l2cpu_idx);
+                let bytes = serial.as_bytes();
+                let n = (len as usize).min(VIRTIO_BLK_ID_BYTES);
+                unsafe {
+                    ptr::write_bytes(addr, 0, n);
+                    let copy_len = bytes.len().min(n);
+                    ptr::copy_nonoverlapping(bytes.as_ptr(), addr, copy_len);
                 }
             }
             t => {

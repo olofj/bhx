@@ -56,6 +56,16 @@ pub struct RegEntry {
     /// Per-queue avail-ring head we've consumed. Lazily resized
     /// when a kick references a queue beyond the current length.
     pub processed: Vec<u16>,
+    /// Last STATUS=0 epoch we saw on a kick. BRISC bumps the per-slot
+    /// epoch on STATUS=0 (see `handle_status_change` in
+    /// `brisc-firmware/virtio.c`). When a new kick arrives with an
+    /// epoch we haven't seen, the guest has reinitialized the queue —
+    /// reset `processed[]` so we read avail.ring[0] for the new
+    /// session instead of avail.ring[stale_index]. Initial value is
+    /// `u32::MAX` so the first kick (epoch=0 from a fresh BRISC, or
+    /// any non-MAX value from an adopted firmware) always triggers a
+    /// reset, which is benign at registration time.
+    pub last_epoch: u32,
 }
 
 impl RegEntry {
@@ -76,6 +86,7 @@ impl RegEntry {
             interrupt_number,
             interrupt_kind,
             processed: vec![0u16; num_queues],
+            last_epoch: u32::MAX,
         }
     }
 
@@ -211,16 +222,28 @@ fn run_poll_loop(
             let queue_idx = (raw[0] >> 16) as u16;
             let seq = raw[1];
             let epoch = raw[2];
-            let _ = (seq, epoch); // currently unused; preserved in case we add per-kick metrics
-                                  // M5.5b: dispatch to the registered (slot, queue)
-                                  // device handler. Reads the per-queue desc/avail/used
-                                  // pointers from BRISC L1 shadow (firmware shadows guest
-                                  // writes via the per-queue snapshot extension), walks
-                                  // the chain over guest DRAM via the L2CPU's memory
-                                  // mapping, calls the device's `process_queue_*` hooks,
-                                  // writes used-ring entries, fires the PLIC IRQ.
+            let _ = seq;
             let mut map = registry.lock().unwrap();
             if let Some(reg) = map.get_mut(&(slot as u32)) {
+                // STATUS=0 epoch tracking: BRISC bumps per-slot epoch
+                // on every guest STATUS=0 (see brisc-firmware
+                // virtio.c::handle_status_change). When a kick lands
+                // with an epoch we haven't seen before, the guest has
+                // reinit'd the queue — reset `processed[]` so the
+                // first dispatch reads avail.ring[0] for the fresh
+                // session instead of avail.ring[stale_idx]. Without
+                // this, AlmaLinux's U-Boot→kernel handoff (U-Boot
+                // probes virtio_blk, writes STATUS=0 on cleanup,
+                // kernel re-probes) had us pulling stale indices from
+                // the kernel's freshly-zeroed avail ring and writing
+                // id=0 into the used ring, tripping the kernel's
+                // "id 0 is not a head" guard.
+                if epoch != reg.last_epoch {
+                    for p in reg.processed.iter_mut() {
+                        *p = 0;
+                    }
+                    reg.last_epoch = epoch;
+                }
                 let posted = dispatch_chain(&engine, reg, queue_idx);
                 if posted {
                     // Push a completion to BRISC for diagnostics +

@@ -173,9 +173,17 @@ static void zero_region(uintptr_t base, uint32_t size_bytes) {
 static void init_device(unsigned slot) {
     const struct device_init *d = device_for_slot(slot);
 
-    // Wipe the per-device reg file first. The guest sees this as the
-    // post-reset state.
-    zero_region(reg_addr(slot, 0), BRISC_VIRTIO_REGS_PER_DEV);
+    // Wipe the standard register window (offsets 0x000..0x100) and
+    // leave the device-specific config region (0x100..) ALONE. The
+    // daemon writes config (e.g. virtio-blk capacity) once at
+    // register_slot time; if we zero it on every STATUS=0 reset (which
+    // U-Boot's virtio cleanup triggers between U-Boot's own probe and
+    // the kernel's re-probe) the kernel sees capacity=0 and binds a
+    // 0-sector blockdev. AlmaLinux 10 hits this path; buildroot
+    // skipped it because its kernel never re-probes after a soft
+    // reset. virtio 1.2 §4.2.2.2 lets device-specific config persist
+    // across guest-driven STATUS=0; we exploit that.
+    zero_region(reg_addr(slot, 0), VIRTIO_MMIO_CONFIG);
     // Wipe the shadow region (per-queue state + snapshots).
     zero_region(shadow_addr(slot, 0), SHADOW_PER_DEVICE);
 
