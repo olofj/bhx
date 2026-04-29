@@ -123,6 +123,8 @@ pub fn serve(
     dlog!("[daemon] shutdown flag set — tearing down L2CPU slots");
     for (i, slot_mutex) in state.l2cpus.iter().enumerate() {
         if let Some(slot) = slot_mutex.lock().unwrap().take() {
+            slot.console_hub
+                .disconnect_all_with_reason("daemon shutting down");
             unregister_engine_slots(&state, i as u8);
             slot.shutdown();
         }
@@ -889,6 +891,9 @@ fn handle_existing_slot(
             "[boot l2cpu {}] --force: tearing down existing slot before re-imaging",
             l2cpu_idx
         );
+        prior
+            .console_hub
+            .disconnect_all_with_reason(&format!("l2cpu {} re-imaged via --force", l2cpu_idx));
         unregister_engine_slots(state, l2cpu_idx);
         prior.shutdown();
         dlog!("[boot l2cpu {}] prior slot torn down", l2cpu_idx);
@@ -1968,6 +1973,11 @@ fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) -> 
     match taken {
         Some(slot) => {
             dlog!("[stop l2cpu {}] slot taken; joining workers", l2cpu_idx);
+            // Surface the stop to any attached `bhx connect` first —
+            // without this they see no chip output, no EOF, no signal
+            // at all (#97).
+            slot.console_hub
+                .disconnect_all_with_reason(&format!("l2cpu {} stopped", l2cpu_idx));
             unregister_engine_slots(state, l2cpu_idx);
             slot.shutdown();
             dlog!("[stop l2cpu {}] workers joined — replying ok", l2cpu_idx);

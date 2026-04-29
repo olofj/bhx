@@ -198,6 +198,25 @@ impl ConsoleHub {
     pub fn client_count(&self) -> usize {
         self.state.lock().unwrap().clients.len()
     }
+
+    /// Send a final goodbye line to every attached client and shut down
+    /// their daemon-side fds so client-side reader threads see EOF and
+    /// exit cleanly. Used by stop / force-reboot / shutdown so a
+    /// `bhx connect` doesn't hang silently after its slot disappears.
+    pub fn disconnect_all_with_reason(&self, reason: &str) {
+        let mut s = self.state.lock().unwrap();
+        let goodbye = format!("\r\n[bhx: {}]\r\n", reason);
+        for c in &s.clients {
+            // Best-effort write of the goodbye line. Errors here are
+            // fine — we're about to shut the socket down anyway.
+            let _ = send_all_dontwait(&c.sock, goodbye.as_bytes());
+            let _ = c.sock.shutdown(std::net::Shutdown::Both);
+        }
+        s.clients.clear();
+        crate::daemon::metrics::L2CPU_CONSOLE_CLIENTS
+            .at(self.idx)
+            .set(0);
+    }
 }
 
 /// `send()` with `MSG_DONTWAIT`. Loops only on EINTR; any partial write (or
@@ -375,6 +394,43 @@ mod tests {
         let (res, replay) = hub.attach(d1, ConsoleMode::Ro);
         assert_eq!(res.scrollback_bytes as usize, b"already-there".len());
         assert_eq!(&replay, b"already-there");
+    }
+
+    #[test]
+    fn disconnect_all_with_reason_sends_message_and_clears_clients() {
+        let hub = ConsoleHub::new(0);
+        let (d1, c1) = pair_nonblocking();
+        let (d2, c2) = pair_nonblocking();
+        hub.attach(d1, ConsoleMode::Rw);
+        hub.attach(d2, ConsoleMode::Ro);
+
+        hub.disconnect_all_with_reason("l2cpu 0 stopped");
+        assert_eq!(hub.client_count(), 0);
+
+        // Each client end should see the goodbye message followed by EOF.
+        c1.set_nonblocking(false).unwrap();
+        c2.set_nonblocking(false).unwrap();
+        let timeout = Some(std::time::Duration::from_secs(2));
+        c1.set_read_timeout(timeout).unwrap();
+        c2.set_read_timeout(timeout).unwrap();
+
+        for client in [&c1, &c2] {
+            let mut all = Vec::new();
+            let mut buf = [0u8; 256];
+            loop {
+                match (&*client).read(&mut buf) {
+                    Ok(0) => break, // EOF — what we want
+                    Ok(n) => all.extend_from_slice(&buf[..n]),
+                    Err(e) => panic!("unexpected read error: {}", e),
+                }
+            }
+            let msg = String::from_utf8_lossy(&all);
+            assert!(
+                msg.contains("[bhx: l2cpu 0 stopped]"),
+                "expected goodbye line, got {:?}",
+                msg
+            );
+        }
     }
 
     #[test]
