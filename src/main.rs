@@ -57,13 +57,21 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Tenstorrent device index
-    #[arg(short = 't', long = "ttdevice", default_value_t = 0, global = true)]
-    ttdevice: u32,
+    /// Tenstorrent device index.
+    ///
+    /// Defaults to 0. May be overridden by an explicit card prefix in
+    /// `-l <C>:<N>`; passing both with conflicting cards is an error.
+    #[arg(short = 't', long = "ttdevice", global = true)]
+    ttdevice: Option<u32>,
 
-    /// L2CPU index (0-3)
-    #[arg(short = 'l', long = "l2cpu", default_value_t = 0, global = true)]
-    l2cpu: usize,
+    /// L2CPU index (0-3), optionally prefixed with `<card>:`.
+    ///
+    /// Plain `-l 2` targets the L2CPU on the card selected by `-t`
+    /// (default 0). `-l 1:2` targets card 1, L2CPU 2 — overrides
+    /// `-t` and surfaces a conflict if `-t` was passed with a
+    /// different card.
+    #[arg(short = 'l', long = "l2cpu", default_value = "0", global = true)]
+    l2cpu: String,
 
     /// Path to disk image (defaults to rootfs.ext4 if present)
     #[arg(short = 'd', long = "disk", global = true)]
@@ -563,9 +571,10 @@ fn main() -> std::process::ExitCode {
                 (Some(p), None) => daemon::protocol::BootPayload::Kernel(p),
                 (None, None) => default_boot_payload(disk.as_deref()),
             };
+            let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
             run_boot_client(
-                cli.ttdevice,
-                cli.l2cpu as u8,
+                card,
+                l2cpu,
                 opensbi,
                 payload,
                 dtb,
@@ -580,52 +589,58 @@ fn main() -> std::process::ExitCode {
                 force,
             )?;
             if attach {
-                run_connect_client(
-                    cli.ttdevice,
-                    cli.l2cpu as u8,
-                    daemon::protocol::ConsoleMode::Rw,
-                )?;
+                run_connect_client(card, l2cpu, daemon::protocol::ConsoleMode::Rw)?;
             }
             Ok(())
         }
         Some(Commands::Connect { mode }) => {
             let pmode = parse_console_mode(&mode)?;
-            run_connect_client(cli.ttdevice, cli.l2cpu as u8, pmode)
+            let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
+            run_connect_client(card, l2cpu, pmode)
         }
         Some(Commands::Stop) => {
-            let mut sock = daemon::client::connect(cli.ttdevice)?;
-            daemon::client::stop_l2cpu(&mut sock, cli.l2cpu as u8)
+            let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
+            let mut sock = daemon::client::connect(card)?;
+            daemon::client::stop_l2cpu(&mut sock, l2cpu)
         }
-        Some(Commands::Status) => daemon::runner::status(cli.ttdevice),
+        Some(Commands::Status) => daemon::runner::status(resolve_card(&cli.l2cpu, cli.ttdevice)?),
         Some(Commands::AddDisk { path }) => {
             // Canonicalize client-side — daemon runs with cwd=/ after
             // double-fork, so relative paths from the user's shell would
             // resolve against the wrong base otherwise.
             let path = absolutize(&path)?;
-            let mut sock = daemon::client::connect(cli.ttdevice)?;
-            daemon::client::add_disk(&mut sock, cli.l2cpu as u8, path)
+            let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
+            let mut sock = daemon::client::connect(card)?;
+            daemon::client::add_disk(&mut sock, l2cpu, path)
         }
         Some(Commands::RemoveDisk) => {
-            let mut sock = daemon::client::connect(cli.ttdevice)?;
-            daemon::client::remove_disk(&mut sock, cli.l2cpu as u8)
+            let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
+            let mut sock = daemon::client::connect(card)?;
+            daemon::client::remove_disk(&mut sock, l2cpu)
         }
         Some(Commands::AddNet { ssh_port, fwd }) => {
-            let mut sock = daemon::client::connect(cli.ttdevice)?;
-            daemon::client::add_net(&mut sock, cli.l2cpu as u8, ssh_port, fwd)
+            let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
+            let mut sock = daemon::client::connect(card)?;
+            daemon::client::add_net(&mut sock, l2cpu, ssh_port, fwd)
         }
         Some(Commands::RemoveNet) => {
-            let mut sock = daemon::client::connect(cli.ttdevice)?;
-            daemon::client::remove_net(&mut sock, cli.l2cpu as u8)
+            let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
+            let mut sock = daemon::client::connect(card)?;
+            daemon::client::remove_net(&mut sock, l2cpu)
         }
         Some(Commands::AddConsole) => {
-            let mut sock = daemon::client::connect(cli.ttdevice)?;
-            daemon::client::add_console(&mut sock, cli.l2cpu as u8)
+            let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
+            let mut sock = daemon::client::connect(card)?;
+            daemon::client::add_console(&mut sock, l2cpu)
         }
         Some(Commands::RemoveConsole) => {
-            let mut sock = daemon::client::connect(cli.ttdevice)?;
-            daemon::client::remove_console(&mut sock, cli.l2cpu as u8)
+            let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
+            let mut sock = daemon::client::connect(card)?;
+            daemon::client::remove_console(&mut sock, l2cpu)
         }
-        Some(Commands::Daemon { action }) => run_daemon_cmd(cli.ttdevice, action),
+        Some(Commands::Daemon { action }) => {
+            run_daemon_cmd(resolve_card(&cli.l2cpu, cli.ttdevice)?, action)
+        }
         Some(Commands::Image { action }) => {
             match action {
                 ImageAction::List => image::cmd_list_available(),
@@ -653,14 +668,14 @@ fn main() -> std::process::ExitCode {
             }
             Ok(())
         }
-        Some(Commands::Debug { action }) => run_debug_cmd(cli.ttdevice, cli.l2cpu, action),
+        Some(Commands::Debug { action }) => {
+            let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
+            run_debug_cmd(card, l2cpu as usize, action)
+        }
         None => {
             // Bare invocation → attach console in rw mode, same as `connect`.
-            run_connect_client(
-                cli.ttdevice,
-                cli.l2cpu as u8,
-                daemon::protocol::ConsoleMode::Rw,
-            )
+            let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
+            run_connect_client(card, l2cpu, daemon::protocol::ConsoleMode::Rw)
         }
     })();
 
@@ -671,6 +686,79 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// Parse the `-l` value into `(Option<card>, l2cpu_idx)`. Plain `<N>`
+/// returns no card override; `<C>:<N>` returns one. Multi-card hosts use
+/// the prefix form; single-card scripts can keep using plain numbers.
+fn parse_l2cpu_locator(s: &str) -> std::result::Result<(Option<u32>, u8), String> {
+    let (card_str, l2cpu_str) = match s.split_once(':') {
+        Some((c, n)) => {
+            if c.is_empty() {
+                return Err(format!("locator missing card before ':' in {:?}", s));
+            }
+            if n.is_empty() {
+                return Err(format!("locator missing l2cpu after ':' in {:?}", s));
+            }
+            (Some(c), n)
+        }
+        None => (None, s),
+    };
+    let card = match card_str {
+        Some(c) => Some(
+            c.parse::<u32>()
+                .map_err(|_| format!("locator card not a number: {:?}", c))?,
+        ),
+        None => None,
+    };
+    let l2cpu = l2cpu_str
+        .parse::<u8>()
+        .map_err(|_| format!("l2cpu not a number: {:?}", l2cpu_str))?;
+    if l2cpu > 3 {
+        return Err(format!("l2cpu index {} out of range (0-3)", l2cpu));
+    }
+    Ok((card, l2cpu))
+}
+
+/// Resolve `(card, l2cpu)` from the global flags. Errors if the locator
+/// carries a card prefix that disagrees with an explicit `-t`. Falls
+/// back to card 0 when neither is given.
+fn resolve_target(loc: &str, ttdevice: Option<u32>) -> std::io::Result<(u32, u8)> {
+    let (loc_card, l2cpu) =
+        parse_l2cpu_locator(loc).map_err(|e| std::io::Error::from(crate::Error::bad_request(e)))?;
+    let card = match (loc_card, ttdevice) {
+        (Some(c), Some(t)) if c != t => {
+            return Err(std::io::Error::from(crate::Error::bad_request(format!(
+                "conflicting card: -l {}:{} vs -t {} (drop one)",
+                c, l2cpu, t
+            ))));
+        }
+        (Some(c), _) => c,
+        (None, Some(t)) => t,
+        (None, None) => 0,
+    };
+    Ok((card, l2cpu))
+}
+
+/// Resolve just the card for subcommands that don't take an L2CPU
+/// (daemon lifecycle, status). Honors a `<C>:<N>` locator prefix even
+/// though the L2CPU index is unused, and surfaces a card conflict the
+/// same way `resolve_target` does.
+fn resolve_card(loc: &str, ttdevice: Option<u32>) -> std::io::Result<u32> {
+    let (loc_card, _) =
+        parse_l2cpu_locator(loc).map_err(|e| std::io::Error::from(crate::Error::bad_request(e)))?;
+    let card = match (loc_card, ttdevice) {
+        (Some(c), Some(t)) if c != t => {
+            return Err(std::io::Error::from(crate::Error::bad_request(format!(
+                "conflicting card: -l {}:* vs -t {} (drop one)",
+                c, t
+            ))));
+        }
+        (Some(c), _) => c,
+        (None, Some(t)) => t,
+        (None, None) => 0,
+    };
+    Ok(card)
 }
 
 fn parse_console_mode(s: &str) -> std::io::Result<daemon::protocol::ConsoleMode> {
@@ -1945,6 +2033,56 @@ mod tests {
         assert!(format!("{}", err).contains("nope"));
         let err = parse_fwd_pair("5201:notaport").unwrap_err();
         assert!(format!("{}", err).contains("notaport"));
+    }
+
+    // --- parse_l2cpu_locator + resolve_target (#98) ------------------------
+
+    #[test]
+    fn locator_plain_n_has_no_card_override() {
+        assert_eq!(parse_l2cpu_locator("0").unwrap(), (None, 0));
+        assert_eq!(parse_l2cpu_locator("3").unwrap(), (None, 3));
+    }
+
+    #[test]
+    fn locator_c_colon_n_returns_card_override() {
+        assert_eq!(parse_l2cpu_locator("0:0").unwrap(), (Some(0), 0));
+        assert_eq!(parse_l2cpu_locator("1:2").unwrap(), (Some(1), 2));
+        assert_eq!(parse_l2cpu_locator("17:3").unwrap(), (Some(17), 3));
+    }
+
+    #[test]
+    fn locator_rejects_malformed() {
+        assert!(parse_l2cpu_locator(":0").is_err()); // empty card
+        assert!(parse_l2cpu_locator("5:").is_err()); // empty l2cpu
+        assert!(parse_l2cpu_locator("abc").is_err()); // non-numeric
+        assert!(parse_l2cpu_locator("0:abc").is_err()); // non-numeric l2cpu
+        assert!(parse_l2cpu_locator("a:0").is_err()); // non-numeric card
+        assert!(parse_l2cpu_locator("4").is_err()); // out-of-range l2cpu
+        assert!(parse_l2cpu_locator("0:9").is_err()); // out-of-range l2cpu
+    }
+
+    #[test]
+    fn resolve_target_uses_ttdevice_when_no_locator_card() {
+        assert_eq!(resolve_target("2", Some(1)).unwrap(), (1, 2));
+        assert_eq!(resolve_target("0", None).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn resolve_target_locator_card_wins_when_ttdevice_absent_or_matches() {
+        assert_eq!(resolve_target("3:1", None).unwrap(), (3, 1));
+        assert_eq!(resolve_target("3:1", Some(3)).unwrap(), (3, 1));
+    }
+
+    #[test]
+    fn resolve_target_errors_on_card_conflict() {
+        // Locator card 1 and -t 2 disagree -> error
+        let err = resolve_target("1:0", Some(2)).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("conflicting card"),
+            "expected conflict diagnostic, got {:?}",
+            msg
+        );
     }
 
     // --- absolutize ---------------------------------------------------------
