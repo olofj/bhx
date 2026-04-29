@@ -1,21 +1,18 @@
 # Reading the Blackhole harvest mask
 
-(Originally filed as issue #75 — moved into `docs/` since the value is
-the text itself, not the issue lifecycle.)
+How `bhx` figures out which Tensix tiles on a Blackhole chip are
+actually reachable. Captured here because `tt-kmd`'s
+`TENSTORRENT_IOCTL_GET_HARVESTING` is a stub and the actual decode
+algorithm only appears as code inside `luwen` — whoever next needs
+this on a different chip family or under a Wormhole port shouldn't
+have to re-walk the same trail.
 
-**Reference / discovery doc.** Captures findings from looking at
-`tt-kmd`, `luwen`, and `tt-metal` UMD source while planning M2
-(#68 — Tensix tile selection). Posterity issue so the next person
-to need this doesn't re-walk the same trail.
-
-Discovery context: while bringing up M1 (#67) on a p100a I observed
-that NOC0-logical Tensix coords `x ∈ [11, 16]` were unreachable
-(reads return `0xFFFFFFFF`) even though `tt-smi` reported
-`HARVESTING_STATE = 0x0` and `ENABLED_TENSIX_COL = 0xFFF`. The
-observed unreachable count was bigger than what either telemetry
-field alone would predict, so before designing M2 I traced where
-those telemetry values actually live and how upstream tools read
-them.
+Empirical context: on a p100a, NOC0-logical Tensix coords
+`x ∈ [11, 16]` read back as `0xFFFFFFFF` even though `tt-smi`
+reported `HARVESTING_STATE = 0x0` and `ENABLED_TENSIX_COL = 0xFFF`.
+The unreachable-column count was bigger than either telemetry
+field alone would predict — that prompted the trace through
+`tt-kmd` / `luwen` / `tt-metal` UMD that's the rest of this doc.
 
 ## TL;DR
 
@@ -89,8 +86,8 @@ All three go through the same path in `luwen-api`'s
    Per tag, the value is the `u32` at offset
    `base + 8 + count*4 + tag_offset*4`.
 6. **Decode by tag id** using the enum from
-   `luwen-api/src/chip/blackhole/telemetry_tags.rs`. Tags we
-   care about for M2 / harvest:
+   `luwen-api/src/chip/blackhole/telemetry_tags.rs`. Tags `bhx`
+   uses for the harvest decode:
 
    | tag id | name                  | meaning                              |
    |--------|-----------------------|--------------------------------------|
@@ -149,29 +146,35 @@ Two follow-on observations:
   haven't seen a chip with row harvest yet, so this is informed
   by tt-metal docs more than direct evidence.
 
-## What this means for bhx M2
+## How `bhx` uses this
 
-- All required reads land inside the existing 2 MiB
-  `SharedChip` window at `0x80000000`. Reuse it; don't add a
-  second AXI accessor.
-- Implementation is pure user-space code over three `axi_read32`
-  values + the lookup table above. No tt-kmd patches, no ARC
-  message round-trips, no new fds.
-- The decoder is unit-testable: feed synthetic
-  `(HarvestingState, EnabledTensixCol, NocTranslation)`
-  triples and assert the produced valid-tile list. Cover at
-  least: pristine, 1 row harvested, 2 cols harvested in
-  translated mode, 2 cols harvested in non-translated mode, and
-  a "no candidate qualifies" edge case.
-- A `debug telemetry-dump` subcommand that prints all three
-  tags plus the decoded valid set is worth adding now — useful
-  for diagnostics and for cross-checking M2's picker against
-  ground truth on any new card.
-- One thing the algorithm does NOT cover: per-row +
-  per-column simultaneous harvest with arbitrary patterns. The
-  decoders treat them as independent. If we ever see a chip
-  with both, M2's picker should AND the two masks to get
-  reachable tiles.
+The decode shipped as `src/telemetry.rs::read_telemetry` (table
+walk + tag indexing) and `src/tensix_tile.rs::working_tensix_cols`
++ `working_tensix_rows` (the per-row / per-column lookups described
+above). They feed `pick_virtio_engine_tile`, which the daemon
+calls at engine bring-up to choose the Tensix tile that hosts the
+virtio firmware.
+
+Implementation choices the doc above motivated:
+
+- All reads go through the existing 2 MiB `SharedChip` window at
+  AXI `0x80000000` — no second accessor.
+- Pure user-space: three `axi_read32` calls + the lookup table.
+  No `tt-kmd` patches, no ARC message round-trips, no new fds.
+- The decoder is unit-tested in `src/tensix_tile.rs` against
+  synthetic `(HarvestingState, EnabledTensixCol, NocTranslation)`
+  triples covering pristine, 1-row-harvested, 2-cols-harvested
+  in both translated and non-translated mode, and the
+  no-candidate-qualifies edge case.
+- A `bhx debug telemetry-dump` subcommand prints all three tags
+  plus the decoded valid set, for cross-checking the picker
+  against ground truth on any new card.
+
+One known gap: the algorithm treats row + column harvest as
+independent. A chip with both simultaneously would need an AND of
+the two masks to get reachable tiles. We haven't seen one yet; if
+one shows up the picker in `tensix_tile.rs` is the place to grow
+the combined check.
 
 ## References
 
@@ -191,9 +194,12 @@ Two follow-on observations:
 
 ## Related
 
-- #66 — Tensix-as-virtio-engine architecture (umbrella).
-- #68 — M2: Tensix tile selection. This document feeds the
-  implementation directly.
-- #67 — M1 (this is where the discovery happened — see
-  M1 verification comment for the empirical observations).
+- [`src/telemetry.rs`](../src/telemetry.rs) — table walk + tag-by-id reader.
+- [`src/tensix_tile.rs`](../src/tensix_tile.rs) — `working_tensix_cols` /
+  `working_tensix_rows` decode + `pick_virtio_engine_tile` picker.
+- [`src/shared_chip.rs`](../src/shared_chip.rs) — the AXI tile-(8,0)
+  accessor every read on this path uses.
+- GitHub issue [#66](https://github.com/olofj/bhx/issues/66) — the
+  Tensix-as-virtio-engine architecture umbrella that motivated all
+  of this.
 
