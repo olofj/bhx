@@ -48,7 +48,7 @@ parser.add_argument("--ttdevice", type=int, default=0)
 parser.add_argument("--size", type=int, default=64 * 1024)
 args = parser.parse_args()
 
-BINARY = os.path.abspath("./target/debug/tt-bh-linux")
+BINARY = os.path.abspath("./target/debug/bhx")
 FILE_SIZE = args.size
 L2CPU = str(args.l2cpu)
 TTDEVICE = str(args.ttdevice)

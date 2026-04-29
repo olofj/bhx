@@ -86,7 +86,7 @@ impl L2Cpu {
         // responsibility of this per-core constructor used to require a
         // tile-(8,0) aliasing TLB on every L2Cpu we built, which was the
         // last concurrent-boot race path holding `boot_lock` in place; see
-        // <https://github.com/olofj/tt-bh-rust/issues/1>.
+        // <https://github.com/olofj/bhx/issues/1>.
 
         let coordinates = L2CPU_TILES[idx];
         let starting_address = L2CPU_STARTING_ADDRESS[idx];

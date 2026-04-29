@@ -10,7 +10,7 @@
 //! those addresses, concurrent writes race at the hardware level: read-modify-
 //! write on `L2CPU_RESET` tears, PLL step sequences interleave, and we've
 //! observed the host dying as a result (see
-//! <https://github.com/olofj/tt-bh-rust/issues/1>).
+//! <https://github.com/olofj/bhx/issues/1>).
 //!
 //! `SharedChip` fixes the structural part by owning the **one and only** TLB
 //! window to tile (8,0) per card for the daemon's lifetime, with an internal

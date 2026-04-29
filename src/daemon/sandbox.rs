@@ -104,7 +104,7 @@ mod imp {
         // virtio-blk worker opens O_RDWR. Landlock checks the symlink
         // path (not the resolved target), so a cwd-rooted symlink
         // pointing to a sibling project (the typical
-        // ../tt-bh-linux/rootfs.ext4 layout) traverses fine.
+        // ../bhx/rootfs.ext4 layout) traverses fine.
         if let Ok(cwd) = std::env::current_dir() {
             allow.push((
                 cwd,

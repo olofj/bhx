@@ -22,7 +22,7 @@
 #   --duration N                 profiling window in seconds (default: 30)
 #   --l2cpu N / --card N         which to boot (defaults: 0/0)
 #   --binary PATH                use this binary (skip rebuild). Defaults
-#                                to ./target/profiling/tt-bh-linux.
+#                                to ./target/profiling/bhx.
 #
 # Prereqs:
 #   - samply installed: `cargo install samply`
@@ -66,7 +66,7 @@ command -v samply >/dev/null || fail "samply not installed; \`cargo install samp
 if [ -z "$BINARY" ]; then
     note "cargo build --profile profiling"
     cargo build --profile profiling
-    BINARY=./target/profiling/tt-bh-linux
+    BINARY=./target/profiling/bhx
 fi
 [ -x "$BINARY" ] || fail "binary $BINARY not executable"
 
@@ -100,7 +100,7 @@ sleep 0.3
 note "cold boot L2CPU $L2CPU (rootfs=$ROOTFS, net=on)"
 timeout 90 "$BINARY" boot -t "$CARD" -l "$L2CPU" -d "$ROOTFS" -n >/dev/null
 
-DAEMON_PID=$(cat "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/tt-bh-linux/$CARD/pid")
+DAEMON_PID=$(cat "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bhx/$CARD/pid")
 note "daemon pid=$DAEMON_PID"
 
 # Let the guest reach steady state (DHCP, dropbear, fs).

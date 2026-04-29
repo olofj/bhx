@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 Olof Johansson
 // SPDX-License-Identifier: MIT
 
-//! tt-bh-linux — unified Rust binary for booting and managing Linux on
+//! bhx — unified Rust binary for booting and managing Linux on
 //! Tenstorrent Blackhole L2CPU (SiFive X280) RISC-V cores.
 
 // Many items across the tree are scaffolding for partially-implemented
@@ -47,7 +47,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "tt-bh-linux")]
+#[command(name = "bhx")]
 #[command(about = "Boot and manage Linux on Tenstorrent Blackhole L2CPU")]
 struct Cli {
     #[command(subcommand)]
@@ -219,7 +219,7 @@ enum DaemonAction {
         #[arg(long)]
         foreground: bool,
         /// Override the log file path (absolute or relative to cwd). Default
-        /// is `$XDG_RUNTIME_DIR/tt-bh-linux/<card>/log` which lives on tmpfs
+        /// is `$XDG_RUNTIME_DIR/bhx/<card>/log` which lives on tmpfs
         /// and is lost on host crash — set this to a file in the project
         /// directory when you need post-mortem logs.
         #[arg(long)]
@@ -786,7 +786,7 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
     if daemon_up && writes_chip {
         return Err(crate::Error::slot_state(format!(
             "daemon is running for card {} — refusing to write chip state from outside the daemon \
-             (stop the daemon first with `tt-bh-linux daemon stop`, then retry)",
+             (stop the daemon first with `bhx daemon stop`, then retry)",
             card
         ))
         .into());
@@ -2021,7 +2021,7 @@ mod tests {
 
     #[test]
     fn cli_defaults_leave_disk_network_off() {
-        let cli = parse(&["tt-bh-linux", "connect"]);
+        let cli = parse(&["bhx", "connect"]);
         assert_eq!(cli.disk, None);
         assert!(!cli.network);
     }
@@ -2030,13 +2030,13 @@ mod tests {
 
     #[test]
     fn cli_disk_long_form_captures_path() {
-        let cli = parse(&["tt-bh-linux", "connect", "--disk", "/path/to/img.ext4"]);
+        let cli = parse(&["bhx", "connect", "--disk", "/path/to/img.ext4"]);
         assert_eq!(cli.disk.as_deref(), Some("/path/to/img.ext4"));
     }
 
     #[test]
     fn cli_disk_short_form_captures_path() {
-        let cli = parse(&["tt-bh-linux", "connect", "-d", "img.ext4"]);
+        let cli = parse(&["bhx", "connect", "-d", "img.ext4"]);
         assert_eq!(cli.disk.as_deref(), Some("img.ext4"));
     }
 
@@ -2044,13 +2044,13 @@ mod tests {
 
     #[test]
     fn cli_network_flag_opts_in() {
-        let cli = parse(&["tt-bh-linux", "connect", "--network"]);
+        let cli = parse(&["bhx", "connect", "--network"]);
         assert!(cli.network);
     }
 
     #[test]
     fn cli_network_short_form_opts_in() {
-        let cli = parse(&["tt-bh-linux", "connect", "-n"]);
+        let cli = parse(&["bhx", "connect", "-n"]);
         assert!(cli.network);
     }
 
@@ -2061,7 +2061,7 @@ mod tests {
         // When no subcommand is given, `main` falls through to
         // run_connect_client (same as the explicit `connect` subcommand);
         // the global flags must still apply.
-        let cli = parse(&["tt-bh-linux", "-n", "-d", "x.ext4"]);
+        let cli = parse(&["bhx", "-n", "-d", "x.ext4"]);
         assert!(cli.command.is_none());
         assert!(cli.network);
         assert_eq!(cli.disk.as_deref(), Some("x.ext4"));

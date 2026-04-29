@@ -19,7 +19,7 @@
 set -uo pipefail
 
 CARD="${CARD:-0}"
-BINARY="${BINARY:-./target/debug/tt-bh-linux}"
+BINARY="${BINARY:-./target/debug/bhx}"
 TT_VENV="${TT_VENV:-$HOME/.tenstorrent-venv/bin/activate}"
 
 note() { echo "[tensix-smoke] $*"; }

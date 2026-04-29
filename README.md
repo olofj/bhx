@@ -1,4 +1,4 @@
-# tt-bh-linux-rs
+# bhx
 
 Rust tool for booting and running Linux on the SiFive X280 RISC-V cores
 (L2CPUs) embedded on a Tenstorrent Blackhole card.
@@ -32,12 +32,12 @@ clients (`boot`, `connect`, `add-disk`, ...).
 Build the tool:
 
 ```bash
-cd tt-bh-linux-rs
+cd bhx
 cargo build --release       # or plain `cargo build` for a dev build
 ```
 
 CI runs the full build/clippy/test gauntlet on every push that touches
-`tt-bh-linux-rs/`; see `.github/workflows/rust-ci.yml` (default and
+`bhx/`; see `.github/workflows/rust-ci.yml` (default and
 `--no-default-features` builds, plus `cargo fmt --check`).
 
 ## Fetching the firmware + a rootfs
@@ -72,13 +72,13 @@ Boot one L2CPU with disk and network, then connect a terminal to it:
 # Start the per-card daemon (once per boot of the host). The log file
 # is pinned to this directory with O_DSYNC so every line is on disk
 # before write() returns — handy if the host ever crashes.
-./target/debug/tt-bh-linux daemon start -t 0 --log-file ./daemon-card0.log
+./target/debug/bhx daemon start -t 0 --log-file ./daemon-card0.log
 
 # Boot L2CPU 0 with the rootfs in this directory and slirp networking.
-./target/debug/tt-bh-linux boot -l 0 -d rootfs.ext4 -n
+./target/debug/bhx boot -l 0 -d rootfs.ext4 -n
 
 # Attach a terminal. Ctrl-A x to detach.
-./target/debug/tt-bh-linux connect -l 0
+./target/debug/bhx connect -l 0
 ```
 
 Log in as `debian` (no password). The `-n` flag enables slirp
@@ -88,7 +88,7 @@ the guest, so you can also `ssh -p 2222 debian@localhost`.
 Check what's running:
 
 ```bash
-./target/debug/tt-bh-linux daemon status -t 0
+./target/debug/bhx daemon status -t 0
 # daemon: running (card 0, pid ..., uptime Ns, sock /run/user/.../sock)
 #   l2cpu 0: Running disk=/.../rootfs.ext4 net=y clients=0
 #   l2cpu 1: Stopped disk=- net=- clients=0
@@ -99,7 +99,7 @@ Check what's running:
 When you're done:
 
 ```bash
-./target/debug/tt-bh-linux daemon stop -t 0
+./target/debug/bhx daemon stop -t 0
 ```
 
 ## Booting stock distro images via U-Boot
@@ -123,15 +123,15 @@ cd ..
 # Pull a U-Boot-bootable cloud image. The pull pipeline lands a
 # whole-disk `.img` (with GPT + ESP intact) when the known image
 # entry has `needs_bootloader: true`:
-./target/debug/tt-bh-linux image pull almalinux
+./target/debug/bhx image pull almalinux
 
 # Boot it. With no `--kernel` and no `--uboot`, the boot subcommand
 # detects from the disk's basename that this image needs U-Boot and
 # auto-defaults to `--uboot uboot/u-boot.bin`:
-./target/debug/tt-bh-linux boot -l 0 -d images/almalinux-10-kitten.img -n
+./target/debug/bhx boot -l 0 -d images/almalinux-10-kitten.img -n
 
 # Or be explicit:
-./target/debug/tt-bh-linux boot -l 0 \
+./target/debug/bhx boot -l 0 \
     --uboot uboot/u-boot.bin \
     -d images/almalinux-10-kitten.img -n
 ```
@@ -155,15 +155,15 @@ rebooting the guest:
 
 ```bash
 # Swap the disk image (the guest sees a short unmount/remount):
-./target/debug/tt-bh-linux remove-disk -l 0
-./target/debug/tt-bh-linux add-disk    -l 0 some-other-rootfs.ext4
+./target/debug/bhx remove-disk -l 0
+./target/debug/bhx add-disk    -l 0 some-other-rootfs.ext4
 
 # Attach/detach networking:
-./target/debug/tt-bh-linux remove-net  -l 0
-./target/debug/tt-bh-linux add-net     -l 0
+./target/debug/bhx remove-net  -l 0
+./target/debug/bhx add-net     -l 0
 
 # Re-image a running core in place (tears down workers first):
-./target/debug/tt-bh-linux boot -l 0 -d rootfs.ext4 -n --force
+./target/debug/bhx boot -l 0 -d rootfs.ext4 -n --force
 ```
 
 Run all four L2CPUs at once — each wants its own rootfs to avoid
@@ -172,7 +172,7 @@ ext4 corruption from concurrent writers:
 ```bash
 for i in 0 1 2 3; do
     cp --reflink=auto rootfs.ext4 rootfs-$i.ext4
-    ./target/debug/tt-bh-linux boot -l $i -d rootfs-$i.ext4 -n
+    ./target/debug/bhx boot -l $i -d rootfs-$i.ext4 -n
 done
 ```
 
@@ -182,7 +182,7 @@ Wrap `connect` with `timeout` when running non-interactively — it runs
 forever and only exits on Ctrl-A x:
 
 ```bash
-timeout 5 ./target/debug/tt-bh-linux connect -l 0 </dev/null 2>/tmp/stderr.log
+timeout 5 ./target/debug/bhx connect -l 0 </dev/null 2>/tmp/stderr.log
 ```
 
 For non-interactive log scraping, the daemon's log file (what you
@@ -208,7 +208,7 @@ The `daemon logs` subcommand tails it for you.
 
 - **`daemon start` reports "already running"**: pidfile/flock is held.
   If you're sure no other daemon is running,
-  `rm /run/user/$UID/tt-bh-linux/0/pid` and try again.
+  `rm /run/user/$UID/bhx/0/pid` and try again.
 
 - **`vdeslirp_open returned NULL`** on `-n`: check `pkg-config
   --modversion vdeslirp libslirp`. Expected: vdeslirp 0.1.x + libslirp
@@ -221,10 +221,10 @@ For poking the chip directly (requires the daemon stopped for this
 card):
 
 ```bash
-./target/debug/tt-bh-linux debug read-reset-reg
-./target/debug/tt-bh-linux debug reset-x280      -l 0
-./target/debug/tt-bh-linux debug assert-reset    -l 0
-./target/debug/tt-bh-linux debug deassert-reset  -l 0
+./target/debug/bhx debug read-reset-reg
+./target/debug/bhx debug reset-x280      -l 0
+./target/debug/bhx debug assert-reset    -l 0
+./target/debug/bhx debug deassert-reset  -l 0
 ```
 
 ## Going deeper
@@ -234,5 +234,5 @@ card):
 - **Hardware soak scripts**: see `scripts/README.md`. Includes a 4-way
   concurrent console I/O roundtrip test.
 - **Open design issues**: the GitHub issue tracker at
-  <https://github.com/olofj/tt-bh-rust/issues>.
+  <https://github.com/olofj/bhx/issues>.
 

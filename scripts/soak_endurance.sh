@@ -48,14 +48,14 @@ WARM_RESUME_EVERY=${WARM_RESUME_EVERY:-100}
 RSS_DRIFT_PCT=${RSS_DRIFT_PCT:-25}
 FD_DRIFT_ABS=${FD_DRIFT_ABS:-10}
 
-BINARY=${BINARY:-./target/debug/tt-bh-linux}
+BINARY=${BINARY:-./target/debug/bhx}
 LOG_FILE=${LOG_FILE:-./daemon-card0.log}
 CARD=${CARD:-0}
 L2CPU=${L2CPU:-0}
 
 ts=$(date +%Y%m%d-%H%M%S)
 CSV=${CSV:-./soak_endurance-$ts.csv}
-PIDFILE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/tt-bh-linux/${CARD}/pid"
+PIDFILE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bhx/${CARD}/pid"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 note() { echo "[soak] $*"; }

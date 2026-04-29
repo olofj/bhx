@@ -10,7 +10,7 @@ use crate::kmd::{self, AllocateTlb, ConfigureTlb, FreeTlb, FreeTlbIn, NocTlbConf
 
 // This code requires 64-bit pointers for 4GB TLB windows and NOC addresses.
 #[cfg(not(target_pointer_width = "64"))]
-compile_error!("tt-bh-linux requires a 64-bit target");
+compile_error!("bhx requires a 64-bit target");
 
 pub const TWO_MEG: usize = 1 << 21;
 pub const FOUR_GIG: usize = 1usize << 32;

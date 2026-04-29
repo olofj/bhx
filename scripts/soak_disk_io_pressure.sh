@@ -24,7 +24,7 @@
 #
 # Env:
 #   ITERATIONS  default 5
-#   BINARY      default ./target/debug/tt-bh-linux
+#   BINARY      default ./target/debug/bhx
 #   LOG_FILE    default ./daemon-card0.log
 #   CARD        default 0
 #   L2CPU       default 0
@@ -33,13 +33,13 @@
 set -euo pipefail
 
 ITERATIONS=${ITERATIONS:-5}
-BINARY=${BINARY:-./target/debug/tt-bh-linux}
+BINARY=${BINARY:-./target/debug/bhx}
 LOG_FILE=${LOG_FILE:-./daemon-card0.log}
 CARD=${CARD:-0}
 L2CPU=${L2CPU:-0}
 TIMEOUT=${TIMEOUT:-5}
 
-PIDFILE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/tt-bh-linux/${CARD}/pid"
+PIDFILE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bhx/${CARD}/pid"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 note() { echo "[soak] $*"; }

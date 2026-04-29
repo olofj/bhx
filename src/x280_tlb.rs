@@ -13,7 +13,7 @@
 //! See `BlackholeA0/L2CPUTile/{MemoryMap,TLBWindows}.md` in
 //! `tenstorrent/tt-isa-documentation` for the canonical description.
 //! Phase-0 prototype on `prototype/64-host-buffer` end-to-end-verified
-//! the path used here (see `tt-bh-linux` issue #64 for results).
+//! the path used here (see `bhx` issue #64 for results).
 
 use crate::l2cpu::L2Cpu;
 

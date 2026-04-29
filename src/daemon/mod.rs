@@ -79,7 +79,7 @@ pub struct L2CpuSlot {
     /// path; useful as plain `/dev/random` backing on direct-kernel paths.
     pub virtio_rng: Option<WorkerHandle>,
     /// Wall-clock instant the slot was installed. Drives
-    /// `tt_bh_l2cpu_uptime_seconds`. Set once at construction; never
+    /// `bhx_l2cpu_uptime_seconds`. Set once at construction; never
     /// updated.
     pub started: Instant,
 }
@@ -137,7 +137,7 @@ pub struct DaemonState {
     /// instead of racing through independently-configured TLB windows.
     /// Kept as an `Arc` so worker threads can hold their own references
     /// if they ever need chip-wide register access. See
-    /// <https://github.com/olofj/tt-bh-rust/issues/1>.
+    /// <https://github.com/olofj/bhx/issues/1>.
     pub shared_chip: Arc<SharedChip>,
     /// Tensix tile reserved for the M3+ virtio-mmio engine (#69). One
     /// tile serves all four L2CPUs on the card. Brought up lazily on

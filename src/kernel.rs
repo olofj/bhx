@@ -7,7 +7,7 @@
 //! tenstorrent/linux and tenstorrent/opensbi repos. Most upstream distro kernels
 //! won't work because they lack the VirtIO polling patches. The firmware bundle
 //! (fw_jump.bin + Image + blackhole-card.dtb) is published as a zip in each
-//! tt-bh-linux GitHub release.
+//! bhx GitHub release.
 //!
 //! # PATH-based binary resolution
 //!
@@ -38,21 +38,20 @@ pub struct KnownKernel {
 pub const KNOWN_KERNELS: &[KnownKernel] = &[
     KnownKernel {
         version: "0.10",
-        url: "https://github.com/tenstorrent/tt-bh-linux/releases/download/v0.10/tt-bh-linux.zip",
-        description:
-            "tt-bh-linux v0.10 — latest release (fw_jump.bin + Image + blackhole-card.dtb)",
+        url: "https://github.com/tenstorrent/bhx/releases/download/v0.10/bhx.zip",
+        description: "bhx v0.10 — latest release (fw_jump.bin + Image + blackhole-card.dtb)",
         is_default: true,
     },
     KnownKernel {
         version: "0.9",
-        url: "https://github.com/tenstorrent/tt-bh-linux/releases/download/v0.9/tt-bh-linux.zip",
-        description: "tt-bh-linux v0.9 (fw_jump.bin + Image + blackhole-card.dtb)",
+        url: "https://github.com/tenstorrent/bhx/releases/download/v0.9/bhx.zip",
+        description: "bhx v0.9 (fw_jump.bin + Image + blackhole-card.dtb)",
         is_default: false,
     },
     KnownKernel {
         version: "0.5",
-        url: "https://github.com/tenstorrent/tt-bh-linux/releases/download/v0.5/tt-bh-linux.zip",
-        description: "tt-bh-linux v0.5 (fw_jump.bin + Image + blackhole-card.dtb)",
+        url: "https://github.com/tenstorrent/bhx/releases/download/v0.5/bhx.zip",
+        description: "bhx v0.5 (fw_jump.bin + Image + blackhole-card.dtb)",
         is_default: false,
     },
 ];
@@ -125,7 +124,7 @@ pub fn pull_kernel(
     // `Image` artifact (the zip itself is removed after extraction;
     // see #26). On the next pull with `Image` still present, the
     // sidecar lives next to it and the HEAD check skips the download.
-    let zip_path = dir.join("tt-bh-linux.zip");
+    let zip_path = dir.join("bhx.zip");
     crate::fetch::download_to_cached(kernel.url, &zip_path, &image_path, force_refetch)?;
 
     // Extract

@@ -1,6 +1,6 @@
-# Running tt-bh-linux alongside tt-metal on the same card
+# Running bhx alongside tt-metal on the same card
 
-`tt-bh-linux daemon` reserves exactly one Tensix tile on each card it
+`bhx daemon` reserves exactly one Tensix tile on each card it
 manages — the tile hosts BRISC firmware that emulates the four
 virtio-mmio devices each L2CPU sees. tt-metal also schedules compute
 onto Tensix tiles. **Without coordination, tt-metal can pick the same
@@ -20,7 +20,7 @@ in two places:
 ### 1. `daemon status`
 
 ```
-$ tt-bh-linux daemon status -t 0
+$ bhx daemon status -t 0
 daemon: running (card 0, pid …, uptime …)
   virtio-engine tile (NOC0): (16, 11)
   l2cpu 0: Running …
@@ -32,13 +32,13 @@ coordinate the daemon picked. Absent until at least one L2CPU has
 been booted (engine bring-up is lazy). The same line appears for
 every `daemon status` invocation — value is stable until daemon stop.
 
-### 2. `$XDG_RUNTIME_DIR/tt-bh-linux/<card>/reserved-tile`
+### 2. `$XDG_RUNTIME_DIR/bhx/<card>/reserved-tile`
 
 A single line, machine-parseable: `<x> <y>\n`. Same NOC0-logical
 coordinate. Useful for shell automation:
 
 ```sh
-read -r ENGINE_X ENGINE_Y < "$XDG_RUNTIME_DIR/tt-bh-linux/0/reserved-tile"
+read -r ENGINE_X ENGINE_Y < "$XDG_RUNTIME_DIR/bhx/0/reserved-tile"
 echo "Daemon's engine tile is ($ENGINE_X, $ENGINE_Y)"
 ```
 
@@ -71,8 +71,8 @@ through:
 import os, subprocess
 
 card = 0
-runtime = os.environ.get("XDG_RUNTIME_DIR", f"/tmp/tt-bh-linux-{os.getuid()}")
-reserved = os.path.join(runtime, "tt-bh-linux", str(card), "reserved-tile")
+runtime = os.environ.get("XDG_RUNTIME_DIR", f"/tmp/bhx-{os.getuid()}")
+reserved = os.path.join(runtime, "bhx", str(card), "reserved-tile")
 
 extra_env = {}
 try:
@@ -103,11 +103,11 @@ the daemon is running, you can expect any of:
   Tensix L1 ranges the daemon's TLB also maps. The daemon traps and
   exits; the chip stays in whatever state tt-metal left it in.
 - **Subsequent boots fail.** A corrupted firmware can't be cleanly
-  re-adopted. Operators see "tt-bh-linux daemon start" succeed, but
+  re-adopted. Operators see "bhx daemon start" succeed, but
   every L2CPU boot fails with a virtio handshake timeout. Recovery:
   `daemon stop`, `tt-smi -r`, `daemon start`, `boot --force`.
 
-None of these are bugs in tt-bh-linux or tt-metal individually —
+None of these are bugs in bhx or tt-metal individually —
 they're the expected outcome of two processes writing to the same
 Tensix tile's L1 + reset registers.
 
@@ -120,7 +120,7 @@ TCM). If found, the daemon logs:
 
 ```
 [tensix-engine] WARNING: tile (16, 11) appears to be running tt-metal
-firmware (signature 0x… at L1+0x…). tt-bh-linux is taking the tile
+firmware (signature 0x… at L1+0x…). bhx is taking the tile
 over and may corrupt the running workload. Stop tt-metal first or
 configure DispatchCoreConfig to exclude this tile.
 ```

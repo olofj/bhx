@@ -50,7 +50,7 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-BINARY = os.environ.get("BINARY", os.path.abspath("./target/debug/tt-bh-linux"))
+BINARY = os.environ.get("BINARY", os.path.abspath("./target/debug/bhx"))
 LOG_FILE = os.environ.get("LOG_FILE", os.path.abspath("./daemon-card0.log"))
 ROOTFS_DEFAULT_BUILDROOT = "tests/rootfs/rootfs.ext4"
 ROOTFS_DEFAULT_LEGACY = "rootfs.ext4"
@@ -63,7 +63,7 @@ if not ROOTFS:
 TTDEVICE = str(args.ttdevice)
 L2CPU = str(args.l2cpu)
 _runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-PIDFILE = f"{_runtime_dir}/tt-bh-linux/{TTDEVICE}/pid"
+PIDFILE = f"{_runtime_dir}/bhx/{TTDEVICE}/pid"
 TAG = f"[fio-soak l2cpu={L2CPU}]"
 
 

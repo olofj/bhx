@@ -143,7 +143,7 @@ static inline unsigned brisc_virtio_slot(unsigned l2cpu_idx, unsigned device_idx
 
 #define VIRTIO_MMIO_MAGIC               0x74726976u  // "virt" little-endian
 #define VIRTIO_MMIO_VERSION_2           2u
-#define BRISC_VENDOR_ID                 0x55544254u  // "TBTU" — tt-bh ttUart-ish
+#define BRISC_VENDOR_ID                 0x55544254u  // "TBTU" little-endian
 
 // Per-device queue counts. Conventional virtio:
 //   blk      — 1 queue

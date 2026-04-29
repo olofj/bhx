@@ -32,7 +32,7 @@ from typing import Iterable
 # and the operator may run any individual script from anywhere.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BINARY = os.environ.get(
-    "BINARY", str(PROJECT_ROOT / "target/debug/tt-bh-linux")
+    "BINARY", str(PROJECT_ROOT / "target/debug/bhx")
 )
 LOG_FILE = os.environ.get(
     "LOG_FILE", str(PROJECT_ROOT / "daemon-card0.log")
@@ -150,7 +150,7 @@ def boot(
     (`fw_jump.bin` / `Image` / `blackhole-card.dtb`) are cwd-relative,
     and `run_all.sh` cd's into `scripts/bench/` where those symlinks
     don't exist. The artifacts live at the project root (symlinks
-    pointing at `../tt-bh-linux/`).
+    pointing at `../bhx/`).
 
     `fwd` is `[(host_port, guest_port), ...]` extra TCP forwards on
     top of the implicit SSH forward. Wired in at cold-boot rather

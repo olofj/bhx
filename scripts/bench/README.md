@@ -98,17 +98,17 @@ If `iperf3` isn't on the host, both rows are emitted with
 - **Disk bandwidth/IOPS down**: virtio descriptor-chain handling
   got slower, the worker poll-tier shifted (less FAST, more SLOW),
   or fio is now hitting a bottleneck the daemon didn't have before.
-  Diff `tt_bh_blk_*` and `tt_bh_worker_tier_seconds_total{worker="virtio_blk"}`
+  Diff `bhx_blk_*` and `bhx_worker_tier_seconds_total{worker="virtio_blk"}`
   in the daemon's `/metrics` to localize.
 - **Disk p99 latency up**: even occasional stalls. Look at
-  `tt_bh_blk_errors_total{reason="ioerr"}` — the rootfs-grow can
+  `bhx_blk_errors_total{reason="ioerr"}` — the rootfs-grow can
   expose IOERR if the test file overflows.
 - **Console throughput/latency**: regressions usually come from
   `chip_console::uart_pass`'s adaptive-sleep tuning (#27) or
   `console_hub` fan-out. The hub holds an internal Mutex; a code
   change that lengthens the critical section shows up here.
 - **Net throughput**: slirp + `virtio::network`. Cross-reference
-  against `tt_bh_net_packets_total` rate during the run; if packet
+  against `bhx_net_packets_total` rate during the run; if packet
   count is still high but bytes are low, the descriptor path
   fragmented packets.
 

@@ -38,7 +38,7 @@ const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
 /// option 12 (#60). RFC-952-clean (`a-z0-9-`, no `_`, ≤63 chars) so
 /// every guest distro accepts it as the system hostname.
 pub fn format_dhcp_hostname(card: u32, l2cpu_idx: u8) -> String {
-    format!("tt-bh-card{}-l2cpu{}", card, l2cpu_idx)
+    format!("bhx-card{}-l2cpu{}", card, l2cpu_idx)
 }
 
 /// Derive a stable MAC for a given (card, l2cpu_idx). Locally
@@ -220,7 +220,7 @@ pub struct VirtioNet {
     mac: [u8; 6],
     /// Per-(card, L2CPU) hostname plumbed into libslirp's vhostname so
     /// the guest's DHCP lease (option 12) carries
-    /// e.g. `tt-bh-card0-l2cpu0` instead of libslirp's compiled-in
+    /// e.g. `bhx-card0-l2cpu0` instead of libslirp's compiled-in
     /// "slirp" default. The CString must outlive `slirp` — libslirp
     /// keeps the pointer verbatim, so we hold ownership here. See #60.
     #[allow(dead_code)]
@@ -500,9 +500,9 @@ mod tests {
 
     #[test]
     fn format_dhcp_hostname_uses_card_and_l2cpu() {
-        assert_eq!(format_dhcp_hostname(0, 0), "tt-bh-card0-l2cpu0");
-        assert_eq!(format_dhcp_hostname(0, 3), "tt-bh-card0-l2cpu3");
-        assert_eq!(format_dhcp_hostname(7, 1), "tt-bh-card7-l2cpu1");
+        assert_eq!(format_dhcp_hostname(0, 0), "bhx-card0-l2cpu0");
+        assert_eq!(format_dhcp_hostname(0, 3), "bhx-card0-l2cpu3");
+        assert_eq!(format_dhcp_hostname(7, 1), "bhx-card7-l2cpu1");
     }
 
     #[test]

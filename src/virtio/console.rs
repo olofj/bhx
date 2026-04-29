@@ -11,7 +11,7 @@
 //! `HVC_RISCV_SBI` got gated behind `NONPORTABLE` (see #51 for context).
 //!
 //! Both pumps push into the same `ConsoleHub`, so an operator's
-//! `tt-bh-linux connect` view shows kernel output regardless of which
+//! `bhx connect` view shows kernel output regardless of which
 //! console driver the kernel ended up using. Operator keystrokes are
 //! fanned out to both pumps in `client_reader_main`; whichever HVC
 //! driver the kernel registered as its active console absorbs them,

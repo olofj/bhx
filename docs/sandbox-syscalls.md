@@ -13,7 +13,7 @@ Captured via `strace -f -tt` over a representative workload:
 
 ```bash
 strace -f -tt -o /tmp/strace-daemon.log \
-  ./target/debug/tt-bh-linux daemon start --foreground -t 0 \
+  ./target/debug/bhx daemon start --foreground -t 0 \
     --log-file ./daemon-card0.log
 # in a separate shell, drive the workload above; then SIGTERM the daemon.
 ```
@@ -81,15 +81,15 @@ These show up only during binary load + `daemon start` setup. Sandbox is install
 /etc/ld.so.cache
 /etc/localtime
 /etc/resolv.conf
-/home/olof/bh/tt-bh-linux/blackhole-card.dtb
-/home/olof/bh/tt-bh-linux/fw_jump.bin
-/home/olof/bh/tt-bh-linux/Image
-/home/olof/bh/tt-bh-rust/tt-bh-linux-rs/./daemon-card0.log
-/home/olof/bh/tt-bh-rust/tt-bh-linux-rs/tests/rootfs/buildroot-2026.02.1/output/images/rootfs.ext2
+/home/olof/bh/bhx/blackhole-card.dtb
+/home/olof/bh/bhx/fw_jump.bin
+/home/olof/bh/bhx/Image
+/home/olof/bh/bhx/bhx/./daemon-card0.log
+/home/olof/bh/bhx/bhx/tests/rootfs/buildroot-2026.02.1/output/images/rootfs.ext2
 /lib/x86_64-linux-gnu/{libatomic,libc,libfdt,libgcc_s,libglib-2.0,libm,libpcre2-8,libslirp,libvdeslirp}.so.{0,1,6}
 /proc/self/maps
-/run/user/1000/tt-bh-linux/0/logpath
-/run/user/1000/tt-bh-linux/0/pid
+/run/user/1000/bhx/0/logpath
+/run/user/1000/bhx/0/pid
 ```
 
 ### Landlock policy
@@ -98,7 +98,7 @@ Tier into "always" / "boot-time" / "log only":
 
 - `/dev/tenstorrent/<card>` — read+write, always.
 - `/dev/urandom` — read, always.
-- `/run/user/<uid>/tt-bh-linux/<card>/` — read+write, always (pidfile, sock, log, sidecars).
+- `/run/user/<uid>/bhx/<card>/` — read+write, always (pidfile, sock, log, sidecars).
 - The `--log-file` path (if outside the runtime dir) — read+write+truncate.
 - The operator's working dir at `daemon start` time — **read** only, always. Captures rootfs.ext4 reads, blackhole-card.dtb / Image / fw_jump.bin reads, and any path the operator might `add-disk` later. Wider than ideal; see #20's "narrowing" note for the per-RPC scope alternative.
 - `/etc/{resolv.conf,localtime}` — read.

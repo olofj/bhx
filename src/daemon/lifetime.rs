@@ -5,12 +5,12 @@
 //!
 //! Per-card runtime layout:
 //! ```text
-//! $XDG_RUNTIME_DIR/tt-bh-linux/<card>/
+//! $XDG_RUNTIME_DIR/bhx/<card>/
 //!     sock    — unix control socket (created by daemon, unlinked on stop)
 //!     pid     — pidfile + exclusivity flock (LOCK_EX|LOCK_NB)
 //!     log     — stdout/stderr after daemonization
 //! ```
-//! Falls back to `/tmp/tt-bh-linux-$UID/<card>/` when `$XDG_RUNTIME_DIR` is
+//! Falls back to `/tmp/bhx-$UID/<card>/` when `$XDG_RUNTIME_DIR` is
 //! not set (common on sshd+pam setups that don't provision one).
 //!
 //! The daemon acquires an exclusive flock on `pid` as its single-instance
@@ -34,16 +34,16 @@ pub fn runtime_dir(card: u32) -> PathBuf {
     let base = match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(x) if !x.is_empty() => PathBuf::from(x),
         _ => {
-            // Fall back to /tmp/tt-bh-linux-$UID (per-user to avoid collisions
+            // Fall back to /tmp/bhx-$UID (per-user to avoid collisions
             // on shared hosts). Creating a world-writable dir would be a
             // security hole; we set mode 0700 in `ensure_runtime_dir`.
             let uid = unsafe { libc::getuid() };
-            PathBuf::from(format!("/tmp/tt-bh-linux-{}", uid))
+            PathBuf::from(format!("/tmp/bhx-{}", uid))
         }
     };
     let mut path = base;
-    if !path.ends_with("tt-bh-linux") {
-        path.push("tt-bh-linux");
+    if !path.ends_with("bhx") {
+        path.push("bhx");
     }
     path.push(card.to_string());
     path
@@ -272,7 +272,7 @@ mod tests {
         let _g = set_xdg(tmp.path());
         let p = runtime_dir(0);
         assert!(p.starts_with(tmp.path()));
-        assert!(p.ends_with(Path::new("tt-bh-linux/0")));
+        assert!(p.ends_with(Path::new("bhx/0")));
     }
 
     #[test]
@@ -280,7 +280,7 @@ mod tests {
         let _g = unset_xdg();
         let p = runtime_dir(2);
         let uid = unsafe { libc::getuid() };
-        let expected = format!("/tmp/tt-bh-linux-{}/tt-bh-linux/2", uid);
+        let expected = format!("/tmp/bhx-{}/bhx/2", uid);
         assert_eq!(p, Path::new(&expected));
     }
 

@@ -65,6 +65,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "bhx"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "clap",
+ "ctrlc",
+ "landlock",
+ "libc",
+ "nix",
+ "seccompiler",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -537,23 +554,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "tt-bh-linux"
-version = "0.1.0"
-dependencies = [
- "cc",
- "clap",
- "ctrlc",
- "landlock",
- "libc",
- "nix",
- "seccompiler",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
 ]
 
 [[package]]

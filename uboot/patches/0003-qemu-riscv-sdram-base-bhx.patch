@@ -1,10 +1,10 @@
-From: tt-bh-linux <noreply@tenstorrent.com>
+From: Olof Johansson <olof@lixom.net>
 Subject: [PATCH] include/configs/qemu-riscv: SDRAM base = 0x400030000000
 
 `setup_dest_addr` in common/board_f.c unconditionally overrides
 gd->ram_base with CFG_SYS_SDRAM_BASE, immediately clobbering whatever
 dram_init read from the DTB. The qemu-riscv config defaults this to
-0x80000000 (qemu-virt's RAM base) — wrong for tt-bh-linux, where
+0x80000000 (qemu-virt's RAM base) — wrong for bhx, where
 L2CPU DRAM starts at 0x400030000000. The wrong base puts
 relocaddr/ram_top in the 0x180000000 range, malloc allocations land
 there too, and virtqueues set up by U-Boot are outside the actual
@@ -13,12 +13,12 @@ panics with "virtqueue desc address X below L2CPU memory start".
 
 Bumping the #define to our DRAM base keeps qemu-riscv64 builds for
 real qemu broken (since it expects 0x80000000), but the qemu-riscv
-config is the upstream we use — tt-bh-linux ships its own U-Boot via
+config is the upstream we use — bhx ships its own U-Boot via
 this build tree, not a stock qemu-riscv image. If we ever need both
 targets the fix is a runtime check or a per-board config; for now,
 hardcoded is fine.
 
-See tt-bh-linux #49.
+See bhx #49.
 
 ---
 --- a/include/configs/qemu-riscv.h
@@ -29,14 +29,14 @@ See tt-bh-linux #49.
  
 -#define CFG_SYS_SDRAM_BASE		0x80000000
 +/*
-+ * tt-bh: SDRAM base address. setup_dest_addr in common/board_f.c
++ * bhx: SDRAM base address. setup_dest_addr in common/board_f.c
 + * unconditionally overrides gd->ram_base with this value, clobbering
 + * whatever dram_init (via fdtdec) reads from the DTB. Patching the
 + * #define here is the only way to make the relocaddr/ram_top math
 + * land inside our actual L2CPU DRAM. Real qemu-riscv64 doesn't share
 + * this address; if the daemon ever needs to support multiple
 + * platforms the fix is a runtime check or per-board config. See
-+ * tt-bh-linux #49.
++ * bhx #49.
 + */
 +#define CFG_SYS_SDRAM_BASE		0x400030000000UL
  

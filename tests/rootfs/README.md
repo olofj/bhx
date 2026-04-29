@@ -1,4 +1,4 @@
-# tt-bh-linux test rootfs (buildroot)
+# bhx test rootfs (buildroot)
 
 A small, reproducible riscv64 ext4 image built with buildroot, intended
 **only** for hardware soaks. **Never** deploy this image anywhere
@@ -24,7 +24,7 @@ First build is slow (~20-30 minutes; downloads + builds the toolchain
 from source). Subsequent builds are incremental.
 
 ```bash
-cd tt-bh-linux-rs/tests/rootfs
+cd bhx/tests/rootfs
 make check-deps          # verify host tools (build-essential, wget, cpio, ...)
 make                     # produces output/images/rootfs.ext4
 ```
@@ -39,10 +39,10 @@ strip packages; raise it if you add more).
 ## Use
 
 ```bash
-cd ../..    # back to tt-bh-linux-rs/
-./target/debug/tt-bh-linux daemon start -t 0 --log-file ./daemon-card0.log
-./target/debug/tt-bh-linux boot -l 0 -d tests/rootfs/output/images/rootfs.ext4 -n
-./target/debug/tt-bh-linux connect -l 0
+cd ../..    # back to bhx/
+./target/debug/bhx daemon start -t 0 --log-file ./daemon-card0.log
+./target/debug/bhx boot -l 0 -d tests/rootfs/output/images/rootfs.ext4 -n
+./target/debug/bhx connect -l 0
 ```
 
 Within ~15s the console drops to `#` (no `login:` prompt). DHCP comes

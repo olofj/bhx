@@ -534,7 +534,7 @@ fn run_handshake(tile: &TensixTile, picked_x: u16, picked_y: u16) -> io::Result<
 /// bytes are non-zero AND don't look like our own start.S header
 /// (which we'd see on warm-resume), log a loud warning that the
 /// daemon is taking over a tile someone else may still be using.
-/// Heuristic — false positives possible (a previous tt-bh-linux
+/// Heuristic — false positives possible (a previous bhx
 /// session that crashed mid-flight), so warn rather than fail. See
 /// #74 + docs/tt-metal-coexistence.md.
 fn warn_if_tile_appears_busy(tile: &TensixTile, x: u16, y: u16) {
@@ -548,7 +548,7 @@ fn warn_if_tile_appears_busy(tile: &TensixTile, x: u16, y: u16) {
     }
     // Our own start.S plants a fixed dispatch sequence at TCM offset
     // 0; if we recognize the leading word as ours, this is a warm
-    // resume of a previous tt-bh-linux session and we're about to
+    // resume of a previous bhx session and we're about to
     // adopt cleanly anyway. Don't spam warnings on the normal path.
     // The expected first bytes are `6f 00 00 08` (LE u32 = 0x0800006f
     // = `j 0x80`, the relative jump that vectors hartid 0 to brisc_main
@@ -562,7 +562,7 @@ fn warn_if_tile_appears_busy(tile: &TensixTile, x: u16, y: u16) {
         "[tensix-engine] WARNING: tile NOC0 ({}, {}) TCM is non-zero \
          before bring-up (first 16 bytes: {:08x} {:08x} {:08x} {:08x}). \
          Another process — most likely tt-metal — may have loaded \
-         firmware here. tt-bh-linux is taking the tile over and may \
+         firmware here. bhx is taking the tile over and may \
          corrupt the running workload. See \
          docs/tt-metal-coexistence.md.",
         x, y, buf[0], buf[1], buf[2], buf[3]
@@ -570,7 +570,7 @@ fn warn_if_tile_appears_busy(tile: &TensixTile, x: u16, y: u16) {
 }
 
 /// Publish the daemon's reserved Tensix tile to
-/// `$XDG_RUNTIME_DIR/tt-bh-linux/<card>/reserved-tile` for tt-metal
+/// `$XDG_RUNTIME_DIR/bhx/<card>/reserved-tile` for tt-metal
 /// coexistence. Format: a single line `<x> <y>\n` in NOC0-logical
 /// coords. Best-effort — failure to write (no runtime dir, EROFS,
 /// race against `daemon stop` cleanup) downgrades to a `dlog!` and

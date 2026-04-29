@@ -1,7 +1,7 @@
-From: tt-bh-linux <noreply@tenstorrent.com>
-Subject: [PATCH] drivers/virtio/virtio_mmio: tt-bh sel_generation handshake
+From: Olof Johansson <olof@lixom.net>
+Subject: [PATCH] drivers/virtio/virtio_mmio: bhx sel_generation handshake
 
-The tt-bh-linux daemon (host-side virtio-mmio emulation) doesn't watch
+The bhx daemon (host-side virtio-mmio emulation) doesn't watch
 every standard register write — it polls a custom `sel_generation`
 register at MMIO offset 0x01c. The guest is expected to bump that
 register after each daemon-monitored write and spin until the daemon
@@ -26,7 +26,7 @@ Sites threaded through, mirroring the kernel exactly:
 
 Real hardware leaves `sw_impl` at 0 (read-only), so the bumps short-
 circuit and standard virtio-mmio behavior is preserved. Tested only
-on tt-bh-linux software emulation. See tt-bh-linux #49.
+on bhx software emulation. See bhx #49.
 
 ---
 --- a/drivers/virtio/virtio_mmio.c
@@ -41,11 +41,11 @@ on tt-bh-linux software emulation. See tt-bh-linux #49.
  #include "virtio_mmio.h"
  
 +/*
-+ * tt-bh sw_impl handshake: the host-side daemon polls SEL_GENERATION
++ * bhx sw_impl handshake: the host-side daemon polls SEL_GENERATION
 + * to know when to react to standard-register writes. Bump after every
 + * write the daemon should see, then spin until the daemon writes back
 + * something other than `prev + 1`. No-op when sw_impl == 0 (real
-+ * hardware). See tt-bh-linux #49.
++ * hardware). See bhx #49.
 + */
 +static int virtio_mmio_sw_impl_sync(struct virtio_mmio_priv *priv)
 +{
@@ -115,9 +115,9 @@ on tt-bh-linux software emulation. See tt-bh-linux #49.
  	}
  
 +	/*
-+	 * tt-bh: single bump after the full queue config block — the
++	 * bhx: single bump after the full queue config block — the
 +	 * daemon's Phase 3 reads QUEUE_SEL + NUM + DESC/AVAIL/USED + READY
-+	 * in one shot when it sees the bump. See tt-bh-linux #49.
++	 * in one shot when it sees the bump. See bhx #49.
 +	 */
 +	if (virtio_mmio_sw_impl_sync(priv)) {
 +		err = -ETIMEDOUT;
@@ -132,10 +132,10 @@ on tt-bh-linux software emulation. See tt-bh-linux #49.
  	uc_priv->vendor = readl(priv->base + VIRTIO_MMIO_VENDOR_ID);
  
 +	/*
-+	 * tt-bh sw_impl flag: the daemon writes 1 here during cold-start
++	 * bhx sw_impl flag: the daemon writes 1 here during cold-start
 +	 * to signal it needs the SEL_GENERATION handshake. Real hardware
 +	 * leaves the slot at 0, in which case all the bumps short-circuit
-+	 * and we behave like a stock virtio-mmio. See tt-bh-linux #49.
++	 * and we behave like a stock virtio-mmio. See bhx #49.
 +	 */
 +	priv->sw_impl = readl(priv->base + VIRTIO_MMIO_SW_IMPL);
 +	debug("(%s): sw_impl=%u\n", udev->name, priv->sw_impl);
@@ -149,10 +149,10 @@ on tt-bh-linux software emulation. See tt-bh-linux #49.
  /* Virtio vendor ID - Read Only */
  #define VIRTIO_MMIO_VENDOR_ID		0x00c
  
-+/* tt-bh: software-implementation flag (1 = host daemon, 0 = hardware) */
++/* bhx: software-implementation flag (1 = host daemon, 0 = hardware) */
 +#define VIRTIO_MMIO_SW_IMPL		0x018
 +
-+/* tt-bh: handshake counter for the sel_generation protocol */
++/* bhx: handshake counter for the sel_generation protocol */
 +#define VIRTIO_MMIO_SEL_GENERATION	0x01c
 +
  /*
@@ -163,7 +163,7 @@ on tt-bh-linux software emulation. See tt-bh-linux #49.
  	void __iomem *base;
  	u32 version;
 +	/*
-+	 * tt-bh: 1 if the host implementation needs the sel_generation
++	 * bhx: 1 if the host implementation needs the sel_generation
 +	 * handshake. Read from MMIO once during probe; const afterwards.
 +	 */
 +	u32 sw_impl;

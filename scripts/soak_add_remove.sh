@@ -17,14 +17,14 @@
 #
 # Env:
 #   ITERATIONS  add/remove cycles (default 10)
-#   BINARY      path to tt-bh-linux
+#   BINARY      path to bhx
 #   LOG_FILE    daemon log path
 #   CARD, L2CPU
 
 set -euo pipefail
 
 ITERATIONS=${ITERATIONS:-10}
-BINARY=${BINARY:-./target/debug/tt-bh-linux}
+BINARY=${BINARY:-./target/debug/bhx}
 LOG_FILE=${LOG_FILE:-./daemon-card0.log}
 CARD=${CARD:-0}
 L2CPU=${L2CPU:-0}

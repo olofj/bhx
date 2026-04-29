@@ -1,4 +1,4 @@
-# tt-bh-linux-rs — notes for Claude
+# bhx — notes for Claude
 
 ## Working style
 
@@ -66,7 +66,7 @@ L2CPU (reset, OpenSBI + kernel + DTB image load, DTB patching, reset
 vectors, prefetchers), then emulates VirtIO block/network devices and
 serves the OpenSBI virtual-UART console.
 
-The tool runs as a **per-card daemon** (`tt-bh-linux daemon start`) that
+The tool runs as a **per-card daemon** (`bhx daemon start`) that
 owns the card's resources; `boot`, `connect`, `add-disk` etc. are thin
 RPC clients. The old in-process `connect` path has been removed.
 
@@ -95,7 +95,7 @@ src/
 │   ├── client.rs     # Thin RPC helpers used by main.rs
 │   ├── runner.rs     # daemon start/stop/restart/status/logs — drives daemon::fork
 │   ├── fork.rs       # POSIX double-fork + setsid + stdio redirect (replaces daemonize crate)
-│   ├── lifetime.rs   # pidfile + flock + runtime dir ($XDG_RUNTIME_DIR/tt-bh-linux/<card>)
+│   ├── lifetime.rs   # pidfile + flock + runtime dir ($XDG_RUNTIME_DIR/bhx/<card>)
 │   ├── protocol.rs   # Request/Response, length-prefixed JSON framing, SCM_RIGHTS fd passing
 │   ├── console_hub.rs# 64 KiB scrollback + writer election (Ro/Rw/Takeover)
 │   ├── chip_console.rs # Daemon's chip-side UART pump; probe_warm_resume + pure decode helpers
@@ -119,7 +119,7 @@ brisc-firmware/        # BRISC + TRISC0 firmware for the Tensix virtio engine
 uboot/                 # U-Boot S-mode payload for booting stock distro images (#44 + sub-issues)
 ├── README.md          # build / pinned config / bumping / reproducibility
 ├── Makefile           # download + extract + patch + merge_config.sh + build
-├── tt-bh.config       # defconfig fragment merged on top of qemu-riscv64_smode_defconfig
+├── bhx.config       # defconfig fragment merged on top of qemu-riscv64_smode_defconfig
 ├── patches/           # 3 downstream patches (sel_generation handshake + 2 RISC-V DRAM fixes)
 ├── sha256sums         # pinned tarball checksum
 └── u-boot.bin         # (gitignored) symlink the build maintains
@@ -149,24 +149,24 @@ cargo build
 
 # Start the daemon once per card. Log pinned to project dir with O_DSYNC
 # so every line hits disk before the write() returns.
-./target/debug/tt-bh-linux daemon start -t 0 --log-file ./daemon-card0.log
+./target/debug/bhx daemon start -t 0 --log-file ./daemon-card0.log
 
 # Boot one L2CPU with its rootfs + net. Defaults: rootfs.ext4 in cwd,
 # fw_jump.bin / Image / blackhole-card.dtb in cwd.
-./target/debug/tt-bh-linux boot -l 0 -d rootfs.ext4 -n
+./target/debug/bhx boot -l 0 -d rootfs.ext4 -n
 
 # Attach an interactive console (Ctrl-A x to detach).
-./target/debug/tt-bh-linux connect -l 0
+./target/debug/bhx connect -l 0
 
 # Swap the disk or net without rebooting the guest:
-./target/debug/tt-bh-linux remove-disk -l 0
-./target/debug/tt-bh-linux add-disk -l 0 other-rootfs.ext4
+./target/debug/bhx remove-disk -l 0
+./target/debug/bhx add-disk -l 0 other-rootfs.ext4
 
 # Check state:
-./target/debug/tt-bh-linux daemon status -t 0
+./target/debug/bhx daemon status -t 0
 
 # Shut down everything on this card:
-./target/debug/tt-bh-linux daemon stop -t 0
+./target/debug/bhx daemon stop -t 0
 ```
 
 `connect` is a thin RPC client: the daemon owns the chip-side UART pump
@@ -179,7 +179,7 @@ and a 64 KiB scrollback hub, and the client receives a socketpair fd via
 with `timeout`:
 
 ```bash
-timeout 5 ./target/debug/tt-bh-linux connect -l 0 </dev/null 2>/tmp/stderr.log
+timeout 5 ./target/debug/bhx connect -l 0 </dev/null 2>/tmp/stderr.log
 ```
 
 Hardware-free: `cargo run -- image|kernel|ramdisk` subcommands (no

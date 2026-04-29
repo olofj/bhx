@@ -41,7 +41,7 @@ all: $(ROOTFS_EXT4)
 	@echo "==> Build complete:"
 	@ls -lh $(ROOTFS_EXT4)
 	@echo
-	@echo "    Use as: tt-bh-linux boot -l 0 -d $(ROOTFS_EXT4)"
+	@echo "    Use as: bhx boot -l 0 -d $(ROOTFS_EXT4)"
 
 help:
 	@echo "Targets:"

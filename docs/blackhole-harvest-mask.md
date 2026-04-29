@@ -149,7 +149,7 @@ Two follow-on observations:
   haven't seen a chip with row harvest yet, so this is informed
   by tt-metal docs more than direct evidence.
 
-## What this means for tt-bh-linux M2
+## What this means for bhx M2
 
 - All required reads land inside the existing 2 MiB
   `SharedChip` window at `0x80000000`. Reuse it; don't add a

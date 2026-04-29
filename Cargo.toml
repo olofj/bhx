@@ -1,8 +1,10 @@
 [package]
-name = "tt-bh-linux"
+name = "bhx"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "Run Linux on the SiFive X280 RISC-V cores embedded in Tenstorrent Blackhole P100/P150 cards."
+repository = "https://github.com/olofj/bhx"
 
 [features]
 default = ["slirp"]
@@ -31,7 +33,7 @@ tempfile = "3"
 
 # Profiling-friendly opt build. Use as:
 #   cargo build --profile profiling
-# Produces target/profiling/tt-bh-linux with full debug info so samply
+# Produces target/profiling/bhx with full debug info so samply
 # / perf can resolve symbols and frame pointers, while still running
 # release-grade optimized code. See scripts/profile_daemon.sh.
 [profile.profiling]

@@ -25,17 +25,17 @@ DL_DIR := $(TOPDIR)/dl
 UB_SRCDIR := $(TOPDIR)/u-boot-$(UBOOT_VERSION)
 
 # Our defconfig is `qemu-riscv64_smode_defconfig` (upstream) plus the
-# fragment in tt-bh.config that turns on SBI console + virtio + EFI for
+# fragment in bhx.config that turns on SBI console + virtio + EFI for
 # the daemon-emulated platform. The fragment is intentionally small
 # enough that bumping U-Boot only re-runs the qemu defconfig + merge,
 # no per-version patches.
 BASE_DEFCONFIG := qemu-riscv64_smode_defconfig
-FRAGMENT := $(TOPDIR)/tt-bh.config
+FRAGMENT := $(TOPDIR)/bhx.config
 
 # Final blob landed by the build.
 UBOOT_BIN := $(UB_SRCDIR)/u-boot.bin
 # Stable convenience path. The Makefile maintains a symlink here so
-# `tt-bh-linux boot --uboot uboot/u-boot.bin` doesn't need to
+# `bhx boot --uboot uboot/u-boot.bin` doesn't need to
 # know the U-Boot version directory name.
 UBOOT_LINK := $(TOPDIR)/u-boot.bin
 
@@ -61,7 +61,7 @@ all: $(UBOOT_BIN)
 	@echo "==> Build complete:"
 	@ls -lh $(UBOOT_BIN)
 	@echo
-	@echo "    Use as: tt-bh-linux boot -l 0 --uboot $(UBOOT_LINK)"
+	@echo "    Use as: bhx boot -l 0 --uboot $(UBOOT_LINK)"
 
 help:
 	@echo "Targets:"
@@ -82,13 +82,13 @@ $(UB_SRCDIR)/Makefile: $(DL_DIR)/$(UBOOT_TARBALL) $(TOPDIR)/patches/serial_sbi_d
 	@cd $(DL_DIR) && sha256sum -c $(TOPDIR)/sha256sums --ignore-missing
 	@echo "==> Extracting"
 	tar -xf $(DL_DIR)/$(UBOOT_TARBALL) -C $(TOPDIR)
-	@echo "==> Installing tt-bh DM SBI serial driver"
+	@echo "==> Installing bhx DM SBI serial driver"
 	cp $(TOPDIR)/patches/serial_sbi_dm.c $(UB_SRCDIR)/drivers/serial/
 	@# Append Kconfig entry + Makefile rule. Idempotent: only add if
 	@# not already present (so re-running this step on an existing
 	@# tree doesn't duplicate.)
 	@grep -q SERIAL_SBI_DM $(UB_SRCDIR)/drivers/serial/Kconfig || \
-		printf '\nconfig SERIAL_SBI_DM\n\tbool "DM serial driver wrapping SBI DBCN"\n\tdepends on DM_SERIAL && RISCV_SMODE\n\thelp\n\t  tt-bh downstream patch — see uboot/patches/serial_sbi_dm.c.\n' >> $(UB_SRCDIR)/drivers/serial/Kconfig
+		printf '\nconfig SERIAL_SBI_DM\n\tbool "DM serial driver wrapping SBI DBCN"\n\tdepends on DM_SERIAL && RISCV_SMODE\n\thelp\n\t  bhx downstream patch — see uboot/patches/serial_sbi_dm.c.\n' >> $(UB_SRCDIR)/drivers/serial/Kconfig
 	@grep -q SERIAL_SBI_DM $(UB_SRCDIR)/drivers/serial/Makefile || \
 		echo 'obj-$$(CONFIG_SERIAL_SBI_DM) += serial_sbi_dm.o' >> $(UB_SRCDIR)/drivers/serial/Makefile
 	@# Apply any *.patch files (alphabetical order). The patch tool's

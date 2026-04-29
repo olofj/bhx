@@ -210,7 +210,7 @@ impl VirtioDeviceImpl for VirtioBlk {
                 // we return UNSUPP the kernel stalls before mount_root.
                 // Buildroot ignores the failure, which is why we got
                 // away with leaving it unimplemented.
-                let serial = format!("tt-bh-l2cpu-{:02}", self.l2cpu_idx);
+                let serial = format!("bhx-l2cpu-{:02}", self.l2cpu_idx);
                 let bytes = serial.as_bytes();
                 let n = (len as usize).min(VIRTIO_BLK_ID_BYTES);
                 unsafe {

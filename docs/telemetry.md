@@ -4,7 +4,7 @@ The daemon exposes a Prometheus-style HTTP exporter. Off by default —
 enable per-card with `--metrics-port`:
 
 ```
-tt-bh-linux daemon start -t 0 --metrics-port 19100
+bhx daemon start -t 0 --metrics-port 19100
 curl -s http://127.0.0.1:19100/metrics
 ```
 
@@ -14,7 +14,7 @@ model. To scrape from a remote host, run an SSH tunnel.
 
 ## What's emitted
 
-All metric names are prefixed `tt_bh_`. Counters end in `_total`; time
+All metric names are prefixed `bhx_`. Counters end in `_total`; time
 metrics end in `_seconds`; gauges have no suffix. Names follow the
 Prometheus 0.0.4 text-format spec; the daemon refuses to start if a
 bind() fails (mirrors the seccomp-install failure path) so a missing
@@ -24,12 +24,12 @@ bind() fails (mirrors the seccomp-install failure path) so a missing
 
 | Metric | Type | Labels | Bumped by |
 |---|---|---|---|
-| `tt_bh_daemon_uptime_seconds` | gauge | — | derived from `DaemonState.started` at scrape time |
-| `tt_bh_daemon_clients_total` | counter | — | `handle_client` on accept |
-| `tt_bh_daemon_clients_active` | gauge | — | `handle_client` (RAII guard inc on entry, dec on return) |
-| `tt_bh_daemon_sandbox_status` | gauge | — | `sandbox::apply_landlock`: 0=disabled, 1=partial, 2=fully-enforced |
-| `tt_bh_daemon_rpc_total` | counter | `method` | `handle_client` on every request, classified via `classify_request` |
-| `tt_bh_daemon_rpc_errors_total` | counter | `method` | `handle_client` after dispatch, when `reply_err` set the per-thread `RPC_FAILED` flag |
+| `bhx_daemon_uptime_seconds` | gauge | — | derived from `DaemonState.started` at scrape time |
+| `bhx_daemon_clients_total` | counter | — | `handle_client` on accept |
+| `bhx_daemon_clients_active` | gauge | — | `handle_client` (RAII guard inc on entry, dec on return) |
+| `bhx_daemon_sandbox_status` | gauge | — | `sandbox::apply_landlock`: 0=disabled, 1=partial, 2=fully-enforced |
+| `bhx_daemon_rpc_total` | counter | `method` | `handle_client` on every request, classified via `classify_request` |
+| `bhx_daemon_rpc_errors_total` | counter | `method` | `handle_client` after dispatch, when `reply_err` set the per-thread `RPC_FAILED` flag |
 
 `method` ∈ {`status`, `boot`, `attach_console`, `add_disk`,
 `remove_disk`, `add_net`, `remove_net`, `stop`, `shutdown`}.
@@ -38,12 +38,12 @@ bind() fails (mirrors the seccomp-install failure path) so a missing
 
 | Metric | Type | Labels | Bumped by |
 |---|---|---|---|
-| `tt_bh_l2cpu_uptime_seconds` | gauge | `idx` | `L2CpuSlot.started` snapshot at scrape time. Absent for empty slots. |
-| `tt_bh_l2cpu_boot_total` | counter | `idx`, `kind` | `dispatch_boot` install path (`kind="cold"`); `warm_resume_released` adoption path (`kind="warm"`) |
-| `tt_bh_l2cpu_console_clients` | gauge | `idx` | `ConsoleHub::{attach,detach,push_chip_output}` (the last one decrements when fan-out drops a slow client) |
-| `tt_bh_l2cpu_console_bytes_total` | counter | `idx`, `direction` | `chip_console::uart_pass`: `g2h` on chip TX → hub batch; `h2g` per byte pushed into chip RX |
-| `tt_bh_l2cpu_disks` | gauge | `idx` | derived from `L2CpuSlot.disks.len()` at scrape time |
-| `tt_bh_l2cpu_net` | gauge | `idx` | derived from `L2CpuSlot.net.is_some()` at scrape time |
+| `bhx_l2cpu_uptime_seconds` | gauge | `idx` | `L2CpuSlot.started` snapshot at scrape time. Absent for empty slots. |
+| `bhx_l2cpu_boot_total` | counter | `idx`, `kind` | `dispatch_boot` install path (`kind="cold"`); `warm_resume_released` adoption path (`kind="warm"`) |
+| `bhx_l2cpu_console_clients` | gauge | `idx` | `ConsoleHub::{attach,detach,push_chip_output}` (the last one decrements when fan-out drops a slow client) |
+| `bhx_l2cpu_console_bytes_total` | counter | `idx`, `direction` | `chip_console::uart_pass`: `g2h` on chip TX → hub batch; `h2g` per byte pushed into chip RX |
+| `bhx_l2cpu_disks` | gauge | `idx` | derived from `L2CpuSlot.disks.len()` at scrape time |
+| `bhx_l2cpu_net` | gauge | `idx` | derived from `L2CpuSlot.net.is_some()` at scrape time |
 
 `idx` ∈ {`0`, `1`, `2`, `3`}; `kind` ∈ {`cold`, `warm`};
 `direction` ∈ {`g2h`, `h2g`}.
@@ -52,10 +52,10 @@ bind() fails (mirrors the seccomp-install failure path) so a missing
 
 | Metric | Type | Labels | Bumped by |
 |---|---|---|---|
-| `tt_bh_blk_requests_total` | counter | `idx`, `disk_id`, `op` | `block::process_queue_complete` based on `req.type_` |
-| `tt_bh_blk_bytes_total` | counter | `idx`, `disk_id`, `op` | same site, `data_offset` accumulator |
-| `tt_bh_blk_errors_total` | counter | `idx`, `disk_id`, `reason` | same site, `req_status` discriminator |
-| `tt_bh_blk_interrupts_total` | counter | `idx`, `disk_id` | `virtio::run_device` at the `set_interrupt` call site, gated on `InterruptKind::Block` |
+| `bhx_blk_requests_total` | counter | `idx`, `disk_id`, `op` | `block::process_queue_complete` based on `req.type_` |
+| `bhx_blk_bytes_total` | counter | `idx`, `disk_id`, `op` | same site, `data_offset` accumulator |
+| `bhx_blk_errors_total` | counter | `idx`, `disk_id`, `reason` | same site, `req_status` discriminator |
+| `bhx_blk_interrupts_total` | counter | `idx`, `disk_id` | `virtio::run_device` at the `set_interrupt` call site, gated on `InterruptKind::Block` |
 
 `op` ∈ {`read`, `write`}; `reason` ∈ {`ioerr`, `unsupp`}; `disk_id`
 is pinned at `"0"` today (one disk per L2CPU; the multi-disk
@@ -65,9 +65,9 @@ is pinned at `"0"` today (one disk per L2CPU; the multi-disk
 
 | Metric | Type | Labels | Bumped by |
 |---|---|---|---|
-| `tt_bh_net_packets_total` | counter | `idx`, `direction` | `network::process_queue_complete`: queue 0 = `rx`, queue 1 = `tx` |
-| `tt_bh_net_bytes_total` | counter | `idx`, `direction` | same site, `copy_len` |
-| `tt_bh_net_interrupts_total` | counter | `idx` | `virtio::run_device` at the `set_interrupt` site, gated on `InterruptKind::Net` |
+| `bhx_net_packets_total` | counter | `idx`, `direction` | `network::process_queue_complete`: queue 0 = `rx`, queue 1 = `tx` |
+| `bhx_net_bytes_total` | counter | `idx`, `direction` | same site, `copy_len` |
+| `bhx_net_interrupts_total` | counter | `idx` | `virtio::run_device` at the `set_interrupt` site, gated on `InterruptKind::Net` |
 
 `direction` ∈ {`rx`, `tx`}.
 
@@ -81,8 +81,8 @@ sleeping enough?" and "where is its CPU going?".
 
 | Metric | Type | Labels | Bumped by |
 |---|---|---|---|
-| `tt_bh_worker_poll_iterations_total` | counter | `worker`, `idx`, `tier` | each loop iteration, after `classify_tier` picks a bucket |
-| `tt_bh_worker_tier_seconds_total` | counter | `worker`, `idx`, `tier` | same site, by the chosen sleep duration. Stored internally as nanoseconds for cheap atomic adds; rendered as `value / 1e9` |
+| `bhx_worker_poll_iterations_total` | counter | `worker`, `idx`, `tier` | each loop iteration, after `classify_tier` picks a bucket |
+| `bhx_worker_tier_seconds_total` | counter | `worker`, `idx`, `tier` | same site, by the chosen sleep duration. Stored internally as nanoseconds for cheap atomic adds; rendered as `value / 1e9` |
 
 `worker` ∈ {`virtio_blk`, `virtio_net`, `chip_console`};
 `tier` ∈ {`fast`, `slow`, `idle`}. Tier boundaries (`FAST_WINDOW`
@@ -94,22 +94,22 @@ and 2 s today but allowed to diverge.
 A few prom-style queries operators tend to want, expressed as English:
 
 - **Is the daemon idle?** Look at
-  `tt_bh_worker_poll_iterations_total{tier="idle"}`. If it's barely
+  `bhx_worker_poll_iterations_total{tier="idle"}`. If it's barely
   moving while everything else moves, the workers are pinning a core.
   See #27.
 - **How fast is virtio-blk?** Bytes/s = derivative of
-  `tt_bh_blk_bytes_total{op="read"}` (or `op="write"`).
+  `bhx_blk_bytes_total{op="read"}` (or `op="write"`).
   Requests/s = same shape on `_requests_total`.
-- **Are there I/O errors?** `tt_bh_blk_errors_total` should stay flat
+- **Are there I/O errors?** `bhx_blk_errors_total` should stay flat
   during normal operation. Any non-zero value means the guest sent a
   request the daemon couldn't satisfy (`reason="ioerr"` = overflow;
   `reason="unsupp"` = unrecognized type).
-- **Is the chip console backed up?** `tt_bh_l2cpu_console_bytes_total{direction="g2h"}`
+- **Is the chip console backed up?** `bhx_l2cpu_console_bytes_total{direction="g2h"}`
   going up while no clients are attached
-  (`tt_bh_l2cpu_console_clients` = 0) means the daemon is pumping
+  (`bhx_l2cpu_console_clients` = 0) means the daemon is pumping
   bytes into the hub's 64 KiB scrollback ring — fine until the ring
   wraps. Operators only see the most-recent 64 KiB.
-- **Are RPCs failing?** `tt_bh_daemon_rpc_errors_total` per method.
+- **Are RPCs failing?** `bhx_daemon_rpc_errors_total` per method.
   Cross-reference against the dlog file (set with `--log-file` or
   `daemon logs`) for the actual error messages.
 

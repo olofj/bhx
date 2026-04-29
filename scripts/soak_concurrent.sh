@@ -26,7 +26,7 @@
 #
 # Env:
 #   ITERATIONS       add/remove cycles (default 5)
-#   BINARY           path to tt-bh-linux
+#   BINARY           path to bhx
 #   LOG_FILE         daemon log path
 #   CARD             tt device index (default 0)
 #   STATUS_POLL_HZ   background status-poll frequency (default 20)
@@ -34,7 +34,7 @@
 set -euo pipefail
 
 ITERATIONS=${ITERATIONS:-5}
-BINARY=${BINARY:-./target/debug/tt-bh-linux}
+BINARY=${BINARY:-./target/debug/bhx}
 LOG_FILE=${LOG_FILE:-./daemon-card0.log}
 CARD=${CARD:-0}
 STATUS_POLL_HZ=${STATUS_POLL_HZ:-20}

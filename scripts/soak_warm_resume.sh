@@ -18,7 +18,7 @@
 #
 # Env:
 #   ITERATIONS  how many stop/start cycles (default 5)
-#   BINARY      path to tt-bh-linux (default ./target/debug/tt-bh-linux)
+#   BINARY      path to bhx (default ./target/debug/bhx)
 #   LOG_FILE    daemon log path (default ./daemon-card0.log)
 #   CARD        tenstorrent device index (default 0)
 #   L2CPU       core index to exercise (default 0)
@@ -26,7 +26,7 @@
 set -euo pipefail
 
 ITERATIONS=${ITERATIONS:-5}
-BINARY=${BINARY:-./target/debug/tt-bh-linux}
+BINARY=${BINARY:-./target/debug/bhx}
 LOG_FILE=${LOG_FILE:-./daemon-card0.log}
 CARD=${CARD:-0}
 L2CPU=${L2CPU:-0}

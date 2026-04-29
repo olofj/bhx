@@ -413,7 +413,7 @@ impl Default for PerL2cpuNetDirCounter {
     }
 }
 
-/// One counter per RPC method. Drives `tt_bh_daemon_rpc_total{method}`
+/// One counter per RPC method. Drives `bhx_daemon_rpc_total{method}`
 /// and `_errors_total{method}`. Adding a new method = one field +
 /// matching arm in `RpcMethod::name`.
 pub struct RpcMethodCounter {
@@ -611,7 +611,7 @@ pub static WORKER_POLL_ITERATIONS_TOTAL: WorkerTierCounter = WorkerTierCounter::
 /// Cumulative wall time slept per tier, in nanoseconds. Internal
 /// representation is u64 nanos so the increments are integer
 /// `fetch_add` — the renderer divides by 1e9 to emit
-/// `tt_bh_worker_tier_seconds_total` as floating-point seconds (the
+/// `bhx_worker_tier_seconds_total` as floating-point seconds (the
 /// canonical Prometheus shape for time).
 pub static WORKER_TIER_NANOS_TOTAL: WorkerTierCounter = WorkerTierCounter::new();
 
@@ -634,25 +634,25 @@ pub fn render_prometheus(state: &DaemonState) -> String {
 
     write_gauge(
         &mut out,
-        "tt_bh_daemon_uptime_seconds",
+        "bhx_daemon_uptime_seconds",
         "Daemon uptime in seconds.",
         state.started.elapsed().as_secs() as i64,
     );
     write_counter(
         &mut out,
-        "tt_bh_daemon_clients_total",
+        "bhx_daemon_clients_total",
         "Cumulative count of accepted RPC client connections.",
         DAEMON_CLIENTS_TOTAL.get(),
     );
     write_gauge(
         &mut out,
-        "tt_bh_daemon_clients_active",
+        "bhx_daemon_clients_active",
         "Currently-connected RPC clients.",
         DAEMON_CLIENTS_ACTIVE.get(),
     );
     write_gauge(
         &mut out,
-        "tt_bh_daemon_sandbox_status",
+        "bhx_daemon_sandbox_status",
         "Sandbox enforcement: 0=disabled, 1=partial, 2=fully-enforced.",
         DAEMON_SANDBOX_STATUS.get(),
     );
@@ -661,13 +661,13 @@ pub fn render_prometheus(state: &DaemonState) -> String {
     // appear once at the top per Prometheus convention.
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_daemon_rpc_total Cumulative RPC count per method."
+        "# HELP bhx_daemon_rpc_total Cumulative RPC count per method."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_daemon_rpc_total counter");
+    let _ = writeln!(&mut out, "# TYPE bhx_daemon_rpc_total counter");
     for &m in RpcMethod::all() {
         let _ = writeln!(
             &mut out,
-            "tt_bh_daemon_rpc_total{{method=\"{}\"}} {}",
+            "bhx_daemon_rpc_total{{method=\"{}\"}} {}",
             m.name(),
             DAEMON_RPC_TOTAL.at(m).get()
         );
@@ -675,13 +675,13 @@ pub fn render_prometheus(state: &DaemonState) -> String {
 
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_daemon_rpc_errors_total RPC failures per method."
+        "# HELP bhx_daemon_rpc_errors_total RPC failures per method."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_daemon_rpc_errors_total counter");
+    let _ = writeln!(&mut out, "# TYPE bhx_daemon_rpc_errors_total counter");
     for &m in RpcMethod::all() {
         let _ = writeln!(
             &mut out,
-            "tt_bh_daemon_rpc_errors_total{{method=\"{}\"}} {}",
+            "bhx_daemon_rpc_errors_total{{method=\"{}\"}} {}",
             m.name(),
             DAEMON_RPC_ERRORS_TOTAL.at(m).get()
         );
@@ -691,19 +691,19 @@ pub fn render_prometheus(state: &DaemonState) -> String {
 
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_l2cpu_boot_total Boot count per L2CPU, by kind (cold|warm)."
+        "# HELP bhx_l2cpu_boot_total Boot count per L2CPU, by kind (cold|warm)."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_l2cpu_boot_total counter");
+    let _ = writeln!(&mut out, "# TYPE bhx_l2cpu_boot_total counter");
     for idx in 0..4u8 {
         let _ = writeln!(
             &mut out,
-            "tt_bh_l2cpu_boot_total{{idx=\"{}\",kind=\"cold\"}} {}",
+            "bhx_l2cpu_boot_total{{idx=\"{}\",kind=\"cold\"}} {}",
             idx,
             L2CPU_BOOT_COLD_TOTAL.at(idx).get()
         );
         let _ = writeln!(
             &mut out,
-            "tt_bh_l2cpu_boot_total{{idx=\"{}\",kind=\"warm\"}} {}",
+            "bhx_l2cpu_boot_total{{idx=\"{}\",kind=\"warm\"}} {}",
             idx,
             L2CPU_BOOT_WARM_TOTAL.at(idx).get()
         );
@@ -711,13 +711,13 @@ pub fn render_prometheus(state: &DaemonState) -> String {
 
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_l2cpu_console_clients Currently-attached console clients per L2CPU."
+        "# HELP bhx_l2cpu_console_clients Currently-attached console clients per L2CPU."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_l2cpu_console_clients gauge");
+    let _ = writeln!(&mut out, "# TYPE bhx_l2cpu_console_clients gauge");
     for idx in 0..4u8 {
         let _ = writeln!(
             &mut out,
-            "tt_bh_l2cpu_console_clients{{idx=\"{}\"}} {}",
+            "bhx_l2cpu_console_clients{{idx=\"{}\"}} {}",
             idx,
             L2CPU_CONSOLE_CLIENTS.at(idx).get()
         );
@@ -725,20 +725,20 @@ pub fn render_prometheus(state: &DaemonState) -> String {
 
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_l2cpu_console_bytes_total Chip-console byte transfers per L2CPU \
+        "# HELP bhx_l2cpu_console_bytes_total Chip-console byte transfers per L2CPU \
          per direction (g2h = guest-to-host, h2g = host-to-guest)."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_l2cpu_console_bytes_total counter");
+    let _ = writeln!(&mut out, "# TYPE bhx_l2cpu_console_bytes_total counter");
     for idx in 0..4u8 {
         let _ = writeln!(
             &mut out,
-            "tt_bh_l2cpu_console_bytes_total{{idx=\"{}\",direction=\"g2h\"}} {}",
+            "bhx_l2cpu_console_bytes_total{{idx=\"{}\",direction=\"g2h\"}} {}",
             idx,
             L2CPU_CONSOLE_BYTES_TOTAL.g2h(idx).get()
         );
         let _ = writeln!(
             &mut out,
-            "tt_bh_l2cpu_console_bytes_total{{idx=\"{}\",direction=\"h2g\"}} {}",
+            "bhx_l2cpu_console_bytes_total{{idx=\"{}\",direction=\"h2g\"}} {}",
             idx,
             L2CPU_CONSOLE_BYTES_TOTAL.h2g(idx).get()
         );
@@ -751,19 +751,19 @@ pub fn render_prometheus(state: &DaemonState) -> String {
 
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_blk_requests_total Block requests completed per L2CPU per op."
+        "# HELP bhx_blk_requests_total Block requests completed per L2CPU per op."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_blk_requests_total counter");
+    let _ = writeln!(&mut out, "# TYPE bhx_blk_requests_total counter");
     for idx in 0..4u8 {
         let _ = writeln!(
             &mut out,
-            "tt_bh_blk_requests_total{{idx=\"{}\",disk_id=\"0\",op=\"read\"}} {}",
+            "bhx_blk_requests_total{{idx=\"{}\",disk_id=\"0\",op=\"read\"}} {}",
             idx,
             BLK_REQUESTS_TOTAL.read(idx).get()
         );
         let _ = writeln!(
             &mut out,
-            "tt_bh_blk_requests_total{{idx=\"{}\",disk_id=\"0\",op=\"write\"}} {}",
+            "bhx_blk_requests_total{{idx=\"{}\",disk_id=\"0\",op=\"write\"}} {}",
             idx,
             BLK_REQUESTS_TOTAL.write(idx).get()
         );
@@ -771,19 +771,19 @@ pub fn render_prometheus(state: &DaemonState) -> String {
 
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_blk_bytes_total Block bytes transferred per L2CPU per op."
+        "# HELP bhx_blk_bytes_total Block bytes transferred per L2CPU per op."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_blk_bytes_total counter");
+    let _ = writeln!(&mut out, "# TYPE bhx_blk_bytes_total counter");
     for idx in 0..4u8 {
         let _ = writeln!(
             &mut out,
-            "tt_bh_blk_bytes_total{{idx=\"{}\",disk_id=\"0\",op=\"read\"}} {}",
+            "bhx_blk_bytes_total{{idx=\"{}\",disk_id=\"0\",op=\"read\"}} {}",
             idx,
             BLK_BYTES_TOTAL.read(idx).get()
         );
         let _ = writeln!(
             &mut out,
-            "tt_bh_blk_bytes_total{{idx=\"{}\",disk_id=\"0\",op=\"write\"}} {}",
+            "bhx_blk_bytes_total{{idx=\"{}\",disk_id=\"0\",op=\"write\"}} {}",
             idx,
             BLK_BYTES_TOTAL.write(idx).get()
         );
@@ -791,20 +791,20 @@ pub fn render_prometheus(state: &DaemonState) -> String {
 
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_blk_errors_total Block-request errors per L2CPU per reason \
+        "# HELP bhx_blk_errors_total Block-request errors per L2CPU per reason \
          (ioerr=overflowed image size, unsupp=unknown request type)."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_blk_errors_total counter");
+    let _ = writeln!(&mut out, "# TYPE bhx_blk_errors_total counter");
     for idx in 0..4u8 {
         let _ = writeln!(
             &mut out,
-            "tt_bh_blk_errors_total{{idx=\"{}\",disk_id=\"0\",reason=\"ioerr\"}} {}",
+            "bhx_blk_errors_total{{idx=\"{}\",disk_id=\"0\",reason=\"ioerr\"}} {}",
             idx,
             BLK_ERRORS_TOTAL.ioerr(idx).get()
         );
         let _ = writeln!(
             &mut out,
-            "tt_bh_blk_errors_total{{idx=\"{}\",disk_id=\"0\",reason=\"unsupp\"}} {}",
+            "bhx_blk_errors_total{{idx=\"{}\",disk_id=\"0\",reason=\"unsupp\"}} {}",
             idx,
             BLK_ERRORS_TOTAL.unsupp(idx).get()
         );
@@ -814,20 +814,20 @@ pub fn render_prometheus(state: &DaemonState) -> String {
 
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_net_packets_total Net packets per L2CPU per direction \
+        "# HELP bhx_net_packets_total Net packets per L2CPU per direction \
          (rx=slirp-to-guest, tx=guest-to-slirp)."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_net_packets_total counter");
+    let _ = writeln!(&mut out, "# TYPE bhx_net_packets_total counter");
     for idx in 0..4u8 {
         let _ = writeln!(
             &mut out,
-            "tt_bh_net_packets_total{{idx=\"{}\",direction=\"rx\"}} {}",
+            "bhx_net_packets_total{{idx=\"{}\",direction=\"rx\"}} {}",
             idx,
             NET_PACKETS_TOTAL.rx(idx).get()
         );
         let _ = writeln!(
             &mut out,
-            "tt_bh_net_packets_total{{idx=\"{}\",direction=\"tx\"}} {}",
+            "bhx_net_packets_total{{idx=\"{}\",direction=\"tx\"}} {}",
             idx,
             NET_PACKETS_TOTAL.tx(idx).get()
         );
@@ -835,19 +835,19 @@ pub fn render_prometheus(state: &DaemonState) -> String {
 
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_net_bytes_total Net bytes per L2CPU per direction."
+        "# HELP bhx_net_bytes_total Net bytes per L2CPU per direction."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_net_bytes_total counter");
+    let _ = writeln!(&mut out, "# TYPE bhx_net_bytes_total counter");
     for idx in 0..4u8 {
         let _ = writeln!(
             &mut out,
-            "tt_bh_net_bytes_total{{idx=\"{}\",direction=\"rx\"}} {}",
+            "bhx_net_bytes_total{{idx=\"{}\",direction=\"rx\"}} {}",
             idx,
             NET_BYTES_TOTAL.rx(idx).get()
         );
         let _ = writeln!(
             &mut out,
-            "tt_bh_net_bytes_total{{idx=\"{}\",direction=\"tx\"}} {}",
+            "bhx_net_bytes_total{{idx=\"{}\",direction=\"tx\"}} {}",
             idx,
             NET_BYTES_TOTAL.tx(idx).get()
         );
@@ -855,13 +855,13 @@ pub fn render_prometheus(state: &DaemonState) -> String {
 
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_blk_interrupts_total Block-device PLIC interrupts per L2CPU."
+        "# HELP bhx_blk_interrupts_total Block-device PLIC interrupts per L2CPU."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_blk_interrupts_total counter");
+    let _ = writeln!(&mut out, "# TYPE bhx_blk_interrupts_total counter");
     for idx in 0..4u8 {
         let _ = writeln!(
             &mut out,
-            "tt_bh_blk_interrupts_total{{idx=\"{}\",disk_id=\"0\"}} {}",
+            "bhx_blk_interrupts_total{{idx=\"{}\",disk_id=\"0\"}} {}",
             idx,
             BLK_INTERRUPTS_TOTAL.at(idx).get()
         );
@@ -869,13 +869,13 @@ pub fn render_prometheus(state: &DaemonState) -> String {
 
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_net_interrupts_total Net-device PLIC interrupts per L2CPU."
+        "# HELP bhx_net_interrupts_total Net-device PLIC interrupts per L2CPU."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_net_interrupts_total counter");
+    let _ = writeln!(&mut out, "# TYPE bhx_net_interrupts_total counter");
     for idx in 0..4u8 {
         let _ = writeln!(
             &mut out,
-            "tt_bh_net_interrupts_total{{idx=\"{}\"}} {}",
+            "bhx_net_interrupts_total{{idx=\"{}\"}} {}",
             idx,
             NET_INTERRUPTS_TOTAL.at(idx).get()
         );
@@ -885,19 +885,16 @@ pub fn render_prometheus(state: &DaemonState) -> String {
 
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_worker_poll_iterations_total Adaptive-sleep loop iterations \
+        "# HELP bhx_worker_poll_iterations_total Adaptive-sleep loop iterations \
          per worker per L2CPU per tier (fast=µs, slow=ms, idle=10ms — see #27)."
     );
-    let _ = writeln!(
-        &mut out,
-        "# TYPE tt_bh_worker_poll_iterations_total counter"
-    );
+    let _ = writeln!(&mut out, "# TYPE bhx_worker_poll_iterations_total counter");
     for &w in WorkerKind::all() {
         for idx in 0..4u8 {
             for &t in Tier::all() {
                 let _ = writeln!(
                     &mut out,
-                    "tt_bh_worker_poll_iterations_total{{worker=\"{}\",idx=\"{}\",tier=\"{}\"}} {}",
+                    "bhx_worker_poll_iterations_total{{worker=\"{}\",idx=\"{}\",tier=\"{}\"}} {}",
                     w.name(),
                     idx,
                     t.name(),
@@ -909,10 +906,10 @@ pub fn render_prometheus(state: &DaemonState) -> String {
 
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_worker_tier_seconds_total Cumulative seconds spent sleeping \
+        "# HELP bhx_worker_tier_seconds_total Cumulative seconds spent sleeping \
          in each tier per worker per L2CPU."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_worker_tier_seconds_total counter");
+    let _ = writeln!(&mut out, "# TYPE bhx_worker_tier_seconds_total counter");
     for &w in WorkerKind::all() {
         for idx in 0..4u8 {
             for &t in Tier::all() {
@@ -922,7 +919,7 @@ pub fn render_prometheus(state: &DaemonState) -> String {
                 let secs = nanos as f64 / 1_000_000_000.0;
                 let _ = writeln!(
                     &mut out,
-                    "tt_bh_worker_tier_seconds_total{{worker=\"{}\",idx=\"{}\",tier=\"{}\"}} {}",
+                    "bhx_worker_tier_seconds_total{{worker=\"{}\",idx=\"{}\",tier=\"{}\"}} {}",
                     w.name(),
                     idx,
                     t.name(),
@@ -936,38 +933,38 @@ pub fn render_prometheus(state: &DaemonState) -> String {
     // mutexes once to read every slot's snapshot.
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_l2cpu_uptime_seconds Seconds since slot installation. \
+        "# HELP bhx_l2cpu_uptime_seconds Seconds since slot installation. \
          Absent for L2CPUs without an installed slot."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_l2cpu_uptime_seconds gauge");
+    let _ = writeln!(&mut out, "# TYPE bhx_l2cpu_uptime_seconds gauge");
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_l2cpu_disks Attached disk-worker count per L2CPU."
+        "# HELP bhx_l2cpu_disks Attached disk-worker count per L2CPU."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_l2cpu_disks gauge");
+    let _ = writeln!(&mut out, "# TYPE bhx_l2cpu_disks gauge");
     let _ = writeln!(
         &mut out,
-        "# HELP tt_bh_l2cpu_net Net-worker presence per L2CPU (0 or 1)."
+        "# HELP bhx_l2cpu_net Net-worker presence per L2CPU (0 or 1)."
     );
-    let _ = writeln!(&mut out, "# TYPE tt_bh_l2cpu_net gauge");
+    let _ = writeln!(&mut out, "# TYPE bhx_l2cpu_net gauge");
     for idx in 0..4u8 {
         let g = state.l2cpus[idx as usize].lock().unwrap();
         if let Some(slot) = g.as_ref() {
             let uptime = slot.started.elapsed().as_secs() as i64;
             let _ = writeln!(
                 &mut out,
-                "tt_bh_l2cpu_uptime_seconds{{idx=\"{}\"}} {}",
+                "bhx_l2cpu_uptime_seconds{{idx=\"{}\"}} {}",
                 idx, uptime
             );
             let _ = writeln!(
                 &mut out,
-                "tt_bh_l2cpu_disks{{idx=\"{}\"}} {}",
+                "bhx_l2cpu_disks{{idx=\"{}\"}} {}",
                 idx,
                 slot.disks.len()
             );
             let _ = writeln!(
                 &mut out,
-                "tt_bh_l2cpu_net{{idx=\"{}\"}} {}",
+                "bhx_l2cpu_net{{idx=\"{}\"}} {}",
                 idx,
                 slot.net.is_some() as u8
             );
@@ -976,8 +973,8 @@ pub fn render_prometheus(state: &DaemonState) -> String {
             // without an "is the slot installed?" lookup. Skip uptime
             // — emitting 0 would alias to "just-installed" which is
             // misleading in a tail of recently-stopped slots.
-            let _ = writeln!(&mut out, "tt_bh_l2cpu_disks{{idx=\"{}\"}} 0", idx);
-            let _ = writeln!(&mut out, "tt_bh_l2cpu_net{{idx=\"{}\"}} 0", idx);
+            let _ = writeln!(&mut out, "bhx_l2cpu_disks{{idx=\"{}\"}} 0", idx);
+            let _ = writeln!(&mut out, "bhx_l2cpu_net{{idx=\"{}\"}} 0", idx);
         }
     }
 
@@ -1286,45 +1283,45 @@ mod tests {
 
         // Daemon-global.
         for needle in [
-            "# HELP tt_bh_daemon_uptime_seconds",
-            "# TYPE tt_bh_daemon_uptime_seconds gauge",
-            "\ntt_bh_daemon_uptime_seconds ",
-            "# HELP tt_bh_daemon_clients_total",
-            "# TYPE tt_bh_daemon_clients_total counter",
-            "# HELP tt_bh_daemon_clients_active",
-            "# TYPE tt_bh_daemon_clients_active gauge",
-            "# HELP tt_bh_daemon_sandbox_status",
-            "# TYPE tt_bh_daemon_sandbox_status gauge",
-            "# HELP tt_bh_daemon_rpc_total",
-            "# TYPE tt_bh_daemon_rpc_total counter",
-            "tt_bh_daemon_rpc_total{method=\"boot\"} ",
-            "tt_bh_daemon_rpc_total{method=\"add_disk\"} ",
-            "tt_bh_daemon_rpc_errors_total{method=\"boot\"} ",
+            "# HELP bhx_daemon_uptime_seconds",
+            "# TYPE bhx_daemon_uptime_seconds gauge",
+            "\nbhx_daemon_uptime_seconds ",
+            "# HELP bhx_daemon_clients_total",
+            "# TYPE bhx_daemon_clients_total counter",
+            "# HELP bhx_daemon_clients_active",
+            "# TYPE bhx_daemon_clients_active gauge",
+            "# HELP bhx_daemon_sandbox_status",
+            "# TYPE bhx_daemon_sandbox_status gauge",
+            "# HELP bhx_daemon_rpc_total",
+            "# TYPE bhx_daemon_rpc_total counter",
+            "bhx_daemon_rpc_total{method=\"boot\"} ",
+            "bhx_daemon_rpc_total{method=\"add_disk\"} ",
+            "bhx_daemon_rpc_errors_total{method=\"boot\"} ",
             // Per-L2CPU (every idx 0..3 should appear).
-            "tt_bh_l2cpu_boot_total{idx=\"0\",kind=\"cold\"} ",
-            "tt_bh_l2cpu_boot_total{idx=\"3\",kind=\"warm\"} ",
-            "tt_bh_l2cpu_console_clients{idx=\"2\"} ",
-            "tt_bh_l2cpu_console_bytes_total{idx=\"0\",direction=\"g2h\"} ",
-            "tt_bh_l2cpu_console_bytes_total{idx=\"3\",direction=\"h2g\"} ",
-            "tt_bh_l2cpu_disks{idx=\"0\"} ",
-            "tt_bh_l2cpu_net{idx=\"3\"} ",
+            "bhx_l2cpu_boot_total{idx=\"0\",kind=\"cold\"} ",
+            "bhx_l2cpu_boot_total{idx=\"3\",kind=\"warm\"} ",
+            "bhx_l2cpu_console_clients{idx=\"2\"} ",
+            "bhx_l2cpu_console_bytes_total{idx=\"0\",direction=\"g2h\"} ",
+            "bhx_l2cpu_console_bytes_total{idx=\"3\",direction=\"h2g\"} ",
+            "bhx_l2cpu_disks{idx=\"0\"} ",
+            "bhx_l2cpu_net{idx=\"3\"} ",
             // Per virtio-block (disk_id pinned at 0 in Phase A).
-            "tt_bh_blk_requests_total{idx=\"0\",disk_id=\"0\",op=\"read\"} ",
-            "tt_bh_blk_requests_total{idx=\"2\",disk_id=\"0\",op=\"write\"} ",
-            "tt_bh_blk_bytes_total{idx=\"3\",disk_id=\"0\",op=\"read\"} ",
-            "tt_bh_blk_errors_total{idx=\"0\",disk_id=\"0\",reason=\"ioerr\"} ",
-            "tt_bh_blk_errors_total{idx=\"1\",disk_id=\"0\",reason=\"unsupp\"} ",
+            "bhx_blk_requests_total{idx=\"0\",disk_id=\"0\",op=\"read\"} ",
+            "bhx_blk_requests_total{idx=\"2\",disk_id=\"0\",op=\"write\"} ",
+            "bhx_blk_bytes_total{idx=\"3\",disk_id=\"0\",op=\"read\"} ",
+            "bhx_blk_errors_total{idx=\"0\",disk_id=\"0\",reason=\"ioerr\"} ",
+            "bhx_blk_errors_total{idx=\"1\",disk_id=\"0\",reason=\"unsupp\"} ",
             // Per virtio-net.
-            "tt_bh_net_packets_total{idx=\"0\",direction=\"rx\"} ",
-            "tt_bh_net_packets_total{idx=\"3\",direction=\"tx\"} ",
-            "tt_bh_net_bytes_total{idx=\"2\",direction=\"rx\"} ",
-            "tt_bh_blk_interrupts_total{idx=\"0\",disk_id=\"0\"} ",
-            "tt_bh_net_interrupts_total{idx=\"3\"} ",
+            "bhx_net_packets_total{idx=\"0\",direction=\"rx\"} ",
+            "bhx_net_packets_total{idx=\"3\",direction=\"tx\"} ",
+            "bhx_net_bytes_total{idx=\"2\",direction=\"rx\"} ",
+            "bhx_blk_interrupts_total{idx=\"0\",disk_id=\"0\"} ",
+            "bhx_net_interrupts_total{idx=\"3\"} ",
             // Worker poll-tier (every (worker, idx, tier) combination
             // gets a line; spot-check a representative subset).
-            "tt_bh_worker_poll_iterations_total{worker=\"virtio_blk\",idx=\"0\",tier=\"fast\"} ",
-            "tt_bh_worker_poll_iterations_total{worker=\"chip_console\",idx=\"3\",tier=\"idle\"} ",
-            "tt_bh_worker_tier_seconds_total{worker=\"virtio_net\",idx=\"2\",tier=\"slow\"} ",
+            "bhx_worker_poll_iterations_total{worker=\"virtio_blk\",idx=\"0\",tier=\"fast\"} ",
+            "bhx_worker_poll_iterations_total{worker=\"chip_console\",idx=\"3\",tier=\"idle\"} ",
+            "bhx_worker_tier_seconds_total{worker=\"virtio_net\",idx=\"2\",tier=\"slow\"} ",
         ] {
             assert!(
                 out.contains(needle),
@@ -1559,8 +1556,8 @@ mod tests {
         let (code, body) = request("/metrics");
         assert_eq!(code, 200, "got status {code}; body:\n{body}");
         assert!(
-            body.contains("\r\n\r\ntt_bh_daemon_uptime_seconds")
-                || body.contains("\r\n\r\n# HELP tt_bh_daemon_uptime_seconds"),
+            body.contains("\r\n\r\nbhx_daemon_uptime_seconds")
+                || body.contains("\r\n\r\n# HELP bhx_daemon_uptime_seconds"),
             "metrics body missing daemon uptime line; body:\n{body}"
         );
         // Content-Type matches the Prometheus text-format spec.

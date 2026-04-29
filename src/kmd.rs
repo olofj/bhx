@@ -291,7 +291,7 @@ pub fn reset_device(fd: RawFd, flags: u32) -> std::io::Result<()> {
 /// difference shows up as a 1.7× slower poll loop.
 ///
 /// We deliberately don't request `MRISC_PHY_WAKEUP` — MRISC manages
-/// GDDR PHY, which `tt-bh-linux` doesn't use (L2CPU runs out of host-
+/// GDDR PHY, which `bhx` doesn't use (L2CPU runs out of host-
 /// allocated DRAM and Tensix uses its own L1).
 ///
 /// Best-effort: if the kmd is older than 2.6 it doesn't know this

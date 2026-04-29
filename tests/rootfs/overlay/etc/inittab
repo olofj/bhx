@@ -1,4 +1,4 @@
-# /etc/inittab — tt-bh-linux test rootfs (overlay copy)
+# /etc/inittab — bhx test rootfs (overlay copy)
 #
 # Differs from the busybox default in two ways:
 #  1. We auto-login as root on hvc0 (the OpenSBI virt-UART). The

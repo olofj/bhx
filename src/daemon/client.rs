@@ -21,7 +21,7 @@ pub fn connect(card: u32) -> io::Result<UnixStream> {
     UnixStream::connect(&sock).map_err(|e| {
         crate::Error::Io {
             ctx: format!(
-                "no daemon socket at {}. Start one with: tt-bh-linux daemon start --card {}",
+                "no daemon socket at {}. Start one with: bhx daemon start --card {}",
                 sock.display(),
                 card
             ),

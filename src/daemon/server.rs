@@ -369,8 +369,8 @@ std::thread_local! {
 }
 
 /// Map a wire-format `Request` to its metrics-friendly `RpcMethod` tag.
-/// Drives `tt_bh_daemon_rpc_total{method}`. Per-method failures live
-/// on `tt_bh_daemon_rpc_errors_total` and are tracked via the
+/// Drives `bhx_daemon_rpc_total{method}`. Per-method failures live
+/// on `bhx_daemon_rpc_errors_total` and are tracked via the
 /// `RPC_FAILED` thread-local — `reply_err` flips it, `handle_client`
 /// reads it after the dispatch returns.
 fn classify_request(req: &Request) -> crate::daemon::metrics::RpcMethod {
@@ -401,7 +401,7 @@ fn reply_ok(mut sock: &UnixStream) {
 /// through as-is — wire format is identical to the pre-#21 shape.
 ///
 /// Also flips the `RPC_FAILED` thread-local so `handle_client` knows
-/// to bump `tt_bh_daemon_rpc_errors_total{method}` on the way out.
+/// to bump `bhx_daemon_rpc_errors_total{method}` on the way out.
 fn reply_err(mut sock: &UnixStream, e: crate::Error) {
     RPC_FAILED.with(|f| f.set(true));
     let wire_msg = match &e {

@@ -1,8 +1,8 @@
-# tt-bh-linux U-Boot
+# bhx U-Boot
 
 A pinned U-Boot build that runs as the S-mode payload after OpenSBI on a
 booted Blackhole L2CPU. Replaces the raw Linux `Image` payload in the
-`tt-bh-linux boot` chain so stock distro images (multi-partition disks
+`bhx boot` chain so stock distro images (multi-partition disks
 with EFI shim + grub + kernel + initramfs) can boot end-to-end.
 
 The umbrella for the U-Boot integration is **#44**; this build feeds
@@ -13,7 +13,7 @@ target, not the binary.
 ## Build
 
 ```bash
-cd uboot                 # from the tt-bh-linux-rs project root
+cd uboot                 # from the bhx project root
 make check-deps          # verifies wget, tar, riscv64-linux-gnu-gcc, bison, flex
 make                     # downloads u-boot-2026.04.tar.bz2, builds u-boot.bin
 ```
@@ -26,10 +26,10 @@ Output: `u-boot.bin` (symlink to the actual file in the source tree).
 ## Use
 
 ```bash
-cd ..    # back to tt-bh-linux-rs/
-./target/debug/tt-bh-linux daemon start -t 0 --log-file ./daemon-card0.log
-./target/debug/tt-bh-linux boot -l 0 --uboot uboot/u-boot.bin
-./target/debug/tt-bh-linux connect -l 0
+cd ..    # back to bhx/
+./target/debug/bhx daemon start -t 0 --log-file ./daemon-card0.log
+./target/debug/bhx boot -l 0 --uboot uboot/u-boot.bin
+./target/debug/bhx connect -l 0
 ```
 
 When the boot subcommand is called without `--uboot` against a disk
@@ -48,7 +48,7 @@ The defconfig is a two-step layer:
 1. **Upstream's `qemu-riscv64_smode_defconfig`** as the base. This is
    the canonical S-mode-after-OpenSBI config: virtio-mmio + virtio-blk
    for disk, EFI loader for bootefi, bootstd for autoboot discovery.
-2. **`tt-bh.config`** (in this directory) as a delta that turns on the
+2. **`bhx.config`** (in this directory) as a delta that turns on the
    SBI debug-console driver (so U-Boot console output reaches our
    `chip_console::uart_pass` worker via OpenSBI ecalls) and pins a few
    bootflow knobs.
@@ -85,7 +85,7 @@ make distclean && make && sha256sum u-boot.bin   # must match
 uboot/
 ├── README.md           (this file)
 ├── Makefile            download + build
-├── tt-bh.config        defconfig fragment merged on top of qemu-riscv64_smode_defconfig
+├── bhx.config        defconfig fragment merged on top of qemu-riscv64_smode_defconfig
 ├── sha256sums          pinned tarball checksum
 ├── dl/                 (gitignored) download cache
 ├── u-boot-2026.04/     (gitignored) extracted source tree

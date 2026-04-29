@@ -1,6 +1,6 @@
 /target/
 
-# Downloaded firmware + kernel artifacts (tt-bh-linux kernel pull / manual copy).
+# Downloaded firmware + kernel artifacts (bhx kernel pull / manual copy).
 /Image
 /fw_jump.bin
 /blackhole-card.dtb
