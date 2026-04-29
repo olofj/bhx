@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Olof Johansson
+# SPDX-License-Identifier: MIT
+
 """
 Shared helpers for the bench/* scripts.
 

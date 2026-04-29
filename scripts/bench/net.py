@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: © 2026 Olof Johansson
+# SPDX-License-Identifier: MIT
+
 """
 Network benchmark — drive `iperf3` between host and guest, capture
 TCP throughput in both directions.

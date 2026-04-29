@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: © 2026 Olof Johansson
+# SPDX-License-Identifier: MIT
+
 # Hardware smoke for the M1+M2+M3 Tensix-engine work (#66 sub-issues
 # #67 #68 #69). Drives the existing debug subcommands and asserts on
 # their output. Resets the card before and after to avoid leaving the

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: © 2026 Olof Johansson
+# SPDX-License-Identifier: MIT
+
 """
 Stress-test `remove-disk` against a guest running real disk I/O via
 `fio`. Complements `soak_disk_io_pressure.sh`, which relies on

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: © 2026 Olof Johansson
+# SPDX-License-Identifier: MIT
+
 """
 Disk benchmark — drive `fio` inside the guest with three job profiles
 and capture bandwidth + IOPS + p99 latency from fio's terse output.

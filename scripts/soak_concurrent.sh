@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: © 2026 Olof Johansson
+# SPDX-License-Identifier: MIT
+
 #
 # Stress-test the daemon under concurrent RPCs hitting sibling L2CPUs.
 # Closes the "concurrent RPCs on sibling L2CPUs" gap in the README.

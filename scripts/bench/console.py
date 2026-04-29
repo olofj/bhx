@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: © 2026 Olof Johansson
+# SPDX-License-Identifier: MIT
+
 """
 Console benchmark — measure the chip-side virtual UART throughput
 and roundtrip latency.

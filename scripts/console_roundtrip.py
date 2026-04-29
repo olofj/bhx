@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: © 2026 Olof Johansson
+# SPDX-License-Identifier: MIT
+
 """
 End-to-end virtual-UART console I/O stress test via the daemon-mediated
 `connect` RPC. Drives everything through the console — no SSH required.

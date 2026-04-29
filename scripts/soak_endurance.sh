@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: © 2026 Olof Johansson
+# SPDX-License-Identifier: MIT
+
 #
 # Long-running endurance soak. The other soak_*.sh scripts catch
 # correctness regressions in 5 iterations / ~2 minutes; this one

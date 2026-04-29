@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: © 2026 Olof Johansson
+# SPDX-License-Identifier: MIT
+
 #
 # Stress-test the dynamic add/remove-disk and add/remove-net RPCs.
 #

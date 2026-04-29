@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: © 2026 Olof Johansson
+# SPDX-License-Identifier: MIT
+
 # Drive every benchmark in this directory, combine the per-bench
 # CSVs into one timestamped run.csv, and (optionally) compare the
 # new run against a baseline — exit nonzero on a >10% regression.

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: © 2026 Olof Johansson
+# SPDX-License-Identifier: MIT
+
 #
 # Capture a CPU profile of the daemon for a fixed duration. Lets us
 # answer "what's burning the idle 6%?" or "where is the disk path
