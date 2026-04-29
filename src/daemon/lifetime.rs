@@ -114,7 +114,8 @@ impl Drop for PidfileGuard {
 /// the kind carries semantic meaning here: `runner::start` matches on
 /// `AlreadyExists` to attach the running pid to its user-facing error
 /// message. This is the *only* place in the crate that uses a non-`Other`
-/// `ErrorKind` deliberately; everywhere else uses `io::Error::other`.
+/// `ErrorKind` deliberately; everywhere else routes through
+/// `crate::Error` (and the `From<crate::Error> for io::Error` bridge).
 pub fn acquire_pidfile(card: u32) -> io::Result<PidfileGuard> {
     ensure_runtime_dir(card)?;
     let path = pidfile_path(card);
@@ -198,7 +199,9 @@ pub fn stop(card: u32) -> io::Result<()> {
     }
     let pid = match read_pid(card)? {
         Some(p) => p,
-        None => return Err(io::Error::other("daemon is running but pidfile is empty")),
+        None => {
+            return Err(crate::Error::internal("daemon is running but pidfile is empty").into())
+        }
     };
     let pid_i = pid as i32;
     unsafe { libc::kill(pid_i, libc::SIGTERM) };

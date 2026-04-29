@@ -121,7 +121,7 @@ fn acquire_pidfile_or_already_running(
     lifetime::acquire_pidfile(card).map_err(|e| {
         if e.kind() == io::ErrorKind::AlreadyExists {
             let existing = lifetime::read_pid(card).ok().flatten();
-            io::Error::other(format!(
+            crate::Error::slot_state(format!(
                 "daemon already running for card {}{} (sock: {})",
                 card,
                 existing
@@ -129,6 +129,7 @@ fn acquire_pidfile_or_already_running(
                     .unwrap_or_default(),
                 sock_path.display()
             ))
+            .into()
         } else {
             e
         }
@@ -306,10 +307,7 @@ fn resolve_log_path(card: u32) -> PathBuf {
 pub fn logs(opts: LogsOpts) -> io::Result<()> {
     let path: PathBuf = resolve_log_path(opts.card);
     if !path.exists() {
-        return Err(io::Error::other(format!(
-            "no log file at {}",
-            path.display()
-        )));
+        return Err(crate::Error::bad_request(format!("no log file at {}", path.display())).into());
     }
     // Print last `lines` lines.
     let mut file = std::fs::File::open(&path)?;

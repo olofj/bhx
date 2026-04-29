@@ -277,14 +277,16 @@ impl VirtioNet {
         let slirp = unsafe { vdeslirp_open(&mut cfg) };
         if slirp.is_null() {
             let err = std::io::Error::last_os_error();
-            return Err(std::io::Error::other(format!(
-                "vdeslirp_open returned NULL (errno: {}). \
+            return Err(crate::Error::Io {
+                ctx: "vdeslirp_open returned NULL. \
                  Likely causes: (1) file descriptor limit reached — check `ulimit -n`; \
                  (2) thread or socketpair creation blocked by a seccomp/container policy; \
                  (3) libvdeslirp/libslirp ABI mismatch — this build expects libvdeslirp \
-                 0.1.x linked against libslirp 4.x (check `pkg-config --modversion vdeslirp libslirp`)",
-                err
-            )));
+                 0.1.x linked against libslirp 4.x (check `pkg-config --modversion vdeslirp libslirp`)"
+                    .into(),
+                source: err,
+            }
+            .into());
         }
 
         let host = InAddr::from_str("127.0.0.1");

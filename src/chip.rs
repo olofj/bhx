@@ -59,8 +59,12 @@ pub fn reset_board(card: u32) -> std::io::Result<()> {
     let mut iters = 0u32;
     loop {
         use std::io::{Read, Seek, SeekFrom};
-        let mut f = std::fs::File::open(&config_path)
-            .map_err(|e| std::io::Error::other(format!("open {}: {}", config_path, e)))?;
+        let mut f = std::fs::File::open(&config_path).map_err(|e| {
+            std::io::Error::from(crate::Error::Io {
+                ctx: format!("open {}", config_path),
+                source: e,
+            })
+        })?;
         f.seek(SeekFrom::Start(4))?;
         let mut byte = [0u8; 1];
         f.read_exact(&mut byte)?;

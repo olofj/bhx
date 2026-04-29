@@ -271,10 +271,11 @@ pub fn reset_device(fd: RawFd, flags: u32) -> std::io::Result<()> {
             .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
     }
     if req.output.result != 0 {
-        return Err(std::io::Error::other(format!(
+        return Err(crate::Error::internal(format!(
             "RESET_DEVICE ioctl reported result={}",
             req.output.result
-        )));
+        ))
+        .into());
     }
     Ok(())
 }

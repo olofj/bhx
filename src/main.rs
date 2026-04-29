@@ -644,10 +644,11 @@ fn parse_console_mode(s: &str) -> std::io::Result<daemon::protocol::ConsoleMode>
         "ro" => Ok(daemon::protocol::ConsoleMode::Ro),
         "rw" => Ok(daemon::protocol::ConsoleMode::Rw),
         "takeover" => Ok(daemon::protocol::ConsoleMode::Takeover),
-        other => Err(std::io::Error::other(format!(
+        other => Err(crate::Error::bad_request(format!(
             "invalid --mode {}; expected ro|rw|takeover",
             other
-        ))),
+        ))
+        .into()),
     }
 }
 
@@ -656,19 +657,29 @@ fn parse_console_mode(s: &str) -> std::io::Result<daemon::protocol::ConsoleMode>
 /// halves all error out cleanly.
 fn parse_fwd_pair(s: &str) -> std::io::Result<(u16, u16)> {
     let (h, g) = s.split_once(':').ok_or_else(|| {
-        std::io::Error::other(format!("invalid --fwd {:?}; expected HOST:GUEST", s))
+        std::io::Error::from(crate::Error::bad_request(format!(
+            "invalid --fwd {:?}; expected HOST:GUEST",
+            s
+        )))
     })?;
-    let host: u16 = h
-        .parse()
-        .map_err(|_| std::io::Error::other(format!("invalid --fwd HOST {:?}", h)))?;
-    let guest: u16 = g
-        .parse()
-        .map_err(|_| std::io::Error::other(format!("invalid --fwd GUEST {:?}", g)))?;
+    let host: u16 = h.parse().map_err(|_| {
+        std::io::Error::from(crate::Error::bad_request(format!(
+            "invalid --fwd HOST {:?}",
+            h
+        )))
+    })?;
+    let guest: u16 = g.parse().map_err(|_| {
+        std::io::Error::from(crate::Error::bad_request(format!(
+            "invalid --fwd GUEST {:?}",
+            g
+        )))
+    })?;
     if host == 0 || guest == 0 {
-        return Err(std::io::Error::other(format!(
+        return Err(crate::Error::bad_request(format!(
             "invalid --fwd {:?}; ports must be 1..=65535",
             s
-        )));
+        ))
+        .into());
     }
     Ok((host, guest))
 }
@@ -732,9 +743,12 @@ fn absolutize(path: &str) -> std::io::Result<String> {
     let p = std::path::Path::new(path);
     let abs = std::fs::canonicalize(p)
         .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {}", path, e)))?;
-    abs.into_os_string()
-        .into_string()
-        .map_err(|_| std::io::Error::other(format!("non-UTF-8 path: {}", path)))
+    abs.into_os_string().into_string().map_err(|_| {
+        std::io::Error::from(crate::Error::bad_request(format!(
+            "non-UTF-8 path: {}",
+            path
+        )))
+    })
 }
 
 fn run_connect_client(
@@ -770,11 +784,12 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
     // drives reset). It belongs in the writes-chip set below.
     let _ = DebugAction::TensixEngine;
     if daemon_up && writes_chip {
-        return Err(std::io::Error::other(format!(
+        return Err(crate::Error::slot_state(format!(
             "daemon is running for card {} — refusing to write chip state from outside the daemon \
              (stop the daemon first with `tt-bh-linux daemon stop`, then retry)",
             card
-        )));
+        ))
+        .into());
     }
     if daemon_up {
         eprintln!(
@@ -783,8 +798,12 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
         );
     }
 
-    let chip = shared_chip::SharedChip::new(card)
-        .map_err(|e| std::io::Error::other(format!("open /dev/tenstorrent/{}: {}", card, e)))?;
+    let chip = shared_chip::SharedChip::new(card).map_err(|e| {
+        std::io::Error::from(crate::Error::Io {
+            ctx: format!("open /dev/tenstorrent/{}", card),
+            source: e,
+        })
+    })?;
     match action {
         DebugAction::ReadResetReg => {
             let reg = 0x80030014u64;
@@ -798,7 +817,7 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
         }
         DebugAction::ResetX280 => {
             if l2cpu > 3 {
-                return Err(std::io::Error::other("l2cpu must be 0..3"));
+                return Err(crate::Error::bad_request("l2cpu must be 0..3").into());
             }
             eprintln!(
                 "[debug] invoking SharedChip::reset_x280 on L2CPU {} (PLL step + OR-in bit {})",
@@ -905,11 +924,12 @@ fn run_tensix_engine(card: u32, chip: &shared_chip::SharedChip) -> std::io::Resu
         );
     } else {
         poller.shutdown();
-        return Err(std::io::Error::other(format!(
+        return Err(crate::Error::internal(format!(
             "kick poller did not consume our synthetic kick within 100 ms \
              (kicks_consumed stayed at {})",
             before
-        )));
+        ))
+        .into());
     }
 
     // M6.1 (#79) Phase A/B verification: the active-slots bitmap drives
@@ -925,11 +945,12 @@ fn run_tensix_engine(card: u32, chip: &shared_chip::SharedChip) -> std::io::Resu
     let hb_quiet2 = engine.trisc0_heartbeat();
     if hb_quiet != hb_quiet2 {
         poller.shutdown();
-        return Err(std::io::Error::other(format!(
+        return Err(crate::Error::internal(format!(
             "TRISC0 heartbeat advanced ({} → {}) while UART bits clear; \
              BRISC isn't holding TRISC0 in reset",
             hb_quiet, hb_quiet2
-        )));
+        ))
+        .into());
     }
     eprintln!(
         "[tensix-engine]   TRISC0 heartbeat held at {} (in reset)",
@@ -944,11 +965,12 @@ fn run_tensix_engine(card: u32, chip: &shared_chip::SharedChip) -> std::io::Resu
     let hb_running2 = engine.trisc0_heartbeat();
     if hb_running2 <= hb_running {
         poller.shutdown();
-        return Err(std::io::Error::other(format!(
+        return Err(crate::Error::internal(format!(
             "TRISC0 heartbeat did not advance after setting UART bit 16 \
              ({} → {}); release path not working",
             hb_running, hb_running2
-        )));
+        ))
+        .into());
     }
     eprintln!(
         "[tensix-engine]   TRISC0 heartbeat advanced {} → {} after UART register",
@@ -963,11 +985,12 @@ fn run_tensix_engine(card: u32, chip: &shared_chip::SharedChip) -> std::io::Resu
     let hb_after_unreg2 = engine.trisc0_heartbeat();
     if hb_after_unreg != hb_after_unreg2 {
         poller.shutdown();
-        return Err(std::io::Error::other(format!(
+        return Err(crate::Error::internal(format!(
             "TRISC0 heartbeat still advancing after clearing UART bit 16 \
              ({} → {}); re-assert path not working",
             hb_after_unreg, hb_after_unreg2
-        )));
+        ))
+        .into());
     }
     eprintln!(
         "[tensix-engine]   TRISC0 heartbeat froze at {} after UART unregister — TRISC0 LIFECYCLE PASS",
@@ -1011,10 +1034,11 @@ fn run_uart_loopback(
     use std::time::Duration;
 
     if l2cpu_idx >= 4 {
-        return Err(std::io::Error::other(format!(
+        return Err(crate::Error::bad_request(format!(
             "uart-loopback: l2cpu must be 0..3 (got {})",
             l2cpu_idx
-        )));
+        ))
+        .into());
     }
 
     eprintln!("[uart-loopback] bringing up engine…");
@@ -1037,10 +1061,11 @@ fn run_uart_loopback(
     std::thread::sleep(Duration::from_millis(10));
     let hb1 = engine.trisc0_heartbeat();
     if hb1 <= hb0 {
-        return Err(std::io::Error::other(format!(
+        return Err(crate::Error::internal(format!(
             "TRISC0 heartbeat not advancing ({} → {}); refusing to send",
             hb0, hb1
-        )));
+        ))
+        .into());
     }
     eprintln!("[uart-loopback] TRISC0 alive (heartbeat {} → {})", hb0, hb1);
 
@@ -1190,10 +1215,11 @@ fn resolve_tensix_coords(
     if let (Some(x), Some(y)) = (x, y) {
         return Ok((x, y));
     }
-    let telem = telemetry::read_telemetry(chip)
-        .map_err(|e| std::io::Error::other(format!("read telemetry: {}", e)))?;
+    let telem = telemetry::read_telemetry(chip).map_err(|e| {
+        std::io::Error::from(crate::Error::internal(format!("read telemetry: {}", e)))
+    })?;
     let picked = tensix_tile::pick_virtio_engine_tile(&telem)
-        .map_err(|e| std::io::Error::other(format!("pick tile: {}", e)))?;
+        .map_err(|e| std::io::Error::from(crate::Error::internal(format!("pick tile: {}", e))))?;
     eprintln!(
         "[tensix-hello] picker chose ({}, {}) [{:?}]",
         picked.x, picked.y, picked.reason
@@ -1208,8 +1234,9 @@ fn run_telemetry_dump(chip: &shared_chip::SharedChip, all_tags: bool) -> std::io
         telemetry::ARC_TELEMETRY_PTR_ADDR,
         table_addr
     );
-    let telem = telemetry::read_telemetry(chip)
-        .map_err(|e| std::io::Error::other(format!("read telemetry: {}", e)))?;
+    let telem = telemetry::read_telemetry(chip).map_err(|e| {
+        std::io::Error::from(crate::Error::internal(format!("read telemetry: {}", e)))
+    })?;
     println!(
         "telemetry: version={:#010x} entry_count={}",
         telem.version, telem.entry_count
@@ -1268,10 +1295,11 @@ fn run_telemetry_dump(chip: &shared_chip::SharedChip, all_tags: bool) -> std::io
 }
 
 fn run_pick_tile(chip: &shared_chip::SharedChip) -> std::io::Result<()> {
-    let telem = telemetry::read_telemetry(chip)
-        .map_err(|e| std::io::Error::other(format!("read telemetry: {}", e)))?;
+    let telem = telemetry::read_telemetry(chip).map_err(|e| {
+        std::io::Error::from(crate::Error::internal(format!("read telemetry: {}", e)))
+    })?;
     let picked = tensix_tile::pick_virtio_engine_tile(&telem)
-        .map_err(|e| std::io::Error::other(format!("pick tile: {}", e)))?;
+        .map_err(|e| std::io::Error::from(crate::Error::internal(format!("pick tile: {}", e))))?;
     println!("{} {} ({:?})", picked.x, picked.y, picked.reason);
     Ok(())
 }
@@ -1290,8 +1318,12 @@ fn run_tensix_hello(card: u32, x: u16, y: u16, duration: u32) -> std::io::Result
         HELLO_FIRMWARE.len()
     );
 
-    let tile = TensixTile::new(card, x, y)
-        .map_err(|e| std::io::Error::other(format!("open tile ({}, {}): {}", x, y, e)))?;
+    let tile = TensixTile::new(card, x, y).map_err(|e| {
+        std::io::Error::from(crate::Error::Io {
+            ctx: format!("open tile ({}, {})", x, y),
+            source: e,
+        })
+    })?;
 
     let prior_reset = tile.read_soft_reset();
     eprintln!(
@@ -1366,10 +1398,11 @@ fn run_tensix_hello(card: u32, x: u16, y: u16, duration: u32) -> std::io::Result
         );
         Ok(())
     } else {
-        Err(std::io::Error::other(format!(
+        Err(crate::Error::internal(format!(
             "FAIL: magic_observed={}, counter_advanced={} after {:.1?}",
             magic_observed, counter_advanced, elapsed
-        )))
+        ))
+        .into())
     }
 }
 
@@ -1391,8 +1424,12 @@ fn run_tensix_virtio(card: u32, x: u16, y: u16) -> std::io::Result<()> {
         ve::VIRTIO_FIRMWARE.len()
     );
 
-    let tile = TensixTile::new(card, x, y)
-        .map_err(|e| std::io::Error::other(format!("open tile ({}, {}): {}", x, y, e)))?;
+    let tile = TensixTile::new(card, x, y).map_err(|e| {
+        std::io::Error::from(crate::Error::Io {
+            ctx: format!("open tile ({}, {})", x, y),
+            source: e,
+        })
+    })?;
 
     eprintln!("[tensix-virtio] asserting all baby-RISC soft resets");
     tile.assert_all_resets();
@@ -1446,10 +1483,11 @@ fn run_tensix_virtio(card: u32, x: u16, y: u16) -> std::io::Result<()> {
                 break;
             }
             if started.elapsed() > timeout {
-                return Err(std::io::Error::other(format!(
+                return Err(crate::Error::internal(format!(
                     "M5 hello-ack timeout after {:?} (got {:#010x})",
                     timeout, m
-                )));
+                ))
+                .into());
             }
             sleep(Duration::from_millis(1));
         }
@@ -1464,11 +1502,12 @@ fn run_tensix_virtio(card: u32, x: u16, y: u16) -> std::io::Result<()> {
             proto_v, fw_v
         );
         if proto_v != proto::PROTOCOL_VERSION {
-            return Err(std::io::Error::other(format!(
+            return Err(crate::Error::internal(format!(
                 "M5 protocol version mismatch: daemon expects {}, firmware reported {}",
                 proto::PROTOCOL_VERSION,
                 proto_v
-            )));
+            ))
+            .into());
         }
     }
 
@@ -1739,10 +1778,7 @@ fn run_tensix_virtio(card: u32, x: u16, y: u16) -> std::io::Result<()> {
         eprintln!("[tensix-virtio] PASS");
         Ok(())
     } else {
-        Err(std::io::Error::other(format!(
-            "FAIL: {} subtests failed",
-            errors
-        )))
+        Err(crate::Error::internal(format!("FAIL: {} subtests failed", errors)).into())
     }
 }
 
@@ -1752,7 +1788,7 @@ fn toggle_reset_bit(
     release: bool,
 ) -> std::io::Result<()> {
     if l2cpu > 3 {
-        return Err(std::io::Error::other("l2cpu must be 0..3"));
+        return Err(crate::Error::bad_request("l2cpu must be 0..3").into());
     }
     let reg: u64 = 0x80030014;
     let bit = 1u32 << (l2cpu + 4);

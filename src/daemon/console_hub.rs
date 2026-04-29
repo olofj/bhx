@@ -217,7 +217,12 @@ fn send_all_dontwait(sock: &UnixStream, mut bytes: &[u8]) -> io::Result<()> {
             return Err(e);
         }
         if n == 0 {
-            return Err(io::Error::other("send returned 0"));
+            // send() returning 0 is unexpected on a streaming socket;
+            // surfacing it as Internal lets the caller's logger flag
+            // it as a daemon-side anomaly rather than a typical IO
+            // error. Bridge to io::Error so the function's
+            // io::Result return type stays unchanged for callers.
+            return Err(crate::Error::internal("send returned 0").into());
         }
         bytes = &bytes[n as usize..];
     }

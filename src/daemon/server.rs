@@ -79,10 +79,11 @@ pub fn serve(
     // next (the seccomp filter already allows TCP listen+accept).
     if let Some(port) = metrics_port {
         if let Err(e) = crate::daemon::metrics::spawn_exporter(port, state.clone()) {
-            return Err(io::Error::other(format!(
-                "metrics exporter bind on 127.0.0.1:{} failed: {}",
-                port, e
-            )));
+            return Err(crate::Error::Io {
+                ctx: format!("metrics exporter bind on 127.0.0.1:{}", port),
+                source: e,
+            }
+            .into());
         }
         // The bound port is also the requested port (we don't pass 0
         // through the CLI), so we don't need to log it here — the

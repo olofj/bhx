@@ -22,46 +22,33 @@
 //! and stuffs the result into `Response::Error { error }`. Soak
 //! scripts grepping for "cannot open disk image" etc. keep matching.
 //!
-//! ## Where `io::Error::other` is still allowed
+//! ## `io::Error::other` policy
 //!
-//! After #21 the `dispatch_*` boundary, `boot::modify_dtb`, and
-//! `fdt_ffi` all use `crate::Result`. The remaining `io::Error::other`
-//! call sites live on `io::Result` chains *below* that boundary and
-//! intentionally keep `io::Result` for now:
+//! `grep -rn "io::Error::other" src/` should return zero hits in this
+//! crate (verified post-#40-Phase-2). All error-construction sites use
+//! a `crate::Error` variant; sites that live on `io::Result` chains
+//! flow through the `From<crate::Error> for io::Error` bridge below.
 //!
-//! - **`src/daemon/protocol.rs`**: `read_frame` / `write_frame` /
-//!   `recv_with_fd`. These are wire-framing primitives consumed by both
-//!   the daemon (server-side dispatch) and the CLI client; both
-//!   chains return `io::Result` to the OS. A `crate::Error::Protocol`
-//!   variant exists for the serde_json case, but the framing helpers
-//!   themselves stay on `io::Result` so cancellation paths (read EOF,
-//!   short-write, EINTR) preserve `io::ErrorKind` end-to-end.
-//! - **`src/daemon/client.rs`**: client-side RPC helpers consumed by
-//!   `main.rs`'s CLI subcommands. The CLI uses `io::Result<()>` for
-//!   exit-code propagation; migrating it would cascade through every
-//!   `clap` subcommand. Out of scope for #21.
-//! - **`src/daemon/runner.rs`**, **`src/daemon/lifetime.rs`**,
-//!   **`src/daemon/console_hub.rs`**: pidfile / log / fan-out helpers
-//!   on `io::Result`. Same cascading argument.
-//! - **`src/chip.rs`**, **`src/kmd.rs`**, **`src/virtio/network.rs`**:
-//!   low-level chip + ioctl + slirp wrappers. Their callers are split
-//!   across daemon and CLI debug subcommands; both paths stay on
-//!   `io::Result`. The errors are intrinsically OS-level (open(),
-//!   ioctl(), vdeslirp_open).
-//! - **`src/main.rs`**, **`src/daemon/server.rs::serve`** (3 sites):
-//!   the daemon entry point and CLI dispatch top-level. Both return
-//!   `io::Result<()>` to the runtime / clap. Sandbox-install /
-//!   metrics-bind failures wrap their message via `io::Error::other`
-//!   so the daemon refuses to start.
+//! Bridge semantics:
+//!   * `Error::Io { ctx, source }` → `io::Error::new(source.kind(),
+//!     "<ctx>: <source>")` — preserves the original `io::ErrorKind`.
+//!   * Every other variant → `io::Error::other(variant.to_string())`.
+//!     Display strings for `Internal` / `Protocol` / `Fdt` carry their
+//!     prefix (e.g. `"internal: ..."`), so error messages that bubble
+//!     up to operator-facing surfaces (CLI exit, daemon wire reply)
+//!     are slightly more informative than the pre-#40 raw strings.
+//!     The wire format is otherwise unchanged: dispatch handlers still
+//!     wrap via `crate::Error::Io { ctx: "boot failed", source: e }`
+//!     before sending `Response::Error`, so the soak scripts'
+//!     `"boot failed: ..."` grep patterns keep matching.
 //!
-//! These sites benefit from the `From<crate::Error> for io::Error`
-//! bridge defined below — code that wants to construct a
-//! `crate::Error` for the variant info can still flow through `?`
-//! into an `io::Result`, preserving `io::ErrorKind` on the `Io`
-//! variant.
-//!
-//! Migrating these chains to `crate::Result` end-to-end is a separate
-//! follow-up. Tracked as the remaining piece of #21.
+//! Wire-bound error sites (those that surface in `Response::Error`)
+//! prefer the no-prefix variants (`BadRequest` / `SlotState` / `Io`)
+//! to keep operator-side message stability. Daemon-internal errors
+//! (telemetry read failures, BRISC handshake timeouts, etc.) use
+//! `Internal` and pick up the `"internal: "` prefix when bridged to
+//! `io::Error` — that's a one-time cosmetic shift that no test or
+//! soak script asserted on.
 
 use thiserror::Error;
 

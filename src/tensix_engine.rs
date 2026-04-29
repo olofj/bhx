@@ -74,10 +74,11 @@ impl TensixEngine {
     /// this returns, the on-tile firmware is running and is ready
     /// to serve guest MMIO.
     pub fn bring_up(card: u32, chip: &SharedChip) -> io::Result<Self> {
-        let telem = telemetry::read_telemetry(chip)
-            .map_err(|e| io::Error::other(format!("read telemetry: {}", e)))?;
+        let telem = telemetry::read_telemetry(chip).map_err(|e| {
+            io::Error::from(crate::Error::internal(format!("read telemetry: {}", e)))
+        })?;
         let picked = tensix_tile::pick_virtio_engine_tile(&telem)
-            .map_err(|e| io::Error::other(format!("pick tile: {}", e)))?;
+            .map_err(|e| io::Error::from(crate::Error::internal(format!("pick tile: {}", e))))?;
 
         // Translate picker output to the L2CPU TLB's coord flavor.
         // For the canonical Blackhole layout (harvest at the tail of
@@ -93,18 +94,21 @@ impl TensixEngine {
             telem.noc_translation_enabled,
         )
         .ok_or_else(|| {
-            io::Error::other(format!(
+            io::Error::from(crate::Error::internal(format!(
                 "tile ({}, {}) has no translated form for L2CPU TLB \
                  (enabled_tensix_col={:#x}, noc_translation={})",
                 picked.x, picked.y, telem.enabled_tensix_col, telem.noc_translation_enabled
-            ))
+            )))
         })?;
 
         let tile = TensixTile::new(card, picked.x, picked.y).map_err(|e| {
-            io::Error::other(format!(
-                "open tensix tile ({}, {}) on card {}: {}",
-                picked.x, picked.y, card, e
-            ))
+            io::Error::from(crate::Error::Io {
+                ctx: format!(
+                    "open tensix tile ({}, {}) on card {}",
+                    picked.x, picked.y, card
+                ),
+                source: e,
+            })
         })?;
 
         // Pre-bring-up sniff: if the picked tile's TCM is already
@@ -172,14 +176,15 @@ impl TensixEngine {
                 break;
             }
             if started.elapsed() > std::time::Duration::from_millis(200) {
-                return Err(io::Error::other(format!(
+                return Err(crate::Error::internal(format!(
                     "BRISC firmware on tile ({}, {}) did not initialize \
                      stats magic within 200 ms (got {:#010x}, expected {:#010x})",
                     picked.x,
                     picked.y,
                     m,
                     ve::STATS_MAGIC_LOADED
-                )));
+                ))
+                .into());
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -240,10 +245,11 @@ impl TensixEngine {
     /// point the chip has lost firmware and the caller should fall
     /// back to a cold `bring_up` (which assumes no L2CPU traffic).
     pub fn adopt_running(card: u32, chip: &SharedChip) -> io::Result<Self> {
-        let telem = telemetry::read_telemetry(chip)
-            .map_err(|e| io::Error::other(format!("read telemetry: {}", e)))?;
+        let telem = telemetry::read_telemetry(chip).map_err(|e| {
+            io::Error::from(crate::Error::internal(format!("read telemetry: {}", e)))
+        })?;
         let picked = tensix_tile::pick_virtio_engine_tile(&telem)
-            .map_err(|e| io::Error::other(format!("pick tile: {}", e)))?;
+            .map_err(|e| io::Error::from(crate::Error::internal(format!("pick tile: {}", e))))?;
         let (translated_x, translated_y) = tensix_tile::noc0_to_translated_tensix(
             picked.x,
             picked.y,
@@ -251,24 +257,28 @@ impl TensixEngine {
             telem.noc_translation_enabled,
         )
         .ok_or_else(|| {
-            io::Error::other(format!(
+            io::Error::from(crate::Error::internal(format!(
                 "tile ({}, {}) has no translated form for L2CPU TLB",
                 picked.x, picked.y
-            ))
+            )))
         })?;
         let tile = TensixTile::new(card, picked.x, picked.y).map_err(|e| {
-            io::Error::other(format!(
-                "open tensix tile ({}, {}) on card {}: {}",
-                picked.x, picked.y, card, e
-            ))
+            io::Error::from(crate::Error::Io {
+                ctx: format!(
+                    "open tensix tile ({}, {}) on card {}",
+                    picked.x, picked.y, card
+                ),
+                source: e,
+            })
         })?;
         let stats_magic = tile.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAGIC);
         if stats_magic != ve::STATS_MAGIC_LOADED {
-            return Err(io::Error::other(format!(
+            return Err(crate::Error::internal(format!(
                 "BRISC firmware not running on tile ({}, {}) (stats magic {:#010x}, expected {:#010x}); \
                  chip lost firmware — caller must cold-`bring_up` instead",
                 picked.x, picked.y, stats_magic, ve::STATS_MAGIC_LOADED
-            )));
+            ))
+            .into());
         }
         let firmware_version = tile.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_VERSION);
         // We adopt the protocol version from the stats page; in the
@@ -487,7 +497,7 @@ fn run_handshake(tile: &TensixTile, picked_x: u16, picked_y: u16) -> io::Result<
             break;
         }
         if started.elapsed() > timeout {
-            return Err(io::Error::other(format!(
+            return Err(crate::Error::internal(format!(
                 "M5 handshake: BRISC on tile ({}, {}) did not respond to hello \
                  within {:?} (last ack magic: {:#010x}, expected {:#010x})",
                 picked_x,
@@ -495,7 +505,8 @@ fn run_handshake(tile: &TensixTile, picked_x: u16, picked_y: u16) -> io::Result<
                 timeout,
                 magic,
                 proto::HELLO_ACK_MAGIC
-            )));
+            ))
+            .into());
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -506,12 +517,13 @@ fn run_handshake(tile: &TensixTile, picked_x: u16, picked_y: u16) -> io::Result<
         proto::CTRL_BASE + proto::CTRL_OFF_HELLO_ACK + proto::HELLO_ACK_OFF_FIRMWARE_VERSION,
     );
     if protocol_version != proto::PROTOCOL_VERSION {
-        return Err(io::Error::other(format!(
+        return Err(crate::Error::internal(format!(
             "M5 handshake: protocol version mismatch — daemon expected {}, \
              firmware reported {}. Rebuild brisc-firmware to match.",
             proto::PROTOCOL_VERSION,
             protocol_version
-        )));
+        ))
+        .into());
     }
     Ok((firmware_version, protocol_version))
 }

@@ -236,13 +236,14 @@ pub const MAX_FRAME_BYTES: u32 = 64 * 1024;
 
 /// Write a length-prefixed JSON frame.
 pub fn write_frame<W: Write, T: Serialize>(mut w: W, msg: &T) -> io::Result<()> {
-    let body = serde_json::to_vec(msg).map_err(io::Error::other)?;
+    let body = serde_json::to_vec(msg).map_err(|e| io::Error::from(crate::Error::Protocol(e)))?;
     if body.len() > MAX_FRAME_BYTES as usize {
-        return Err(io::Error::other(format!(
+        return Err(crate::Error::internal(format!(
             "frame too large: {} > {}",
             body.len(),
             MAX_FRAME_BYTES
-        )));
+        ))
+        .into());
     }
     let len = (body.len() as u32).to_le_bytes();
     w.write_all(&len)?;
@@ -256,14 +257,15 @@ pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(mut r: R) -> io::Result
     r.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf);
     if len > MAX_FRAME_BYTES {
-        return Err(io::Error::other(format!(
+        return Err(crate::Error::internal(format!(
             "frame too large: {} > {}",
             len, MAX_FRAME_BYTES
-        )));
+        ))
+        .into());
     }
     let mut body = vec![0u8; len as usize];
     r.read_exact(&mut body)?;
-    serde_json::from_slice(&body).map_err(io::Error::other)
+    serde_json::from_slice(&body).map_err(|e| io::Error::from(crate::Error::Protocol(e)))
 }
 
 /// Send a file descriptor alongside a single data byte. Unix requires that
@@ -309,7 +311,7 @@ pub fn recv_fd(sock: &UnixStream) -> io::Result<OwnedFd> {
             }
         }
     }
-    Err(io::Error::other("no SCM_RIGHTS fd in message"))
+    Err(crate::Error::internal("no SCM_RIGHTS fd in message").into())
 }
 
 #[cfg(test)]

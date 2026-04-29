@@ -19,23 +19,23 @@ use crate::daemon::protocol::{
 pub fn connect(card: u32) -> io::Result<UnixStream> {
     let sock = lifetime::socket_path(card);
     UnixStream::connect(&sock).map_err(|e| {
-        io::Error::other(format!(
-            "no daemon socket at {} ({}). Start one with: tt-bh-linux daemon start --card {}",
-            sock.display(),
-            e,
-            card
-        ))
+        crate::Error::Io {
+            ctx: format!(
+                "no daemon socket at {}. Start one with: tt-bh-linux daemon start --card {}",
+                sock.display(),
+                card
+            ),
+            source: e,
+        }
+        .into()
     })
 }
 
 fn expect_ok(resp: Response) -> io::Result<()> {
     match resp {
         Response::Ok => Ok(()),
-        Response::Error { error } => Err(io::Error::other(error)),
-        other => Err(io::Error::other(format!(
-            "unexpected response: {:?}",
-            other
-        ))),
+        Response::Error { error } => Err(crate::Error::bad_request(error).into()),
+        other => Err(crate::Error::internal(format!("unexpected response: {:?}", other)).into()),
     }
 }
 
@@ -43,11 +43,8 @@ pub fn status(sock: &mut UnixStream) -> io::Result<StatusPayload> {
     write_frame(&mut *sock, &Request::Status)?;
     match read_frame::<_, Response>(&mut *sock)? {
         Response::Status(s) => Ok(s),
-        Response::Error { error } => Err(io::Error::other(error)),
-        other => Err(io::Error::other(format!(
-            "unexpected response: {:?}",
-            other
-        ))),
+        Response::Error { error } => Err(crate::Error::bad_request(error).into()),
+        other => Err(crate::Error::internal(format!("unexpected response: {:?}", other)).into()),
     }
 }
 
@@ -155,10 +152,7 @@ pub fn attach_console(
             let fd = recv_fd(sock)?;
             Ok((scrollback_bytes, fd))
         }
-        Response::Error { error } => Err(io::Error::other(error)),
-        other => Err(io::Error::other(format!(
-            "unexpected response: {:?}",
-            other
-        ))),
+        Response::Error { error } => Err(crate::Error::bad_request(error).into()),
+        other => Err(crate::Error::internal(format!("unexpected response: {:?}", other)).into()),
     }
 }
