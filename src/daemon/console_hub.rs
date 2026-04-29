@@ -29,8 +29,11 @@ use std::sync::Mutex;
 use crate::daemon::protocol::ConsoleMode;
 
 /// Fixed-size per-L2CPU scrollback buffer. Sized to comfortably hold a full
-/// kernel+systemd boot log (~20–40 KiB worth of ANSI-decorated output).
-pub const SCROLLBACK_BYTES: usize = 64 * 1024;
+/// stock-distro boot log — Fedora 42's OpenSBI + U-Boot + grub + kernel +
+/// systemd output runs ~200 KiB of ANSI-decorated bytes, so 1 MiB leaves
+/// headroom for a verbose initramfs without truncating the early-boot
+/// banners by the time an operator runs `bhx connect`.
+pub const SCROLLBACK_BYTES: usize = 1024 * 1024;
 
 /// A single attached client. The socket is the daemon-side end of the
 /// socketpair; the other end was sent to the client via SCM_RIGHTS.

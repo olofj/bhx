@@ -95,7 +95,11 @@ pub const VIRTIO_ID_BLOCK: u32 = 2;
 pub const VIRTIO_ID_CONSOLE: u32 = 3;
 pub const VIRTIO_ID_ENTROPY: u32 = 4;
 
-pub const QUEUE_NUM_MAX: u32 = 64;
+/// Must match `BRISC_VIRTIO_QUEUE_NUM_MAX` in
+/// `brisc-firmware/include/virtio_layout.h` — the diagnostic in
+/// `main.rs::cmd_engine_probe` reads QUEUE_NUM_MAX off the chip and
+/// asserts it equals this constant.
+pub const QUEUE_NUM_MAX: u32 = 256;
 
 // ----- Status bits (virtio 1.2 §2.1) -----
 

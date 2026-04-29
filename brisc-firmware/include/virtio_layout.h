@@ -157,10 +157,16 @@ static inline unsigned brisc_virtio_slot(unsigned l2cpu_idx, unsigned device_idx
 #define BRISC_VIRTIO_QUEUES_CONSOLE     2u
 #define BRISC_VIRTIO_QUEUES_RNG         1u
 
-// Per-queue maximum descriptor count we advertise. Round number that
-// any reasonable driver accepts; the actual value the driver picks
-// is written back via QUEUE_NUM.
-#define BRISC_VIRTIO_QUEUE_NUM_MAX      64u
+// Per-queue maximum descriptor count we advertise. The actual value
+// the driver picks is written back via QUEUE_NUM.
+//
+// 256 gives the guest enough headroom to soak a kernel printk burst
+// (or an `hvc_console_print` storm with `console=hvc0`) without
+// filling the ring before the daemon's kick poller wakes from its
+// SLOW=1ms / IDLE=10ms sleep tier. With 64 we observed Fedora's boot
+// hang on `console=hvc0` while the kernel busy-waited in
+// `hvc_console_print` for free TX descriptors.
+#define BRISC_VIRTIO_QUEUE_NUM_MAX      256u
 
 // ----- Status bits (virtio 1.2 §2.1) -----
 
