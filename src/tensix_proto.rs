@@ -33,13 +33,15 @@
 /// Protocol version. Bump on any wire-incompatible change.
 ///
 /// v1 = M5 (#71) virtio kick ring + completion ring.
-/// v2 = M6 (#78) extends the kick-ring slot enumeration to 32 entries
-/// so slots 16..19 carry per-L2CPU 16550 UART TX bytes (with the byte
-/// in the queue_idx field). The on-the-wire `KickEntry` layout is
-/// unchanged; this bump exists so a daemon and a firmware that
-/// disagree about whether UART kicks exist refuse to handshake
-/// instead of silently dropping bytes.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v2 = M6 (#78) extended the kick-ring slot encoding so slots 16..19
+/// carried per-L2CPU UART TX bytes (one byte per 16-byte kick entry —
+/// later found to overflow the 64-entry ring on boot bursts, see #79).
+/// v3 = M6.1 (#79) splits UART traffic off the kick ring entirely.
+/// TRISC0 produces bytes into per-L2CPU feed rings in BRISC L1, and
+/// the daemon polls those rings directly through the chip-side TLB
+/// (4 bytes per slot, 1024 slots per ring, one ring per L2CPU). The
+/// kick ring is virtio-only at v3, original 64-entry layout.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // ----- L1 control-plane region (BRISC L1) -----
 //
@@ -192,8 +194,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_version_is_two() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+    fn protocol_version_is_three() {
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     #[test]

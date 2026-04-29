@@ -130,18 +130,22 @@ impl TensixEngine {
         // doesn't release TRISC0 directly, the firmware does on the
         // first UART register.
         let trisc0_pc = tile.read_trisc0_reset_entry();
-        if trisc0_pc == 0 {
-            return Err(io::Error::other(format!(
-                "BRISC firmware on tile ({}, {}) did not plant a \
-                 TRISC0 reset entry address at L1[0x{:x}] — likely a \
-                 firmware/build mismatch",
+        if trisc0_pc != 0 {
+            tile.set_trisc0_reset_pc(trisc0_pc);
+            tile.enable_trisc0_reset_pc_override();
+        } else {
+            // Pre-M6.1 firmware doesn't plant the TRISC0 entry word,
+            // so we just skip the override. BRISC's lifecycle code
+            // also doesn't exist in that case, so TRISC0 stays in
+            // soft-reset and nothing tries to release it.
+            eprintln!(
+                "[tensix-engine] firmware {:#010x} on tile ({}, {}) \
+                 doesn't expose a TRISC0 entry; skipping reset-PC override",
+                tile.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_VERSION),
                 picked.x,
-                picked.y,
-                crate::tensix::TRISC0_RESET_ENTRY_PTR_L1_OFFSET
-            )));
+                picked.y
+            );
         }
-        tile.set_trisc0_reset_pc(trisc0_pc);
-        tile.enable_trisc0_reset_pc_override();
 
         tile.release_brisc_only();
 

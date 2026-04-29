@@ -62,7 +62,7 @@ pub fn uart_pa_from_engine_base(engine_base: u64) -> u64 {
 // for state that doesn't belong to any one L2CPU: the TRISC0 heartbeat
 // today, more diagnostics later as Phase B/C land.
 
-pub const TRISC0_GLOBAL_BASE: u32 = 0x0005_0400;
+pub const TRISC0_GLOBAL_BASE: u32 = 0x0005_8000;
 pub const TRISC0_GLOBAL_OFF_HEARTBEAT: u32 = 0x00;
 
 /// L1 address of the TRISC0 heartbeat slot (`bumped each iteration of
@@ -80,13 +80,13 @@ pub fn trisc0_heartbeat_addr() -> u32 {
 // and BRISC drains.
 
 pub const UART_PRIVATE_BASE: u32 = 0x0005_0000;
-pub const UART_PRIVATE_PER_L2CPU: u32 = 0x0000_0100;
+pub const UART_PRIVATE_PER_L2CPU: u32 = 0x0000_2000;
 pub const UART_PRIV_OFF_HOLD: u32 = 0x00;
 pub const UART_PRIV_OFF_FEED_PRODUCER_SEQ: u32 = 0x04;
 pub const UART_PRIV_OFF_FEED_CONSUMER_SEQ: u32 = 0x08;
 pub const UART_PRIV_OFF_FEED_DROP_COUNT: u32 = 0x0C;
 pub const UART_PRIV_OFF_FEED_RING: u32 = 0x40;
-pub const UART_FEED_RING_ENTRIES: u32 = 32;
+pub const UART_FEED_RING_ENTRIES: u32 = 1024;
 
 #[inline]
 pub fn uart_private_base(l2cpu_idx: u8) -> u32 {
@@ -149,13 +149,13 @@ mod tests {
         assert_eq!(UART_PRIV_OFF_FEED_CONSUMER_SEQ, 0x08);
         assert_eq!(UART_PRIV_OFF_FEED_DROP_COUNT, 0x0C);
         assert_eq!(UART_PRIV_OFF_FEED_RING, 0x40);
-        assert_eq!(UART_FEED_RING_ENTRIES, 32);
+        assert_eq!(UART_FEED_RING_ENTRIES, 1024);
     }
 
     #[test]
     fn uart_private_base_strides_correctly() {
         assert_eq!(uart_private_base(0), 0x50000);
-        assert_eq!(uart_private_base(3), 0x50300);
+        assert_eq!(uart_private_base(3), 0x56000);
     }
 
     #[test]

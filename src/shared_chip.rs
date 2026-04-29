@@ -140,6 +140,22 @@ impl SharedChip {
 
     fn open_inner(card: u32) -> io::Result<Inner> {
         let fd = kmd::open_device(card)?;
+
+        // Request max power state. The kmd aggregates flags across all
+        // open fds; this fd lives for the daemon's lifetime, so the
+        // bump persists. Without it the chip runs at low AICLK (legacy
+        // default leaves MAX_AI_CLK off), which slows every Tensix
+        // baby-RISC by ~1.7× and breaks the timing assumptions in
+        // M6/M6.1's UART poll. Best-effort: older kmds without
+        // SET_POWER_STATE return ENOTTY — we warn and carry on.
+        if let Err(e) = kmd::request_max_power(fd) {
+            eprintln!(
+                "[shared-chip] warning: SET_POWER_STATE failed ({}); \
+                 chip will run at low AICLK (kmd < 2.6?)",
+                e
+            );
+        }
+
         let axi_window = match TlbWindow::new_2m(fd, AXI_TILE_X, AXI_TILE_Y, AXI_WINDOW_BASE) {
             Ok(w) => w,
             Err(e) => {

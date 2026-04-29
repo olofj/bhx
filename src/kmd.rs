@@ -176,6 +176,38 @@ pub struct AllocateDmaBuf {
     pub output: AllocateDmaBufOut,
 }
 
+// --- SET_POWER_STATE (kmd >= 2.6) ---
+//
+// Per-fd power-flag aggregation. tt-metal's UMD calls this on
+// LocalChip construction with all four flags set; without it the chip
+// runs at low AICLK (800 MHz on p100a) instead of max (1350 MHz),
+// which makes BRISC/TRISC0 ~1.7× slower than designed for. AICLK is
+// the only flag the legacy default leaves OFF — so just defaulting
+// the open is not enough; we have to call this ioctl explicitly.
+//
+// All flags drop again when the last fd that requested them closes.
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PowerState {
+    pub argsz: u32,
+    pub flags: u32,
+    pub reserved0: u8,
+    pub validity: u8,
+    pub power_flags: u16,
+    pub power_settings: [u16; 14],
+}
+
+pub const TT_POWER_FLAG_MAX_AI_CLK: u16 = 1 << 0;
+pub const TT_POWER_FLAG_MRISC_PHY_WAKEUP: u16 = 1 << 1;
+pub const TT_POWER_FLAG_TENSIX_ENABLE: u16 = 1 << 2;
+pub const TT_POWER_FLAG_L2CPU_ENABLE: u16 = 1 << 3;
+
+#[inline]
+const fn validity(flags_count: u8, settings_count: u8) -> u8 {
+    (flags_count & 0xF) | ((settings_count & 0xF) << 4)
+}
+
 // --- Ioctl number computation ---
 // Linux _IO macro: direction=0 (none), so ioctl nr = (magic << 8) | nr
 
@@ -189,6 +221,7 @@ pub const IOCTL_RESET_DEVICE: u64 = io(TENSTORRENT_IOCTL_MAGIC, 6);
 pub const IOCTL_ALLOCATE_TLB: u64 = io(TENSTORRENT_IOCTL_MAGIC, 11);
 pub const IOCTL_FREE_TLB: u64 = io(TENSTORRENT_IOCTL_MAGIC, 12);
 pub const IOCTL_CONFIGURE_TLB: u64 = io(TENSTORRENT_IOCTL_MAGIC, 13);
+pub const IOCTL_SET_POWER_STATE: u64 = io(TENSTORRENT_IOCTL_MAGIC, 15);
 
 // --- Ioctl wrappers using nix ---
 
@@ -202,6 +235,7 @@ nix::ioctl_readwrite_bad!(ioctl_reset_device, IOCTL_RESET_DEVICE, ResetDevice);
 nix::ioctl_readwrite_bad!(ioctl_allocate_tlb, IOCTL_ALLOCATE_TLB, AllocateTlb);
 nix::ioctl_readwrite_bad!(ioctl_free_tlb, IOCTL_FREE_TLB, FreeTlb);
 nix::ioctl_readwrite_bad!(ioctl_configure_tlb, IOCTL_CONFIGURE_TLB, ConfigureTlb);
+nix::ioctl_readwrite_bad!(ioctl_set_power_state, IOCTL_SET_POWER_STATE, PowerState);
 
 /// Open the tenstorrent character device for the given card index.
 pub fn open_device(card: u32) -> std::io::Result<RawFd> {
@@ -241,6 +275,43 @@ pub fn reset_device(fd: RawFd, flags: u32) -> std::io::Result<()> {
             "RESET_DEVICE ioctl reported result={}",
             req.output.result
         )));
+    }
+    Ok(())
+}
+
+/// Request max-power state on `fd`: AICLK at max, Tensix + L2CPU
+/// enabled. The kmd aggregates this with any other open fd's request
+/// and signals the ARC firmware. The state lasts until `fd` is closed
+/// (or the flags are unset via another call).
+///
+/// Without this the chip runs at the legacy default — everything
+/// enabled EXCEPT max AICLK — which on a p100a means 800 MHz instead
+/// of 1350 MHz. Tensix baby-RISCs share that clock domain, so the
+/// difference shows up as a 1.7× slower poll loop.
+///
+/// We deliberately don't request `MRISC_PHY_WAKEUP` — MRISC manages
+/// GDDR PHY, which `tt-bh-linux` doesn't use (L2CPU runs out of host-
+/// allocated DRAM and Tensix uses its own L1).
+///
+/// Best-effort: if the kmd is older than 2.6 it doesn't know this
+/// ioctl and returns ENOTTY/EINVAL. We log and continue rather than
+/// fail bring-up — the daemon still works, just at low clock.
+pub fn request_max_power(fd: RawFd) -> std::io::Result<()> {
+    let mut state = PowerState {
+        argsz: std::mem::size_of::<PowerState>() as u32,
+        // 4 valid flags so the kmd OR-aggregates ALL of bits 0..3 (we
+        // request 0=MAX_AI_CLK, 2=TENSIX_ENABLE, 3=L2CPU_ENABLE; bit 1
+        // / MRISC_PHY_WAKEUP intentionally left clear since we don't
+        // touch GDDR).
+        validity: validity(4, 0),
+        power_flags: TT_POWER_FLAG_MAX_AI_CLK
+            | TT_POWER_FLAG_TENSIX_ENABLE
+            | TT_POWER_FLAG_L2CPU_ENABLE,
+        ..Default::default()
+    };
+    unsafe {
+        ioctl_set_power_state(fd, &mut state)
+            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
     }
     Ok(())
 }

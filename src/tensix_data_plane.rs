@@ -284,37 +284,29 @@ fn run_poll_loop(
     let mut consumer: u32 = engine.kick_ring_header().1;
     let mut last_active = std::time::Instant::now();
 
+    // Per-L2CPU UART feed-ring consumer state. M6.1 #79 v3 (Phase B
+    // revised): the daemon polls these rings directly via the chip
+    // TLB instead of going through BRISC's kick ring. Each ring slot
+    // is 4 bytes (one byte in low 8 bits) and there are 1024 slots,
+    // so a stock-distro boot's ~10 KB of TX fits comfortably without
+    // any rate limiting.
+    let mut uart_consumer: [u32; uart::UART_NUM_SLOTS as usize] =
+        [0; uart::UART_NUM_SLOTS as usize];
+
     while !exit.load(Ordering::Relaxed) {
         let producer = engine.kick_producer_seq();
         let mut consumed_this_pass = 0u64;
         while consumer != producer {
             let raw = engine.read_kick_entry(consumer);
             // raw[0] = (queue_idx << 16) | slot ; matches the
-            // firmware's `kick_ring_push` packing.
+            // firmware's `kick_ring_push` packing. Kick ring is
+            // virtio-only at v3 (#79) — UART traffic moved to per-
+            // L2CPU feed rings polled below.
             let slot = (raw[0] & 0xFFFF) as u16;
             let queue_idx = (raw[0] >> 16) as u16;
             let seq = raw[1];
             let epoch = raw[2];
             let _ = seq;
-
-            // M6 (#78) UART kicks live in slot range 16..20 with the
-            // TX byte in `queue_idx` (low 8 bits). Route to the
-            // registered console_hub for that L2CPU; nothing to do
-            // with virtio descriptor rings, so handle separately.
-            if let Some(l2cpu_idx) = uart::l2cpu_for_slot(slot) {
-                let byte = queue_idx as u8;
-                if let Some(hub) = uart_registry.lock().unwrap().get(&l2cpu_idx) {
-                    hub.push_chip_output(&[byte]);
-                }
-                stats.last_kick_slot_queue.store(
-                    ((slot as u64) << 16) | (queue_idx as u64),
-                    Ordering::Relaxed,
-                );
-                stats.kicks_consumed.fetch_add(1, Ordering::Relaxed);
-                consumer = consumer.wrapping_add(1);
-                consumed_this_pass += 1;
-                continue;
-            }
 
             let mut map = registry.lock().unwrap();
             if let Some(reg) = map.get_mut(&(slot as u32)) {
@@ -393,6 +385,48 @@ fn run_poll_loop(
         }
         if rx_drained {
             last_active = std::time::Instant::now();
+        }
+
+        // M6.1 #79 v3 (Phase B revised): drain each registered UART's
+        // feed ring directly. TRISC0 produces; we consume. One ring
+        // per L2CPU, 1024 slots, 4 bytes per slot (byte in low 8 bits).
+        // We hold the registry lock for the whole drain to keep the
+        // ConsoleHub Arc alive without bumping refcounts every byte.
+        {
+            let map = uart_registry.lock().unwrap();
+            for (&l2cpu_idx, hub) in map.iter() {
+                if (l2cpu_idx as u32) >= uart::UART_NUM_SLOTS as u32 {
+                    continue;
+                }
+                let priv_base = uart::uart_private_base(l2cpu_idx);
+                let producer =
+                    engine.read_l1_u32(priv_base + uart::UART_PRIV_OFF_FEED_PRODUCER_SEQ);
+                let mut local_consumer = uart_consumer[l2cpu_idx as usize];
+                if producer == local_consumer {
+                    continue;
+                }
+                // Read all available bytes into a stack buffer, then
+                // push to the hub once per drain pass — keeps the per-
+                // byte overhead (lock + memcpy + send) amortized.
+                let mask = uart::UART_FEED_RING_ENTRIES - 1;
+                let mut buf = [0u8; 256];
+                while local_consumer != producer {
+                    let take =
+                        std::cmp::min(producer.wrapping_sub(local_consumer) as usize, buf.len());
+                    for (i, slot) in buf.iter_mut().take(take).enumerate() {
+                        let idx = local_consumer.wrapping_add(i as u32) & mask;
+                        let cell = engine
+                            .read_l1_u32(priv_base + uart::UART_PRIV_OFF_FEED_RING + idx * 4);
+                        *slot = (cell & 0xFF) as u8;
+                    }
+                    hub.push_chip_output(&buf[..take]);
+                    local_consumer = local_consumer.wrapping_add(take as u32);
+                }
+                engine
+                    .write_l1_u32(priv_base + uart::UART_PRIV_OFF_FEED_CONSUMER_SEQ, local_consumer);
+                uart_consumer[l2cpu_idx as usize] = local_consumer;
+                last_active = std::time::Instant::now();
+            }
         }
 
         stats.poll_iterations.fetch_add(1, Ordering::Relaxed);

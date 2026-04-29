@@ -74,13 +74,17 @@
 #include <stdint.h>
 
 // Protocol version. v1 = M5 (#71) virtio kick ring + completion ring.
-// v2 = M6 (#78) extends the kick-ring slot encoding to 32 slots so
-// slots 16..19 carry per-L2CPU 16550 UART TX bytes (with the byte in
-// the queue_idx field). Wire layout of KickEntry is unchanged; only
-// the slot enumeration grew. A daemon talking to a v1 firmware
-// refuses to boot, so old-daemon-vs-new-firmware can't end up
-// silently dropping UART kicks.
-#define TENSIX_PROTOCOL_VERSION 2u
+// v2 = M6 (#78) extended the kick-ring slot encoding so slots 16..19
+// carried per-L2CPU 16550 UART TX bytes — one byte per 16-byte kick
+// entry, which overflowed the 64-entry ring during stock-distro boot
+// bursts.
+// v3 = M6.1 (#79) splits UART traffic off the kick ring entirely:
+// TRISC0 produces bytes into a per-L2CPU 1024-entry SPSC feed ring at
+// `BRISC_UART_PRIVATE_BASE + idx*0x2000` (see uart_layout.h), and the
+// daemon polls those rings directly through the chip-side TLB. BRISC
+// is no longer in the UART data path. Kick ring stays virtio-only at
+// its original 64-entry size and layout.
+#define TENSIX_PROTOCOL_VERSION 3u
 
 // L1 control-plane region (within the BRISC firmware tile's L1).
 //
@@ -98,13 +102,14 @@
 #define CTRL_OFF_HELLO            0x0000u
 #define CTRL_OFF_HELLO_ACK        0x0040u
 #define CTRL_OFF_KICK_RING_HDR    0x0080u
-// 16-bit bitmap (low 16 bits used) of active virtio slots. Daemon
-// sets the bit when register_slot is called for that slot, clears
-// when unregister_slot. BRISC's main poll loop skips slots whose
-// bit is 0 — cuts the per-slot sweep cost on a single-L2CPU boot
-// (4 active vs 16 total) so the sweep period drops far enough
-// to reliably win the SEL→READY race against stock kernels that
-// don't have the SW_IMPL handshake.
+// u32 bitmap of "active" slots. Bits 0..15 are virtio slots —
+// daemon sets the bit when register_slot is called and clears on
+// unregister; BRISC's main poll loop skips slots whose bit is 0
+// (sweep period drops from ~4µs to ~1µs on a single-L2CPU boot,
+// closing the SEL→READY race against stock kernels). Bits 16..19
+// are per-L2CPU UART enables (#78) — daemon flips them on
+// register_uart, BRISC uses them to drive TRISC0's reset lifecycle
+// (#79) AND TRISC0 uses them to know which UART reg files to poll.
 #define CTRL_OFF_ACTIVE_SLOTS     0x00C0u
 #define CTRL_OFF_KICK_RING        0x0100u
 #define CTRL_OFF_COMPL_RING_HDR   0x0500u
