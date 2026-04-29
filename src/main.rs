@@ -4,14 +4,13 @@
 //! bhx — unified Rust binary for booting and managing Linux on
 //! Tenstorrent Blackhole L2CPU (SiFive X280) RISC-V cores.
 
-// `kmd.rs` mirrors the full tt-kmd ABI (ioctl numbers, struct layouts,
-// flag constants); only a subset is currently used. Same for the
-// virtio/regs/tensix layout-constant modules — they document the wire
-// format and we want a future use-site to find them already named, not
-// have to rediscover the offset. The crate-wide allow keeps those
-// compiled without noise; per-module audits live in #100 if/when we
-// want to prune.
-#![allow(dead_code)]
+// Crate-wide allow(dead_code) was retired in favor of targeted
+// module-level allows (kmd, regs, virtio_engine, virtio/mod, uart_engine,
+// tensix_proto) plus a handful of per-item allows on retained API
+// surface — see #100. New unused items should now surface as build
+// warnings; either delete them, justify with an inline allow, or fold
+// into the appropriate module-level allow if it's another wire-format
+// constant.
 
 mod boot;
 mod chip;

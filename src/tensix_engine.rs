@@ -308,16 +308,6 @@ impl TensixEngine {
         })
     }
 
-    /// Read the firmware version reported in the stats page. The
-    /// handshake-time version is cached on `self.firmware_version`;
-    /// this getter is useful only if you want to read it again (e.g.
-    /// after the firmware is reloaded mid-daemon, which we don't
-    /// currently support).
-    pub fn read_firmware_version(&self) -> u32 {
-        self.tile
-            .read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_VERSION)
-    }
-
     /// Snapshot of the kick ring header. Diagnostic; the actual
     /// data-plane consumer in M5+ will read producer_seq in a tight
     /// loop and consume entries.
@@ -417,12 +407,6 @@ impl TensixEngine {
         self.tile.write_l1_u32(entry_off + 4, used_idx);
         self.tile
             .write_l1_u32(producer_addr, producer.wrapping_add(1));
-    }
-
-    /// Read the cumulative QUEUE_NOTIFY event count. Diagnostic only.
-    pub fn notify_event_count(&self) -> u32 {
-        self.tile
-            .read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_NOTIFY_EVENTS)
     }
 
     /// Read TRISC0's heartbeat (M6.1, #79). Bumped each iteration of

@@ -113,7 +113,12 @@ const TLB_BASE_DEBUG_REGS: u64 = 0xFFA0_0000;
 /// needs the fd open), then we close the fd. `ManuallyDrop` enforces
 /// the ordering regardless of the default field-drop order.
 pub struct TensixTile {
+    /// NoC0 logical X / Y of this tile. Stored at construction for
+    /// diagnostic logging; not read by the current code paths after
+    /// the TLB windows are wired.
+    #[allow(dead_code)]
     pub x: u16,
+    #[allow(dead_code)]
     pub y: u16,
     fd: RawFd,
     l1_window: ManuallyDrop<TlbWindow>,

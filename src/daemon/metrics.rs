@@ -107,11 +107,16 @@ impl Default for Gauge {
 /// Fixed-size array of counters keyed by a small finite index (most often
 /// L2CPU index 0..3, sometimes virtio-block disk_id, etc.). Avoids the
 /// runtime cost and allocation of a `HashMap<String, Counter>` for the
-/// label tuples we actually have.
+/// label tuples we actually have. Kept available even when the current
+/// metric set doesn't instantiate a generic vec — specialized variants
+/// (`PerL2cpuCounter`, `PerL2cpuDirCounter`, …) are the more common
+/// shape today.
+#[allow(dead_code)]
 pub struct CounterVec<const N: usize> {
     values: [Counter; N],
 }
 
+#[allow(dead_code)]
 impl<const N: usize> CounterVec<N> {
     pub const fn new() -> Self {
         // Workaround for `[Counter::new(); N]` not being permitted on
@@ -137,10 +142,12 @@ impl<const N: usize> Default for CounterVec<N> {
 }
 
 /// Same shape as `CounterVec` but for `Gauge`s.
+#[allow(dead_code)]
 pub struct GaugeVec<const N: usize> {
     values: [Gauge; N],
 }
 
+#[allow(dead_code)]
 impl<const N: usize> GaugeVec<N> {
     pub const fn new() -> Self {
         Self {

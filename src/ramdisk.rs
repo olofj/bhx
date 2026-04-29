@@ -21,9 +21,13 @@ use crate::error::{Error, Result};
 
 /// Compression format of the ramdisk download.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum Compression {
     None,
     Gz,
+    /// No KnownRamdisk currently uses Xz; the decompression match
+    /// arm is wired so a future xz-compressed initrd entry just sets
+    /// the variant.
     Xz,
 }
 

@@ -46,6 +46,9 @@ pub mod tag {
     pub const BOARD_ID_LOW: u16 = 2;
     pub const ASIC_ID: u16 = 3;
     pub const HARVESTING_STATE: u16 = 4;
+    /// Sentinel: total number of distinct telemetry tag IDs the ARC
+    /// firmware can emit. Pinned for parity with the firmware header.
+    #[allow(dead_code)]
     pub const TELEM_ENUM_COUNT: u16 = 33;
     pub const ENABLED_TENSIX_COL: u16 = 34;
     pub const ENABLED_ETH: u16 = 35;

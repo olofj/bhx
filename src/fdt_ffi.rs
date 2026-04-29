@@ -24,6 +24,10 @@ extern "C" {
         val: *const c_void,
         len: c_int,
     ) -> c_int;
+    // Used only by `Fdt::getprop`, which is a test-time helper today;
+    // declared here so test code reads through the same FFI surface as
+    // production calls.
+    #[allow(dead_code)]
     pub fn fdt_getprop(
         fdt: *const c_void,
         nodeoffset: c_int,
@@ -203,6 +207,9 @@ impl Fdt {
     }
 
     /// Get property `name` on `node` as raw bytes. Returns None if missing.
+    /// Test-time helper today; production code never reads back its own
+    /// patches, so it sees this as dead.
+    #[allow(dead_code)]
     pub fn getprop<'a>(&'a self, node: c_int, name: &str) -> Option<&'a [u8]> {
         let c_name = CString::new(name).ok()?;
         let mut len: c_int = 0;

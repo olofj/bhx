@@ -9,10 +9,17 @@
 //! / `2 * 1024 * 1024` in the body of a function should be a named
 //! constant in this module instead.
 //!
+//! Module-wide `#![allow(dead_code)]` — register-layout constants are
+//! kept named for future use even when the current code path doesn't
+//! reach them. The compile-time invariants below pin the relationships
+//! between values; an unused name with a known meaning beats having to
+//! re-derive an offset later.
+//!
 //! ## Conventions
 //!
 //! - Constants are grouped into submodules by the device they describe
 //!   (`l2cpu`, `plic`, `boot_image`, `slirp`, `virtio_mmio`).
+#![allow(dead_code)]
 //! - AXI tile (8,0) registers (PLL, reset unit, etc.) and the
 //!   `SharedChip` window over them stay in `shared_chip.rs` —
 //!   that's where the lock + access methods live, so locality of

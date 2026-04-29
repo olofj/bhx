@@ -223,11 +223,6 @@ pub fn get_known_image(name: &str) -> Option<&'static KnownImage> {
     KNOWN_IMAGES.iter().find(|img| img.aliases.contains(&name))
 }
 
-/// List all known image names.
-pub fn list_known_images() -> &'static [KnownImage] {
-    KNOWN_IMAGES
-}
-
 /// Map a disk path back to its [`KnownImage`] entry, if the basename
 /// (minus `.ext4` / `.img` extension) matches a known image's `name`.
 ///

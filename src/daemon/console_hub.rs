@@ -59,6 +59,11 @@ pub struct ConsoleHub {
 /// Outcome of an attach request.
 pub struct AttachResult {
     pub id: u64,
+    /// Whether this client became the writer (Rw / Takeover); the
+    /// daemon side reads it via `current_writer_id` on the hub, but
+    /// callers who attach occasionally read this snapshot directly.
+    /// Tests assert against it; production currently doesn't.
+    #[allow(dead_code)]
     pub is_writer: bool,
     pub scrollback_bytes: u32,
     /// Ids of clients that were demoted from writer as a side effect of this

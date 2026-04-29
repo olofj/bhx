@@ -11,6 +11,11 @@
 //! TLB on the picker tile. The constants here MUST match the
 //! firmware header — the hardware-test path verifies them by
 //! reading `MAGIC_VALUE` at the expected offsets.
+//!
+//! Module-wide `#![allow(dead_code)]` — wire-format constants and
+//! VirtioFwSim helpers are intentionally retained even when the
+//! current crate path doesn't reach all of them.
+#![allow(dead_code)]
 
 /// The embedded M3 firmware bytes, produced by
 /// `brisc-firmware/Makefile` and surfaced via `build.rs`.

@@ -92,6 +92,10 @@ impl RegEntry {
         }
     }
 
+    /// Diagnostic helper used in dlog output during debugging. Kept
+    /// behind the registry so a future log-line addition can name the
+    /// device kind without re-deriving the enum->string match.
+    #[allow(dead_code)]
     pub fn interrupt_kind_name(&self) -> &'static str {
         match self.interrupt_kind {
             InterruptKind::Block => "block",

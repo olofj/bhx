@@ -32,8 +32,12 @@ pub const SMALL_TLB_WINDOW_SHIFT: u32 = 21;
 pub const SMALL_TLB_WINDOW_SIZE: u64 = 1u64 << SMALL_TLB_WINDOW_SHIFT;
 
 /// Translated NoC coordinates of the in-use PCIe tile on Blackhole
-/// (p100 / p150). Valid for both NoC #0 and NoC #1.
+/// (p100 / p150). Valid for both NoC #0 and NoC #1. Pinned here as
+/// reference; current code paths route to the PCIe tile via SharedChip
+/// instead.
+#[allow(dead_code)]
 pub const PCIE_TILE_X: u32 = 19;
+#[allow(dead_code)]
 pub const PCIE_TILE_Y: u32 = 24;
 
 /// Per-L2CPU small-TLB slot allocation for the shared virtio MMIO

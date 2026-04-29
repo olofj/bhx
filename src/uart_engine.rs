@@ -12,6 +12,11 @@
 //! L2CPU TX bytes, with the byte payload in the `queue_idx` field of
 //! the existing `KickEntry`.
 //!
+//! Module-wide `#![allow(dead_code)]` — feed-ring offset constants are
+//! kept named to mirror the firmware header even where the host path
+//! doesn't currently read them.
+#![allow(dead_code)]
+//!
 //! TX-only on this side too — the daemon's kick consumer routes
 //! `slot >= UART_SLOT_BASE` kicks into `console_hub::push_chip_output`.
 //! RX is intentionally a future commit (see `uart_layout.h`).

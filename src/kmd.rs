@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 //! Kernel module ioctl bindings — exact `#[repr(C)]` translations of console/ioctl.h
+//!
+//! Mirrors the full tt-kmd ABI (ioctl numbers, struct fields, flag
+//! constants) so a future call site finds the name already wired up.
+//! The unused-today bits stay around as documentation of the ABI surface.
+#![allow(dead_code)]
 
 use std::os::unix::io::RawFd;
 

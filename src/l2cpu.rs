@@ -167,6 +167,11 @@ impl L2Cpu {
         self.idx
     }
 
+    /// Raw kmd fd, exposed for ioctls outside this module (TLB
+    /// allocation in `tlb.rs`, etc). Currently only the in-module
+    /// callers use it; left public so a future caller doesn't have to
+    /// rediscover the accessor.
+    #[allow(dead_code)]
     pub fn fd(&self) -> RawFd {
         self.fd
     }

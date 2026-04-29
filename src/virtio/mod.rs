@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 //! VirtIO MMIO device framework — base implementation for device emulation.
+//!
+//! Module-wide `#![allow(dead_code)]` — virtio-mmio register offsets
+//! and feature-bit constants are kept named to mirror the spec even
+//! when the current code paths don't reach all of them.
+#![allow(dead_code)]
 
 pub mod block;
 pub mod console;

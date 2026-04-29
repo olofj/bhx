@@ -133,6 +133,10 @@ pub fn stop_l2cpu(sock: &mut UnixStream, l2cpu: u8) -> io::Result<()> {
     expect_ok(read_frame(&mut *sock)?)
 }
 
+/// Daemon-shutdown RPC. Currently no CLI subcommand calls it (the
+/// operator-facing `bhx daemon stop` goes through SIGTERM / lifetime
+/// instead), but the wire protocol carries it; kept for completeness.
+#[allow(dead_code)]
 pub fn shutdown(sock: &mut UnixStream) -> io::Result<()> {
     write_frame(&mut *sock, &Request::Shutdown)?;
     expect_ok(read_frame(&mut *sock)?)

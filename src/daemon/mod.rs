@@ -44,6 +44,11 @@ use console_hub::ConsoleHub;
 pub struct WorkerHandle {
     pub exit: Arc<AtomicBool>,
     pub thread: Option<JoinHandle<()>>,
+    /// Human-readable identifier for the worker (e.g. "disk l2cpu 2 @
+    /// rootfs.ext4 (engine)"). Set at construction; not currently read
+    /// at runtime, but populated everywhere so a future log line can
+    /// pick it up without a separate refactor.
+    #[allow(dead_code)]
     pub description: String,
 }
 
@@ -58,6 +63,10 @@ impl WorkerHandle {
 
 /// State of a per-L2CPU slot inside the daemon.
 pub struct L2CpuSlot {
+    /// Slot index (0..3). Self-documenting; kept on the slot for
+    /// future call sites to avoid threading the index through
+    /// separately.
+    #[allow(dead_code)]
     pub idx: u8,
     pub l2cpu: Arc<L2Cpu>,
     pub interrupt: Arc<InterruptController>,

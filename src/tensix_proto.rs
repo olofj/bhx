@@ -9,6 +9,11 @@
 //! talking to a firmware with a different protocol version refuses
 //! to boot, with a clear error message naming both versions.
 //!
+//! Module-wide `#![allow(dead_code)]` — kick / completion ring offset
+//! constants are kept named for future use even when the current host
+//! path doesn't read all of them.
+#![allow(dead_code)]
+//!
 //! The protocol has three phases:
 //!
 //!   1. **Handshake.** Daemon writes [`HelloMsg`] to L1, BRISC

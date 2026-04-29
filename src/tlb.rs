@@ -120,6 +120,7 @@ impl TlbHandle {
         self.tlb_base
     }
 
+    #[allow(dead_code)]
     pub fn size(&self) -> usize {
         self.tlb_size
     }
@@ -226,6 +227,7 @@ impl TlbWindow {
         unsafe { self.window.data().add(self.offset) }
     }
 
+    #[allow(dead_code)]
     pub fn data(&self) -> *mut u8 {
         self.window.data()
     }

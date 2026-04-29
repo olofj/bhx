@@ -91,10 +91,14 @@ pub fn ensure_runtime_dir(card: u32) -> io::Result<PathBuf> {
 /// "left over from a crash" from "never started").
 pub struct PidfileGuard {
     _file: File,
+    /// Pidfile path, surfaced to test code that asserts the guard is
+    /// pointing at the right place. Production has no readers today.
+    #[allow(dead_code)]
     path: PathBuf,
 }
 
 impl PidfileGuard {
+    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }
