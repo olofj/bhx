@@ -145,19 +145,34 @@ static inline void write_u32(uintptr_t addr, uint32_t v) {
     FENCE_W();
 }
 
+// VIRTIO_NET_F_MAC: bit 5 of the low half (features[0]). Set on the
+// net slot only so the kernel reads `mac` from device-config space at
+// offset 0..6 instead of generating a random MAC. See #77 + the
+// `extra_features_low` comment in `init_device` below.
+#define VIRTIO_NET_F_MAC_BIT (1u << 5)
+
 // Static device descriptors used to populate the per-slot reg file
 // at boot. Same set for every L2CPU — each L2CPU's guest sees the
 // same four virtio devices.
+//
+// `extra_features_low` carries per-device feature bits we want the
+// kernel to negotiate from the LOW half (features[0]). The HIGH-half
+// `VIRTIO_F_VERSION_1` bit is OR'd in unconditionally inside
+// `init_device`; it lives in features[1] but our static-value scheme
+// (see DEVICE_FEATURES discussion in `init_device`) collapses both
+// halves to one register, so per-device extras and VERSION_1 share
+// the same word.
 struct device_init {
     uint32_t device_id;
-    uint32_t num_queues;  // shadow only; not visible-as-MMIO
+    uint32_t num_queues;            // shadow only; not visible-as-MMIO
+    uint32_t extra_features_low;    // bits we OR into DEVICE_FEATURES
 };
 
 static const struct device_init DEVICE_TEMPLATE[BRISC_VIRTIO_DEVS_PER_L2CPU] = {
-    [BRISC_VIRTIO_DEV_BLK]     = { VIRTIO_ID_BLOCK,   BRISC_VIRTIO_QUEUES_BLK     },
-    [BRISC_VIRTIO_DEV_NET]     = { VIRTIO_ID_NET,     BRISC_VIRTIO_QUEUES_NET     },
-    [BRISC_VIRTIO_DEV_CONSOLE] = { VIRTIO_ID_CONSOLE, BRISC_VIRTIO_QUEUES_CONSOLE },
-    [BRISC_VIRTIO_DEV_RNG]     = { VIRTIO_ID_ENTROPY, BRISC_VIRTIO_QUEUES_RNG     },
+    [BRISC_VIRTIO_DEV_BLK]     = { VIRTIO_ID_BLOCK,   BRISC_VIRTIO_QUEUES_BLK,     0 },
+    [BRISC_VIRTIO_DEV_NET]     = { VIRTIO_ID_NET,     BRISC_VIRTIO_QUEUES_NET,     VIRTIO_NET_F_MAC_BIT },
+    [BRISC_VIRTIO_DEV_CONSOLE] = { VIRTIO_ID_CONSOLE, BRISC_VIRTIO_QUEUES_CONSOLE, 0 },
+    [BRISC_VIRTIO_DEV_RNG]     = { VIRTIO_ID_ENTROPY, BRISC_VIRTIO_QUEUES_RNG,     0 },
 };
 
 static const struct device_init *device_for_slot(unsigned slot) {
@@ -228,18 +243,28 @@ static void init_device(unsigned slot) {
     *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NUM_MAX)) = BRISC_VIRTIO_QUEUE_NUM_MAX;
 
     // DEVICE_FEATURES — pre-populate with the VIRTIO_F_VERSION_1
-    // bit (high half, bit 32 of the 64-bit feature space). The
-    // poll-loop SEL multiplexer below also writes this on every
-    // iteration, but pre-setting here closes the race window
-    // between L2CPU reset release and BRISC's first poll: stock
-    // Linux virtio-mmio drivers race ~µs between
-    // `writel(SEL=1)` and `readl(DEVICE_FEATURES)`, comparable
-    // to BRISC's full sweep, so without this initialization the
-    // kernel's first read can land on a stale 0 value. We
-    // accept that the SEL=0 path can race (kernel sees stale
-    // 0x1 instead of 0) — that's a spurious low-half feature
-    // bit, which device drivers ignore for unknown bits.
-    *l1_u32(reg_addr(slot, VIRTIO_MMIO_DEVICE_FEATURES)) = VIRTIO_F_VERSION_1_HIGH_BIT;
+    // bit (high half, bit 32 of the 64-bit feature space) plus any
+    // per-device extras from the template (today: VIRTIO_NET_F_MAC
+    // for the net slot, see #77). The poll-loop SEL multiplexer
+    // below also writes this on every iteration, but pre-setting
+    // here closes the race window between L2CPU reset release and
+    // BRISC's first poll: stock Linux virtio-mmio drivers race ~µs
+    // between `writel(SEL=1)` and `readl(DEVICE_FEATURES)`,
+    // comparable to BRISC's full sweep, so without this
+    // initialization the kernel's first read can land on a stale 0
+    // value.
+    //
+    // We accept that the SEL=0 read returns the same word as SEL=1
+    // (high-half bits aliased into low-half reads). That means:
+    //   * On the net slot the kernel sees bit 5 (MAC) at SEL=0 ✓
+    //     plus bit 37 at SEL=1 — bit 37 is undefined, kernel ignores.
+    //   * On all slots the kernel sees bit 0 (CSUM) leaked at SEL=0
+    //     (because VIRTIO_F_VERSION_1 = bit 0 of the high half lit).
+    //     We don't ACK CSUM in DRIVER_FEATURES, but virtio-net's TX
+    //     path still acts as if CSUM were negotiated; that's
+    //     compensated for in `network.rs::fix_tx_l4_checksum`.
+    *l1_u32(reg_addr(slot, VIRTIO_MMIO_DEVICE_FEATURES)) =
+        VIRTIO_F_VERSION_1_HIGH_BIT | d->extra_features_low;
 
     // QUEUE_NOTIFY: clear to sentinel (-1) so the first poll
     // after init_device doesn't fire a spurious "queue 0" notify
