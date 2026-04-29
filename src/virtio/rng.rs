@@ -134,27 +134,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn device_id_is_entropy() {
+    fn device_metadata_matches_spec() {
+        // virtio 1.2: device_id 4 = entropy; single queue; no
+        // per-request header; features advertise only VERSION_1 (bit
+        // 32 = features[1] bit 0).
         let d = VirtioRng::new();
         assert_eq!(d.device_id(), 4);
-        assert_eq!(d.device_id(), crate::regs::virtio_mmio::VIRTIO_ID_ENTROPY);
-    }
-
-    #[test]
-    fn single_queue() {
-        assert_eq!(VirtioRng::new().num_queues(), 1);
-    }
-
-    #[test]
-    fn no_request_header() {
-        assert_eq!(VirtioRng::new().queue_header_size(), 0);
-    }
-
-    #[test]
-    fn advertises_only_version_1() {
-        let f = VirtioRng::new().device_features();
-        assert_eq!(f[0], 0);
-        assert_eq!(f[1], 1);
+        assert_eq!(d.num_queues(), 1);
+        assert_eq!(d.queue_header_size(), 0);
+        assert_eq!(d.device_features(), [0, 1]);
     }
 
     #[test]

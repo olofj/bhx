@@ -87,6 +87,7 @@ pub const MMIO_CONFIG: u32 = 0x100;
 // ----- Constants the firmware writes -----
 
 pub const MAGIC: u32 = 0x7472_6976; // "virt" little-endian
+const _MAGIC_IS_VIRT_LE: () = assert!(MAGIC == u32::from_le_bytes([b'v', b'i', b'r', b't']));
 pub const VERSION: u32 = 2;
 pub const VENDOR_ID: u32 = 0x5554_4254; // "TBTU" — keep in sync with virtio.c
 
@@ -510,12 +511,6 @@ mod tests {
             VIRTIO_FIRMWARE[3],
         ]);
         assert_eq!(entry, 0x0800_006f);
-    }
-
-    #[test]
-    fn magic_constant_is_virt_little_endian() {
-        // 'v' | 'i'<<8 | 'r'<<16 | 't'<<24 = 0x74726976
-        assert_eq!(MAGIC, u32::from_le_bytes([b'v', b'i', b'r', b't']));
     }
 
     // ----- Firmware-state-machine simulator tests (M3 #69) -----

@@ -587,16 +587,8 @@ fn write_reserved_tile_file(card: u32, x: u16, y: u16) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    // Hardware-touching code lives here; the non-trivial logic
-    // (translation, layout) is tested in `tensix_tile` and
-    // `virtio_engine` already. This module is mostly glue.
-
-    #[test]
-    fn module_compiles_with_virtio_engine_feature_off() {
-        // Smoke: the module is referenced from main.rs even when
-        // the feature is off, so it has to compile cleanly. Nothing
-        // to assert beyond that.
-    }
-}
+// Hardware-touching code lives here; the non-trivial logic (translation,
+// layout) is tested in `tensix_tile` and `virtio_engine`. This module is
+// mostly glue, exercised end-to-end by the soak harness rather than by
+// unit tests. CI's `--no-default-features` build is the gate that
+// catches feature-gated compile breakage.

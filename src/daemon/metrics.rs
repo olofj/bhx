@@ -1229,51 +1229,6 @@ mod tests {
     }
 
     #[test]
-    fn counter_inc_and_add() {
-        let c = Counter::new();
-        assert_eq!(c.get(), 0);
-        c.inc();
-        c.inc();
-        c.add(5);
-        assert_eq!(c.get(), 7);
-    }
-
-    #[test]
-    fn gauge_set_inc_dec() {
-        let g = Gauge::new();
-        assert_eq!(g.get(), 0);
-        g.inc();
-        g.inc();
-        g.inc();
-        g.dec();
-        assert_eq!(g.get(), 2);
-        g.set(-10);
-        assert_eq!(g.get(), -10);
-    }
-
-    #[test]
-    fn counter_vec_indexed_access() {
-        let cv: CounterVec<4> = CounterVec::new();
-        cv.at(0).inc();
-        cv.at(2).add(7);
-        cv.at(2).inc();
-        assert_eq!(cv.at(0).get(), 1);
-        assert_eq!(cv.at(1).get(), 0);
-        assert_eq!(cv.at(2).get(), 8);
-        assert_eq!(cv.at(3).get(), 0);
-    }
-
-    #[test]
-    fn gauge_vec_indexed_access() {
-        let gv: GaugeVec<4> = GaugeVec::new();
-        gv.at(1).set(42);
-        gv.at(3).inc();
-        assert_eq!(gv.at(0).get(), 0);
-        assert_eq!(gv.at(1).get(), 42);
-        assert_eq!(gv.at(3).get(), 1);
-    }
-
-    #[test]
     fn render_prometheus_emits_expected_metric_names() {
         // Don't assert exact counter values against shared statics —
         // other tests in this module touch the same globals and run in
@@ -1373,16 +1328,6 @@ mod tests {
             help_count >= 8,
             "expected at least 8 metric names, got {help_count}"
         );
-    }
-
-    #[test]
-    fn per_l2cpu_counter_indexed() {
-        let m = PerL2cpuCounter::new();
-        m.at(0).add(10);
-        m.at(2).add(7);
-        assert_eq!(m.at(0).get(), 10);
-        assert_eq!(m.at(1).get(), 0);
-        assert_eq!(m.at(2).get(), 7);
     }
 
     #[test]

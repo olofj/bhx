@@ -123,11 +123,19 @@ mod tests {
     // The byte-feed ring + its headers must fit inside the per-L2CPU
     // 0x100-byte region. The ring alone is `entries × 4` (each cell
     // holds the byte in the low 8 bits of a u32) and starts at
-    // `UART_PRIV_OFF_FEED_RING`.
+    // `UART_PRIV_OFF_FEED_RING`. The header offsets that follow are
+    // pinned to their wire-format values so a refactor here can't
+    // drift from the firmware's matching constants.
     const _FEED_RING_FITS: () = {
         let ring_size = UART_FEED_RING_ENTRIES * 4;
         assert!(UART_PRIV_OFF_FEED_RING + ring_size <= UART_PRIVATE_PER_L2CPU);
         assert!(UART_FEED_RING_ENTRIES.is_power_of_two());
+        assert!(UART_PRIV_OFF_HOLD == 0x00);
+        assert!(UART_PRIV_OFF_FEED_PRODUCER_SEQ == 0x04);
+        assert!(UART_PRIV_OFF_FEED_CONSUMER_SEQ == 0x08);
+        assert!(UART_PRIV_OFF_FEED_DROP_COUNT == 0x0C);
+        assert!(UART_PRIV_OFF_FEED_RING == 0x40);
+        assert!(UART_FEED_RING_ENTRIES == 1024);
     };
 
     // TRISC0 globals must live past the last per-L2CPU slot (4 ×
@@ -139,18 +147,6 @@ mod tests {
                 >= UART_PRIVATE_BASE + (UART_NUM_SLOTS as u32) * UART_PRIVATE_PER_L2CPU
         );
     };
-
-    #[test]
-    fn feed_ring_layout_matches_firmware() {
-        // Spot-check the offsets the firmware uses so a future move
-        // here forces a sync.
-        assert_eq!(UART_PRIV_OFF_HOLD, 0x00);
-        assert_eq!(UART_PRIV_OFF_FEED_PRODUCER_SEQ, 0x04);
-        assert_eq!(UART_PRIV_OFF_FEED_CONSUMER_SEQ, 0x08);
-        assert_eq!(UART_PRIV_OFF_FEED_DROP_COUNT, 0x0C);
-        assert_eq!(UART_PRIV_OFF_FEED_RING, 0x40);
-        assert_eq!(UART_FEED_RING_ENTRIES, 1024);
-    }
 
     #[test]
     fn uart_private_base_strides_correctly() {

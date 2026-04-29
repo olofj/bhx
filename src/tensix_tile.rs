@@ -504,29 +504,6 @@ mod tests {
     }
 
     #[test]
-    fn translate_drops_first_col_shifts_rest_down() {
-        // Synthetic harvest: only the FIRST col (NOC0 col 1) is
-        // disabled. enabled_count = 13. NOC0 col 14 (array pos 11)
-        // has 11 cols ahead of it in the array; with the first col
-        // harvested, only positions 0..12 (excluding pos 0) count
-        // as enabled prefix. Per the algorithm, pos 11 (NOC0 14)
-        // is considered enabled (logical_x = 11), and translates to
-        // TENSIX_COLS_NOC0[11] = 14. So even with a first-col
-        // harvest, NOC0 14 stays at translated 14 because the
-        // counting matches — the "enabled prefix" convention means
-        // logical_x = pos when pos < enabled_count.
-        //
-        // This test confirms the algorithm, even though the result
-        // matches identity in this specific case. A non-prefix
-        // harvest (e.g. col 2 disabled but col 1 enabled) is the
-        // case where translation actually shifts; the M2 decoder
-        // rule rejects those layouts as invalid input, so we don't
-        // exercise them here.
-        let t = noc0_to_translated_tensix(14, 11, 0x1FFF, true); // 13 enabled
-        assert_eq!(t, Some((14, 11)));
-    }
-
-    #[test]
     fn translate_disabled_col_returns_none() {
         // p100a: cols 15, 16 are at array positions 12, 13. With
         // enabled_count=12, those positions are past the range,

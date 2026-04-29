@@ -285,28 +285,15 @@ impl Drop for TensixTile {
 mod tests {
     use super::*;
 
-    #[test]
-    fn soft_reset_all_includes_every_core() {
-        assert_eq!(SOFT_RESET_ALL & SOFT_RESET_BRISC, SOFT_RESET_BRISC);
-        assert_eq!(SOFT_RESET_ALL & SOFT_RESET_TRISC0, SOFT_RESET_TRISC0);
-        assert_eq!(SOFT_RESET_ALL & SOFT_RESET_TRISC1, SOFT_RESET_TRISC1);
-        assert_eq!(SOFT_RESET_ALL & SOFT_RESET_TRISC2, SOFT_RESET_TRISC2);
-        assert_eq!(SOFT_RESET_ALL & SOFT_RESET_NCRISC, SOFT_RESET_NCRISC);
-    }
-
-    #[test]
-    fn release_brisc_clears_only_brisc() {
-        let masked_off = SOFT_RESET_ALL & !SOFT_RESET_ALL_EXCEPT_BRISC;
-        assert_eq!(masked_off, SOFT_RESET_BRISC);
-    }
-
     // The soft-reset register must land inside the 2 MiB debug-regs
     // window, otherwise the offset arithmetic in
     // {read,write}_soft_reset would underflow or read past the
     // window. The TRISC0 reset-PC override registers (M6.1, #79) live
     // in the same range and need the same bound. Compile-time check —
     // `const { assert!(...) }` fails the build instead of a test if a
-    // future edit breaks the invariant.
+    // future edit breaks the invariant. The same block also pins the
+    // soft-reset bitmask membership and the TRISC0 PC-override bit
+    // layout (matches `BlackholeA0/TensixTile/SoftReset.md`).
     const _DEBUG_REGS_WINDOW_INVARIANTS: () = {
         const TWO_MEG: u64 = 2 * 1024 * 1024;
         assert!(TENSIX_SOFT_RESET_ADDR >= TLB_BASE_DEBUG_REGS);
@@ -315,15 +302,14 @@ mod tests {
         assert!(RISCV_DEBUG_REG_TRISC0_RESET_PC + 4 <= TLB_BASE_DEBUG_REGS + TWO_MEG);
         assert!(RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE >= TLB_BASE_DEBUG_REGS);
         assert!(RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE + 4 <= TLB_BASE_DEBUG_REGS + TWO_MEG);
+        assert!(SOFT_RESET_ALL & SOFT_RESET_BRISC == SOFT_RESET_BRISC);
+        assert!(SOFT_RESET_ALL & SOFT_RESET_TRISC0 == SOFT_RESET_TRISC0);
+        assert!(SOFT_RESET_ALL & SOFT_RESET_TRISC1 == SOFT_RESET_TRISC1);
+        assert!(SOFT_RESET_ALL & SOFT_RESET_TRISC2 == SOFT_RESET_TRISC2);
+        assert!(SOFT_RESET_ALL & SOFT_RESET_NCRISC == SOFT_RESET_NCRISC);
+        assert!(SOFT_RESET_ALL & !SOFT_RESET_ALL_EXCEPT_BRISC == SOFT_RESET_BRISC);
+        assert!(TRISC_RESET_PC_OVERRIDE_T0 == 0x1);
     };
-
-    #[test]
-    fn trisc0_reset_pc_override_bit_matches_softreset_md() {
-        // Bit 0 enables TRISC0; bits 1/2 enable TRISC1/TRISC2 (not
-        // used in M6.1). Match the layout in
-        // `BlackholeA0/TensixTile/SoftReset.md`.
-        assert_eq!(TRISC_RESET_PC_OVERRIDE_T0, 0x1);
-    }
 
     #[test]
     fn hello_firmware_is_nonempty_and_aligned() {

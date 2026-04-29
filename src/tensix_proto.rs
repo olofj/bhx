@@ -189,14 +189,13 @@ impl CompletionEntry {
     }
 }
 
+// Lock the wire-format protocol version against the firmware. A bump to
+// PROTOCOL_VERSION must be matched on both sides simultaneously.
+const _PROTOCOL_VERSION_PINNED: () = assert!(PROTOCOL_VERSION == 3);
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn protocol_version_is_three() {
-        assert_eq!(PROTOCOL_VERSION, 3);
-    }
 
     #[test]
     fn magic_words_decode_to_ascii() {

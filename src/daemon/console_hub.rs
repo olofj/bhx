@@ -291,6 +291,17 @@ mod tests {
         assert!(dropped.is_empty());
         assert_eq!(hub.client_count(), 2);
 
+        // Read with a tight blocking timeout instead of relying on the
+        // socket buffer being immediately ready after the push. Either
+        // client side blocking forever would mean push_chip_output's
+        // fan-out missed it; a tight bound surfaces that as a clean
+        // test failure rather than a hang.
+        a_client.set_nonblocking(false).unwrap();
+        b_client.set_nonblocking(false).unwrap();
+        let timeout = Some(std::time::Duration::from_secs(2));
+        a_client.set_read_timeout(timeout).unwrap();
+        b_client.set_read_timeout(timeout).unwrap();
+
         let mut buf_a = [0u8; 16];
         let mut buf_b = [0u8; 16];
         let n_a = (&a_client).read(&mut buf_a).unwrap();

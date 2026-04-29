@@ -21,6 +21,18 @@ use crate::l2cpu::L2Cpu;
 const BUFFER_SIZE: u32 = 0x1000;
 const VIRTUAL_UART_MAGIC: u64 = 0x5649525455415254; // "VIRTUART"
 
+// The constant's hex digits spell the ASCII codes for "VIRTUART" when
+// read high-to-low — i.e. it's `u64::from_be_bytes(b"VIRTUART")`.
+// That's how firmware chooses the value. The chip writes this u64 to
+// DRAM natively; on a little-endian host+chip that's 8 bytes in the
+// order "TRAUTRIV", which `from_le_bytes` recovers back to the
+// constant. Lock both readings down so a future refactor that switches
+// to raw byte comparison can pick whichever is handier.
+const _VIRTUAL_UART_MAGIC_PINNED: () = {
+    assert!(VIRTUAL_UART_MAGIC == u64::from_be_bytes(*b"VIRTUART"));
+    assert!(VIRTUAL_UART_MAGIC == u64::from_le_bytes(*b"TRAUTRIV"));
+};
+
 const OPENSBI_DEBUG_PTR: u64 = 0x80;
 const EYE_CATCHER: &[u8; 8] = b"OSBIdbug";
 
@@ -554,18 +566,5 @@ mod tests {
         let bogus: u64 = 0xdead_beef_cafe_f00d;
         let bytes = bogus.to_le_bytes();
         assert_eq!(decode_magic(&bytes), Err(bogus));
-    }
-
-    #[test]
-    fn virtual_uart_magic_constant_matches_ascii_virtuart() {
-        // The constant's hex digits spell the ASCII codes for "VIRTUART"
-        // when read high-to-low — i.e. it's `u64::from_be_bytes(b"VIRTUART")`.
-        // That's how firmware chooses the value. The chip writes this u64 to
-        // DRAM natively; on a little-endian host+chip that's 8 bytes in the
-        // order "TRAUTRIV", which `from_le_bytes` recovers back to the
-        // constant. Lock both readings down so a future refactor that
-        // switches to raw byte comparison can pick whichever is handier.
-        assert_eq!(u64::from_be_bytes(*b"VIRTUART"), VIRTUAL_UART_MAGIC);
-        assert_eq!(u64::from_le_bytes(*b"TRAUTRIV"), VIRTUAL_UART_MAGIC);
     }
 }

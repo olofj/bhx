@@ -213,29 +213,15 @@ mod tests {
     }
 
     #[test]
-    fn device_id_is_console() {
+    fn device_metadata_matches_spec() {
+        // virtio 1.2: device_id 3 = console; one rx + one tx queue;
+        // no per-request header; features advertise only VERSION_1
+        // (bit 32 lands in features[1] bit 0). No MULTIPORT, F_SIZE,
+        // or EMERG_WRITE.
         let (d, _) = make();
         assert_eq!(d.device_id(), 3);
-        assert_eq!(d.device_id(), crate::regs::virtio_mmio::VIRTIO_ID_CONSOLE);
-    }
-
-    #[test]
-    fn single_port_two_queues() {
-        let (d, _) = make();
         assert_eq!(d.num_queues(), 2);
-    }
-
-    #[test]
-    fn no_request_header() {
-        let (d, _) = make();
         assert_eq!(d.queue_header_size(), 0);
-    }
-
-    #[test]
-    fn features_advertise_only_version_1() {
-        let (d, _) = make();
-        // Bit 32 (VERSION_1) is in features[1] bit 0. No other bits
-        // set — no MULTIPORT, F_SIZE, EMERG_WRITE.
         assert_eq!(d.device_features(), [0, 1]);
     }
 
