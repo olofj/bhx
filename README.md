@@ -243,10 +243,16 @@ card):
 
 ## Going deeper
 
-- **Architecture + per-module map**: see `CLAUDE.md` in this directory
-  (written for AI assistants but very readable as a design doc).
-- **Hardware soak scripts**: see `scripts/README.md`. Includes a 4-way
-  concurrent console I/O roundtrip test.
-- **Open design issues**: the GitHub issue tracker at
+- **Architecture, design notes, reference docs**: [`docs/`](docs/) —
+  see [`docs/README.md`](docs/README.md) for the index. Covers the
+  Tensix-engine virtio architecture, Blackhole harvest-mask reading,
+  tt-metal coexistence, telemetry / metrics, and the sandboxing
+  syscall set.
+- **Per-module map** (one-line summary of every file in `src/`):
+  [`CLAUDE.md`](CLAUDE.md). Originally written for AI assistants but
+  it's the most thorough developer-onboarding doc in the tree.
+- **Hardware soak scripts**: [`scripts/README.md`](scripts/README.md).
+  Includes a 4-way concurrent console I/O roundtrip test.
+- **Open design issues + roadmap**: the GitHub issue tracker at
   <https://github.com/olofj/bhx/issues>.
 

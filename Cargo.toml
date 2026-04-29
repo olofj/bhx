@@ -3,8 +3,11 @@ name = "bhx"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Run Linux on the SiFive X280 RISC-V cores embedded in Tenstorrent Blackhole P100/P150 cards."
+description = "Boot Linux on the SiFive X280 RISC-V cores inside Tenstorrent Blackhole AI accelerators. Per-card Rust daemon with virtio-mmio block/net/console and U-Boot/EFI support for stock cloud images."
 repository = "https://github.com/olofj/bhx"
+readme = "README.md"
+keywords = ["riscv", "tenstorrent", "blackhole", "virtio", "u-boot"]
+categories = ["command-line-utilities", "virtualization"]
 
 [features]
 default = ["slirp"]

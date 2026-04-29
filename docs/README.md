@@ -1,0 +1,32 @@
+# `docs/` — design notes and reference material
+
+Stable references for things that are awkward to discover from the
+source alone — chip-specific magic, operator-facing contracts, and the
+parts of the design that needed a paragraph more than a code comment
+could carry. Keep one document per topic; the source tree is the
+authoritative reference for behavior, this directory is the *why*.
+
+## Index
+
+| Document | What's in it |
+|---|---|
+| [`blackhole-harvest-mask.md`](blackhole-harvest-mask.md) | How to read the Blackhole chip's row/column harvest mask. tt-kmd's `GET_HARVESTING` ioctl is a stub — the mask actually lives in the ARC firmware telemetry table at `SCRATCH_RAM[13]`. Includes the column-decode algorithm (the only place it appears as code outside `luwen`). Feeds the `src/tensix_tile.rs` picker. |
+| [`sandbox-syscalls.md`](sandbox-syscalls.md) | The exact syscall + path set the daemon needs after seccomp + landlock are installed. Maintained alongside `src/daemon/sandbox.rs`; expand the inventory before adding any new daemon code path that hits a syscall outside the list. |
+| [`telemetry.md`](telemetry.md) | Layout of the ARC firmware telemetry table the daemon reads at startup. Field offsets, value semantics, version handling. Cross-references `luwen` and the tt-kmd headers we don't link against. |
+| [`tt-metal-coexistence.md`](tt-metal-coexistence.md) | How to run bhx alongside `tt-metal` on the same card without colliding over the reserved Tensix tile. Describes the operator contract: read the daemon's reserved-tile coordinate from `daemon status` or `$XDG_RUNTIME_DIR/bhx/<card>/reserved-tile`, exclude that tile from `tt_metal::DispatchCoreConfig`. |
+
+## Where else to look
+
+- [`../CLAUDE.md`](../CLAUDE.md) — per-module map of `src/`, working-style
+  guidance, gotchas. Originally written for AI agents but the most
+  thorough onboarding doc in the tree.
+- [`../scripts/README.md`](../scripts/README.md) — operator-driven hardware
+  soak scripts (warm-resume, concurrent boots, kill-recovery, fio /
+  iperf3 sustained I/O, console roundtrip).
+- [`../scripts/bench/README.md`](../scripts/bench/README.md) — per-surface
+  performance baselines (disk, console, net) with a regression-fail mode.
+- [`../uboot/README.md`](../uboot/README.md) — the pinned U-Boot build
+  used for stock distro images (config fragment, downstream patches,
+  reproducibility).
+- [`../tests/rootfs/README.md`](../tests/rootfs/README.md) — the
+  buildroot test rootfs construction.
