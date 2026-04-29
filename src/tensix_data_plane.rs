@@ -27,8 +27,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crate::daemon::console_hub::ConsoleHub;
 use crate::l2cpu::L2Cpu;
 use crate::tensix_engine::TensixEngine;
+use crate::uart_engine as uart;
 use crate::virtio::interrupt::InterruptController;
 use crate::virtio::{
     process_one_chain_for_queue, InterruptKind, VirtioDeviceImpl, VringAvail, VringDesc, VringUsed,
@@ -123,11 +125,21 @@ pub struct PollerStats {
 /// device_idx` packing (0..16).
 pub type Registry = Arc<Mutex<HashMap<u32, RegEntry>>>;
 
+/// Per-L2CPU UART (#78) registry. Maps `l2cpu_idx` → the slot's
+/// `console_hub`. The kick poller routes UART TX bytes (kick-ring
+/// slots 16..19) through `push_chip_output` on the appropriate
+/// hub. Separate from the virtio `Registry` so register/unregister
+/// is independent — `register_uart` flips bit `16+idx` in the
+/// active-slots bitmap, telling BRISC to start sweeping that L2CPU's
+/// UART reg file.
+pub type UartRegistry = Arc<Mutex<HashMap<u8, Arc<ConsoleHub>>>>;
+
 /// Daemon-side kick consumer. Owns a thread that loops on
 /// `engine.kick_producer_seq()` and consumes new entries.
 pub struct KickPoller {
     pub stats: Arc<PollerStats>,
     pub registry: Registry,
+    pub uart_registry: UartRegistry,
     /// Cloned for register/unregister to push the active-slots
     /// bitmap into BRISC L1 — BRISC uses it to skip non-active
     /// slots in its sweep. Without this, BRISC polls all 16 slots
@@ -145,30 +157,49 @@ impl KickPoller {
     pub fn spawn(engine: Arc<TensixEngine>) -> Self {
         let stats = Arc::new(PollerStats::default());
         let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+        let uart_registry: UartRegistry = Arc::new(Mutex::new(HashMap::new()));
         let exit = Arc::new(AtomicBool::new(false));
         let stats_thread = Arc::clone(&stats);
         let registry_thread = Arc::clone(&registry);
+        let uart_registry_thread = Arc::clone(&uart_registry);
         let exit_thread = Arc::clone(&exit);
         let engine_thread = Arc::clone(&engine);
         let join = thread::Builder::new()
             .name("tensix-kick-poller".to_string())
-            .spawn(move || run_poll_loop(engine_thread, stats_thread, registry_thread, exit_thread))
+            .spawn(move || {
+                run_poll_loop(
+                    engine_thread,
+                    stats_thread,
+                    registry_thread,
+                    uart_registry_thread,
+                    exit_thread,
+                )
+            })
             .expect("spawn tensix-kick-poller");
         KickPoller {
             stats,
             registry,
+            uart_registry,
             engine,
             exit,
             join: Some(join),
         }
     }
 
-    /// Recompute the active-slots bitmap from the registry and write
-    /// it into BRISC L1 at CTRL_OFF_ACTIVE_SLOTS. BRISC reads this
-    /// on every sweep iteration; bit `i` set means \"poll slot `i`.\"
-    fn publish_active_mask(&self, map: &HashMap<u32, RegEntry>) {
+    /// Recompute the active-slots bitmap from the virtio + UART
+    /// registries and write it into BRISC L1 at CTRL_OFF_ACTIVE_SLOTS.
+    /// BRISC reads this on every sweep iteration; bit `i` set means
+    /// "poll slot `i`." Virtio slots live in 0..16; UART slots live
+    /// at `uart::UART_SLOT_BASE` + l2cpu_idx (16..20).
+    fn publish_active_mask(&self) {
         let mut mask: u32 = 0;
-        for &slot in map.keys() {
+        for &slot in self.registry.lock().unwrap().keys() {
+            if slot < 32 {
+                mask |= 1u32 << slot;
+            }
+        }
+        for &l2cpu_idx in self.uart_registry.lock().unwrap().keys() {
+            let slot = uart::slot_for_l2cpu(l2cpu_idx) as u32;
             if slot < 32 {
                 mask |= 1u32 << slot;
             }
@@ -185,9 +216,8 @@ impl KickPoller {
     /// enabled device.
     pub fn register_slot(&self, entry: RegEntry) {
         let slot = entry.slot;
-        let mut map = self.registry.lock().unwrap();
-        map.insert(slot, entry);
-        self.publish_active_mask(&map);
+        self.registry.lock().unwrap().insert(slot, entry);
+        self.publish_active_mask();
     }
 
     /// Unregister a slot — called when an L2CPU is being torn down
@@ -195,9 +225,25 @@ impl KickPoller {
     /// kicks for `slot` log a "no registration" warning and bump
     /// stats; they don't touch the device or fire IRQs.
     pub fn unregister_slot(&self, slot: u32) {
-        let mut map = self.registry.lock().unwrap();
-        map.remove(&slot);
-        self.publish_active_mask(&map);
+        self.registry.lock().unwrap().remove(&slot);
+        self.publish_active_mask();
+    }
+
+    /// Register an L2CPU's 16550 UART. Future kicks with slot
+    /// `uart::UART_SLOT_BASE + l2cpu_idx` route the byte payload
+    /// through the registered `console_hub` via `push_chip_output`.
+    /// Sets bit `16+idx` of the active-slots bitmap so BRISC starts
+    /// sweeping the L2CPU's UART reg file.
+    pub fn register_uart(&self, l2cpu_idx: u8, hub: Arc<ConsoleHub>) {
+        self.uart_registry.lock().unwrap().insert(l2cpu_idx, hub);
+        self.publish_active_mask();
+    }
+
+    /// Unregister an L2CPU's UART. Clears bit `16+idx` of the
+    /// active-slots bitmap so BRISC stops sweeping that reg file.
+    pub fn unregister_uart(&self, l2cpu_idx: u8) {
+        self.uart_registry.lock().unwrap().remove(&l2cpu_idx);
+        self.publish_active_mask();
     }
 
     /// Signal the thread to exit and join it. Idempotent.
@@ -221,6 +267,7 @@ fn run_poll_loop(
     engine: Arc<TensixEngine>,
     stats: Arc<PollerStats>,
     registry: Registry,
+    uart_registry: UartRegistry,
     exit: Arc<AtomicBool>,
 ) {
     // Three-tier adaptive sleep mirroring `virtio::run_device`'s
@@ -249,6 +296,26 @@ fn run_poll_loop(
             let seq = raw[1];
             let epoch = raw[2];
             let _ = seq;
+
+            // M6 (#78) UART kicks live in slot range 16..20 with the
+            // TX byte in `queue_idx` (low 8 bits). Route to the
+            // registered console_hub for that L2CPU; nothing to do
+            // with virtio descriptor rings, so handle separately.
+            if let Some(l2cpu_idx) = uart::l2cpu_for_slot(slot) {
+                let byte = queue_idx as u8;
+                if let Some(hub) = uart_registry.lock().unwrap().get(&l2cpu_idx) {
+                    hub.push_chip_output(&[byte]);
+                }
+                stats.last_kick_slot_queue.store(
+                    ((slot as u64) << 16) | (queue_idx as u64),
+                    Ordering::Relaxed,
+                );
+                stats.kicks_consumed.fetch_add(1, Ordering::Relaxed);
+                consumer = consumer.wrapping_add(1);
+                consumed_this_pass += 1;
+                continue;
+            }
+
             let mut map = registry.lock().unwrap();
             if let Some(reg) = map.get_mut(&(slot as u32)) {
                 // STATUS=0 epoch tracking: BRISC bumps per-slot epoch

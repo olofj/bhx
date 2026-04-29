@@ -73,7 +73,14 @@
 
 #include <stdint.h>
 
-#define TENSIX_PROTOCOL_VERSION 1u
+// Protocol version. v1 = M5 (#71) virtio kick ring + completion ring.
+// v2 = M6 (#78) extends the kick-ring slot encoding to 32 slots so
+// slots 16..19 carry per-L2CPU 16550 UART TX bytes (with the byte in
+// the queue_idx field). Wire layout of KickEntry is unchanged; only
+// the slot enumeration grew. A daemon talking to a v1 firmware
+// refuses to boot, so old-daemon-vs-new-firmware can't end up
+// silently dropping UART kicks.
+#define TENSIX_PROTOCOL_VERSION 2u
 
 // L1 control-plane region (within the BRISC firmware tile's L1).
 //

@@ -31,7 +31,15 @@
 //! buffers; this module is only the data plane.
 
 /// Protocol version. Bump on any wire-incompatible change.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v1 = M5 (#71) virtio kick ring + completion ring.
+/// v2 = M6 (#78) extends the kick-ring slot enumeration to 32 entries
+/// so slots 16..19 carry per-L2CPU 16550 UART TX bytes (with the byte
+/// in the queue_idx field). The on-the-wire `KickEntry` layout is
+/// unchanged; this bump exists so a daemon and a firmware that
+/// disagree about whether UART kicks exist refuse to handshake
+/// instead of silently dropping bytes.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // ----- L1 control-plane region (BRISC L1) -----
 //
@@ -184,8 +192,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_version_is_one() {
-        assert_eq!(PROTOCOL_VERSION, 1);
+    fn protocol_version_is_two() {
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     #[test]

@@ -114,6 +114,13 @@ pub mod virtio_mmio {
     /// PLIC interrupt for virtio-rng.
     pub const RNG_IRQ: u32 = 30;
 
+    /// PLIC interrupt for the M6 (#78) 16550 UART. Disjoint from the
+    /// virtio range (30..33) so it doesn't share with virtio-console.
+    /// TX-only today — no IRQ is actually fired for TX completion;
+    /// reserved for the future RX path. Documented here so adding
+    /// RX doesn't have to find a free number under pressure.
+    pub const UART_IRQ: u32 = 35;
+
     /// VirtIO `device_id` value for the block device (block = 2).
     pub const VIRTIO_ID_BLOCK: u32 = 2;
     /// VirtIO `device_id` value for the network device (net = 1).

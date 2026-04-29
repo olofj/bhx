@@ -34,12 +34,13 @@
 #include <stdint.h>
 
 #include "tensix_proto.h"
+#include "uart_layout.h"
 #include "virtio_layout.h"
 
 // Firmware version, inspected via the stats page. Bump for any
 // wire-protocol change between daemon ↔ BRISC. Format: 0xAABBCCDD
 // where AA=major, BB=minor, CC=patch, DD=reserved/build.
-#define BRISC_VIRTIO_FW_VERSION 0x00050002u  // M5 (#71), build 0002 — adds SW_IMPL/sel_gen echo
+#define BRISC_VIRTIO_FW_VERSION 0x00060001u  // M6 (#78), build 0001 — adds 16550 UART (TX-only)
 
 #define FENCE_W() __asm__ volatile("fence w, w" ::: "memory")
 
@@ -562,6 +563,176 @@ static void poll_one_device(unsigned slot) {
     }
 }
 
+// ----- M6 (#78) 16550 UART emulation, TX-only first cut -----
+//
+// One UART per L2CPU. The reg file lives at L1
+// `BRISC_UART_BASE + l2cpu_idx*BRISC_UART_PER_L2CPU_STRIDE` and is
+// covered by the L2CPU's existing engine TLB window at offset
+// `BRISC_UART_OFFSET_FROM_ENGINE_BASE` from its base. The DTB emits
+// an `ns16550a` node at that PA; the kernel's 8250 driver binds it
+// as `ttyS0` and writes boot output there.
+//
+// TX detection is a sentinel-clear pattern: at init, we write
+// `BRISC_UART_THR_SENTINEL` (0xFFFFFFFFu) to the RBR/THR cell. The
+// kernel writes a single byte as a 32-bit MMIO with the byte in the
+// low 8 bits and zeros above. So `read(THR) != SENTINEL && (read &
+// 0xFF000000) == 0` ⇒ guest just wrote a TX byte. We grab the byte,
+// push it as a kick-ring entry (slot = `BRISC_KICK_UART_SLOT_BASE +
+// l2cpu_idx`, byte in queue_idx field), and reset the cell to the
+// sentinel.
+//
+// RX is intentionally *not* implemented in this commit. A static
+// MMIO reg file can't observe the kernel's RBR reads, so it can't
+// safely advance an RX FIFO without risking duplicate-byte reads
+// from the kernel's `do { read RBR; read LSR; } while (LSR & DR);`
+// drain loop. Leaving LSR.DR=0 keeps the kernel from ever reading
+// RBR; output flows out, input is silent. That's enough for #47's
+// "boot reaches a login prompt" verification, and a follow-up commit
+// can add a metered-delivery RX without touching the wire layout.
+
+static inline uintptr_t uart_reg_addr(unsigned l2cpu_idx, unsigned reg_off) {
+    return brisc_uart_regs_base(l2cpu_idx) + reg_off;
+}
+
+// Plant the static reg state every guest expects to see post-reset:
+// THR holding the sentinel, LSR with THRE+TEMT (TX always ready),
+// MSR with CTS+DSR (good link), MCR with DTR+RTS+OUT2 (typical post-
+// reset), LCR=0x03 (8N1), IIR with the 16550A FIFO indicator + the
+// no-pending-interrupt bit, IER/SCR zeroed. Reg-shift=2 means each
+// 8-bit register occupies a 4-byte cell; we pre-init the whole 4 KiB
+// to zero so any access past the active register set returns zero.
+static void uart_init_one(unsigned l2cpu_idx) {
+    uintptr_t base = brisc_uart_regs_base(l2cpu_idx);
+    for (unsigned off = 0; off < BRISC_UART_REG_FILE_SIZE; off += 4) {
+        *l1_u32(base + off) = 0;
+    }
+    // RBR/THR sentinel — the TX poll uses this as the "no fresh byte
+    // from guest" mark.
+    *l1_u32(base + UART_REG_RBR_THR) = BRISC_UART_THR_SENTINEL;
+    *l1_u32(base + UART_REG_LCR)     = UART_LCR_8N1;
+    *l1_u32(base + UART_REG_MCR)     = UART_MCR_DTR_RTS_OUT2;
+    *l1_u32(base + UART_REG_LSR)     = UART_LSR_THRE | UART_LSR_TEMT;
+    *l1_u32(base + UART_REG_MSR)     = UART_MSR_CTS | UART_MSR_DSR;
+    *l1_u32(base + UART_REG_IIR_FCR) = UART_IIR_NO_FIFO | UART_IIR_NO_INT;
+    FENCE_W();
+
+    // BRISC-private per-UART state — currently unused beyond
+    // zero-init; a future RX patch will store the rx-ring head/tail
+    // and metered-delivery cookies here.
+    uintptr_t priv = brisc_uart_private_base(l2cpu_idx);
+    for (unsigned off = 0; off < BRISC_UART_PRIVATE_PER_L2CPU; off += 4) {
+        *l1_u32(priv + off) = 0;
+    }
+    FENCE_W();
+}
+
+static void uart_init_devices(void) {
+    for (unsigned i = 0; i < BRISC_KICK_UART_NUM_SLOTS; i++) {
+        uart_init_one(i);
+    }
+}
+
+// Push a UART TX byte to the kick ring. Slot encoding shares the
+// virtio kick ring with `BRISC_KICK_UART_SLOT_BASE + l2cpu_idx` for
+// the slot field and the byte payload in queue_idx (low 8 bits).
+// Daemon-side dispatcher branches on slot >= 16. Epoch is unused for
+// UART; we read the slot's epoch (always 0 for non-virtio slots in
+// the current shadow layout) for layout symmetry with virtio kicks.
+static void uart_kick_push(unsigned l2cpu_idx, uint8_t byte) {
+    unsigned slot = BRISC_KICK_UART_SLOT_BASE + l2cpu_idx;
+    uint32_t seq = read_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_PRODUCER_SEQ));
+    uint32_t idx = seq & (KICK_RING_ENTRIES - 1u);
+    uintptr_t entry = ctrl_addr(CTRL_OFF_KICK_RING + idx * KICK_ENTRY_SIZE);
+    *l1_u32(entry + KICK_ENTRY_OFF_SLOT) = ((uint32_t)slot & 0xFFFFu) | ((uint32_t)byte << 16);
+    *l1_u32(entry + KICK_ENTRY_OFF_SEQ) = seq;
+    *l1_u32(entry + KICK_ENTRY_OFF_EPOCH) = 0;
+    FENCE_W();
+    write_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_PRODUCER_SEQ), seq + 1u);
+}
+
+// Sweep one UART. Two-state machine: IDLE → ARMED → IDLE.
+//   IDLE:  cell == sentinel, LSR.THRE=1; nothing to do unless a
+//          byte has appeared. On a fresh byte, immediately set
+//          THRE=0, push the byte, write the sentinel back, and
+//          arm a hold-down counter so THRE stays 0 for several
+//          more sweeps.
+//   ARMED: byte processed, LSR.THRE=0, holding for a fixed count
+//          of sweeps. Each sweep decrements the counter; when it
+//          hits zero we set THRE=1 and return to IDLE.
+//
+// The hold-down (`UART_THRE_HOLD_SWEEPS`) gives the L2CPU's LSR
+// read enough wall-clock window to observe THRE=0 even with a
+// noisy NoC RTT. Without it, a tight `writel(THR); readl(LSR);
+// writel(THR); readl(LSR);` loop can occasionally read LSR before
+// our THRE=0 store propagates, see THRE=1 (from the previous
+// cycle), and blast another byte through that overwrites the
+// pending one. The counter is BRISC-private state, kept in the
+// per-L2CPU private region.
+//
+// Throughput: with hold = 4 sweeps and a sweep period ≈ 200 ns,
+// we deliver ≥ 1 byte / 1.5 µs ≈ 670 KB/s — comfortably above any
+// human-driven console rate and the 115200 bps stock distros set.
+#define UART_PRIV_OFF_HOLD     0x00u
+#define UART_THRE_HOLD_SWEEPS  20u
+
+static void uart_poll_one(unsigned l2cpu_idx) {
+    uintptr_t cell = uart_reg_addr(l2cpu_idx, UART_REG_RBR_THR);
+    uintptr_t lsr_addr = uart_reg_addr(l2cpu_idx, UART_REG_LSR);
+    uintptr_t hold_addr = brisc_uart_private_base(l2cpu_idx) + UART_PRIV_OFF_HOLD;
+
+    uint32_t hold = *l1_u32(hold_addr);
+    if (hold > 0) {
+        hold -= 1;
+        *l1_u32(hold_addr) = hold;
+        if (hold == 0) {
+            *l1_u32(lsr_addr) = UART_LSR_THRE | UART_LSR_TEMT;
+            FENCE_W();
+        }
+        return;
+    }
+
+    uint32_t v = *l1_u32(cell);
+    if (v == BRISC_UART_THR_SENTINEL) {
+        return;
+    }
+    // Drop THRE+TEMT immediately so the kernel's next LSR poll
+    // sees a busy transmitter and stalls.
+    *l1_u32(lsr_addr) = 0;
+    FENCE_W();
+    // Guard against the LCR.DLAB=1 dance: when the kernel sets
+    // DLAB and writes the divisor low byte, that write also lands
+    // here. We must NOT push the divisor as a TX byte. The kernel's
+    // pattern is `write LCR=0x83; write DLL; write DLM; write
+    // LCR=0x03;` — between the DLAB-set and DLAB-clear, treat any
+    // THR write as a divisor byte (silently consume + reset
+    // sentinel).
+    uint32_t lcr = *l1_u32(uart_reg_addr(l2cpu_idx, UART_REG_LCR));
+    if (lcr & UART_LCR_DLAB) {
+        *l1_u32(cell) = BRISC_UART_THR_SENTINEL;
+        FENCE_W();
+        *l1_u32(lsr_addr) = UART_LSR_THRE | UART_LSR_TEMT;
+        FENCE_W();
+        return;
+    }
+    uint8_t byte = (uint8_t)(v & 0xFFu);
+    *l1_u32(cell) = BRISC_UART_THR_SENTINEL;
+    FENCE_W();
+    uart_kick_push(l2cpu_idx, byte);
+    // Hold THRE=0 for a few more sweeps so the L2CPU's LSR read
+    // has a wide-enough wall-clock window to observe it.
+    *l1_u32(hold_addr) = UART_THRE_HOLD_SWEEPS;
+}
+
+static void uart_poll_devices(uint32_t active_slots) {
+    for (unsigned i = 0; i < BRISC_KICK_UART_NUM_SLOTS; i++) {
+        unsigned slot = BRISC_KICK_UART_SLOT_BASE + i;
+        if (((active_slots >> slot) & 1u) == 0) {
+            continue;
+        }
+        uart_poll_one(i);
+    }
+}
+
 // ----- M5 (#71) handshake -----
 
 // Initialize the control-plane region: zero the hello/hello-ack/
@@ -608,6 +779,7 @@ void main(void) {
     for (unsigned slot = 0; slot < BRISC_VIRTIO_NUM_SLOTS; slot++) {
         init_device(slot);
     }
+    uart_init_devices();
 
     // Block on the daemon's hello before entering the steady-state
     // poll loop. Without this, a guest could (in theory) start
@@ -631,6 +803,9 @@ void main(void) {
             }
             poll_one_device(slot);
         }
+        // UART slots live at 16..19 in the same bitmap; the daemon
+        // sets the bit on register-uart and clears on unregister.
+        uart_poll_devices(active);
         poll_completion_ring();
         heartbeat += 1u;
         // Don't fence on every iteration — heartbeat is observed at

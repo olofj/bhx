@@ -32,6 +32,7 @@ mod tensix_engine;
 mod tensix_proto;
 mod tensix_tile;
 mod tlb;
+mod uart_engine;
 mod virtio;
 mod virtio_engine;
 mod x280_tlb;

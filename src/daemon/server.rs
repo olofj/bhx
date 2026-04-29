@@ -827,6 +827,17 @@ fn dispatch_boot(
                     input_buf,
                 });
             }
+            // M6 (#78) 16550 UART: register the L2CPU's console_hub so
+            // BRISC's TX kicks (slot 16+l2cpu_idx) route the byte
+            // through `push_chip_output`. Always-on with the engine —
+            // the DTB node is also unconditionally emitted, so distro
+            // kernels with `console=ttyS0` find a real backing device.
+            poller.register_uart(l2cpu_idx, Arc::clone(&slot.console_hub));
+            dlog!(
+                "[run_boot l2cpu {}] uart-engine: registered TX path on slot {}",
+                l2cpu_idx,
+                crate::uart_engine::slot_for_l2cpu(l2cpu_idx),
+            );
         } else {
             dlog!(
                 "[run_boot l2cpu {}] virtio-engine: engine + kick poller not up — \
@@ -1036,6 +1047,7 @@ fn run_boot_sequence(
     // matters today, was already known to bind reliably when block
     // probes after net so we keep DISK last.
     let mut virtio_nodes: Vec<crate::boot::VirtioMmioNode> = Vec::with_capacity(8);
+    let mut uart_addr_for_dtb: Option<u64> = None;
 
     let any_host_device = has_rng || has_network || has_disk || has_console;
 
@@ -1115,13 +1127,28 @@ fn run_boot_sequence(
             crate::regs::virtio_mmio::RNG_IRQ,
             "rng",
         );
+        // M6 (#78) 16550 UART. Lives at a fixed offset within the
+        // engine's small TLB window — no second TLB slot needed. We
+        // emit the DTB node unconditionally on the engine path so
+        // distro kernels with `console=ttyS0` find a real backing
+        // device; UART TX is independent of the virtio-console
+        // device, and the patched-kernel path that uses
+        // `console=hvc0` simply ignores it.
+        let uart_pa = crate::uart_engine::uart_pa_from_engine_base(x280_base);
+        dlog!(
+            "[run_boot l2cpu {}]   uart: x280_pa={:#x}",
+            l2cpu_idx,
+            uart_pa
+        );
+        uart_addr_for_dtb = Some(uart_pa);
     }
     dlog!(
-        "[run_boot l2cpu {}] patching DTB (memory start=0x{:x} size=0x{:x}, {} virtio nodes)",
+        "[run_boot l2cpu {}] patching DTB (memory start=0x{:x} size=0x{:x}, {} virtio nodes, uart={:?})",
         l2cpu_idx,
         starting_address,
         memory_size,
-        virtio_nodes.len()
+        virtio_nodes.len(),
+        uart_addr_for_dtb,
     );
     let dtb_patched = boot::modify_dtb(
         &dtb_raw,
@@ -1129,6 +1156,7 @@ fn run_boot_sequence(
         starting_address,
         memory_size,
         &virtio_nodes,
+        uart_addr_for_dtb,
     )?;
 
     let initramfs_pb = initramfs.map(std::path::PathBuf::from);
@@ -1912,6 +1940,7 @@ fn unregister_engine_slots(state: &Arc<DaemonState>, l2cpu_idx: u8) {
         for dev_idx in 0..crate::virtio_engine::DEVS_PER_L2CPU {
             poller.unregister_slot(base + dev_idx);
         }
+        poller.unregister_uart(l2cpu_idx);
     }
 }
 

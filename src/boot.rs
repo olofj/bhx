@@ -238,6 +238,7 @@ pub fn modify_dtb(
     mem_start: u64,
     mem_size: u64,
     virtio_nodes: &[VirtioMmioNode],
+    uart_addr: Option<u64>,
 ) -> crate::Result<Vec<u8>> {
     let mem_end = mem_start + mem_size;
     eprintln!(
@@ -360,6 +361,33 @@ pub fn modify_dtb(
         fdt.setprop_u32(node, "interrupt-parent", plic_phandle)?;
     }
 
+    // /soc/serial@<UART_PA> — M6 (#78) 16550 UART, TX-only first cut.
+    // Emitted under /soc so distro kernels with `console=ttyS0` find
+    // a real backing device. `reg-shift = 2` matches our 4-byte stride
+    // reg file; `clock-frequency` is purely informational (Linux's
+    // 8250 driver doesn't reprogram the divisor on a memory-mapped
+    // device that already has a `current-speed` set).
+    if let Some(addr) = uart_addr {
+        let name = format!("serial@{:x}", addr);
+        eprintln!(
+            "[modify_dtb]   adding {} size=0x1000 irq={} (UART, TX-only)",
+            name,
+            crate::regs::virtio_mmio::UART_IRQ,
+        );
+        let node = fdt.add_subnode(soc, &name)?;
+        fdt.setprop_string(node, "compatible", "ns16550a")?;
+        let mut reg = Vec::with_capacity(16);
+        reg.extend_from_slice(&addr.to_be_bytes());
+        reg.extend_from_slice(&0x1000u64.to_be_bytes());
+        fdt.setprop(node, "reg", &reg)?;
+        fdt.setprop_u32(node, "reg-shift", 2)?;
+        fdt.setprop_u32(node, "reg-io-width", 4)?;
+        fdt.setprop_u32(node, "clock-frequency", 1843200)?;
+        fdt.setprop_u32(node, "current-speed", 115200)?;
+        fdt.setprop_u32(node, "interrupts", crate::regs::virtio_mmio::UART_IRQ)?;
+        fdt.setprop_u32(node, "interrupt-parent", plic_phandle)?;
+    }
+
     let packed = fdt.pack()?;
     eprintln!("[modify_dtb] packed DTB {} bytes", packed.len());
     Ok(packed)
@@ -412,14 +440,22 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x8000_0000u64; // 2 GiB
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[]).unwrap();
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None).unwrap();
         assert_eq!(read_memory_reg(&out), (mem_start, mem_size));
     }
 
     #[test]
     fn modify_dtb_bootargs_for_vda_root() {
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, 0x4000_3000_0000, 0x1_0000_0000, &[]).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            0x4000_3000_0000,
+            0x1_0000_0000,
+            &[],
+            None,
+        )
+        .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let chosen = fdt.path_offset("/chosen").unwrap().unwrap();
         let args = fdt.getprop(chosen, "bootargs").unwrap();
@@ -439,7 +475,15 @@ mod tests {
             addr: 0x4000_3210_0000,
             len: 4096,
         };
-        let out = modify_dtb(FIXTURE_DTB, &dev, 0x4000_3000_0000, 0x1_0000_0000, &[]).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            0x4000_3000_0000,
+            0x1_0000_0000,
+            &[],
+            None,
+        )
+        .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let chosen = fdt.path_offset("/chosen").unwrap().unwrap();
         let args = fdt.getprop(chosen, "bootargs").unwrap();
@@ -460,7 +504,7 @@ mod tests {
         let expected_base = mem_end - crate::regs::virtio_mmio::RESERVED_SIZE;
 
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[]).unwrap();
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None).unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let res = fdt
             .path_offset("/reserved-memory/memory@4000afa00000")
@@ -496,7 +540,7 @@ mod tests {
                 irq: DISK_IRQ - i as u32,
             })
             .collect();
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &nodes).unwrap();
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &nodes, None).unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
 
         for spec in &nodes {
@@ -527,7 +571,7 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x1_0000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[]).unwrap();
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None).unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         for i in 0..4u64 {
             let addr = mem_start + mem_size - crate::regs::virtio_mmio::MMIO_SLOT_SIZE * (i + 1);

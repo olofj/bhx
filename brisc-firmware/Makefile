@@ -73,7 +73,7 @@ $(OUT_DIR)/start.o: start.S | $(OUT_DIR)
 $(OUT_DIR)/hello.o: hello.c | $(OUT_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(OUT_DIR)/virtio.o: virtio.c include/virtio_layout.h | $(OUT_DIR)
+$(OUT_DIR)/virtio.o: virtio.c include/virtio_layout.h include/uart_layout.h include/tensix_proto.h | $(OUT_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Link + objcopy + size-check, parametrized by variant.
