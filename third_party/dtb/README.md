@@ -6,11 +6,11 @@ reads at L2CPU DRAM start + 1 MiB (`FW_JUMP_FDT_OFFSET=0x100000`) and
 that `boot::modify_dtb` patches further at runtime (per-L2CPU DRAM
 size, virtio-mmio nodes, reserved memory, `/chosen/bootargs`).
 
-This is the second source of `blackhole-card.dtb`. The default operator
-path remains `bhx kernel pull`, which downloads the DTB as part of a
-prebuilt bundle from `tt-bh-linux` releases. Use this in-tree build
-when you want to avoid the dependency on someone else's release
-artifacts, or to patch the device tree itself.
+This is the only source of `blackhole-card.dtb` — every operator
+builds it locally from this directory. (Earlier versions of bhx had a
+`kernel pull` subcommand that downloaded a prebuilt DTB from the
+`tt-bh-linux` release bundle; that subcommand has been removed in
+favor of in-tree builds, see #84.)
 
 ## Build
 
@@ -66,7 +66,7 @@ that dual license. Copyright stays with **Tenstorrent AI ULC**.
 ```
 
 `bhx boot` defaults `--dtb` to `blackhole-card.dtb` in the caller's
-cwd (the `kernel pull` convention), so the simplest workflow is:
+cwd, so the simplest workflow is:
 
 ```bash
 make -C third_party/dtb

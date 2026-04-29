@@ -17,7 +17,6 @@ mod error;
 mod fdt_ffi;
 mod fetch;
 mod image;
-mod kernel;
 mod kmd;
 mod l2cpu;
 mod ramdisk;
@@ -195,11 +194,6 @@ enum Commands {
         #[command(subcommand)]
         action: ImageAction,
     },
-    /// Manage kernel/firmware (fw_jump.bin + Image + DTB)
-    Kernel {
-        #[command(subcommand)]
-        action: KernelAction,
-    },
     /// Low-level diagnostic probes that bypass the daemon.
     Debug {
         #[command(subcommand)]
@@ -293,24 +287,6 @@ enum ImageAction {
         /// (The "image already exists" short-circuit on the converted
         /// .ext4 still applies — delete that file too if you want a
         /// truly clean fetch.)
-        #[arg(long)]
-        refetch: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum KernelAction {
-    /// List available kernel/firmware versions
-    List,
-    /// Download kernel/firmware bundle (fw_jump.bin + Image + DTB)
-    Pull {
-        /// Kernel version (e.g., "0.10", "v0.9"); defaults to latest
-        #[arg(short, long)]
-        version: Option<String>,
-        /// Output directory (default: current directory)
-        #[arg(short, long)]
-        output: Option<String>,
-        /// Bypass the HTTP-conditional cache and always re-download.
         #[arg(long)]
         refetch: bool,
     },
@@ -591,19 +567,6 @@ fn main() -> std::process::ExitCode {
                     refetch,
                 } => {
                     image::cmd_pull(&name, output.as_deref(), refetch);
-                }
-            }
-            Ok(())
-        }
-        Some(Commands::Kernel { action }) => {
-            match action {
-                KernelAction::List => kernel::cmd_list(),
-                KernelAction::Pull {
-                    version,
-                    output,
-                    refetch,
-                } => {
-                    kernel::cmd_pull(version.as_deref(), output.as_deref(), refetch);
                 }
             }
             Ok(())

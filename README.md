@@ -56,27 +56,24 @@ CI runs the full build/clippy/test gauntlet on every push that touches
 
 ## Fetching the firmware + a rootfs
 
-You need three firmware files plus a disk image, all in the current
-directory:
-
-- `fw_jump.bin` — OpenSBI
-- `Image` — Linux kernel
-- `blackhole-card.dtb` — device tree blob
-- `rootfs.ext4` — root filesystem
-
-The tool can download them for you:
+For the U-Boot/EFI/GRUB path (any modern distro), all you need is the
+disk image:
 
 ```bash
-# Firmware (fw_jump.bin + Image + blackhole-card.dtb):
-cargo run -- kernel pull
-
-# Rootfs (Debian 13 is the default pick):
-cargo run -- image pull debian
-ln -sf images/debian-13.ext4 rootfs.ext4     # or use --disk in boot below
+cargo run -- image pull debian        # or fedora, ubuntu, almalinux, …
 ```
 
-Run `cargo run -- image list` / `cargo run -- kernel list` to see what
-else is available.
+Run `cargo run -- image list` to see the registry. The daemon resolves
+`u-boot.bin`, `fw_jump.bin`, and `blackhole-card.dtb` from the in-tree
+`third_party/{uboot,opensbi,dtb}/` build trees automatically — see
+their per-directory READMEs for `make`-based bumps and reproducibility
+notes.
+
+For the legacy direct-kernel boot path (`boot --kernel <path>`), you
+also need to provide `Image` yourself — most often a kernel you've
+just built from a checked-out Linux tree. The host symlink convention
+is `./Image` in the project root; pass `--kernel <path>` on `boot` to
+point elsewhere.
 
 ## Quick start
 

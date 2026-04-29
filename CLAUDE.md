@@ -103,7 +103,6 @@ src/
 │   └── terminal.rs   # Client-side tty pump for `connect` (Ctrl-A x exit detection)
 ├── slirp_ffi.rs      # FFI to libvdeslirp 0.1.x (only with slirp feature)
 ├── image.rs          # download / convert rootfs images (Debian/Ubuntu/Fedora) — hardware-free
-├── kernel.rs         # download kernel+OpenSBI+DTB bundles — hardware-free
 └── ramdisk.rs        # download initramfs images — hardware-free
 
 scripts/  (see scripts/README.md)
@@ -194,9 +193,10 @@ with `timeout`:
 timeout 5 ./target/debug/bhx connect -l 0 </dev/null 2>/tmp/stderr.log
 ```
 
-Hardware-free: `cargo run -- image|kernel|ramdisk` subcommands (no
-daemon, no card needed). `image pull <distro>` downloads + converts to
-`.ext4`; `kernel pull` drops `fw_jump.bin`/`Image`/`*.dtb` into cwd.
+Hardware-free: `cargo run -- image|ramdisk` subcommands (no daemon, no
+card needed). `image pull <distro>` downloads + converts disk images;
+`fw_jump.bin` / `blackhole-card.dtb` / `u-boot.bin` come from the
+in-tree `third_party/{opensbi,dtb,uboot}/` build trees.
 
 Low-level diagnostics that bypass the daemon (require the daemon
 stopped — enforced at the client):

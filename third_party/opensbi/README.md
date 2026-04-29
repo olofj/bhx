@@ -5,11 +5,11 @@ the L2CPU lands in after release-from-reset. OpenSBI sets up M-mode
 state, reads the DTB at `+0x10_0000`, and jumps to the next stage at
 `+0x20_0000` (either a raw Linux `Image` or U-Boot in S-mode).
 
-This is the second source of `fw_jump.bin`. The default operator path
-remains `bhx kernel pull`, which downloads a pre-built bundle (kernel
-+ OpenSBI + DTB) from the `tt-bh-linux` GitHub releases. Use this
-in-tree build when you want to track / patch OpenSBI yourself, or to
-avoid the dependency on someone else's release artifacts.
+This is the only source of `fw_jump.bin` — every operator builds it
+locally from this directory. (Earlier versions of bhx had a
+`kernel pull` subcommand that downloaded a prebuilt OpenSBI from the
+`tt-bh-linux` release bundle; that subcommand has been removed in
+favor of in-tree builds, see #84.)
 
 ## Build
 
@@ -34,9 +34,8 @@ cd ../..    # back to bhx/
 ./target/debug/bhx connect -l 0
 ```
 
-`bhx boot` defaults `--opensbi` to `fw_jump.bin` in the caller's cwd
-(the `kernel pull` convention), so the simplest workflow is to keep
-the symlink there:
+`bhx boot` defaults `--opensbi` to `fw_jump.bin` in the caller's cwd,
+so the simplest workflow is to keep the symlink there:
 
 ```bash
 ln -sf third_party/opensbi/fw_jump.bin ./fw_jump.bin
