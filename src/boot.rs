@@ -259,8 +259,6 @@ pub fn modify_dtb(
     // 3 (2 GiB each, with L2CPU 3 starting at 0x4000_b000_0000) leaves the
     // kernel thinking it has 4 GiB and allocating virtio buffers past the
     // end of its DRAM window, which our server then rejects as out-of-range.
-    // (See #85: the unit name still says `@400030000000` even on L2CPU 3,
-    // which is cosmetic — the kernel reads `reg`, not the unit name.)
     let memory_node = fdt.path_offset("/memory@400030000000")?.ok_or_else(|| {
         crate::Error::fdt("path_offset", "memory@400030000000 node not found in DT")
     })?;
@@ -268,10 +266,19 @@ pub fn modify_dtb(
     reg.extend_from_slice(&mem_start.to_be_bytes());
     reg.extend_from_slice(&mem_size.to_be_bytes());
     fdt.setprop(memory_node, "reg", &reg)?;
+    // Keep the unit address in the node name in sync with the patched
+    // reg. Cosmetic — the kernel only reads `reg` — but `fdtdump` /
+    // `dtc -I dtb -O dts` read the unit name and a mismatch derails
+    // a manual triage session for an L2CPU 3 boot bug (#85).
+    let canonical_name = format!("memory@{:x}", mem_start);
+    if fdt.get_name(memory_node).as_deref() != Some(canonical_name.as_str()) {
+        fdt.set_name(memory_node, &canonical_name)?;
+    }
     crate::dlog!(
-        "[modify_dtb]   /memory reg patched -> start=0x{:x} size=0x{:x}",
+        "[modify_dtb]   /memory reg patched -> start=0x{:x} size=0x{:x} (node {})",
         mem_start,
-        mem_size
+        mem_size,
+        canonical_name
     );
 
     let chosen = match fdt.path_offset("/chosen")? {
@@ -436,12 +443,16 @@ mod tests {
         }
     }
 
-    /// Locate `/memory@400030000000` and parse its `reg` property as
+    /// Locate `/memory@<hex(start)>` and parse its `reg` property as
     /// (start, size) — the layout `boot::modify_dtb` writes is two
     /// big-endian u64s.
-    fn read_memory_reg(dtb: &[u8]) -> (u64, u64) {
+    fn read_memory_reg(dtb: &[u8], start: u64) -> (u64, u64) {
         let fdt = Fdt::open_into(dtb, 0).unwrap();
-        let node = fdt.path_offset("/memory@400030000000").unwrap().unwrap();
+        let path = format!("/memory@{:x}", start);
+        let node = fdt
+            .path_offset(&path)
+            .unwrap()
+            .unwrap_or_else(|| panic!("expected {} in patched DTB", path));
         let reg = fdt.getprop(node, "reg").unwrap();
         assert_eq!(reg.len(), 16);
         let start = u64::from_be_bytes(reg[0..8].try_into().unwrap());
@@ -451,13 +462,37 @@ mod tests {
 
     #[test]
     fn modify_dtb_patches_memory_node_for_l2cpu_with_2gib() {
-        // L2CPU 2/3 each see 2 GiB. Verify modify_dtb writes (start, 2 GiB)
-        // into /memory's reg.
+        // L2CPU 2 sees 2 GiB at the original 0x4000_3000_0000 base; the
+        // node unit name in the input fixture matches, so no rename is
+        // needed.
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x8000_0000u64; // 2 GiB
         let dev = BootDevice::Vda("vda".to_string());
         let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None).unwrap();
-        assert_eq!(read_memory_reg(&out), (mem_start, mem_size));
+        assert_eq!(read_memory_reg(&out, mem_start), (mem_start, mem_size));
+    }
+
+    #[test]
+    fn modify_dtb_renames_memory_node_for_l2cpu_3_base() {
+        // L2CPU 3 starts at 0x4000_b000_0000 — different from the input
+        // fixture's baked-in `/memory@400030000000`. After modify_dtb
+        // the reg must reflect the L2CPU 3 base AND the node must be
+        // reachable as `/memory@4000b0000000` (and not the old name).
+        let mem_start = 0x4000_b000_0000u64;
+        let mem_size = 0x8000_0000u64;
+        let dev = BootDevice::Vda("vda".to_string());
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None).unwrap();
+        assert_eq!(read_memory_reg(&out, mem_start), (mem_start, mem_size));
+
+        let fdt = Fdt::open_into(&out, 0).unwrap();
+        assert!(
+            fdt.path_offset("/memory@400030000000").unwrap().is_none(),
+            "old unit name must be gone after rename"
+        );
+        assert!(
+            fdt.path_offset("/memory@4000b0000000").unwrap().is_some(),
+            "canonical L2CPU 3 unit name must be reachable"
+        );
     }
 
     #[test]

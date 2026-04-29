@@ -15,6 +15,8 @@ extern "C" {
     pub fn fdt_pack(fdt: *mut c_void) -> c_int;
     pub fn fdt_path_offset(fdt: *const c_void, path: *const c_char) -> c_int;
     pub fn fdt_add_subnode(fdt: *mut c_void, parentoffset: c_int, name: *const c_char) -> c_int;
+    pub fn fdt_set_name(fdt: *mut c_void, nodeoffset: c_int, name: *const c_char) -> c_int;
+    pub fn fdt_get_name(fdt: *const c_void, nodeoffset: c_int, lenp: *mut c_int) -> *const c_char;
     pub fn fdt_setprop(
         fdt: *mut c_void,
         nodeoffset: c_int,
@@ -153,6 +155,26 @@ impl Fdt {
         } else {
             Ok(ret)
         }
+    }
+
+    /// Rename `node`'s unit name in place (e.g. `memory@400030000000` ->
+    /// `memory@4000b0000000`). Used when patching `reg` shifts the unit
+    /// address out of sync with the baked-in node name (#85).
+    pub fn set_name(&mut self, node: c_int, name: &str) -> crate::Result<()> {
+        let c_name = CString::new(name).map_err(|e| Error::fdt("fdt_set_name", e.to_string()))?;
+        let ret = unsafe { fdt_set_name(self.ptr_mut(), node, c_name.as_ptr()) };
+        check(ret, &format!("fdt_set_name({})", name))
+    }
+
+    /// Get the unit name for `node` (the part after the last `/` of its path).
+    pub fn get_name(&self, node: c_int) -> Option<String> {
+        let mut len: c_int = 0;
+        let p = unsafe { fdt_get_name(self.ptr(), node, &mut len) };
+        if p.is_null() || len < 0 {
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(p as *const u8, len as usize) };
+        std::str::from_utf8(bytes).ok().map(|s| s.to_string())
     }
 
     /// Set property `name` on `node` to raw `value` bytes.
