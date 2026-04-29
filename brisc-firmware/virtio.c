@@ -42,11 +42,14 @@
 // where AA=major, BB=minor, CC=patch, DD=reserved/build.
 //
 // 0x00060001 — M6 (#78): adds 16550 UART (TX-only) on BRISC poll
-// 0x00060101 — M6.1 (#79): TRISC0 skeleton + active-slots-driven
-//              reset lifecycle (BRISC owns TRISC0's soft-reset bit).
-//              UART poll still on BRISC at this point; Phase B moves
-//              it to TRISC0 and bumps the patch byte.
-#define BRISC_VIRTIO_FW_VERSION 0x00060101u
+// 0x00060101 — M6.1 (#79) Phase A: TRISC0 skeleton + active-slots-
+//              driven reset lifecycle (BRISC owns TRISC0's soft-reset
+//              bit). UART poll still on BRISC at this step.
+// 0x00060102 — M6.1 (#79) Phase B: UART poll moves to TRISC0; per-
+//              L2CPU SPSC byte-feed ring carries TX bytes from TRISC0
+//              to BRISC. Closes the BRISC sweep-period race that
+//              caused 30–60% byte loss on bursts.
+#define BRISC_VIRTIO_FW_VERSION 0x00060102u
 
 #define FENCE_W() __asm__ volatile("fence w, w" ::: "memory")
 
@@ -569,7 +572,7 @@ static void poll_one_device(unsigned slot) {
     }
 }
 
-// ----- M6 (#78) 16550 UART emulation, TX-only first cut -----
+// ----- M6 (#78) 16550 UART emulation, TX-only -----
 //
 // One UART per L2CPU. The reg file lives at L1
 // `BRISC_UART_BASE + l2cpu_idx*BRISC_UART_PER_L2CPU_STRIDE` and is
@@ -578,23 +581,17 @@ static void poll_one_device(unsigned slot) {
 // an `ns16550a` node at that PA; the kernel's 8250 driver binds it
 // as `ttyS0` and writes boot output there.
 //
-// TX detection is a sentinel-clear pattern: at init, we write
-// `BRISC_UART_THR_SENTINEL` (0xFFFFFFFFu) to the RBR/THR cell. The
-// kernel writes a single byte as a 32-bit MMIO with the byte in the
-// low 8 bits and zeros above. So `read(THR) != SENTINEL && (read &
-// 0xFF000000) == 0` ⇒ guest just wrote a TX byte. We grab the byte,
-// push it as a kick-ring entry (slot = `BRISC_KICK_UART_SLOT_BASE +
-// l2cpu_idx`, byte in queue_idx field), and reset the cell to the
-// sentinel.
+// M6.1 (#79) split: TRISC0 polls the UART reg files and feeds bytes
+// through a per-L2CPU SPSC ring in BRISC L1; BRISC drains the rings
+// and pushes kick-ring entries to the daemon. Same on-the-wire shape
+// as M6 (slot=BRISC_KICK_UART_SLOT_BASE+idx, byte in queue_idx); the
+// dedicated TRISC0 sweep closes the LSR-write race that drove the
+// 30–60% byte-loss observed on BRISC-only polling.
 //
-// RX is intentionally *not* implemented in this commit. A static
-// MMIO reg file can't observe the kernel's RBR reads, so it can't
-// safely advance an RX FIFO without risking duplicate-byte reads
-// from the kernel's `do { read RBR; read LSR; } while (LSR & DR);`
-// drain loop. Leaving LSR.DR=0 keeps the kernel from ever reading
-// RBR; output flows out, input is silent. That's enough for #47's
-// "boot reaches a login prompt" verification, and a follow-up commit
-// can add a metered-delivery RX without touching the wire layout.
+// RX is intentionally not implemented. A static MMIO reg file can't
+// observe the kernel's RBR reads, so it can't safely advance an RX
+// FIFO. LSR.DR stays 0 forever and the kernel never reads RBR. A
+// follow-up can add metered-delivery RX without touching this layout.
 
 static inline uintptr_t uart_reg_addr(unsigned l2cpu_idx, unsigned reg_off) {
     return brisc_uart_regs_base(l2cpu_idx) + reg_off;
@@ -607,13 +604,17 @@ static inline uintptr_t uart_reg_addr(unsigned l2cpu_idx, unsigned reg_off) {
 // no-pending-interrupt bit, IER/SCR zeroed. Reg-shift=2 means each
 // 8-bit register occupies a 4-byte cell; we pre-init the whole 4 KiB
 // to zero so any access past the active register set returns zero.
+//
+// BRISC owns the reg-file initialization (one-shot at boot, plus
+// re-init on TRISC0 lifecycle changes if ever needed). TRISC0 only
+// polls; it never plants the static regs.
 static void uart_init_one(unsigned l2cpu_idx) {
     uintptr_t base = brisc_uart_regs_base(l2cpu_idx);
     for (unsigned off = 0; off < BRISC_UART_REG_FILE_SIZE; off += 4) {
         *l1_u32(base + off) = 0;
     }
-    // RBR/THR sentinel — the TX poll uses this as the "no fresh byte
-    // from guest" mark.
+    // RBR/THR sentinel — TRISC0's TX poll uses this as the "no fresh
+    // byte from guest" mark.
     *l1_u32(base + UART_REG_RBR_THR) = BRISC_UART_THR_SENTINEL;
     *l1_u32(base + UART_REG_LCR)     = UART_LCR_8N1;
     *l1_u32(base + UART_REG_MCR)     = UART_MCR_DTR_RTS_OUT2;
@@ -622,9 +623,11 @@ static void uart_init_one(unsigned l2cpu_idx) {
     *l1_u32(base + UART_REG_IIR_FCR) = UART_IIR_NO_FIFO | UART_IIR_NO_INT;
     FENCE_W();
 
-    // BRISC-private per-UART state — currently unused beyond
-    // zero-init; a future RX patch will store the rx-ring head/tail
-    // and metered-delivery cookies here.
+    // Per-L2CPU UART feed ring + headers — see uart_layout.h for the
+    // 0x100-byte block layout. Zero the whole region at boot so we
+    // start with producer = consumer = drop_count = 0 and a clean
+    // ring. TRISC0 producer / BRISC consumer indices wrap modulo
+    // BRISC_UART_FEED_RING_ENTRIES.
     uintptr_t priv = brisc_uart_private_base(l2cpu_idx);
     for (unsigned off = 0; off < BRISC_UART_PRIVATE_PER_L2CPU; off += 4) {
         *l1_u32(priv + off) = 0;
@@ -642,8 +645,11 @@ static void uart_init_devices(void) {
 // virtio kick ring with `BRISC_KICK_UART_SLOT_BASE + l2cpu_idx` for
 // the slot field and the byte payload in queue_idx (low 8 bits).
 // Daemon-side dispatcher branches on slot >= 16. Epoch is unused for
-// UART; we read the slot's epoch (always 0 for non-virtio slots in
-// the current shadow layout) for layout symmetry with virtio kicks.
+// UART; we set 0 for layout symmetry with virtio kicks.
+//
+// BRISC-only: TRISC0 never writes the kick ring directly (keeps it
+// SPSC). TRISC0 produces to the per-L2CPU feed ring and BRISC drains
+// it via brisc_drain_uart_feed_ring().
 static void uart_kick_push(unsigned l2cpu_idx, uint8_t byte) {
     unsigned slot = BRISC_KICK_UART_SLOT_BASE + l2cpu_idx;
     uint32_t seq = read_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_PRODUCER_SEQ));
@@ -656,32 +662,51 @@ static void uart_kick_push(unsigned l2cpu_idx, uint8_t byte) {
     write_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_PRODUCER_SEQ), seq + 1u);
 }
 
-// Sweep one UART. Two-state machine: IDLE → ARMED → IDLE.
-//   IDLE:  cell == sentinel, LSR.THRE=1; nothing to do unless a
-//          byte has appeared. On a fresh byte, immediately set
-//          THRE=0, push the byte, write the sentinel back, and
-//          arm a hold-down counter so THRE stays 0 for several
-//          more sweeps.
-//   ARMED: byte processed, LSR.THRE=0, holding for a fixed count
-//          of sweeps. Each sweep decrements the counter; when it
-//          hits zero we set THRE=1 and return to IDLE.
+// ----- TRISC0 UART poll (M6.1 #79 Phase B) -----
 //
-// The hold-down (`UART_THRE_HOLD_SWEEPS`) gives the L2CPU's LSR
-// read enough wall-clock window to observe THRE=0 even with a
-// noisy NoC RTT. Without it, a tight `writel(THR); readl(LSR);
-// writel(THR); readl(LSR);` loop can occasionally read LSR before
-// our THRE=0 store propagates, see THRE=1 (from the previous
-// cycle), and blast another byte through that overwrites the
-// pending one. The counter is BRISC-private state, kept in the
-// per-L2CPU private region.
+// trisc0_uart_poll_one: same logic as the old BRISC version, but
+// instead of pushing to the kick ring it produces to a per-L2CPU
+// SPSC byte-feed ring. BRISC drains the ring and forwards bytes.
 //
-// Throughput: with hold = 4 sweeps and a sweep period ≈ 200 ns,
-// we deliver ≥ 1 byte / 1.5 µs ≈ 670 KB/s — comfortably above any
-// human-driven console rate and the 115200 bps stock distros set.
-#define UART_PRIV_OFF_HOLD     0x00u
-#define UART_THRE_HOLD_SWEEPS  20u
+// State machine per UART:
+//   IDLE:  cell == sentinel, LSR.THRE=1; ready for the next guest
+//          write. On observing a fresh byte: drop LSR=0 immediately,
+//          handle DLAB/divisor, otherwise enqueue into the feed ring,
+//          reset the sentinel, arm hold-down.
+//   ARMED: byte enqueued, LSR.THRE=0, hold counter > 0; each sweep
+//          decrements, and on hitting zero we restore LSR.THRE+TEMT.
+//
+// The dedicated TRISC0 loop sweeps just the 4 UARTs (no virtio reg
+// files), so the per-UART revisit cadence is well under 1 µs even
+// after pessimistic instruction count + L1 latency. That's faster
+// than the L2CPU's `writel(THR); readl(LSR);` loop iteration time
+// (~200 ns per write + ~50 ns NoC RTT for LSR), so the THRE=0 store
+// reliably lands before the kernel's next LSR poll → no byte loss.
+static void trisc0_uart_feed_push(unsigned l2cpu_idx, uint8_t byte) {
+    uintptr_t priv = brisc_uart_private_base(l2cpu_idx);
+    uint32_t producer = *l1_u32(priv + UART_PRIV_OFF_FEED_PRODUCER_SEQ);
+    uint32_t consumer = *l1_u32(priv + UART_PRIV_OFF_FEED_CONSUMER_SEQ);
+    if (producer - consumer >= BRISC_UART_FEED_RING_ENTRIES) {
+        // Ring full — drop the byte and bump the per-L2CPU drop
+        // counter. With THRE held at 0 the kernel won't write more,
+        // but the existing in-flight byte the kernel saw THRE=1 for
+        // is what we'd have to drop. The drop counter tells the
+        // daemon if the ring needs to grow.
+        uintptr_t drop_addr = priv + UART_PRIV_OFF_FEED_DROP_COUNT;
+        uint32_t d = *l1_u32(drop_addr);
+        *l1_u32(drop_addr) = d + 1u;
+        FENCE_W();
+        return;
+    }
+    uint32_t idx = producer & BRISC_UART_FEED_RING_MASK;
+    uintptr_t slot_addr = priv + UART_PRIV_OFF_FEED_RING + idx * 4u;
+    *l1_u32(slot_addr) = (uint32_t)byte;
+    FENCE_W();
+    *l1_u32(priv + UART_PRIV_OFF_FEED_PRODUCER_SEQ) = producer + 1u;
+    FENCE_W();
+}
 
-static void uart_poll_one(unsigned l2cpu_idx) {
+static void trisc0_uart_poll_one(unsigned l2cpu_idx) {
     uintptr_t cell = uart_reg_addr(l2cpu_idx, UART_REG_RBR_THR);
     uintptr_t lsr_addr = uart_reg_addr(l2cpu_idx, UART_REG_LSR);
     uintptr_t hold_addr = brisc_uart_private_base(l2cpu_idx) + UART_PRIV_OFF_HOLD;
@@ -705,13 +730,12 @@ static void uart_poll_one(unsigned l2cpu_idx) {
     // sees a busy transmitter and stalls.
     *l1_u32(lsr_addr) = 0;
     FENCE_W();
-    // Guard against the LCR.DLAB=1 dance: when the kernel sets
-    // DLAB and writes the divisor low byte, that write also lands
-    // here. We must NOT push the divisor as a TX byte. The kernel's
-    // pattern is `write LCR=0x83; write DLL; write DLM; write
-    // LCR=0x03;` — between the DLAB-set and DLAB-clear, treat any
-    // THR write as a divisor byte (silently consume + reset
-    // sentinel).
+    // Guard against the LCR.DLAB=1 divisor-latch dance: when the
+    // kernel sets DLAB and writes DLL/DLM, those writes land in this
+    // cell. Don't enqueue them as TX bytes. Pattern is `write
+    // LCR=0x83; write DLL; write DLM; write LCR=0x03;` — between
+    // DLAB-set and DLAB-clear, treat any THR write as a divisor byte
+    // (silently consume + reset sentinel).
     uint32_t lcr = *l1_u32(uart_reg_addr(l2cpu_idx, UART_REG_LCR));
     if (lcr & UART_LCR_DLAB) {
         *l1_u32(cell) = BRISC_UART_THR_SENTINEL;
@@ -723,19 +747,43 @@ static void uart_poll_one(unsigned l2cpu_idx) {
     uint8_t byte = (uint8_t)(v & 0xFFu);
     *l1_u32(cell) = BRISC_UART_THR_SENTINEL;
     FENCE_W();
-    uart_kick_push(l2cpu_idx, byte);
+    trisc0_uart_feed_push(l2cpu_idx, byte);
     // Hold THRE=0 for a few more sweeps so the L2CPU's LSR read
     // has a wide-enough wall-clock window to observe it.
-    *l1_u32(hold_addr) = UART_THRE_HOLD_SWEEPS;
+    *l1_u32(hold_addr) = TRISC0_UART_THRE_HOLD_SWEEPS;
 }
 
-static void uart_poll_devices(uint32_t active_slots) {
+// ----- BRISC drain (M6.1 #79 Phase B) -----
+//
+// Once per BRISC main-loop iteration, sweep the 4 per-L2CPU feed
+// rings. For each ring: read producer_seq (TRISC0 writes), compare
+// to consumer_seq (BRISC's own state), and forward bytes via
+// uart_kick_push(). Bumping consumer_seq after every byte means a
+// burst of 32 bytes from TRISC0 is drained one-by-one; cheap, and
+// each byte gets its own kick-ring entry which the daemon already
+// expects.
+//
+// We sweep all 4 rings unconditionally even if a UART isn't active —
+// the only cost is two L1 reads per ring (cheap), and skipping based
+// on the active mask buys us nothing because TRISC0 won't produce to
+// inactive rings either.
+static void brisc_drain_uart_feed_ring_one(unsigned l2cpu_idx) {
+    uintptr_t priv = brisc_uart_private_base(l2cpu_idx);
+    uint32_t producer = *l1_u32(priv + UART_PRIV_OFF_FEED_PRODUCER_SEQ);
+    uint32_t consumer = *l1_u32(priv + UART_PRIV_OFF_FEED_CONSUMER_SEQ);
+    while (consumer != producer) {
+        uint32_t idx = consumer & BRISC_UART_FEED_RING_MASK;
+        uint32_t cell = *l1_u32(priv + UART_PRIV_OFF_FEED_RING + idx * 4u);
+        uart_kick_push(l2cpu_idx, (uint8_t)(cell & 0xFFu));
+        consumer += 1u;
+    }
+    *l1_u32(priv + UART_PRIV_OFF_FEED_CONSUMER_SEQ) = consumer;
+    FENCE_W();
+}
+
+static void brisc_drain_uart_feed_rings(void) {
     for (unsigned i = 0; i < BRISC_KICK_UART_NUM_SLOTS; i++) {
-        unsigned slot = BRISC_KICK_UART_SLOT_BASE + i;
-        if (((active_slots >> slot) & 1u) == 0) {
-            continue;
-        }
-        uart_poll_one(i);
+        brisc_drain_uart_feed_ring_one(i);
     }
 }
 
@@ -799,21 +847,44 @@ static void brisc_drive_trisc0_lifecycle(uint32_t active_slots) {
     }
 }
 
-// ----- TRISC0 entry (M6.1 #79 Phase A) -----
+// ----- TRISC0 entry (M6.1 #79 Phase B) -----
 //
-// Phase A: just bump a heartbeat word in L1 so BRISC + host can
-// observe TRISC0 is alive. Phase B replaces this body with the UART
-// poll loop and the SPSC byte-feed ring producer side; the entry
-// point and stack setup (in `start.S::trisc0_reset_entry`) stays the
-// same.
+// Steady-state UART poll loop. TRISC0 is held in soft reset until
+// BRISC observes a non-zero UART_SLOT_MASK in the active-slots
+// bitmap; once released, this is the loop it runs.
+//
+// Each iteration:
+//   1. Read CTRL_OFF_ACTIVE_SLOTS (BRISC L1) to know which UARTs are
+//      registered.
+//   2. For each registered UART, call `trisc0_uart_poll_one`. The
+//      poll handles THRE backpressure + DLAB guard + feed-ring push.
+//   3. Bump the heartbeat slot every N iterations (gives BRISC a
+//      lightweight liveness signal without fenc'ing on every sweep).
+//
+// Why bump the heartbeat every N (vs every iteration): a fenced L1
+// store on every sweep eats the cycles we just bought by moving off
+// BRISC. Heartbeat is observed at human timescales (debug
+// inspections), 1 in 1024 sweeps is plenty.
 void trisc0_main(void) {
+    volatile uint32_t *active_p = (volatile uint32_t *)
+        (uintptr_t)(CTRL_BASE + CTRL_OFF_ACTIVE_SLOTS);
     volatile uint32_t *hb = (volatile uint32_t *)
         (uintptr_t)(BRISC_TRISC0_GLOBAL_BASE + TRISC0_GLOBAL_OFF_HEARTBEAT);
     uint32_t c = 0;
     for (;;) {
+        uint32_t active = *active_p;
+        for (unsigned i = 0; i < BRISC_KICK_UART_NUM_SLOTS; i++) {
+            unsigned slot = BRISC_KICK_UART_SLOT_BASE + i;
+            if (((active >> slot) & 1u) == 0) {
+                continue;
+            }
+            trisc0_uart_poll_one(i);
+        }
         c += 1u;
-        *hb = c;
-        FENCE_W();
+        if ((c & 0x3FFu) == 0) {
+            *hb = c;
+            FENCE_W();
+        }
     }
 }
 
@@ -887,14 +958,14 @@ void main(void) {
             }
             poll_one_device(slot);
         }
-        // UART slots live at 16..19 in the same bitmap; the daemon
-        // sets the bit on register-uart and clears on unregister.
-        // M6.1 (#79): BRISC also drives TRISC0's reset lifecycle from
-        // the same mask — TRISC0 runs only while at least one UART is
-        // registered. The UART poll itself stays on BRISC at this
-        // step; Phase B moves it to TRISC0.
+        // UART slots live at 16..19 in the same bitmap. M6.1 (#79):
+        // BRISC drives TRISC0's reset lifecycle from this mask —
+        // TRISC0 runs only while at least one UART is registered —
+        // and TRISC0 owns the actual UART poll, producing into per-
+        // L2CPU SPSC feed rings. BRISC's UART responsibility shrinks
+        // to draining those rings and pushing kick-ring entries.
         brisc_drive_trisc0_lifecycle(active);
-        uart_poll_devices(active);
+        brisc_drain_uart_feed_rings();
         poll_completion_ring();
         heartbeat += 1u;
         // Don't fence on every iteration — heartbeat is observed at

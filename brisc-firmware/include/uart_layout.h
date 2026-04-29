@@ -49,14 +49,58 @@ static inline uintptr_t brisc_uart_regs_base(unsigned l2cpu_idx) {
     return (uintptr_t)(BRISC_UART_BASE + l2cpu_idx * BRISC_UART_PER_L2CPU_STRIDE);
 }
 
-// ----- BRISC-private state, separate from guest-visible reg file -----
+// ----- BRISC ↔ TRISC0 per-L2CPU UART state -----
 //
-// Per-L2CPU 256 bytes at 0x50000 + idx*0x100. Holds the TX sentinel's
-// "last-seen" cookie (sweep counter) and future RX ring metadata.
+// Per-L2CPU 256 bytes at 0x50000 + idx*0x100. Layout (M6.1, #79):
+//
+//   +0x00  hold_counter  (TRISC0-private; THRE=0 backpressure window
+//                          counted in TRISC0 sweeps after a TX byte)
+//   +0x04  producer_seq  (TRISC0 writes, BRISC reads — SPSC head)
+//   +0x08  consumer_seq  (BRISC writes, TRISC0 reads — SPSC tail)
+//   +0x0c  drop_count    (TRISC0 writes; bumped when ring is full and
+//                          a fresh byte from the guest has to be
+//                          dropped. Diagnostics for the daemon.)
+//   +0x10..0x40           reserved
+//   +0x40..0xC0           ring[BRISC_UART_FEED_RING_ENTRIES] (each
+//                          slot u32; payload byte in low 8 bits)
+//   +0xC0..0x100          reserved
+//
+// Why split the SPSC ring per L2CPU instead of one shared ring:
+// TRISC0 polls the four UARTs in a fixed order, so it never produces
+// to two L2CPUs in one sweep — but BRISC's drain pass needs to know
+// which L2CPU a byte belongs to, and a per-L2CPU ring makes that
+// inherent in the address. Also keeps the consumer-side scan cheap
+// (BRISC reads producer_seq for each L2CPU; ~4 L1 reads per main
+// iteration).
+//
+// Why 32 entries: handles ~12 back-to-back kernel printk calls (each
+// ~32 bytes, ~400 bytes), well above what fits in the kernel's tight
+// "writel(THR); readl(LSR);" loop before TRISC0's first drain. If the
+// ring fills, the drop counter records the loss and the kernel's next
+// LSR.THRE poll sees `0` (TRISC0 keeps the backpressure on) — the
+// kernel just retries. Bump to 64 if observed in the wild.
+//
 // Not mapped into any L2CPU TLB window.
 
 #define BRISC_UART_PRIVATE_BASE              0x00050000u
 #define BRISC_UART_PRIVATE_PER_L2CPU         0x00000100u
+
+#define UART_PRIV_OFF_HOLD                   0x00u
+#define UART_PRIV_OFF_FEED_PRODUCER_SEQ      0x04u
+#define UART_PRIV_OFF_FEED_CONSUMER_SEQ      0x08u
+#define UART_PRIV_OFF_FEED_DROP_COUNT        0x0Cu
+#define UART_PRIV_OFF_FEED_RING              0x40u
+
+#define BRISC_UART_FEED_RING_ENTRIES         32u
+#define BRISC_UART_FEED_RING_MASK            (BRISC_UART_FEED_RING_ENTRIES - 1u)
+
+// TRISC0 sweep is ~5x faster than BRISC's old combined sweep (BRISC
+// shared its loop with 16 virtio reg files; TRISC0 only sees 4
+// UARTs). So the THRE hold window can be smaller and still cover the
+// L2CPU's worst-case LSR-read latency. ~10 sweeps × ~100 ns/sweep ≈
+// 1 µs of THRE=0 — much wider than the L2CPU's NoC RTT (~200 ns), so
+// the kernel reliably observes the backpressure.
+#define TRISC0_UART_THRE_HOLD_SWEEPS         10u
 
 static inline uintptr_t brisc_uart_private_base(unsigned l2cpu_idx) {
     return (uintptr_t)(BRISC_UART_PRIVATE_BASE + l2cpu_idx * BRISC_UART_PRIVATE_PER_L2CPU);

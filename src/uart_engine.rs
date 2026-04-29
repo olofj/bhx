@@ -73,6 +73,31 @@ pub fn trisc0_heartbeat_addr() -> u32 {
     TRISC0_GLOBAL_BASE + TRISC0_GLOBAL_OFF_HEARTBEAT
 }
 
+// ----- Per-L2CPU UART private region (M6.1, #79) -----
+//
+// Mirror of the layout in `brisc-firmware/include/uart_layout.h`.
+// Each L2CPU gets a 256-byte slot with a tiny SPSC ring TRISC0 fills
+// and BRISC drains.
+
+pub const UART_PRIVATE_BASE: u32 = 0x0005_0000;
+pub const UART_PRIVATE_PER_L2CPU: u32 = 0x0000_0100;
+pub const UART_PRIV_OFF_HOLD: u32 = 0x00;
+pub const UART_PRIV_OFF_FEED_PRODUCER_SEQ: u32 = 0x04;
+pub const UART_PRIV_OFF_FEED_CONSUMER_SEQ: u32 = 0x08;
+pub const UART_PRIV_OFF_FEED_DROP_COUNT: u32 = 0x0C;
+pub const UART_PRIV_OFF_FEED_RING: u32 = 0x40;
+pub const UART_FEED_RING_ENTRIES: u32 = 32;
+
+#[inline]
+pub fn uart_private_base(l2cpu_idx: u8) -> u32 {
+    UART_PRIVATE_BASE + (l2cpu_idx as u32) * UART_PRIVATE_PER_L2CPU
+}
+
+#[inline]
+pub fn feed_drop_count_addr(l2cpu_idx: u8) -> u32 {
+    uart_private_base(l2cpu_idx) + UART_PRIV_OFF_FEED_DROP_COUNT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +119,44 @@ mod tests {
         assert!(UART_OFFSET_FROM_ENGINE_BASE > 0x4000); // past virtio reg files
         assert!(UART_OFFSET_FROM_ENGINE_BASE + UART_REG_FILE_SIZE < 0x20_0000);
     };
+
+    // The byte-feed ring + its headers must fit inside the per-L2CPU
+    // 0x100-byte region. The ring alone is `entries × 4` (each cell
+    // holds the byte in the low 8 bits of a u32) and starts at
+    // `UART_PRIV_OFF_FEED_RING`.
+    const _FEED_RING_FITS: () = {
+        let ring_size = UART_FEED_RING_ENTRIES * 4;
+        assert!(UART_PRIV_OFF_FEED_RING + ring_size <= UART_PRIVATE_PER_L2CPU);
+        assert!(UART_FEED_RING_ENTRIES.is_power_of_two());
+    };
+
+    // TRISC0 globals must live past the last per-L2CPU slot (4 ×
+    // 0x100 = 0x400) and not collide with anything else. Compile-time
+    // check.
+    const _TRISC0_GLOBALS_AFTER_PER_L2CPU: () = {
+        assert!(
+            TRISC0_GLOBAL_BASE
+                >= UART_PRIVATE_BASE + (UART_NUM_SLOTS as u32) * UART_PRIVATE_PER_L2CPU
+        );
+    };
+
+    #[test]
+    fn feed_ring_layout_matches_firmware() {
+        // Spot-check the offsets the firmware uses so a future move
+        // here forces a sync.
+        assert_eq!(UART_PRIV_OFF_HOLD, 0x00);
+        assert_eq!(UART_PRIV_OFF_FEED_PRODUCER_SEQ, 0x04);
+        assert_eq!(UART_PRIV_OFF_FEED_CONSUMER_SEQ, 0x08);
+        assert_eq!(UART_PRIV_OFF_FEED_DROP_COUNT, 0x0C);
+        assert_eq!(UART_PRIV_OFF_FEED_RING, 0x40);
+        assert_eq!(UART_FEED_RING_ENTRIES, 32);
+    }
+
+    #[test]
+    fn uart_private_base_strides_correctly() {
+        assert_eq!(uart_private_base(0), 0x50000);
+        assert_eq!(uart_private_base(3), 0x50300);
+    }
 
     #[test]
     fn uart_pa_helper_offsets_correctly() {
