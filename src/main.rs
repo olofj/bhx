@@ -158,6 +158,14 @@ enum Commands {
         /// virtio_net after teardown.
         #[arg(long = "fwd", value_parser = parse_fwd_pair)]
         fwd: Vec<(u16, u16)>,
+        /// Attach a terminal (Rw mode) immediately after boot.
+        ///
+        /// Equivalent to running `bhx connect -l N` straight after a
+        /// successful `boot`, but with no round-trip gap so the
+        /// OpenSBI banner + early kernel printk arrive live rather
+        /// than as scrollback. Ctrl-A x to detach.
+        #[arg(short = 'a', long)]
+        attach: bool,
     },
     /// Attach a terminal to a booted L2CPU's console via the daemon.
     Connect {
@@ -535,6 +543,7 @@ fn main() -> std::process::ExitCode {
             virtio_console,
             no_virtio_rng,
             fwd,
+            attach,
         }) => {
             let disk = resolve_disk_path(
                 cli.disk,
@@ -569,7 +578,15 @@ fn main() -> std::process::ExitCode {
                 virtio_console,
                 !no_virtio_rng,
                 force,
-            )
+            )?;
+            if attach {
+                run_connect_client(
+                    cli.ttdevice,
+                    cli.l2cpu as u8,
+                    daemon::protocol::ConsoleMode::Rw,
+                )?;
+            }
+            Ok(())
         }
         Some(Commands::Connect { mode }) => {
             let pmode = parse_console_mode(&mode)?;
