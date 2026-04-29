@@ -18,6 +18,9 @@
 # Daemon runtime output when --log-file points into the repo.
 /daemon-card*.log
 
+# Validation harness outputs (probe_sweep-<UTC>.csv, etc.).
+/probe_sweep-*.csv
+
 # libvdeslirp source tarballs / build tree (downloaded for linking).
 /libvdeslirp-*/
 /libvdeslirp_*.tar.*
