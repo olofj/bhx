@@ -457,6 +457,22 @@ fn resolve_disk_path(
     }
 }
 
+/// Default boot payload when neither `--kernel` nor `--uboot` was
+/// passed: peek at the disk basename to see if it matches a known
+/// image whose `needs_bootloader` is true, and pick the U-Boot+EFI
+/// path in that case. Falls back to the pre-#44 direct-kernel default
+/// of `Image` otherwise.
+fn default_boot_payload(disk: Option<&str>) -> daemon::protocol::BootPayload {
+    if let Some(d) = disk {
+        if let Some(img) = image::known_image_for_disk(std::path::Path::new(d)) {
+            if img.needs_bootloader {
+                return daemon::protocol::BootPayload::Uboot("u-boot.bin".to_string());
+            }
+        }
+    }
+    daemon::protocol::BootPayload::Kernel("Image".to_string())
+}
+
 fn main() -> std::process::ExitCode {
     // Ignore SIGPIPE globally — affects all subcommands (network slirp,
     // wget subprocesses, piped stdout, etc.)
@@ -486,14 +502,17 @@ fn main() -> std::process::ExitCode {
                 std::path::Path::new(DEFAULT_DISK_PATH).exists(),
             );
             // clap's `conflicts_with` already enforces mutual exclusion;
-            // here we just pick the variant. Default to kernel `Image`
-            // if neither flag was given (backwards-compat with the
-            // pre-#44 default).
+            // here we just pick the variant. With neither flag given,
+            // peek at the disk path: if it maps to a known image whose
+            // entry has `needs_bootloader=true` (e.g. AlmaLinux's GPT
+            // cloud image), default to the U-Boot+EFI path with
+            // `u-boot.bin` in cwd. Otherwise fall back to the pre-#44
+            // direct-kernel default of `Image`.
             let payload = match (kernel, uboot) {
                 (Some(_), Some(_)) => unreachable!("clap conflicts_with"),
                 (_, Some(p)) => daemon::protocol::BootPayload::Uboot(p),
                 (Some(p), None) => daemon::protocol::BootPayload::Kernel(p),
-                (None, None) => daemon::protocol::BootPayload::Kernel("Image".to_string()),
+                (None, None) => default_boot_payload(disk.as_deref()),
             };
             run_boot_client(
                 cli.ttdevice,
@@ -1902,6 +1921,47 @@ mod tests {
     fn disk_skipped_when_default_missing_and_unspecified() {
         let got = resolve_disk_path(None, "rootfs.ext4", false);
         assert_eq!(got, None);
+    }
+
+    // --- default_boot_payload (#42 / needs_bootloader) -----------------------
+
+    #[test]
+    fn default_payload_with_no_disk_falls_back_to_kernel_image() {
+        match default_boot_payload(None) {
+            daemon::protocol::BootPayload::Kernel(p) => assert_eq!(p, "Image"),
+            other => panic!("expected Kernel(Image), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn default_payload_for_unknown_disk_falls_back_to_kernel_image() {
+        // A disk path whose basename doesn't match any known image —
+        // we must preserve the pre-#44 direct-kernel default.
+        match default_boot_payload(Some("/some/random/rootfs.ext4")) {
+            daemon::protocol::BootPayload::Kernel(p) => assert_eq!(p, "Image"),
+            other => panic!("expected Kernel(Image), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn default_payload_for_known_extract_image_picks_kernel() {
+        // tt-debian is a single-FS ext4 with needs_bootloader=false:
+        // the boot subcommand should default to direct-kernel mode.
+        match default_boot_payload(Some("images/tt-debian.ext4")) {
+            daemon::protocol::BootPayload::Kernel(p) => assert_eq!(p, "Image"),
+            other => panic!("expected Kernel(Image), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn default_payload_for_known_uboot_image_picks_uboot() {
+        // almalinux-10-kitten lands as a whole-disk `.img` with
+        // needs_bootloader=true: default must flip to U-Boot mode
+        // pointing at u-boot.bin in cwd.
+        match default_boot_payload(Some("images/almalinux-10-kitten.img")) {
+            daemon::protocol::BootPayload::Uboot(p) => assert_eq!(p, "u-boot.bin"),
+            other => panic!("expected Uboot(u-boot.bin), got {:?}", other),
+        }
     }
 
     // --- CLI parsing: defaults -----------------------------------------------

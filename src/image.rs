@@ -49,73 +49,6 @@ pub enum Compression {
     Zip,
 }
 
-/// Filesystem detected on an extracted partition. Determines both the
-/// final-path suffix the operator sees and which resize-step tool we
-/// can run on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Filesystem {
-    Ext4,
-    Xfs,
-    Btrfs,
-    /// Filesystem we don't recognize. Land the file as `.img` and let
-    /// the guest grow it on first boot.
-    Unknown,
-}
-
-impl Filesystem {
-    /// Filename suffix matching this filesystem's magic.
-    pub fn suffix(self) -> &'static str {
-        match self {
-            Filesystem::Ext4 => "ext4",
-            Filesystem::Xfs => "xfs",
-            Filesystem::Btrfs => "btrfs",
-            Filesystem::Unknown => "img",
-        }
-    }
-}
-
-/// Detect the filesystem inside a single-partition file by reading
-/// the canonical magic bytes:
-///   * ext4: bytes 0x438..0x43A == 0xEF 0x53 (little-endian s_magic in
-///     the superblock at offset 1024).
-///   * xfs:  bytes 0..4 == "XFSB" (the SB_MAGIC at offset 0).
-///   * btrfs: bytes 0x10040..0x10048 == "_BHRfS_M" (the BTRFS_MAGIC at
-///     offset 0x10040, well inside the first 64 KiB).
-///
-/// Reads the relevant ranges only; doesn't care if the file is partial.
-pub fn detect_filesystem(path: &Path) -> Filesystem {
-    use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut f) = fs::File::open(path) else {
-        return Filesystem::Unknown;
-    };
-
-    // ext4 superblock magic (16-bit LE at offset 0x438).
-    let mut ext4_buf = [0u8; 2];
-    if f.seek(SeekFrom::Start(0x438)).is_ok()
-        && f.read_exact(&mut ext4_buf).is_ok()
-        && ext4_buf == [0x53, 0xEF]
-    {
-        return Filesystem::Ext4;
-    }
-    // xfs SB_MAGIC ("XFSB") at offset 0.
-    let mut xfs_buf = [0u8; 4];
-    if f.seek(SeekFrom::Start(0)).is_ok()
-        && f.read_exact(&mut xfs_buf).is_ok()
-        && &xfs_buf == b"XFSB"
-    {
-        return Filesystem::Xfs;
-    }
-    // btrfs BTRFS_MAGIC ("_BHRfS_M") at offset 0x10040.
-    let mut btrfs_buf = [0u8; 8];
-    if f.seek(SeekFrom::Start(0x10040)).is_ok()
-        && f.read_exact(&mut btrfs_buf).is_ok()
-        && &btrfs_buf == b"_BHRfS_M"
-    {
-        return Filesystem::Btrfs;
-    }
-    Filesystem::Unknown
-}
-
 /// A known riscv64 image available for download.
 #[derive(Debug, Clone)]
 pub struct KnownImage {
@@ -139,6 +72,21 @@ pub struct KnownImage {
     pub default_password: &'static str,
     /// Whether the image has cloud-init support.
     pub cloud_init: bool,
+    /// Whether to extract the largest partition as the final
+    /// artifact (true → land an `.ext4` single-FS image) or land
+    /// the whole partitioned disk image (false → `.img`). Pairs
+    /// with `needs_bootloader` below: an image whose disk has a
+    /// GPT and an ESP wants both fields false→true (whole disk,
+    /// boot via U-Boot/EFI); a single-FS rootfs image wants
+    /// true→false (extract, boot kernel directly).
+    pub extract_partition: bool,
+    /// Whether the on-disk image expects U-Boot to read the
+    /// partition table and chainload /boot/EFI/* (true), versus
+    /// the host loading kernel + initrd directly and pointing
+    /// `root=/dev/vda` at a single-FS partition image (false).
+    /// The boot subcommand picks `BootDevice::Uboot` vs
+    /// `BootDevice::Vda` accordingly.
+    pub needs_bootloader: bool,
 }
 
 /// Registry of known riscv64 images available for download.
@@ -157,6 +105,11 @@ pub const KNOWN_IMAGES: &[KnownImage] = &[
         default_user: "debian",
         default_password: "debian",
         cloud_init: true,
+        // Already a single ext4 — no partition table to extract from.
+        extract_partition: false,
+        // The legacy direct-boot path: kernel + initrd loaded by the
+        // host, root=/dev/vda points straight at this single-FS image.
+        needs_bootloader: false,
     },
     // ========================================================================
     // Debian Cloud Images (from cloud.debian.org)
@@ -174,6 +127,10 @@ pub const KNOWN_IMAGES: &[KnownImage] = &[
         default_user: "root",
         default_password: "",
         cloud_init: false,
+        // Whole disk — boot via U-Boot + EFI which reads GPT and
+        // chainloads /boot/EFI from the ESP partition.
+        extract_partition: false,
+        needs_bootloader: true,
     },
     KnownImage {
         name: "debian-13-cloud",
@@ -186,6 +143,8 @@ pub const KNOWN_IMAGES: &[KnownImage] = &[
         default_user: "",
         default_password: "",
         cloud_init: true,
+        extract_partition: false,
+        needs_bootloader: true,
     },
     // ========================================================================
     // Ubuntu (from cdimage.ubuntu.com)
@@ -202,6 +161,8 @@ pub const KNOWN_IMAGES: &[KnownImage] = &[
         default_user: "ubuntu",
         default_password: "ubuntu",
         cloud_init: true,
+        extract_partition: false,
+        needs_bootloader: true,
     },
     // ========================================================================
     // RPM-based cloud images — qcow2 format, cloud-init for first-boot setup.
@@ -217,6 +178,8 @@ pub const KNOWN_IMAGES: &[KnownImage] = &[
         default_user: "",
         default_password: "",
         cloud_init: true,
+        extract_partition: false,
+        needs_bootloader: true,
     },
     // AlmaLinux Kitten 10: the community RHEL10 development branch
     // (downstream of CentOS Stream 10, upstream of AlmaLinux 10 stable).
@@ -235,6 +198,8 @@ pub const KNOWN_IMAGES: &[KnownImage] = &[
         default_user: "",
         default_password: "",
         cloud_init: true,
+        extract_partition: false,
+        needs_bootloader: true,
     },
 ];
 
@@ -251,6 +216,29 @@ pub fn list_known_images() -> &'static [KnownImage] {
     KNOWN_IMAGES
 }
 
+/// Map a disk path back to its [`KnownImage`] entry, if the basename
+/// (minus `.ext4` / `.img` extension) matches a known image's `name`.
+///
+/// `pull_image` lands artifacts at `images/<name>.{ext4,img}`, so a
+/// boot client passing `--disk images/almalinux-10-kitten.img` (or a
+/// symlink with the same basename) can recover the image's metadata
+/// — including `needs_bootloader` — without the user having to repeat
+/// it on the command line.
+pub fn known_image_for_disk(path: &Path) -> Option<&'static KnownImage> {
+    let stem = path.file_stem()?.to_str()?;
+    KNOWN_IMAGES.iter().find(|img| img.name == stem)
+}
+
+/// Whether the on-disk artifact for this image is a single-FS file
+/// (true → `.ext4`) or a whole partitioned disk (false → `.img`).
+///
+/// True iff we explicitly extracted the partition or the source was
+/// already raw `Ext4` (no partition table to extract from). False
+/// otherwise — i.e. RawDisk/Qcow2 sources we kept whole.
+pub fn is_single_fs_artifact(image: &KnownImage) -> bool {
+    image.extract_partition || matches!(image.format, ImageFormat::Ext4)
+}
+
 // ============================================================================
 // Download and conversion pipeline
 // ============================================================================
@@ -264,12 +252,13 @@ pub fn image_dir() -> PathBuf {
 
 /// Pull (download and convert) an image by name.
 ///
-/// Returns the path to the ready-to-use ext4 image. With `force_refetch`,
-/// the HTTP-conditional cache is bypassed and the body is re-downloaded
-/// even if the upstream's ETag/Last-Modified hasn't changed; the
-/// already-converted `.ext4` short-circuit at the top still applies
-/// because that's a separate "I already have the final artifact"
-/// signal and re-converting is far slower than the conditional GET.
+/// Output suffix tracks the artifact's shape:
+///   * `.ext4` — single-FS image. Lands when `extract_partition=true`
+///     (we extracted the largest partition out of a partitioned source)
+///     or when the source format is already raw `Ext4`.
+///   * `.img` — whole partitioned disk image, suitable for the
+///     U-Boot + EFI boot path that reads GPT and chainloads
+///     /boot/EFI from inside the disk.
 pub fn pull_image(name: &str, output: Option<&Path>, force_refetch: bool) -> Result<PathBuf> {
     let image = get_known_image(name).ok_or_else(|| {
         Error::bad_request(format!(
@@ -279,99 +268,57 @@ pub fn pull_image(name: &str, output: Option<&Path>, force_refetch: bool) -> Res
     })?;
 
     let dir = image_dir();
-    // The final path's suffix tracks the actual filesystem we extract,
-    // not "ext4" by convention. If `output` is given, use it verbatim;
-    // otherwise we don't know the suffix yet and drop in the convert
-    // step. For the existence-check short-circuit on a default path,
-    // probe each filesystem suffix we know about.
-    let explicit_output = output.map(PathBuf::from);
-    if let Some(p) = &explicit_output {
-        if p.exists() && !force_refetch {
-            eprintln!("Image already exists at {}", p.display());
-            eprintln!("Delete it first or pass --refetch if you want to re-download.");
-            return Ok(p.clone());
-        }
+    let suffix = if is_single_fs_artifact(image) {
+        "ext4"
     } else {
-        for candidate_suffix in ["ext4", "xfs", "btrfs", "img"] {
-            let candidate = dir.join(format!("{}.{}", image.name, candidate_suffix));
-            if candidate.exists() && !force_refetch {
-                eprintln!("Image already exists at {}", candidate.display());
-                eprintln!("Delete it first or pass --refetch if you want to re-download.");
-                return Ok(candidate);
-            }
-        }
+        "img"
+    };
+    let final_path = output
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.join(format!("{}.{}", image.name, suffix)));
+
+    if final_path.exists() && !force_refetch {
+        eprintln!("Image already exists at {}", final_path.display());
+        eprintln!("Delete it first or pass --refetch if you want to re-download.");
+        return Ok(final_path);
     }
 
     eprintln!("Pulling {} ...", image.name);
     eprintln!("  {}", image.description);
     eprintln!("  URL: {}", image.url);
 
-    // Working path during the conversion: until we know the
-    // filesystem inside, use a `.partition` suffix that doesn't
-    // pretend to be anything specific. Renamed to the right suffix
-    // post-detection.
-    let work_path = explicit_output
-        .clone()
-        .unwrap_or_else(|| dir.join(format!("{}.partition", image.name)));
-
-    // Anchor the HTTP-conditional sidecar at a fstype-agnostic path
-    // (`<name>.fetch.json`) so cache hits work regardless of which
-    // filesystem suffix we end up writing. For an explicit output
-    // path we anchor at the operator-supplied path verbatim — they
-    // own that filename's whole story.
-    let sidecar_anchor = explicit_output
-        .clone()
-        .unwrap_or_else(|| dir.join(image.name));
-
-    // Step 1: Download. See #26 for the cache-anchor reasoning.
+    // Step 1: Download. Anchor the sidecar at `final_path` (the
+    // surviving artifact) so the cache check works on a re-pull when
+    // the download intermediate is gone. See #26.
     let download_path = download_file(
         image.url,
         &dir,
         image.compression,
-        &sidecar_anchor,
+        &final_path,
         force_refetch,
     )?;
 
-    // Step 2: Convert / partition-extract.
-    let extracted_path = convert_to_ext4(&download_path, image.format, &work_path)?;
+    // Step 2: Convert / optionally partition-extract.
+    let final_path = convert_to_disk_image(
+        &download_path,
+        image.format,
+        image.extract_partition,
+        &final_path,
+    )?;
 
-    // Step 3: Detect the actual filesystem and rename if we have a
-    // default output path (operator-supplied paths are kept verbatim
-    // — they asked for it, they get it).
-    let fs = detect_filesystem(&extracted_path);
-    let final_path = if let Some(p) = explicit_output {
-        eprintln!(
-            "  Detected filesystem: {} (output kept at operator-supplied path)",
-            fs.suffix()
-        );
-        p
-    } else {
-        let renamed = dir.join(format!("{}.{}", image.name, fs.suffix()));
-        if renamed != extracted_path {
-            eprintln!(
-                "  Detected filesystem: {} → renaming to {}",
-                fs.suffix(),
-                renamed.display()
-            );
-            fs::rename(&extracted_path, &renamed)
-                .map_err(Error::io_ctx("Failed to rename extracted partition"))?;
-        }
-        renamed
-    };
-
-    // Step 4: Resize if configured. Only ext4 supports offline resize
-    // (e2fsck + resize2fs on a loopback-free file). For other
-    // filesystems we still grow the *file* so the guest sees the
-    // requested capacity, but the filesystem itself stays at its
-    // original extent — the guest grows it on first boot (xfs_growfs
-    // for xfs, btrfs filesystem resize for btrfs; cloud-init's
-    // `growpart` + systemd-growfs handle this automatically on most
-    // distros).
+    // Step 3: Resize the file. For `.ext4` (single-FS) we also grow
+    // the filesystem in place via e2fsck + resize2fs. For `.img`
+    // (whole disk) we only grow the file; cloud-init's growpart +
+    // systemd-growfs (or the equivalent on first boot) extend the
+    // partition + filesystem from inside the guest.
     if !image.default_size.is_empty() {
-        resize_image(&final_path, image.default_size, fs)?;
+        resize_image(
+            &final_path,
+            image.default_size,
+            is_single_fs_artifact(image),
+        )?;
     }
 
-    // Clean up intermediate files
     if download_path != final_path && download_path.exists() {
         let _ = fs::remove_file(&download_path);
     }
@@ -467,11 +414,27 @@ fn download_file(
     }
 }
 
-/// Convert a downloaded image to a raw ext4 filesystem.
-fn convert_to_ext4(input: &Path, format: ImageFormat, output: &Path) -> Result<PathBuf> {
+/// Convert a downloaded image to its final on-disk shape:
+///
+///   * `extract_partition = true` — pluck the largest partition from
+///     the GPT/MBR disk and land it as the output. Used for the
+///     direct-boot path that mounts `root=/dev/vda` against a single
+///     ext4 filesystem.
+///   * `extract_partition = false` — keep the whole partitioned disk
+///     image. Qcow2 still gets a `qemu-img convert` to raw bytes;
+///     RawDisk and Ext4 sources just move/rename. The output is
+///     suitable for the U-Boot + EFI boot flow that reads GPT and
+///     chainloads /boot/EFI from inside the disk.
+fn convert_to_disk_image(
+    input: &Path,
+    format: ImageFormat,
+    extract_partition: bool,
+    output: &Path,
+) -> Result<PathBuf> {
     match format {
         ImageFormat::Ext4 => {
-            // Already ext4, just rename/move
+            // Already ext4, just rename/move. (extract_partition is
+            // moot here — there's no partition table.)
             if input != output {
                 fs::rename(input, output)
                     .or_else(|_| fs::copy(input, output).map(|_| ()))
@@ -481,13 +444,19 @@ fn convert_to_ext4(input: &Path, format: ImageFormat, output: &Path) -> Result<P
             Ok(output.to_path_buf())
         }
         ImageFormat::Qcow2 => {
-            // Convert qcow2 to raw disk first
             eprintln!("  Converting qcow2 to raw...");
-            let raw_path = input.with_extension("raw");
+            // For extract_partition we need a temporary raw disk to
+            // run sfdisk against; for whole-disk we can convert
+            // straight into the output path.
+            let raw_dest = if extract_partition {
+                input.with_extension("raw")
+            } else {
+                output.to_path_buf()
+            };
             let status = Command::new("qemu-img")
                 .args(["convert", "-f", "qcow2", "-O", "raw"])
                 .arg(input)
-                .arg(&raw_path)
+                .arg(&raw_dest)
                 .status()
                 .map_err(|e| {
                     Error::internal(format!(
@@ -499,15 +468,22 @@ fn convert_to_ext4(input: &Path, format: ImageFormat, output: &Path) -> Result<P
                 return Err(Error::internal("qemu-img convert failed"));
             }
             let _ = fs::remove_file(input);
-            // Now extract partition from raw disk
-            extract_root_partition(&raw_path, output)?;
-            let _ = fs::remove_file(&raw_path);
+            if extract_partition {
+                extract_root_partition(&raw_dest, output)?;
+                let _ = fs::remove_file(&raw_dest);
+            }
             Ok(output.to_path_buf())
         }
         ImageFormat::RawDisk => {
-            // Extract the root partition from GPT disk
-            extract_root_partition(input, output)?;
-            let _ = fs::remove_file(input);
+            if extract_partition {
+                extract_root_partition(input, output)?;
+                let _ = fs::remove_file(input);
+            } else if input != output {
+                fs::rename(input, output)
+                    .or_else(|_| fs::copy(input, output).map(|_| ()))
+                    .map_err(Error::io_ctx("Failed to move image"))?;
+                let _ = fs::remove_file(input);
+            }
             Ok(output.to_path_buf())
         }
     }
@@ -600,13 +576,12 @@ fn parse_largest_partition(json: &str) -> Result<(u64, u64)> {
     Ok((best_start, best_size))
 }
 
-/// Grow the image file to the given size, and (for ext4) grow the
-/// filesystem inside it to match. For non-ext4 filesystems we only
-/// grow the file — the guest extends the filesystem on first boot
-/// (cloud-init's growpart + systemd-growfs do this automatically on
-/// every distro that ships either xfs or btrfs as the cloud-image
-/// rootfs).
-fn resize_image(path: &Path, size: &str, fs_kind: Filesystem) -> Result<()> {
+/// Grow the image file to the given size, and (when `is_single_fs`)
+/// grow the ext4 filesystem inside it to match. For whole-disk
+/// images (`!is_single_fs`) we only grow the file; the guest's
+/// first-boot cloud-init growpart + systemd-growfs extend the
+/// partition + filesystem from inside the running guest.
+fn resize_image(path: &Path, size: &str, is_single_fs: bool) -> Result<()> {
     eprintln!("  Resizing to {}...", size);
 
     // First resize the file
@@ -630,17 +605,17 @@ fn resize_image(path: &Path, size: &str, fs_kind: Filesystem) -> Result<()> {
         }
     }
 
-    if fs_kind != Filesystem::Ext4 {
+    if !is_single_fs {
         eprintln!(
-            "  Filesystem is {}; file grown to {} but the FS itself stays at its original \
-             extent. Guest cloud-init / systemd-growfs will expand it on first boot.",
-            fs_kind.suffix(),
+            "  Whole-disk image: file grown to {} but partitions + FS stay at \
+             their original extent. Guest's cloud-init growpart / systemd-growfs \
+             will expand on first boot.",
             size
         );
         return Ok(());
     }
 
-    // Then resize the filesystem (ext4 only — see top of fn).
+    // Single-FS image — assumed ext4 by the caller. Grow the FS.
     let status = Command::new("e2fsck").args(["-f", "-y"]).arg(path).status();
     if let Ok(s) = status {
         if !s.success() && s.code() != Some(1) {
@@ -726,6 +701,22 @@ pub fn cmd_image_info(name: &str) {
             println!(
                 "Cloud-init:    {}",
                 if img.cloud_init { "yes" } else { "no" }
+            );
+            println!(
+                "Layout:        {}",
+                if is_single_fs_artifact(img) {
+                    "single-FS .ext4"
+                } else {
+                    "whole partitioned disk (.img)"
+                }
+            );
+            println!(
+                "Boot path:     {}",
+                if img.needs_bootloader {
+                    "U-Boot + EFI (chainload /boot/EFI from disk)"
+                } else {
+                    "direct kernel (host loads Image + initrd)"
+                }
             );
         }
         None => {
@@ -853,61 +844,43 @@ mod tests {
         }
     }
 
-    /// Build a dummy file with `bytes` placed at `offset`, padded with
-    /// zeros to at least 0x10100 so all three magic-byte probes
-    /// (ext4 @ 0x438, xfs @ 0, btrfs @ 0x10040) can read past EOF
-    /// without short-read aborting the detector. Filename includes a
-    /// per-call counter so concurrent tests don't share a temp path.
-    fn write_test_image(bytes: &[u8], offset: usize) -> std::path::PathBuf {
-        use std::io::Write;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "tt-bh-image-test-{}-{}-{}",
-            std::process::id(),
-            offset,
-            id
-        ));
-        let mut buf = vec![0u8; std::cmp::max(0x10100, offset + bytes.len())];
-        buf[offset..offset + bytes.len()].copy_from_slice(bytes);
-        let mut f = std::fs::File::create(&path).expect("create temp image");
-        f.write_all(&buf).expect("write temp image");
-        path
+    #[test]
+    fn single_fs_artifact_classifies_known_images() {
+        // tt-debian: source format Ext4, no extraction needed → single-FS.
+        let tt = get_known_image("tt-debian").unwrap();
+        assert!(is_single_fs_artifact(tt));
+
+        // AlmaLinux Kitten: Qcow2 source kept as a whole disk (GPT + ESP)
+        // for U-Boot/EFI boot → not single-FS.
+        let alma = get_known_image("almalinux").unwrap();
+        assert!(!is_single_fs_artifact(alma));
+
+        // Ubuntu/Debian cloud: RawDisk, extract_partition=false → whole disk.
+        let ubu = get_known_image("ubuntu").unwrap();
+        assert!(!is_single_fs_artifact(ubu));
+        let deb = get_known_image("debian-13").unwrap();
+        assert!(!is_single_fs_artifact(deb));
     }
 
     #[test]
-    fn detect_filesystem_recognizes_ext4_xfs_btrfs() {
-        // ext4: 0xEF 0x53 little-endian s_magic at offset 0x438.
-        let p_ext4 = write_test_image(&[0x53, 0xEF], 0x438);
-        assert_eq!(detect_filesystem(&p_ext4), Filesystem::Ext4);
-        let _ = std::fs::remove_file(&p_ext4);
+    fn known_image_for_disk_matches_basename_stem() {
+        // The pull pipeline lands AlmaLinux as `images/almalinux-10-kitten.img`
+        // — the stem matches, so the boot subcommand can recover the
+        // image's `needs_bootloader` from the disk path alone.
+        let p = Path::new("images/almalinux-10-kitten.img");
+        let img = known_image_for_disk(p).expect("alma should resolve");
+        assert_eq!(img.name, "almalinux-10-kitten");
+        assert!(img.needs_bootloader);
 
-        // xfs: "XFSB" at offset 0.
-        let p_xfs = write_test_image(b"XFSB", 0);
-        assert_eq!(detect_filesystem(&p_xfs), Filesystem::Xfs);
-        let _ = std::fs::remove_file(&p_xfs);
+        // Single-FS artifact: tt-debian.ext4 → tt-debian entry.
+        let p = Path::new("images/tt-debian.ext4");
+        let img = known_image_for_disk(p).expect("tt-debian should resolve");
+        assert_eq!(img.name, "tt-debian");
+        assert!(!img.needs_bootloader);
 
-        // btrfs: "_BHRfS_M" at offset 0x10040.
-        let p_btrfs = write_test_image(b"_BHRfS_M", 0x10040);
-        assert_eq!(detect_filesystem(&p_btrfs), Filesystem::Btrfs);
-        let _ = std::fs::remove_file(&p_btrfs);
-    }
-
-    #[test]
-    fn detect_filesystem_returns_unknown_for_garbage() {
-        // All zeros — none of the magics match.
-        let p = write_test_image(&[0; 16], 0);
-        assert_eq!(detect_filesystem(&p), Filesystem::Unknown);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn filesystem_suffix_matches_detected_kinds() {
-        assert_eq!(Filesystem::Ext4.suffix(), "ext4");
-        assert_eq!(Filesystem::Xfs.suffix(), "xfs");
-        assert_eq!(Filesystem::Btrfs.suffix(), "btrfs");
-        assert_eq!(Filesystem::Unknown.suffix(), "img");
+        // Path with no recognisable basename → None.
+        assert!(known_image_for_disk(Path::new("/tmp/random.img")).is_none());
+        // No extension at all is fine — file_stem is the whole basename.
+        assert!(known_image_for_disk(Path::new("almalinux-10-kitten")).is_some());
     }
 }
