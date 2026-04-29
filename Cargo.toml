@@ -40,3 +40,6 @@ debug = true
 strip = false
 
 [build-dependencies]
+# Compile the small C shim in src/slirp_set_hostname.c that pokes
+# `vhostname` into libslirp's opaque-from-Rust SlirpConfig (#60).
+cc = "1"

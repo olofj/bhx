@@ -34,6 +34,13 @@ const VIRTIO_NET_F_MAC_BIT: u32 = 1 << 5; // bit 5 of features[0]
 const VIRTIO_F_VERSION_1_BIT: u32 = 1 << 0; // bit 0 of features[1]
 const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
 
+/// Format the per-(card, L2CPU) hostname libslirp advertises in DHCP
+/// option 12 (#60). RFC-952-clean (`a-z0-9-`, no `_`, ≤63 chars) so
+/// every guest distro accepts it as the system hostname.
+pub fn format_dhcp_hostname(card: u32, l2cpu_idx: u8) -> String {
+    format!("tt-bh-card{}-l2cpu{}", card, l2cpu_idx)
+}
+
 /// Derive a stable MAC for a given (card, l2cpu_idx). Locally
 /// administered (bit 1 of byte 0 set) and unicast (bit 0 clear) so
 /// it never collides with a real OUI. Card + L2CPU index encoded in
@@ -211,6 +218,13 @@ pub struct VirtioNet {
     /// which we advertise so U-Boot stops spamming "No valid MAC
     /// address found" and Linux uses a deterministic address (#77).
     mac: [u8; 6],
+    /// Per-(card, L2CPU) hostname plumbed into libslirp's vhostname so
+    /// the guest's DHCP lease (option 12) carries
+    /// e.g. `tt-bh-card0-l2cpu0` instead of libslirp's compiled-in
+    /// "slirp" default. The CString must outlive `slirp` — libslirp
+    /// keeps the pointer verbatim, so we hold ownership here. See #60.
+    #[allow(dead_code)]
+    hostname: std::ffi::CString,
 }
 
 unsafe impl Send for VirtioNet {}
@@ -248,8 +262,18 @@ impl VirtioNet {
     /// [`derive_mac`] that is published in config space and announced
     /// via `VIRTIO_NET_F_MAC`.
     pub fn new(forwards: &[(u16, u16)], card: u32, l2cpu_idx: u8) -> std::io::Result<Self> {
+        let hostname = std::ffi::CString::new(format_dhcp_hostname(card, l2cpu_idx))
+            .expect("hostname is plain ASCII, no embedded NULs");
         let mut cfg: SlirpConfig = unsafe { std::mem::zeroed() };
-        unsafe { vdeslirp_init(&mut cfg, VDE_INIT_DEFAULT) };
+        unsafe {
+            vdeslirp_init(&mut cfg, VDE_INIT_DEFAULT);
+            // Override libslirp's "slirp" default vhostname with our
+            // per-L2CPU name. Order matters: must run after
+            // `vdeslirp_init` (which populates defaults) and before
+            // `vdeslirp_open` (which copies / consumes the config).
+            // See #60.
+            tt_slirp_set_vhostname(&mut cfg, hostname.as_ptr());
+        }
         let slirp = unsafe { vdeslirp_open(&mut cfg) };
         if slirp.is_null() {
             let err = std::io::Error::last_os_error();
@@ -283,6 +307,7 @@ impl VirtioNet {
             queue_header_size: std::mem::size_of::<VirtioNetHdrMrgRxbuf>() as u64,
             l2cpu_idx,
             mac: derive_mac(card, l2cpu_idx),
+            hostname,
         })
     }
 }
@@ -470,6 +495,37 @@ impl VirtioDeviceImpl for VirtioNet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_dhcp_hostname_uses_card_and_l2cpu() {
+        assert_eq!(format_dhcp_hostname(0, 0), "tt-bh-card0-l2cpu0");
+        assert_eq!(format_dhcp_hostname(0, 3), "tt-bh-card0-l2cpu3");
+        assert_eq!(format_dhcp_hostname(7, 1), "tt-bh-card7-l2cpu1");
+    }
+
+    #[test]
+    fn format_dhcp_hostname_is_rfc952_clean() {
+        // RFC 952: hostnames must be ≤63 chars, drawn from {a-z, 0-9, -}.
+        // Underscores are common but not RFC-952; we deliberately avoid
+        // them since some older DHCP clients reject the hostname option
+        // when the name has them.
+        for card in [0u32, 1, 99, 1234, u32::MAX] {
+            for l2cpu in 0u8..4 {
+                let h = format_dhcp_hostname(card, l2cpu);
+                assert!(h.len() <= 63, "len {} > 63: {}", h.len(), h);
+                for c in h.chars() {
+                    assert!(
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-',
+                        "non-RFC-952 char {:?} in {}",
+                        c,
+                        h
+                    );
+                }
+                // CString round-trip: no embedded NULs.
+                std::ffi::CString::new(h.clone()).unwrap_or_else(|_| panic!("CString: {}", h));
+            }
+        }
+    }
 
     #[test]
     fn derive_mac_encodes_card_and_l2cpu_index() {

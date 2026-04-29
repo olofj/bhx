@@ -92,6 +92,15 @@ fn build_slirp_size_probe() {
         println!("cargo:rustc-link-lib=vdeslirp");
         println!("cargo:rustc-link-lib=slirp");
 
+        // Compile the C shim that pokes `vhostname` into the libslirp
+        // SlirpConfig (#60). Trivially short — one assignment — but
+        // needs a real C `#include` of `<slirp/libslirp.h>` so we don't
+        // have to mirror the SlirpConfig layout in Rust.
+        println!("cargo:rerun-if-changed=src/slirp_set_hostname.c");
+        cc::Build::new()
+            .file("src/slirp_set_hostname.c")
+            .compile("tt_slirp_helpers");
+
         // Verify that our opaque SlirpConfig buffer (512 bytes) is large
         // enough for the actual struct from libslirp. Fail at build time if
         // the library has grown. Cargo cleans up `OUT_DIR` on `cargo clean`,

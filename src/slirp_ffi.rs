@@ -43,6 +43,13 @@ extern "C" {
     pub fn vdeslirp_send(slirp: *mut VdeSlirp, buf: *const u8, len: libc::size_t) -> libc::ssize_t;
 
     pub fn inet_aton(cp: *const libc::c_char, inp: *mut InAddr) -> libc::c_int;
+
+    /// Set the DHCP hostname libslirp advertises to the guest (option
+    /// 12). Implementation in `src/slirp_set_hostname.c`. The
+    /// `vhostname` pointer must outlive `cfg`'s next `vdeslirp_open`
+    /// call — the caller (currently `VirtioNet::new`) holds a
+    /// `CString` field for that. See #60.
+    pub fn tt_slirp_set_vhostname(cfg: *mut SlirpConfig, vhostname: *const libc::c_char);
 }
 
 impl InAddr {
