@@ -12,7 +12,7 @@ authoritative reference for behavior, this directory is the *why*.
 |---|---|
 | [`blackhole-harvest-mask.md`](blackhole-harvest-mask.md) | How to read the Blackhole chip's row/column harvest mask. tt-kmd's `GET_HARVESTING` ioctl is a stub — the mask actually lives in the ARC firmware telemetry table at `SCRATCH_RAM[13]`. Includes the column-decode algorithm (the only place it appears as code outside `luwen`). Feeds the `src/tensix_tile.rs` picker. |
 | [`sandbox-syscalls.md`](sandbox-syscalls.md) | The exact syscall + path set the daemon needs after seccomp + landlock are installed. Maintained alongside `src/daemon/sandbox.rs`; expand the inventory before adding any new daemon code path that hits a syscall outside the list. |
-| [`telemetry.md`](telemetry.md) | Layout of the ARC firmware telemetry table the daemon reads at startup. Field offsets, value semantics, version handling. Cross-references `luwen` and the tt-kmd headers we don't link against. |
+| [`telemetry.md`](telemetry.md) | The daemon's Prometheus-style metrics exporter — enable flag, listener security model, and the full per-metric inventory (daemon-global + per-L2CPU). Cross-reference for anyone scraping the daemon. |
 | [`tt-metal-coexistence.md`](tt-metal-coexistence.md) | How to run bhx alongside `tt-metal` on the same card without colliding over the reserved Tensix tile. Describes the operator contract: read the daemon's reserved-tile coordinate from `daemon status` or `$XDG_RUNTIME_DIR/bhx/<card>/reserved-tile`, exclude that tile from `tt_metal::DispatchCoreConfig`. |
 
 ## Where else to look
