@@ -165,13 +165,36 @@ pub const KNOWN_IMAGES: &[KnownImage] = &[
         needs_bootloader: true,
     },
     // ========================================================================
-    // RPM-based cloud images — qcow2 format, cloud-init for first-boot setup.
+    // Fedora 42 (riscv64). Two flavors mirror the Debian pattern:
+    //   * fedora-42         — Server-Host-Generic, .raw.xz (whole disk).
+    //                         Same RawDisk+Xz pipeline as Ubuntu. Has the
+    //                         full server package set; first-boot setup
+    //                         goes through cloud-init when seeded with a
+    //                         NoCloud drive (otherwise no usable login).
+    //   * fedora-42-cloud   — Cloud-Base-Generic, .qcow2. Smaller image
+    //                         aimed at cloud-init-driven provisioning;
+    //                         requires a NoCloud seed for first login.
+    // Both boot via U-Boot+EFI off the GPT/ESP on the disk.
     // ========================================================================
     KnownImage {
         name: "fedora-42",
+        url: "https://dl.fedoraproject.org/pub/alt/risc-v/release/42/Server/riscv64/images/Fedora-Server-Host-Generic-42.20250911-2251ba41cdd3.riscv64.raw.xz",
+        description: "Fedora 42 Server Host Generic — full server image, riscv64",
+        aliases: &["fedora", "fedora-server"],
+        format: ImageFormat::RawDisk,
+        compression: Compression::Xz,
+        default_size: "10G",
+        default_user: "",
+        default_password: "",
+        cloud_init: true,
+        extract_partition: false,
+        needs_bootloader: true,
+    },
+    KnownImage {
+        name: "fedora-42-cloud",
         url: "https://dl.fedoraproject.org/pub/alt/risc-v/release/42/Cloud/riscv64/images/Fedora-Cloud-Base-Generic-42.20250911-2251ba41cdd3.riscv64.qcow2",
-        description: "Fedora 42 Cloud Base — generic riscv64 cloud image",
-        aliases: &["fedora"],
+        description: "Fedora 42 Cloud Base — small cloud image, riscv64 (needs cloud-init)",
+        aliases: &["fedora-cloud"],
         format: ImageFormat::Qcow2,
         compression: Compression::None,
         default_size: "10G",
