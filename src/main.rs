@@ -814,6 +814,12 @@ fn run_tensix_engine(card: u32, chip: &shared_chip::SharedChip) -> std::io::Resu
     let mut poller = tensix_data_plane::KickPoller::spawn(Arc::clone(&engine));
     let stats = Arc::clone(&poller.stats);
 
+    // BRISC's main loop only polls slots whose bit is set in the
+    // active-slots bitmap (M7 optimization to keep the per-slot revisit
+    // period tight when only a few slots are in use). Set bit 7 first
+    // so the synthetic notify is observed.
+    engine.write_active_slots(1u32 << 7);
+
     // Synthetic kick: write QUEUE_NOTIFY=2 on slot 7 (L2CPU 1's
     // rng device, in the firmware's slot ordering). BRISC sees the
     // write next sweep, appends a KickEntry, advances producer_seq;
@@ -850,6 +856,66 @@ fn run_tensix_engine(card: u32, chip: &shared_chip::SharedChip) -> std::io::Resu
             before
         )));
     }
+
+    // M6.1 (#79) Phase A/B verification: the active-slots bitmap drives
+    // TRISC0's reset lifecycle (BRISC owns the soft-reset bit). Without
+    // any UART bit set, TRISC0 is held in reset and its heartbeat must
+    // not advance. Setting any of bits 16..19 releases TRISC0; clearing
+    // them re-asserts.
+    eprintln!("[tensix-engine] M6.1: verifying TRISC0 lifecycle");
+    engine.write_active_slots(1u32 << 7); // UART bits clear
+    std::thread::sleep(Duration::from_millis(20));
+    let hb_quiet = engine.trisc0_heartbeat();
+    std::thread::sleep(Duration::from_millis(20));
+    let hb_quiet2 = engine.trisc0_heartbeat();
+    if hb_quiet != hb_quiet2 {
+        poller.shutdown();
+        return Err(std::io::Error::other(format!(
+            "TRISC0 heartbeat advanced ({} → {}) while UART bits clear; \
+             BRISC isn't holding TRISC0 in reset",
+            hb_quiet, hb_quiet2
+        )));
+    }
+    eprintln!("[tensix-engine]   TRISC0 heartbeat held at {} (in reset)", hb_quiet);
+
+    // Set bit 16 (UART for L2CPU 0) — BRISC must release TRISC0.
+    engine.write_active_slots((1u32 << 7) | (1u32 << 16));
+    std::thread::sleep(Duration::from_millis(20));
+    let hb_running = engine.trisc0_heartbeat();
+    std::thread::sleep(Duration::from_millis(20));
+    let hb_running2 = engine.trisc0_heartbeat();
+    if hb_running2 <= hb_running {
+        poller.shutdown();
+        return Err(std::io::Error::other(format!(
+            "TRISC0 heartbeat did not advance after setting UART bit 16 \
+             ({} → {}); release path not working",
+            hb_running, hb_running2
+        )));
+    }
+    eprintln!(
+        "[tensix-engine]   TRISC0 heartbeat advanced {} → {} after UART register",
+        hb_running, hb_running2
+    );
+
+    // Clear bit 16 — BRISC must re-assert TRISC0.
+    engine.write_active_slots(1u32 << 7);
+    std::thread::sleep(Duration::from_millis(20));
+    let hb_after_unreg = engine.trisc0_heartbeat();
+    std::thread::sleep(Duration::from_millis(20));
+    let hb_after_unreg2 = engine.trisc0_heartbeat();
+    if hb_after_unreg != hb_after_unreg2 {
+        poller.shutdown();
+        return Err(std::io::Error::other(format!(
+            "TRISC0 heartbeat still advancing after clearing UART bit 16 \
+             ({} → {}); re-assert path not working",
+            hb_after_unreg, hb_after_unreg2
+        )));
+    }
+    eprintln!(
+        "[tensix-engine]   TRISC0 heartbeat froze at {} after UART unregister — TRISC0 LIFECYCLE PASS",
+        hb_after_unreg
+    );
+
     poller.shutdown();
     Ok(())
 }
