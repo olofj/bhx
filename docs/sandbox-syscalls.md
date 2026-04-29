@@ -81,11 +81,11 @@ These show up only during binary load + `daemon start` setup. Sandbox is install
 /etc/ld.so.cache
 /etc/localtime
 /etc/resolv.conf
-/home/olof/bh/bhx/blackhole-card.dtb
-/home/olof/bh/bhx/fw_jump.bin
-/home/olof/bh/bhx/Image
-/home/olof/bh/bhx/bhx/./daemon-card0.log
-/home/olof/bh/bhx/bhx/tests/rootfs/buildroot-2026.02.1/output/images/rootfs.ext2
+<repo>/blackhole-card.dtb
+<repo>/fw_jump.bin
+<repo>/Image
+<repo>/daemon-card0.log
+<repo>/tests/rootfs/buildroot-2026.02.1/output/images/rootfs.ext2
 /lib/x86_64-linux-gnu/{libatomic,libc,libfdt,libgcc_s,libglib-2.0,libm,libpcre2-8,libslirp,libvdeslirp}.so.{0,1,6}
 /proc/self/maps
 /run/user/1000/bhx/0/logpath
