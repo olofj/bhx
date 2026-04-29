@@ -255,6 +255,11 @@ pub fn status(card: u32) -> io::Result<()> {
                     p.uptime_secs,
                     lifetime::socket_path(card).display()
                 );
+                if let Some((x, y)) = p.engine_tile {
+                    // tt-metal operators must exclude this tile from
+                    // DispatchCoreConfig — see docs/tt-metal-coexistence.md.
+                    println!("  virtio-engine tile (NOC0): ({}, {})", x, y);
+                }
                 for l in &p.l2cpus {
                     let disk = l.disk.as_deref().unwrap_or("-");
                     let net = if l.net { "y" } else { "-" };

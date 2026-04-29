@@ -194,6 +194,14 @@ pub struct StatusPayload {
     pub pid: u32,
     pub uptime_secs: u64,
     pub l2cpus: Vec<L2CpuStatus>,
+    /// NOC0-logical (x, y) of the Tensix tile this daemon reserved
+    /// for its virtio engine, or `None` if bring-up hasn't run yet
+    /// (no L2CPU booted since daemon start). Operators running
+    /// tt-metal alongside the daemon must exclude this tile from
+    /// their `DispatchCoreConfig`. See #74. `#[serde(default)]`
+    /// keeps pre-#74 clients wire-compatible.
+    #[serde(default)]
+    pub engine_tile: Option<(u16, u16)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -382,6 +390,7 @@ mod tests {
                 virtio_console: true,
                 clients: 1,
             }],
+            engine_tile: Some((16, 11)),
         });
         let mut buf = Vec::new();
         write_frame(&mut buf, &resp).unwrap();
@@ -391,6 +400,7 @@ mod tests {
             assert_eq!(s.l2cpus.len(), 1);
             assert_eq!(s.l2cpus[0].state, L2CpuState::Running);
             assert!(s.l2cpus[0].virtio_console);
+            assert_eq!(s.engine_tile, Some((16, 11)));
         } else {
             panic!("wrong variant");
         }

@@ -107,6 +107,16 @@ impl TensixEngine {
             ))
         })?;
 
+        // Pre-bring-up sniff: if the picked tile's TCM is already
+        // non-zero, *something* loaded firmware here previously.
+        // tt-metal's dispatch firmware lives in TCM at offset 0
+        // (instruction stream); a fresh chip after `tt-smi -r` zeros
+        // L1 and TCM, so any non-zero pattern that isn't ours is a
+        // tip-off. We can't always tell tt-metal residue from a
+        // benign leftover, so we warn rather than fail. See #74 +
+        // docs/tt-metal-coexistence.md.
+        warn_if_tile_appears_busy(&tile, picked.x, picked.y);
+
         // Halt all baby RISCs, pre-clear the reg-file region so the
         // firmware's writes are unambiguous, load firmware, release
         // BRISC. Same pattern as `debug tensix-virtio` (M3 smoke).
@@ -191,6 +201,11 @@ impl TensixEngine {
             protocol_version,
         );
 
+        // Surface the reservation to operators / wrapper scripts that
+        // run tt-metal alongside the daemon. See #74 +
+        // docs/tt-metal-coexistence.md for the contract.
+        write_reserved_tile_file(card, picked.x, picked.y);
+
         Ok(TensixEngine {
             tile,
             noc0_x: picked.x,
@@ -266,6 +281,12 @@ impl TensixEngine {
              firmware version {:#010x}",
             card, picked.x, picked.y, firmware_version,
         );
+        // Same as `bring_up`: republish the reservation. The previous
+        // daemon may have left a stale file behind (or none, if it
+        // pre-dated #74) so a fresh write keeps operator tooling
+        // accurate without depending on the prior daemon's state.
+        write_reserved_tile_file(card, picked.x, picked.y);
+
         Ok(TensixEngine {
             tile,
             noc0_x: picked.x,
@@ -493,6 +514,65 @@ fn run_handshake(tile: &TensixTile, picked_x: u16, picked_y: u16) -> io::Result<
         )));
     }
     Ok((firmware_version, protocol_version))
+}
+
+/// Sniff the picked tile's L1 for prior-firmware bytes. tt-metal's
+/// dispatch firmware sits at the start of BRISC TCM (offset 0); a
+/// fresh chip after `tt-smi -r` has zeros there. If the first 16
+/// bytes are non-zero AND don't look like our own start.S header
+/// (which we'd see on warm-resume), log a loud warning that the
+/// daemon is taking over a tile someone else may still be using.
+/// Heuristic — false positives possible (a previous tt-bh-linux
+/// session that crashed mid-flight), so warn rather than fail. See
+/// #74 + docs/tt-metal-coexistence.md.
+fn warn_if_tile_appears_busy(tile: &TensixTile, x: u16, y: u16) {
+    let mut buf = [0u32; 4];
+    for (i, slot) in buf.iter_mut().enumerate() {
+        *slot = tile.read_l1_u32((i * 4) as u32);
+    }
+    // All-zero TCM is the freshly-reset baseline. Don't warn there.
+    if buf.iter().all(|w| *w == 0) {
+        return;
+    }
+    // Our own start.S plants a fixed dispatch sequence at TCM offset
+    // 0; if we recognize the leading word as ours, this is a warm
+    // resume of a previous tt-bh-linux session and we're about to
+    // adopt cleanly anyway. Don't spam warnings on the normal path.
+    // The expected first bytes are `6f 00 00 08` (LE u32 = 0x0800006f
+    // = `j 0x80`, the relative jump that vectors hartid 0 to brisc_main
+    // and others to the per-core dispatch). If start.S changes that
+    // leading instruction this needs updating.
+    const TT_BH_BRISC_FIRMWARE_FIRST_WORD: u32 = 0x0800006f;
+    if buf[0] == TT_BH_BRISC_FIRMWARE_FIRST_WORD {
+        return;
+    }
+    eprintln!(
+        "[tensix-engine] WARNING: tile NOC0 ({}, {}) TCM is non-zero \
+         before bring-up (first 16 bytes: {:08x} {:08x} {:08x} {:08x}). \
+         Another process — most likely tt-metal — may have loaded \
+         firmware here. tt-bh-linux is taking the tile over and may \
+         corrupt the running workload. See \
+         docs/tt-metal-coexistence.md.",
+        x, y, buf[0], buf[1], buf[2], buf[3]
+    );
+}
+
+/// Publish the daemon's reserved Tensix tile to
+/// `$XDG_RUNTIME_DIR/tt-bh-linux/<card>/reserved-tile` for tt-metal
+/// coexistence. Format: a single line `<x> <y>\n` in NOC0-logical
+/// coords. Best-effort — failure to write (no runtime dir, EROFS,
+/// race against `daemon stop` cleanup) downgrades to a `dlog!` and
+/// doesn't fail bring-up. See #74 + docs/tt-metal-coexistence.md.
+fn write_reserved_tile_file(card: u32, x: u16, y: u16) {
+    let path = crate::daemon::lifetime::reserved_tile_path(card);
+    let body = format!("{} {}\n", x, y);
+    if let Err(e) = std::fs::write(&path, body.as_bytes()) {
+        crate::dlog!(
+            "[tensix-engine] failed to write reserved-tile file {}: {}",
+            path.display(),
+            e
+        );
+    }
 }
 
 #[cfg(test)]

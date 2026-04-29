@@ -548,10 +548,17 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Re
         });
     }
 
+    let engine_tile = state
+        .tensix_engine
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|e| (e.noc0_x, e.noc0_y));
     let payload = StatusPayload {
         pid: std::process::id(),
         uptime_secs: state.started.elapsed().as_secs(),
         l2cpus,
+        engine_tile,
     };
     let _ = write_frame(&mut sock, &Response::Status(payload));
     Ok(())

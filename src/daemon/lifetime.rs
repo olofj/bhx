@@ -67,6 +67,17 @@ pub fn log_path(card: u32) -> PathBuf {
     p
 }
 
+/// Path to the file that records the Tensix tile this daemon has
+/// reserved for its virtio engine. Operators or wrapper scripts that
+/// run tt-metal alongside the daemon read this to exclude the tile
+/// from `DispatchCoreConfig`. Format: a single line `<x> <y>\n` in
+/// NOC0-logical coords; absent if bring-up hasn't picked yet. See #74.
+pub fn reserved_tile_path(card: u32) -> PathBuf {
+    let mut p = runtime_dir(card);
+    p.push("reserved-tile");
+    p
+}
+
 /// Create the runtime directory if missing, with mode 0700. Idempotent.
 pub fn ensure_runtime_dir(card: u32) -> io::Result<PathBuf> {
     let dir = runtime_dir(card);
@@ -182,6 +193,7 @@ pub fn stop(card: u32) -> io::Result<()> {
         // Clean up stale files if any exist.
         let _ = fs::remove_file(socket_path(card));
         let _ = fs::remove_file(pidfile_path(card));
+        let _ = fs::remove_file(reserved_tile_path(card));
         return Ok(());
     }
     let pid = match read_pid(card)? {
@@ -207,6 +219,7 @@ pub fn stop(card: u32) -> io::Result<()> {
 
     let _ = fs::remove_file(socket_path(card));
     let _ = fs::remove_file(pidfile_path(card));
+    let _ = fs::remove_file(reserved_tile_path(card));
     Ok(())
 }
 
