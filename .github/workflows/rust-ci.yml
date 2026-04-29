@@ -10,7 +10,7 @@ jobs:
     name: build / clippy / test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain (stable + rustfmt + clippy)
         uses: dtolnay/rust-toolchain@stable
@@ -58,7 +58,7 @@ jobs:
     # the continue-on-error so an advisory becomes a hard fail.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
