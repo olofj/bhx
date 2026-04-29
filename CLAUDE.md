@@ -124,11 +124,14 @@ third_party/           # vendored, builds-from-source dependencies
 │   ├── patches/       # 3 downstream patches (sel_generation handshake + 2 RISC-V DRAM fixes)
 │   ├── sha256sums     # pinned tarball checksum
 │   └── u-boot.bin     # (gitignored) symlink the build maintains
-└── opensbi/           # OpenSBI M-mode payload — produces fw_jump.bin
-    ├── README.md      # build / pinned version / bumping / reproducibility
-    ├── Makefile       # download + verify + build (PLATFORM=generic, FW_JUMP=y)
-    ├── sha256sums     # pinned tarball checksum
-    └── fw_jump.bin    # (gitignored) symlink the build maintains
+├── opensbi/           # OpenSBI M-mode payload — produces fw_jump.bin
+│   ├── README.md      # build / pinned version / bumping / reproducibility
+│   ├── Makefile       # download + verify + build (PLATFORM=generic, FW_JUMP=y)
+│   ├── sha256sums     # pinned tarball checksum
+│   └── fw_jump.bin    # (gitignored) symlink the build maintains
+└── dtb/               # Blackhole device tree blob, vendored from tt-bh-linux
+    ├── README.md      # provenance (upstream commit SHAs, license, refresh)
+    └── blackhole-card.dtb  # checked-in binary (~2.7 KB; (GPL-2.0 OR MIT))
 ```
 
 The `slirp` feature is on by default and links `libvdeslirp`+`libslirp`;
