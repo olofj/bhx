@@ -35,7 +35,7 @@ FRAGMENT := $(TOPDIR)/bhx.config
 # Final blob landed by the build.
 UBOOT_BIN := $(UB_SRCDIR)/u-boot.bin
 # Stable convenience path. The Makefile maintains a symlink here so
-# `bhx boot --uboot uboot/u-boot.bin` doesn't need to
+# `bhx boot --uboot third_party/uboot/u-boot.bin` doesn't need to
 # know the U-Boot version directory name.
 UBOOT_LINK := $(TOPDIR)/u-boot.bin
 
@@ -47,9 +47,9 @@ UBOOT_LINK := $(TOPDIR)/u-boot.bin
 CROSS_COMPILE ?= riscv64-linux-gnu-
 
 # Reproducibility: same workflow as tests/rootfs/. SOURCE_DATE_EPOCH
-# pinned to the most recent commit touching uboot/, anchored at
-# $(TOPDIR) so unrelated commits don't bump the cache; ?= so the env
-# wins for CI-style fixed-epoch builds. See #39.
+# pinned to the most recent commit touching third_party/uboot/,
+# anchored at $(TOPDIR) so unrelated commits don't bump the cache;
+# ?= so the env wins for CI-style fixed-epoch builds. See #39.
 SOURCE_DATE_EPOCH ?= $(shell git -C $(TOPDIR) log -1 --format=%ct -- $(TOPDIR) 2>/dev/null || echo 0)
 export SOURCE_DATE_EPOCH
 

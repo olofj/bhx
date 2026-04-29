@@ -131,8 +131,8 @@ For those, run U-Boot as the S-mode payload and let it walk the disk:
 
 ```bash
 # One-time: build U-Boot from source.
-cd uboot && make check-deps && make    # ~5 min cold; idempotent
-cd ..
+cd third_party/uboot && make check-deps && make    # ~5 min cold; idempotent
+cd ../..
 
 # Pull a U-Boot-bootable cloud image. The pull pipeline lands a
 # whole-disk `.img` (with GPT + ESP intact) when the known image
@@ -141,12 +141,12 @@ cd ..
 
 # Boot it. With no `--kernel` and no `--uboot`, the boot subcommand
 # detects from the disk's basename that this image needs U-Boot and
-# auto-defaults to `--uboot uboot/u-boot.bin`:
+# auto-defaults to `--uboot third_party/uboot/u-boot.bin`:
 ./target/debug/bhx boot -l 0 -d images/almalinux-10-kitten.img -n
 
 # Or be explicit:
 ./target/debug/bhx boot -l 0 \
-    --uboot uboot/u-boot.bin \
+    --uboot third_party/uboot/u-boot.bin \
     -d images/almalinux-10-kitten.img -n
 ```
 
@@ -158,7 +158,7 @@ loads the kernel + initrd from `/boot`. End-to-end UEFI on RISC-V.
 `whole partitioned disk` images go through U-Boot, `single-FS .ext4`
 images go through `--kernel`.
 
-The U-Boot build is documented in `uboot/README.md`: pinned config,
+The U-Boot build is documented in `third_party/uboot/README.md`: pinned config,
 the three downstream patches we apply (closes #49 plus two RISC-V
 DRAM-init fixes), reproducibility workflow.
 

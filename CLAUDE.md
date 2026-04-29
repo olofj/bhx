@@ -116,10 +116,10 @@ brisc-firmware/        # BRISC + TRISC0 firmware for the Tensix virtio engine
 ├── prebuilt/          # checked-in *.bin fallback when sfpi toolchain absent
 └── Makefile           # toolchain at /opt/tenstorrent/sfpi/compiler/bin
 
-uboot/                 # U-Boot S-mode payload for booting stock distro images (#44 + sub-issues)
+third_party/uboot/     # U-Boot S-mode payload for booting stock distro images (#44 + sub-issues)
 ├── README.md          # build / pinned config / bumping / reproducibility
 ├── Makefile           # download + extract + patch + merge_config.sh + build
-├── bhx.config       # defconfig fragment merged on top of qemu-riscv64_smode_defconfig
+├── bhx.config         # defconfig fragment merged on top of qemu-riscv64_smode_defconfig
 ├── patches/           # 3 downstream patches (sel_generation handshake + 2 RISC-V DRAM fixes)
 ├── sha256sums         # pinned tarball checksum
 └── u-boot.bin         # (gitignored) symlink the build maintains
@@ -324,5 +324,5 @@ image/kernel/ramdisk downloaders.
   itself. Each known image entry's `needs_bootloader` field decides
   which mode the no-`--uboot` boot path defaults to (see
   `default_boot_payload` in main.rs). `default_uboot_path` prefers
-  `./u-boot.bin` (operator symlink) over `./uboot/u-boot.bin` (in-tree
-  build); see `uboot/README.md` for the build.
+  `./u-boot.bin` (operator symlink) over `./third_party/uboot/u-boot.bin`
+  (in-tree build); see `third_party/uboot/README.md` for the build.

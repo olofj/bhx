@@ -296,7 +296,7 @@ pub fn modify_dtb(
     bootargs_bytes.push(0);
     fdt.setprop(chosen, "bootargs", &bootargs_bytes)?;
     // /chosen/sbi-console — bind point for U-Boot's downstream DM SBI
-    // serial driver (uboot/patches/serial_sbi_dm.c, see #45).
+    // serial driver (third_party/uboot/patches/serial_sbi_dm.c, see #45).
     // The Linux kernel uses its own SBI HVC driver regardless of DT;
     // adding this node is harmless when booting raw kernel mode and
     // required for U-Boot's interactive console.

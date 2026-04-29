@@ -13,7 +13,7 @@ target, not the binary.
 ## Build
 
 ```bash
-cd uboot                 # from the bhx project root
+cd third_party/uboot     # from the bhx project root
 make check-deps          # verifies wget, tar, riscv64-linux-gnu-gcc, bison, flex
 make                     # downloads u-boot-2026.04.tar.bz2, builds u-boot.bin
 ```
@@ -26,9 +26,9 @@ Output: `u-boot.bin` (symlink to the actual file in the source tree).
 ## Use
 
 ```bash
-cd ..    # back to bhx/
+cd ../..    # back to bhx/
 ./target/debug/bhx daemon start -t 0 --log-file ./daemon-card0.log
-./target/debug/bhx boot -l 0 --uboot uboot/u-boot.bin
+./target/debug/bhx boot -l 0 --uboot third_party/uboot/u-boot.bin
 ./target/debug/bhx connect -l 0
 ```
 
@@ -71,8 +71,8 @@ fork.
 
 Same workflow as `tests/rootfs/` (#39): the Makefile pins
 `SOURCE_DATE_EPOCH` to the timestamp of the last commit touching
-`uboot/`. Two clean builds from the same commit produce a byte-
-identical `u-boot.bin`. Verify:
+`third_party/uboot/`. Two clean builds from the same commit produce a
+byte-identical `u-boot.bin`. Verify:
 
 ```bash
 make distclean && make && sha256sum u-boot.bin
@@ -82,10 +82,10 @@ make distclean && make && sha256sum u-boot.bin   # must match
 ## Layout
 
 ```
-uboot/
+third_party/uboot/
 ├── README.md           (this file)
 ├── Makefile            download + build
-├── bhx.config        defconfig fragment merged on top of qemu-riscv64_smode_defconfig
+├── bhx.config          defconfig fragment merged on top of qemu-riscv64_smode_defconfig
 ├── sha256sums          pinned tarball checksum
 ├── dl/                 (gitignored) download cache
 ├── u-boot-2026.04/     (gitignored) extracted source tree

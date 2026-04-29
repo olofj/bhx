@@ -25,7 +25,7 @@ authoritative reference for behavior, this directory is the *why*.
   iperf3 sustained I/O, console roundtrip).
 - [`../scripts/bench/README.md`](../scripts/bench/README.md) — per-surface
   performance baselines (disk, console, net) with a regression-fail mode.
-- [`../uboot/README.md`](../uboot/README.md) — the pinned U-Boot build
+- [`../third_party/uboot/README.md`](../third_party/uboot/README.md) — the pinned U-Boot build
   used for stock distro images (config fragment, downstream patches,
   reproducibility).
 - [`../tests/rootfs/README.md`](../tests/rootfs/README.md) — the

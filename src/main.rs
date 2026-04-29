@@ -457,9 +457,10 @@ fn resolve_disk_path(
 ///
 /// U-Boot binary lookup prefers `u-boot.bin` symlinked into the
 /// caller's cwd (the same convention `rootfs.ext4` follows), and
-/// falls back to `uboot/u-boot.bin` (the in-tree build path that
-/// `make -C uboot` produces). If neither exists, uses
-/// `uboot/u-boot.bin` so the daemon-side error names a concrete path.
+/// falls back to `third_party/uboot/u-boot.bin` (the in-tree build
+/// path that `make -C third_party/uboot` produces). If neither
+/// exists, uses `third_party/uboot/u-boot.bin` so the daemon-side
+/// error names a concrete path.
 fn default_boot_payload(disk: Option<&str>) -> daemon::protocol::BootPayload {
     if let Some(d) = disk {
         if let Some(img) = image::known_image_for_disk(std::path::Path::new(d)) {
@@ -473,13 +474,14 @@ fn default_boot_payload(disk: Option<&str>) -> daemon::protocol::BootPayload {
 
 /// Pick a sensible default U-Boot binary path for the no-`--uboot`
 /// flow. Prefers `./u-boot.bin` if present (pre-#48 operator
-/// convention of symlinking into cwd), else `./uboot/u-boot.bin`
-/// (the in-tree `make -C uboot` build output).
+/// convention of symlinking into cwd), else
+/// `./third_party/uboot/u-boot.bin` (the in-tree
+/// `make -C third_party/uboot` build output).
 fn default_uboot_path() -> String {
     if std::path::Path::new("u-boot.bin").exists() {
         "u-boot.bin".to_string()
     } else {
-        "uboot/u-boot.bin".to_string()
+        "third_party/uboot/u-boot.bin".to_string()
     }
 }
 
@@ -2004,13 +2006,13 @@ mod tests {
         // almalinux-10-kitten lands as a whole-disk `.img` with
         // needs_bootloader=true: default must flip to U-Boot mode.
         // Path is either `u-boot.bin` (operator symlinked into cwd)
-        // or `uboot/u-boot.bin` (in-tree build) — `default_uboot_path`
-        // picks based on cwd, so test against the legal set rather
-        // than the cwd-dependent specific value.
+        // or `third_party/uboot/u-boot.bin` (in-tree build) —
+        // `default_uboot_path` picks based on cwd, so test against
+        // the legal set rather than the cwd-dependent specific value.
         match default_boot_payload(Some("images/almalinux-10-kitten.img")) {
             daemon::protocol::BootPayload::Uboot(p) => assert!(
-                p == "u-boot.bin" || p == "uboot/u-boot.bin",
-                "expected u-boot.bin or uboot/u-boot.bin, got {:?}",
+                p == "u-boot.bin" || p == "third_party/uboot/u-boot.bin",
+                "expected u-boot.bin or third_party/uboot/u-boot.bin, got {:?}",
                 p
             ),
             other => panic!("expected Uboot(...), got {:?}", other),

@@ -142,7 +142,7 @@ pub enum BootPayload {
     /// Raw Linux `Image`. OpenSBI's `fw_jump` jumps to this address;
     /// the kernel takes the L2CPU directly.
     Kernel(String),
-    /// U-Boot binary built for S-mode (e.g. `uboot/u-boot.bin`).
+    /// U-Boot binary built for S-mode (e.g. `third_party/uboot/u-boot.bin`).
     /// OpenSBI hands control to U-Boot; U-Boot then reads kernel +
     /// initrd from a virtio-blk disk and `booti`s into them.
     Uboot(String),
