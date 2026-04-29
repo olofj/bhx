@@ -38,12 +38,14 @@ pub fn reset_board(card: u32) -> std::io::Result<()> {
         format!("{:04x}:{:02x}:{:02x}.{}", domain, bus, dev, func)
     };
     let config_path = format!("/sys/bus/pci/devices/{}/config", bdf);
-    eprintln!(
+    crate::dlog!(
         "[reset_board] card={} BDF={} config={}",
-        card, bdf, config_path
+        card,
+        bdf,
+        config_path
     );
 
-    eprintln!("[reset_board] step 1: open fd + CONFIG_WRITE ioctl (triggers LDS reset)");
+    crate::dlog!("[reset_board] step 1: open fd + CONFIG_WRITE ioctl (triggers LDS reset)");
     {
         let fd = kmd::open_device(card)?;
         let r = kmd::reset_device(fd, kmd::TENSTORRENT_RESET_DEVICE_CONFIG_WRITE);
@@ -53,7 +55,7 @@ pub fn reset_board(card: u32) -> std::io::Result<()> {
         r?;
     }
 
-    eprintln!("[reset_board] step 2: polling config byte 4 bit 1 for reset completion (max 2s)");
+    crate::dlog!("[reset_board] step 2: polling config byte 4 bit 1 for reset completion (max 2s)");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let mut saw_asserted = false;
     let mut iters = 0u32;
@@ -74,23 +76,26 @@ pub fn reset_board(card: u32) -> std::io::Result<()> {
             saw_asserted = true;
         }
         if reset_bit == 0 && saw_asserted {
-            eprintln!(
+            crate::dlog!(
                 "[reset_board]   reset completed after {} polls (command byte={:#04x})",
-                iters, byte[0]
+                iters,
+                byte[0]
             );
             break;
         }
         if std::time::Instant::now() >= deadline {
-            eprintln!(
+            crate::dlog!(
                 "[reset_board]   timeout after {} polls (last byte={:#04x}, saw_asserted={})",
-                iters, byte[0], saw_asserted
+                iters,
+                byte[0],
+                saw_asserted
             );
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
 
-    eprintln!("[reset_board] step 3: open fd + RESTORE_STATE ioctl");
+    crate::dlog!("[reset_board] step 3: open fd + RESTORE_STATE ioctl");
     {
         let fd = kmd::open_device(card)?;
         let r = kmd::reset_device(fd, kmd::TENSTORRENT_RESET_DEVICE_RESTORE_STATE);
@@ -99,6 +104,6 @@ pub fn reset_board(card: u32) -> std::io::Result<()> {
         }
         r?;
     }
-    eprintln!("[reset_board] complete");
+    crate::dlog!("[reset_board] complete");
     Ok(())
 }

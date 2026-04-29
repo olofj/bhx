@@ -212,7 +212,7 @@ fn run_daemonized(
         log_path,
         opts.metrics_port,
     ) {
-        eprintln!("[daemon] fatal: {}", e);
+        crate::dlog!("[daemon] fatal: {}", e);
     }
     let _ = std::fs::remove_file(sock_path);
     let _ = std::fs::remove_file(pid_path);

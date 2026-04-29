@@ -113,7 +113,7 @@ fn uart_pass(
         for (i, &expected) in EYE_CATCHER.iter().enumerate() {
             let byte = unsafe { ptr::read_volatile(&(*desc).eye_catcher[i]) };
             if byte != expected {
-                eprintln!(
+                crate::dlog!(
                     "[console l2cpu {}] debug descriptor eye catcher mismatch",
                     l2cpu.idx()
                 );
@@ -122,7 +122,7 @@ fn uart_pass(
         }
         let base = unsafe { ptr::read_volatile(&(*desc).virtuart_base) };
         if base == !0u64 {
-            eprintln!(
+            crate::dlog!(
                 "[console l2cpu {}] virtuart_base is ~0; chip not ready",
                 l2cpu.idx()
             );
@@ -130,7 +130,7 @@ fn uart_pass(
         }
         base
     };
-    eprintln!(
+    crate::dlog!(
         "[console l2cpu {}] attached virt UART @ 0x{:x} (tile {},{})",
         l2cpu.idx(),
         uart_base,
@@ -277,7 +277,7 @@ pub fn probe_warm_resume(l2cpu: &L2Cpu) -> bool {
     let desc_window = match l2cpu.get_persistent_2m_window(starting_address + debug_ptr as u64) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!(
+            crate::dlog!(
                 "[probe l2cpu {}] descriptor window failed: {}",
                 l2cpu.idx(),
                 e
@@ -303,7 +303,7 @@ pub fn probe_warm_resume(l2cpu: &L2Cpu) -> bool {
     let uart_base = match decode_descriptor(&desc_bytes) {
         Ok(b) => b,
         Err(DescriptorError::EyeCatcherMismatch { offset, got, want }) => {
-            eprintln!(
+            crate::dlog!(
                 "[probe l2cpu {}] OSBIdbug eye catcher mismatch at byte {} (got 0x{:02x}, want 0x{:02x})",
                 l2cpu.idx(),
                 offset,
@@ -313,7 +313,7 @@ pub fn probe_warm_resume(l2cpu: &L2Cpu) -> bool {
             return false;
         }
         Err(DescriptorError::VirtuartBaseUninit) => {
-            eprintln!(
+            crate::dlog!(
                 "[probe l2cpu {}] virtuart_base is ~0 (chip not fully initialized)",
                 l2cpu.idx()
             );
@@ -324,7 +324,7 @@ pub fn probe_warm_resume(l2cpu: &L2Cpu) -> bool {
     let queue_window = match l2cpu.get_persistent_2m_window(uart_base) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("[probe l2cpu {}] queue window failed: {}", l2cpu.idx(), e);
+            crate::dlog!("[probe l2cpu {}] queue window failed: {}", l2cpu.idx(), e);
             return false;
         }
     };
@@ -335,7 +335,7 @@ pub fn probe_warm_resume(l2cpu: &L2Cpu) -> bool {
     }
     match decode_magic(&magic_bytes) {
         Ok(()) => {
-            eprintln!(
+            crate::dlog!(
                 "[probe l2cpu {}] warm-resume viable (virtuart @ 0x{:x})",
                 l2cpu.idx(),
                 uart_base
@@ -343,7 +343,7 @@ pub fn probe_warm_resume(l2cpu: &L2Cpu) -> bool {
             true
         }
         Err(got) => {
-            eprintln!(
+            crate::dlog!(
                 "[probe l2cpu {}] virt UART magic is 0x{:016x} (want 0x{:016x}) — wedged",
                 l2cpu.idx(),
                 got,
@@ -419,7 +419,7 @@ pub fn chip_console_main(
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) => {
-                eprintln!("[console l2cpu {}] error: {} — retrying", l2cpu.idx(), e);
+                crate::dlog!("[console l2cpu {}] error: {} — retrying", l2cpu.idx(), e);
                 std::thread::sleep(Duration::from_millis(100));
             }
         }

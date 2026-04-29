@@ -87,7 +87,7 @@ pub fn boot_l2cpu(
         L2CPU_TILES.len()
     );
     let tile = L2CPU_TILES[l2cpu_idx];
-    eprintln!(
+    crate::dlog!(
         "[boot_l2cpu] L2CPU {} -> tile ({}, {}), control_base=0x{:x}",
         l2cpu_idx,
         tile.x,
@@ -95,7 +95,7 @@ pub fn boot_l2cpu(
         regs_l2cpu::CONTROL_BASE
     );
 
-    eprintln!(
+    crate::dlog!(
         "[boot_l2cpu] enabling L3 cache at 0x{:x}+{}",
         regs_l2cpu::L3_CTRL_BASE,
         regs_l2cpu::L3_ENABLE_OFFSET
@@ -103,10 +103,10 @@ pub fn boot_l2cpu(
     let l3_enable_addr = regs_l2cpu::L3_CTRL_BASE + regs_l2cpu::L3_ENABLE_OFFSET;
     l2cpu.write32(l3_enable_addr, regs_l2cpu::L3_ENABLE_VALUE);
     let l3_readback = l2cpu.read32(l3_enable_addr);
-    eprintln!("[boot_l2cpu]   L3 readback: {:#x}", l3_readback);
+    crate::dlog!("[boot_l2cpu]   L3 readback: {:#x}", l3_readback);
 
     let opensbi_bytes = read_bin_file(opensbi_path)?;
-    eprintln!(
+    crate::dlog!(
         "[boot_l2cpu] Writing OpenSBI ({} bytes from {}) to 0x{:x}",
         opensbi_bytes.len(),
         opensbi_path.display(),
@@ -116,7 +116,7 @@ pub fn boot_l2cpu(
 
     if let Some(kpath) = kernel_path {
         let kernel_bytes = read_bin_file(kpath)?;
-        eprintln!(
+        crate::dlog!(
             "[boot_l2cpu] Writing Kernel ({} bytes from {}) to 0x{:x}",
             kernel_bytes.len(),
             kpath.display(),
@@ -130,7 +130,7 @@ pub fn boot_l2cpu(
     if padding != 0 {
         dtb_padded.extend(std::iter::repeat_n(0u8, 4 - padding));
     }
-    eprintln!(
+    crate::dlog!(
         "[boot_l2cpu] Writing DTB ({} bytes, padded to {}) to 0x{:x}",
         dtb_bytes.len(),
         dtb_padded.len(),
@@ -140,7 +140,7 @@ pub fn boot_l2cpu(
 
     if let Some(rpath) = rootfs_path {
         let rootfs_bytes = read_bin_file(rpath)?;
-        eprintln!(
+        crate::dlog!(
             "[boot_l2cpu] Writing rootfs ({} bytes from {}) to 0x{:x}",
             rootfs_bytes.len(),
             rpath.display(),
@@ -151,15 +151,16 @@ pub fn boot_l2cpu(
 
     let reset_vector_0 = (opensbi_addr & 0xffff_ffff) as u32;
     let reset_vector_1 = (opensbi_addr >> 32) as u32;
-    eprintln!(
+    crate::dlog!(
         "[boot_l2cpu] Setting reset vectors for 4 cores: lo={:#x}, hi={:#x}",
-        reset_vector_0, reset_vector_1
+        reset_vector_0,
+        reset_vector_1
     );
     for core in 0..4u64 {
         l2cpu.write32(regs_l2cpu::CONTROL_BASE + core * 8, reset_vector_0);
         l2cpu.write32(regs_l2cpu::CONTROL_BASE + core * 8 + 4, reset_vector_1);
     }
-    eprintln!("[boot_l2cpu] L2CPU {} image + vectors loaded", l2cpu_idx);
+    crate::dlog!("[boot_l2cpu] L2CPU {} image + vectors loaded", l2cpu_idx);
 
     Ok(())
 }
@@ -176,7 +177,7 @@ pub fn configure_prefetchers(l2cpu: &L2Cpu) {
         L2CPU_TILES.len()
     );
     let tile = L2CPU_TILES[l2cpu_idx];
-    eprintln!(
+    crate::dlog!(
         "[configure_prefetchers] L2CPU {} tile ({}, {}) base=0x{:x}",
         l2cpu_idx,
         tile.x,
@@ -188,7 +189,7 @@ pub fn configure_prefetchers(l2cpu: &L2Cpu) {
         l2cpu.write32(base, regs_l2cpu::L2_PREFETCH_CFG_LO);
         l2cpu.write32(base + 4, regs_l2cpu::L2_PREFETCH_CFG_HI);
     }
-    eprintln!("[configure_prefetchers] done");
+    crate::dlog!("[configure_prefetchers] done");
 }
 
 /// Boot-device selection for the guest kernel. Controls the `bootargs` value
@@ -242,7 +243,7 @@ pub fn modify_dtb(
     uart_addr: Option<u64>,
 ) -> crate::Result<Vec<u8>> {
     let mem_end = mem_start + mem_size;
-    eprintln!(
+    crate::dlog!(
         "[modify_dtb] input DTB {} bytes, mem=[0x{:x}..0x{:x}) ({} MB), boot_device={:?}",
         dtb_bytes.len(),
         mem_start,
@@ -267,9 +268,10 @@ pub fn modify_dtb(
     reg.extend_from_slice(&mem_start.to_be_bytes());
     reg.extend_from_slice(&mem_size.to_be_bytes());
     fdt.setprop(memory_node, "reg", &reg)?;
-    eprintln!(
+    crate::dlog!(
         "[modify_dtb]   /memory reg patched -> start=0x{:x} size=0x{:x}",
-        mem_start, mem_size
+        mem_start,
+        mem_size
     );
 
     let chosen = match fdt.path_offset("/chosen")? {
@@ -293,7 +295,7 @@ pub fn modify_dtb(
         ),
         BootDevice::Uboot => "console=hvc0 earlycon=sbi keep_bootcon".to_string(),
     };
-    eprintln!("[modify_dtb]   bootargs = {:?}", bootargs);
+    crate::dlog!("[modify_dtb]   bootargs = {:?}", bootargs);
     let mut bootargs_bytes = bootargs.into_bytes();
     bootargs_bytes.push(0);
     fdt.setprop(chosen, "bootargs", &bootargs_bytes)?;
@@ -338,20 +340,23 @@ pub fn modify_dtb(
     let mut plic_phandle = fdt.get_phandle(plic);
     if plic_phandle == 0 {
         plic_phandle = fdt.find_max_phandle()? + 1;
-        eprintln!(
+        crate::dlog!(
             "[modify_dtb]   PLIC had no phandle, allocating {}",
             plic_phandle
         );
         fdt.setprop_u32(plic, "phandle", plic_phandle)?;
     } else {
-        eprintln!("[modify_dtb]   PLIC phandle = {}", plic_phandle);
+        crate::dlog!("[modify_dtb]   PLIC phandle = {}", plic_phandle);
     }
 
     for node_spec in virtio_nodes {
         let name = format!("virtio@{:x}", node_spec.addr);
-        eprintln!(
+        crate::dlog!(
             "[modify_dtb]   adding {} size={:#x} irq={} parent={}",
-            name, node_spec.size, node_spec.irq, plic_phandle
+            name,
+            node_spec.size,
+            node_spec.irq,
+            plic_phandle
         );
         let node = fdt.add_subnode(soc, &name)?;
         fdt.setprop_string(node, "compatible", "virtio,mmio")?;
@@ -380,7 +385,7 @@ pub fn modify_dtb(
     // on `console=ttyS0`.
     if let Some(addr) = uart_addr {
         let name = format!("serial@{:x}", addr);
-        eprintln!(
+        crate::dlog!(
             "[modify_dtb]   adding {} size=0x1000 irq={} (UART, TX-only)",
             name,
             crate::regs::virtio_mmio::UART_IRQ,
@@ -400,7 +405,7 @@ pub fn modify_dtb(
     }
 
     let packed = fdt.pack()?;
-    eprintln!("[modify_dtb] packed DTB {} bytes", packed.len());
+    crate::dlog!("[modify_dtb] packed DTB {} bytes", packed.len());
     Ok(packed)
 }
 

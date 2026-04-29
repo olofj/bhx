@@ -157,9 +157,11 @@ impl VirtioDeviceImpl for VirtioBlk {
         let end = disk_offset.saturating_add(len);
 
         if end > self.file_size as u64 {
-            eprintln!(
+            crate::dlog!(
                 "block: I/O at offset {:#x} len {} exceeds disk size {:#x}, returning IOERR",
-                disk_offset, len, self.file_size
+                disk_offset,
+                len,
+                self.file_size
             );
             // Signal a device I/O error to the guest. Without this the
             // request looked successful from the guest's POV and its
@@ -206,7 +208,7 @@ impl VirtioDeviceImpl for VirtioBlk {
                 }
             }
             t => {
-                eprintln!("Unimplemented block request type: {} len: {}", t, len);
+                crate::dlog!("Unimplemented block request type: {} len: {}", t, len);
                 // Tell the guest "we don't know what this is" so its
                 // block layer surfaces an error instead of hanging.
                 self.req_status = VIRTIO_BLK_S_UNSUPP;

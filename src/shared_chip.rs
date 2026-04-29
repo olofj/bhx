@@ -149,7 +149,7 @@ impl SharedChip {
         // M6/M6.1's UART poll. Best-effort: older kmds without
         // SET_POWER_STATE return ENOTTY — we warn and carry on.
         if let Err(e) = kmd::request_max_power(fd) {
-            eprintln!(
+            crate::dlog!(
                 "[shared-chip] warning: SET_POWER_STATE failed ({}); \
                  chip will run at low AICLK (kmd < 2.6?)",
                 e
@@ -236,20 +236,11 @@ impl SharedChip {
     }
 
     /// Probe whether L2CPU `idx`'s release bit is set. Pure read; no
-    /// `seq_lock`. Mirrors the logging style of the old `boot::l2cpu_is_running`.
+    /// `seq_lock`.
     pub fn l2cpu_is_running(&self, l2cpu_idx: usize) -> bool {
         let val = self.axi_read32(L2CPU_RESET_ADDR);
         let bit_idx = l2cpu_idx + 4;
-        let running = (val >> bit_idx) & 1 == 1;
-        eprintln!(
-            "[l2cpu_is_running] L2CPU_RESET@0x{:x}={:#010x}, bit {}={}, running={}",
-            L2CPU_RESET_ADDR,
-            val,
-            bit_idx,
-            (val >> bit_idx) & 1,
-            running,
-        );
-        running
+        (val >> bit_idx) & 1 == 1
     }
 
     /// Read `L2CPU_RESET` raw — used by daemon startup probe to report all
@@ -265,7 +256,7 @@ impl SharedChip {
     pub fn reset_x280(&self, l2cpu_indices: &[usize]) {
         let _guard = self.seq_lock.lock().unwrap();
 
-        eprintln!("[reset_x280] stepping PLL down to 200 MHz");
+        crate::dlog!("[reset_x280] stepping PLL down to 200 MHz");
         clock::set_frequency(self, 200);
 
         let reset_val_before = self.axi_read32(L2CPU_RESET_ADDR);
@@ -275,20 +266,20 @@ impl SharedChip {
             mask |= 1 << (idx + 4);
             reset_val |= 1 << (idx + 4);
         }
-        eprintln!(
+        crate::dlog!(
             "[reset_x280] L2CPU_RESET@0x{:x}: {:#010x} | {:#010x} -> {:#010x} (releasing L2CPU {:?})",
             L2CPU_RESET_ADDR, reset_val_before, mask, reset_val, l2cpu_indices
         );
         self.axi_write32(L2CPU_RESET_ADDR, reset_val);
         let reset_val_after = self.axi_read32(L2CPU_RESET_ADDR);
-        eprintln!(
+        crate::dlog!(
             "[reset_x280] L2CPU_RESET readback: {:#010x}",
             reset_val_after
         );
 
-        eprintln!("[reset_x280] stepping PLL up to 1750 MHz");
+        crate::dlog!("[reset_x280] stepping PLL up to 1750 MHz");
         clock::set_frequency(self, 1750);
-        eprintln!("[reset_x280] done");
+        crate::dlog!("[reset_x280] done");
     }
 
     /// Full PCIe link reset via tt-kmd's `RESET_DEVICE` ioctl. The
