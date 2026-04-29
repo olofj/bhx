@@ -276,6 +276,50 @@ mod tests {
     }
 
     #[test]
+    fn set_frequency_steps_fbdiv_up_then_postdiv_down_when_stepping_up() {
+        // From 200 → 1750: fbdiv must go from 128 to 140 (UP), then
+        // postdiv from 15 to 1 (DOWN). Step 1 of set_frequency
+        // (postdiv-up) is a no-op since target postdiv [1,1,1,1] is
+        // already below initial [15,15,15,15]. So the order is:
+        //   - all CNTL1 writes (fbdiv increment)
+        //   - all CNTL5 writes (postdiv decrement)
+        // Verify the reverse-direction sequencing — the symmetric
+        // counterpart to set_frequency_steps_postdiv_up_then_fbdiv_then_postdiv_down.
+        let initial_cntl1 = PllCntl1 {
+            refdiv: 0,
+            postdiv: 0,
+            fbdiv: 128,
+        }
+        .to_u32();
+        let initial_cntl5 = PllCntl5 {
+            postdiv: [15, 15, 15, 15],
+        }
+        .to_u32();
+        let mock = MockPll::new(initial_cntl1, initial_cntl5);
+
+        set_frequency(&mock, 1750);
+
+        // Final state lands on the 1750 MHz solution.
+        let final_cntl1 = PllCntl1::from_u32(*mock.cntl1.borrow());
+        assert_eq!(final_cntl1.fbdiv, 140);
+        let final_cntl5 = PllCntl5::from_u32(*mock.cntl5.borrow());
+        assert_eq!(final_cntl5.postdiv, [1, 1, 1, 1]);
+
+        // Sequencing: every CNTL1 write precedes every CNTL5 write.
+        let log = mock.log.borrow();
+        let last_cntl1 = log.iter().rposition(|&(a, _)| a == PLL4_BASE + PLL_CNTL_1);
+        let first_cntl5 = log.iter().position(|&(a, _)| a == PLL4_BASE + PLL_CNTL_5);
+        assert!(
+            last_cntl1.is_some() && first_cntl5.is_some(),
+            "expected both CNTL1 and CNTL5 writes during a 200 -> 1750 step-up"
+        );
+        assert!(
+            last_cntl1.unwrap() < first_cntl5.unwrap(),
+            "all fbdiv (CNTL1) writes must complete before postdiv (CNTL5) stepping starts"
+        );
+    }
+
+    #[test]
     fn set_frequency_to_already_current_target_is_idempotent() {
         // When the PLL is already at 200 MHz and we ask for 200 MHz
         // again (e.g. SharedChip::idle_pll called against an idle chip
