@@ -5,7 +5,6 @@
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::path::Path;
 use std::ptr;
 
 use crate::virtio::VirtioDeviceImpl;
@@ -89,19 +88,6 @@ impl Drop for VirtioBlk {
 }
 
 impl VirtioBlk {
-    /// Open `image_path` and construct a VirtioBlk against it. Used by
-    /// CLI / debug paths that don't go through `dispatch_add_disk`.
-    /// The daemon's add-disk path uses `from_file` with a pre-vetted
-    /// File handle to avoid the path-resolved-twice TOCTOU.
-    #[allow(dead_code)]
-    pub fn new(image_path: &Path, l2cpu_idx: u8) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(image_path)?;
-        Self::from_file(file, l2cpu_idx)
-    }
-
     /// Construct a VirtioBlk from an already-opened File. The File is
     /// owned by the resulting VirtioBlk for its full lifetime; the
     /// caller is freed from any close responsibility. `mmap` derives

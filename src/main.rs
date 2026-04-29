@@ -4,8 +4,13 @@
 //! bhx — unified Rust binary for booting and managing Linux on
 //! Tenstorrent Blackhole L2CPU (SiFive X280) RISC-V cores.
 
-// Many items across the tree are scaffolding for partially-implemented
-// subcommands (boot, kmd ioctls, etc.) — keep them compiled without noise.
+// `kmd.rs` mirrors the full tt-kmd ABI (ioctl numbers, struct layouts,
+// flag constants); only a subset is currently used. Same for the
+// virtio/regs/tensix layout-constant modules — they document the wire
+// format and we want a future use-site to find them already named, not
+// have to rediscover the offset. The crate-wide allow keeps those
+// compiled without noise; per-module audits live in #100 if/when we
+// want to prune.
 #![allow(dead_code)]
 
 mod boot;

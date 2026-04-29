@@ -221,10 +221,11 @@ pub struct VirtioNet {
     /// Per-(card, L2CPU) hostname plumbed into libslirp's vhostname so
     /// the guest's DHCP lease (option 12) carries
     /// e.g. `bhx-card0-l2cpu0` instead of libslirp's compiled-in
-    /// "slirp" default. The CString must outlive `slirp` — libslirp
-    /// keeps the pointer verbatim, so we hold ownership here. See #60.
-    #[allow(dead_code)]
-    hostname: std::ffi::CString,
+    /// "slirp" default. libslirp keeps the C-string pointer verbatim
+    /// (no copy), so this CString must outlive the `slirp` instance.
+    /// Field is intentionally read-only after construction — the
+    /// underscore prefix tells `dead_code` to leave it alone. See #60.
+    _hostname_lifetime: std::ffi::CString,
 }
 
 unsafe impl Send for VirtioNet {}
@@ -309,7 +310,7 @@ impl VirtioNet {
             queue_header_size: std::mem::size_of::<VirtioNetHdrMrgRxbuf>() as u64,
             l2cpu_idx,
             mac: derive_mac(card, l2cpu_idx),
-            hostname,
+            _hostname_lifetime: hostname,
         })
     }
 }
