@@ -128,6 +128,12 @@ pub const STATS_OFF_READY_EVENTS: u32 = 0x01c;
 pub const STATS_OFF_LAST_NOTIFY: u32 = 0x020;
 pub const STATS_OFF_COMPL_EVENTS: u32 = 0x024;
 pub const STATS_OFF_LAST_COMPL: u32 = 0x028;
+/// Cumulative count of `kick_ring_push` calls dropped due to a full
+/// kick ring (#101). BRISC bumps this when daemon backpressure leaves
+/// `(producer - consumer) >= KICK_RING_ENTRIES` at the moment a new
+/// kick would be appended; the daemon polls this and surfaces deltas
+/// via `bhx_kick_drops_total`.
+pub const STATS_OFF_KICK_DROPS: u32 = 0x02c;
 
 // ----- Per-queue shadow region (BRISC L1, M5.5b firmware) -----
 //
@@ -444,6 +450,40 @@ pub mod sim {
                 (slot << 16) | (q & 0xFFFF),
             );
             self.bump_stat(STATS_OFF_NOTIFY_EVENTS);
+            self.kick_ring_push(slot, q);
+        }
+
+        /// Mirror of the firmware's `kick_ring_push` for the
+        /// fullness-check + drop-counter behavior in #101. Returns
+        /// true if the entry was appended; false if the ring was
+        /// already at `KICK_RING_ENTRIES - 1` outstanding and we had
+        /// to drop.
+        pub fn kick_ring_push(&mut self, slot: u32, queue_idx: u32) -> bool {
+            use crate::tensix_proto as proto;
+            let producer = self.l1.read(
+                proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_PRODUCER_SEQ,
+            );
+            let consumer = self.l1.read(
+                proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_CONSUMER_SEQ,
+            );
+            if producer.wrapping_sub(consumer) >= proto::KICK_RING_ENTRIES {
+                self.bump_stat(STATS_OFF_KICK_DROPS);
+                return false;
+            }
+            let idx = producer & (proto::KICK_RING_ENTRIES - 1);
+            let entry = proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING + idx * proto::KICK_ENTRY_SIZE;
+            // SLOT field packs queue_idx into the high half — matches
+            // the firmware's KICK_ENTRY_OFF_SLOT layout.
+            self.l1.write(
+                entry + proto::KICK_ENTRY_OFF_SLOT,
+                (slot & 0xFFFF) | ((queue_idx & 0xFFFF) << 16),
+            );
+            self.l1.write(entry + proto::KICK_ENTRY_OFF_SEQ, producer);
+            self.l1.write(
+                proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_PRODUCER_SEQ,
+                producer.wrapping_add(1),
+            );
+            true
         }
 
         fn bump_stat(&mut self, off: u32) {
@@ -642,6 +682,69 @@ mod tests {
         let last = sim.stat(STATS_OFF_LAST_NOTIFY);
         assert_eq!(last, (net << 16) | 1);
         assert_eq!(sim.stat(STATS_OFF_NOTIFY_EVENTS), 1);
+    }
+
+    #[test]
+    fn firmware_kick_ring_push_writes_entry_and_bumps_producer() {
+        use crate::tensix_proto as proto;
+        let mut sim = VirtioFwSim::new();
+        sim.boot();
+        // First push lands at producer=0, idx=0.
+        assert!(sim.kick_ring_push(7, 1));
+        let producer = sim.read(
+            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_PRODUCER_SEQ,
+        );
+        assert_eq!(producer, 1);
+        let entry0 = proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING;
+        let raw = sim.read(entry0 + proto::KICK_ENTRY_OFF_SLOT);
+        assert_eq!(raw & 0xFFFF, 7);
+        assert_eq!(raw >> 16, 1);
+        // Drop counter stays at 0 on a healthy push.
+        assert_eq!(sim.stat(STATS_OFF_KICK_DROPS), 0);
+    }
+
+    #[test]
+    fn firmware_kick_ring_push_drops_when_ring_full() {
+        // #101: when (producer - consumer) >= KICK_RING_ENTRIES the
+        // firmware drops the kick instead of overwriting an unread
+        // entry, and bumps STATS_OFF_KICK_DROPS so the daemon can
+        // surface the pressure.
+        use crate::tensix_proto as proto;
+        let mut sim = VirtioFwSim::new();
+        sim.boot();
+        // Fill the ring without advancing the consumer.
+        for i in 0..proto::KICK_RING_ENTRIES {
+            assert!(
+                sim.kick_ring_push(0, i),
+                "iteration {} should fit in the ring",
+                i
+            );
+        }
+        assert_eq!(sim.stat(STATS_OFF_KICK_DROPS), 0);
+
+        // The next push must drop.
+        assert!(!sim.kick_ring_push(0, 99));
+        assert_eq!(sim.stat(STATS_OFF_KICK_DROPS), 1);
+        let producer = sim.read(
+            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_PRODUCER_SEQ,
+        );
+        // Producer doesn't advance on a drop.
+        assert_eq!(producer, proto::KICK_RING_ENTRIES);
+
+        // Advancing the consumer makes room again.
+        sim.write(
+            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_CONSUMER_SEQ,
+            proto::KICK_RING_ENTRIES / 2,
+        );
+        for i in 0..proto::KICK_RING_ENTRIES / 2 {
+            assert!(
+                sim.kick_ring_push(0, 100 + i),
+                "post-drain push {} should fit",
+                i
+            );
+        }
+        // Drop count unchanged — only the original overflow.
+        assert_eq!(sim.stat(STATS_OFF_KICK_DROPS), 1);
     }
 
     #[test]

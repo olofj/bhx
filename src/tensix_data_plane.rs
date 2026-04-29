@@ -37,6 +37,20 @@ use crate::virtio::{
 };
 use crate::virtio_engine as ve;
 
+/// Wraparound recovery for an SPSC ring: if the producer has run
+/// `> ring_entries` ahead of the consumer, the daemon's view of
+/// "old" entries has been overwritten in their ring slots already.
+/// Fast-forward the consumer to the start of the still-readable
+/// window so we drop the unreachable entries instead of replaying
+/// stale ring contents. See #101.
+fn clamp_consumer_to_ring(producer: u32, consumer: u32, ring_entries: u32) -> u32 {
+    if producer.wrapping_sub(consumer) > ring_entries {
+        producer.wrapping_sub(ring_entries)
+    } else {
+        consumer
+    }
+}
+
 /// One registered (slot, device) pair the kick poller dispatches to
 /// when a kick arrives. The fields mirror what `virtio::run_device`
 /// holds per device today: an `Arc<L2Cpu>` for guest DRAM access,
@@ -297,8 +311,36 @@ fn run_poll_loop(
     let mut uart_consumer: [u32; uart::UART_NUM_SLOTS as usize] =
         [0; uart::UART_NUM_SLOTS as usize];
 
+    // Last-seen drop counters (#101). BRISC and TRISC0 expose
+    // monotonic u32s; we cache the last value we saw and surface
+    // every delta to dlog! + the matching Prometheus counter, so an
+    // operator polling `/metrics` sees the actual drop count rather
+    // than waiting for a future-restart-then-zero rollover.
+    let mut last_kick_drops: u32 = 0;
+    let mut last_uart_drops: [u32; uart::UART_NUM_SLOTS as usize] =
+        [0; uart::UART_NUM_SLOTS as usize];
+
     while !exit.load(Ordering::Relaxed) {
         let producer = engine.kick_producer_seq();
+
+        // Defensive: if the firmware's fullness check ever regresses
+        // (or we're talking to an older firmware), `producer -
+        // consumer > KICK_RING_ENTRIES` means BRISC has overwritten
+        // entries we never read. Fast-forward the consumer to the
+        // oldest still-readable position so we drop the ring's worth
+        // of stale entries instead of replaying garbage. See #101.
+        let clamped =
+            clamp_consumer_to_ring(producer, consumer, crate::tensix_proto::KICK_RING_ENTRIES);
+        if clamped != consumer {
+            crate::dlog!(
+                "[kick-poller] producer {} consumer {} > ring ({}); fast-forwarding consumer to {}",
+                producer,
+                consumer,
+                crate::tensix_proto::KICK_RING_ENTRIES,
+                clamped
+            );
+            consumer = clamped;
+        }
         let mut consumed_this_pass = 0u64;
         while consumer != producer {
             let raw = engine.read_kick_entry(consumer);
@@ -409,6 +451,24 @@ fn run_poll_loop(
                 if producer == local_consumer {
                     continue;
                 }
+                // Wraparound recovery (#101): if TRISC0's producer ran
+                // away faster than we drained, the oldest unread bytes
+                // have already been overwritten in their ring slots.
+                // Fast-forward the consumer to the start of the still-
+                // readable window so we don't replay garbage.
+                let clamped =
+                    clamp_consumer_to_ring(producer, local_consumer, uart::UART_FEED_RING_ENTRIES);
+                if clamped != local_consumer {
+                    crate::dlog!(
+                        "[kick-poller] uart l2cpu {} producer {} consumer {} > ring ({}); fast-forwarding consumer to {}",
+                        l2cpu_idx,
+                        producer,
+                        local_consumer,
+                        uart::UART_FEED_RING_ENTRIES,
+                        clamped
+                    );
+                    local_consumer = clamped;
+                }
                 // Read all available bytes into a stack buffer, then
                 // push to the hub once per drain pass — keeps the per-
                 // byte overhead (lock + memcpy + send) amortized.
@@ -436,6 +496,47 @@ fn run_poll_loop(
         }
 
         stats.poll_iterations.fetch_add(1, Ordering::Relaxed);
+
+        // #101: surface drop counters so a stalled daemon shows up in
+        // metrics + the daemon log instead of silently corrupting the
+        // ring. Polled once per iteration — the IDLE tier (10 ms) is
+        // plenty of headroom; even at the FAST tier (50 µs) the
+        // overhead is two extra L1 reads per registered L2CPU.
+        let kick_drops = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_KICK_DROPS);
+        if kick_drops != last_kick_drops {
+            let delta = kick_drops.wrapping_sub(last_kick_drops);
+            crate::dlog!(
+                "[kick-poller] BRISC dropped {} kick(s) (cumulative {})",
+                delta,
+                kick_drops
+            );
+            crate::daemon::metrics::KICK_DROPS_TOTAL.add(delta as u64);
+            last_kick_drops = kick_drops;
+        }
+        {
+            let map = uart_registry.lock().unwrap();
+            for (&l2cpu_idx, _) in map.iter() {
+                if (l2cpu_idx as u32) >= uart::UART_NUM_SLOTS as u32 {
+                    continue;
+                }
+                let priv_base = uart::uart_private_base(l2cpu_idx);
+                let drops = engine.read_l1_u32(priv_base + uart::UART_PRIV_OFF_FEED_DROP_COUNT);
+                let prev = last_uart_drops[l2cpu_idx as usize];
+                if drops != prev {
+                    let delta = drops.wrapping_sub(prev);
+                    crate::dlog!(
+                        "[kick-poller] uart l2cpu {} dropped {} byte(s) (cumulative {})",
+                        l2cpu_idx,
+                        delta,
+                        drops
+                    );
+                    crate::daemon::metrics::UART_FEED_DROPS_TOTAL
+                        .at(l2cpu_idx)
+                        .add(delta as u64);
+                    last_uart_drops[l2cpu_idx as usize] = drops;
+                }
+            }
+        }
 
         let idle = last_active.elapsed();
         let sleep = if idle < FAST_WINDOW {
@@ -637,5 +738,44 @@ mod tests {
         assert_eq!(s.kicks_consumed.load(Ordering::Relaxed), 0);
         assert_eq!(s.poll_iterations.load(Ordering::Relaxed), 0);
         assert_eq!(s.last_kick_slot_queue.load(Ordering::Relaxed), 0);
+    }
+
+    // ---- clamp_consumer_to_ring (#101) ----
+
+    #[test]
+    fn clamp_consumer_returns_input_when_outstanding_fits_in_ring() {
+        // Common-case: producer ahead of consumer by less than the ring.
+        assert_eq!(clamp_consumer_to_ring(10, 5, 64), 5);
+        assert_eq!(clamp_consumer_to_ring(64, 0, 64), 0);
+        assert_eq!(clamp_consumer_to_ring(63, 0, 64), 0);
+    }
+
+    #[test]
+    fn clamp_consumer_fast_forwards_on_overflow() {
+        // producer - consumer > ring -> fast-forward.
+        assert_eq!(clamp_consumer_to_ring(100, 0, 64), 100 - 64);
+        assert_eq!(clamp_consumer_to_ring(2000, 100, 1024), 2000 - 1024);
+    }
+
+    #[test]
+    fn clamp_consumer_handles_u32_wraparound() {
+        // Consumer near the u32::MAX edge; producer has wrapped past
+        // 0. wrapping_sub handles the modular gap correctly.
+        let consumer: u32 = u32::MAX;
+        let producer: u32 = 99; // 100 steps after consumer (mod 2^32)
+        assert_eq!(producer.wrapping_sub(consumer), 100);
+        // 100 > 64 -> fast-forward to producer - 64.
+        assert_eq!(
+            clamp_consumer_to_ring(producer, consumer, 64),
+            producer.wrapping_sub(64)
+        );
+    }
+
+    #[test]
+    fn clamp_consumer_at_exact_ring_boundary_does_not_clamp() {
+        // gap == ring is "ring is exactly full" — still readable.
+        // gap > ring is the trigger.
+        assert_eq!(clamp_consumer_to_ring(64, 0, 64), 0);
+        assert_eq!(clamp_consumer_to_ring(65, 0, 64), 65 - 64);
     }
 }

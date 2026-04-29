@@ -76,6 +76,7 @@
 #define STATS_OFF_LAST_NOTIFY     0x020  // last (slot << 16 | queue_idx)
 #define STATS_OFF_COMPL_EVENTS    0x024  // count of completion entries consumed
 #define STATS_OFF_LAST_COMPL      0x028  // last (slot << 16 | queue_idx) consumed
+#define STATS_OFF_KICK_DROPS      0x02c  // count of kick_ring_push drops (#101)
 
 #define STATS_MAGIC_LOADED        0x0000B155u
 
@@ -388,8 +389,25 @@ static inline uintptr_t epoch_addr(unsigned slot) {
 // and drains entries in `[consumer_seq..producer_seq)`. Same SPSC
 // pattern as a virtio split virtqueue, but with the ring in BRISC
 // L1 rather than guest DRAM.
+//
+// Pre-#101 we wrote unconditionally; under daemon backpressure (slow
+// `process_one_chain_for_queue` on a disk stall etc.) BRISC would
+// overwrite unread entries and the daemon would consume garbage
+// re-runs of the ring. Now we check fullness first: if the ring is
+// already at `KICK_RING_ENTRIES - 1` outstanding, drop the kick and
+// bump `STATS_OFF_KICK_DROPS` so the daemon can surface the
+// pressure rather than silently corrupting state. We don't block —
+// BRISC is preemption-free and a stalled daemon will only get worse
+// if firmware also stalls.
 static void kick_ring_push(unsigned slot, uint32_t queue_idx) {
     uint32_t seq = read_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_PRODUCER_SEQ));
+    uint32_t consumer = read_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_CONSUMER_SEQ));
+    uint32_t outstanding = seq - consumer;
+    if (outstanding >= KICK_RING_ENTRIES) {
+        uint32_t drops = read_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_KICK_DROPS);
+        write_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_KICK_DROPS, drops + 1u);
+        return;
+    }
     uint32_t epoch = read_u32(epoch_addr(slot));
     uint32_t idx = seq & (KICK_RING_ENTRIES - 1u);
     uintptr_t entry = ctrl_addr(CTRL_OFF_KICK_RING + idx * KICK_ENTRY_SIZE);

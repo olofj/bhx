@@ -607,6 +607,20 @@ pub static CONSOLE_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
 /// `run_device` loop. See #62.
 pub static RNG_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
 
+// --- BRISC ↔ daemon ring overflow (#101) ---
+
+/// Cumulative count of `kick_ring_push` calls the firmware dropped
+/// because the ring was already full. Bumped from the daemon poller
+/// when it observes `STATS_OFF_KICK_DROPS` advance — see
+/// `tensix_data_plane::run_kick_consumer`.
+pub static KICK_DROPS_TOTAL: Counter = Counter::new();
+
+/// Per-L2CPU UART feed-ring drop counter. TRISC0 bumps the chip-side
+/// counter (`UART_PRIV_OFF_FEED_DROP_COUNT`) when its producer
+/// outpaces the daemon consumer; the daemon polls the chip-side
+/// counter each iteration and surfaces deltas here. See #101.
+pub static UART_FEED_DROPS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
+
 // --- Worker poll loop ---
 
 /// Iterations per worker per L2CPU per tier. A high count in
@@ -934,6 +948,30 @@ pub fn render_prometheus(state: &DaemonState) -> String {
                 );
             }
         }
+    }
+
+    // ----- BRISC ↔ daemon ring overflow (#101) -----
+
+    write_counter(
+        &mut out,
+        "bhx_kick_drops_total",
+        "Cumulative count of kick_ring_push calls dropped because the ring \
+         was full (BRISC backpressure).",
+        KICK_DROPS_TOTAL.get(),
+    );
+    let _ = writeln!(
+        &mut out,
+        "# HELP bhx_uart_feed_drops_total UART feed-ring drops per L2CPU \
+         (TRISC0 producer outpaced the daemon consumer)."
+    );
+    let _ = writeln!(&mut out, "# TYPE bhx_uart_feed_drops_total counter");
+    for idx in 0..4u8 {
+        let _ = writeln!(
+            &mut out,
+            "bhx_uart_feed_drops_total{{idx=\"{}\"}} {}",
+            idx,
+            UART_FEED_DROPS_TOTAL.at(idx).get()
+        );
     }
 
     // Slot-derived gauges: uptime, disks, net, state. Walk the
@@ -1284,6 +1322,14 @@ mod tests {
             "bhx_worker_poll_iterations_total{worker=\"virtio_blk\",idx=\"0\",tier=\"fast\"} ",
             "bhx_worker_poll_iterations_total{worker=\"chip_console\",idx=\"3\",tier=\"idle\"} ",
             "bhx_worker_tier_seconds_total{worker=\"virtio_net\",idx=\"2\",tier=\"slow\"} ",
+            // BRISC ↔ daemon ring overflow (#101).
+            "# HELP bhx_kick_drops_total",
+            "# TYPE bhx_kick_drops_total counter",
+            "\nbhx_kick_drops_total ",
+            "# HELP bhx_uart_feed_drops_total",
+            "# TYPE bhx_uart_feed_drops_total counter",
+            "bhx_uart_feed_drops_total{idx=\"0\"} ",
+            "bhx_uart_feed_drops_total{idx=\"3\"} ",
         ] {
             assert!(
                 out.contains(needle),
