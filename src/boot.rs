@@ -367,6 +367,15 @@ pub fn modify_dtb(
     // reg file; `clock-frequency` is purely informational (Linux's
     // 8250 driver doesn't reprogram the divisor on a memory-mapped
     // device that already has a `current-speed` set).
+    //
+    // The caller controls whether this node lands in the DTB (pass
+    // `None` to suppress). Adding it makes the Tenstorrent-built
+    // OpenSBI pick the ns16550a as its M-mode console — which is
+    // the lossy 8250 emulation per #79 — instead of its DBCN
+    // debug-console path that's drained byte-cleanly by
+    // `chip_console.rs`. Today the daemon defaults to `None` and
+    // operators opt in via boot flag when a stock distro insists
+    // on `console=ttyS0`.
     if let Some(addr) = uart_addr {
         let name = format!("serial@{:x}", addr);
         eprintln!(

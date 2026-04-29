@@ -1057,7 +1057,7 @@ fn run_boot_sequence(
     // matters today, was already known to bind reliably when block
     // probes after net so we keep DISK last.
     let mut virtio_nodes: Vec<crate::boot::VirtioMmioNode> = Vec::with_capacity(8);
-    let mut uart_addr_for_dtb: Option<u64> = None;
+    let uart_addr_for_dtb: Option<u64> = None;
 
     let any_host_device = has_rng || has_network || has_disk || has_console;
 
@@ -1138,19 +1138,26 @@ fn run_boot_sequence(
             "rng",
         );
         // M6 (#78) 16550 UART. Lives at a fixed offset within the
-        // engine's small TLB window — no second TLB slot needed. We
-        // emit the DTB node unconditionally on the engine path so
-        // distro kernels with `console=ttyS0` find a real backing
-        // device; UART TX is independent of the virtio-console
-        // device, and the patched-kernel path that uses
-        // `console=hvc0` simply ignores it.
-        let uart_pa = crate::uart_engine::uart_pa_from_engine_base(x280_base);
-        dlog!(
-            "[run_boot l2cpu {}]   uart: x280_pa={:#x}",
-            l2cpu_idx,
-            uart_pa
-        );
-        uart_addr_for_dtb = Some(uart_pa);
+        // engine's small TLB window — no second TLB slot needed.
+        //
+        // INTENTIONALLY NOT EMITTED IN THE DTB by default. The
+        // Tenstorrent-built OpenSBI scans `/chosen/stdout-path` AND
+        // /soc/serial* and prefers a real ns16550a over its DBCN
+        // debug-console fallback. With this node present, M-mode
+        // console output goes through the lossy 8250 emulation (#79)
+        // instead of the byte-clean chip-DRAM virtuart drained by
+        // `chip_console.rs`. Symptom: U-Boot / OpenSBI / earlycon
+        // banners arrive at the operator's terminal heavily
+        // corrupted.
+        //
+        // The 8250 *register file* is still set up in BRISC L1 so a
+        // patched guest that writes to the fixed UART PA gets its
+        // bytes drained by TRISC0 + the kick poller. Leaving it
+        // visible to OpenSBI was the regression. Re-add the DTB node
+        // (set `uart_addr_for_dtb = Some(uart_pa)`) only when
+        // bringing up a distro that *requires* `console=ttyS0` AND
+        // accepts the corrupted boot output.
+        let _uart_pa = crate::uart_engine::uart_pa_from_engine_base(x280_base);
     }
     dlog!(
         "[run_boot l2cpu {}] patching DTB (memory start=0x{:x} size=0x{:x}, {} virtio nodes, uart={:?})",

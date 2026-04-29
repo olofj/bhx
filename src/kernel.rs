@@ -38,20 +38,20 @@ pub struct KnownKernel {
 pub const KNOWN_KERNELS: &[KnownKernel] = &[
     KnownKernel {
         version: "0.10",
-        url: "https://github.com/tenstorrent/bhx/releases/download/v0.10/bhx.zip",
-        description: "bhx v0.10 — latest release (fw_jump.bin + Image + blackhole-card.dtb)",
+        url: "https://github.com/tenstorrent/tt-bh-linux/releases/download/v0.10/tt-bh-linux.zip",
+        description: "Tenstorrent tt-bh-linux v0.10 (fw_jump.bin + Image + blackhole-card.dtb)",
         is_default: true,
     },
     KnownKernel {
         version: "0.9",
-        url: "https://github.com/tenstorrent/bhx/releases/download/v0.9/bhx.zip",
-        description: "bhx v0.9 (fw_jump.bin + Image + blackhole-card.dtb)",
+        url: "https://github.com/tenstorrent/tt-bh-linux/releases/download/v0.9/tt-bh-linux.zip",
+        description: "Tenstorrent tt-bh-linux v0.9 (fw_jump.bin + Image + blackhole-card.dtb)",
         is_default: false,
     },
     KnownKernel {
         version: "0.5",
-        url: "https://github.com/tenstorrent/bhx/releases/download/v0.5/bhx.zip",
-        description: "bhx v0.5 (fw_jump.bin + Image + blackhole-card.dtb)",
+        url: "https://github.com/tenstorrent/tt-bh-linux/releases/download/v0.5/tt-bh-linux.zip",
+        description: "Tenstorrent tt-bh-linux v0.5 (fw_jump.bin + Image + blackhole-card.dtb)",
         is_default: false,
     },
 ];
