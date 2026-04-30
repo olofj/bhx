@@ -281,6 +281,18 @@ image/kernel/ramdisk downloaders.
 
 ## Conventions / gotchas
 
+- Never put GitHub issue numbers (`#NNN`) in user-visible strings —
+  CLI help text (clap `///` doc comments on enum variants and struct
+  fields), `eprintln!` / `println!` output, error messages, log lines
+  the operator reads. Issue numbers are project-management metadata;
+  they're noise to a user reading `--help`. Internal Rust comments
+  (regular `//` source comments, `///` docs on non-CLI items) keep
+  the references for future-debug context. Quick check before
+  committing CLI changes:
+  ```bash
+  ./target/debug/bhx --help | grep -E '#[0-9]+'   # should be empty
+  ./target/debug/bhx <subcommand> --help | grep -E '#[0-9]+'
+  ```
 - Worker poll loops (`virtio::run_device`, `chip_console::uart_pass`)
   use a three-tier adaptive sleep: FAST (1 µs / 100 µs) while there's
   observable activity; SLOW (1 ms) after `FAST_WINDOW=200ms` quiet;
