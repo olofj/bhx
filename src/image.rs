@@ -216,6 +216,28 @@ pub const KNOWN_IMAGES: &[KnownImage] = &[
         extract_partition: false,
         needs_bootloader: true,
     },
+    // openSUSE Tumbleweed JeOS — "Just Enough Operating System": SUSE's
+    // minimal-footprint image, the openSUSE counterpart to Fedora's
+    // Cloud-Base-Generic and AlmaLinux's GenericCloud. Adds a non-
+    // RHEL/non-Debian-family distro to the catalog. Boot path matches
+    // fedora-42: GPT + ESP, U-Boot reads the partition table and
+    // chainloads /boot/EFI. URL is a stable symlink to the latest
+    // snapshot — fetch.rs's HTTP-conditional cache re-pulls only when
+    // upstream's ETag/Last-Modified changes.
+    KnownImage {
+        name: "opensuse-tumbleweed",
+        url: "https://download.opensuse.org/ports/riscv/tumbleweed/appliances/openSUSE-Tumbleweed-RISC-V-JeOS-efi.riscv64.raw.xz",
+        description: "openSUSE Tumbleweed JeOS — minimal rolling-release image, riscv64",
+        aliases: &["opensuse", "tumbleweed", "suse", "jeos"],
+        format: ImageFormat::RawDisk,
+        compression: Compression::Xz,
+        default_size: "10G",
+        default_user: "",
+        default_password: "",
+        cloud_init: true,
+        extract_partition: false,
+        needs_bootloader: true,
+    },
 ];
 
 /// Look up a known image by name or alias.
