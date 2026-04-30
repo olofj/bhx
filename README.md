@@ -136,26 +136,35 @@ bhx image pull <name>           # download + prepare
 
 Currently shipped:
 
-| Name                   | Boot path     | Notes                                                |
-| ---------------------- | ------------- | ---------------------------------------------------- |
-| `debian-13`            | U-Boot + EFI  | Default; alias `debian`/`trixie`                     |
-| `ubuntu-24.04`         | U-Boot + EFI  | Alias `ubuntu`/`noble`                               |
-| `fedora-42`            | U-Boot + EFI  | Server Host Generic                                  |
-| `fedora-42-cloud`      | U-Boot + EFI  | Cloud Base; needs cloud-init                         |
-| `almalinux-10-kitten`  | U-Boot + EFI  | Alias `alma`/`kitten`                                |
-| `opensuse-tumbleweed`  | U-Boot + EFI  | Aliases `opensuse`/`tumbleweed`/`suse`/`jeos`. JeOS minimal rolling-release; interactive `jeos-firstboot` on console (no cloud-init) |
+| Name                   | Layout                  | Boot path                    | Notes                                                |
+| ---------------------- | ----------------------- | ---------------------------- | ---------------------------------------------------- |
+| `tt-debian`            | single-FS `.ext4`       | direct kernel (host `Image`) | Tenstorrent pre-built; needs an external `--kernel`  |
+| `debian-13`            | whole partitioned disk  | U-Boot + EFI                 | Default; alias `debian`/`trixie`                     |
+| `ubuntu-24.04`         | whole partitioned disk  | U-Boot + EFI                 | Alias `ubuntu`/`noble`                               |
+| `fedora-42`            | whole partitioned disk  | U-Boot + EFI                 | Server Host Generic                                  |
+| `fedora-42-cloud`      | whole partitioned disk  | U-Boot + EFI                 | Cloud Base; needs cloud-init                         |
+| `almalinux-10-kitten`  | whole partitioned disk  | U-Boot + EFI                 | Alias `alma`/`kitten`                                |
+| `opensuse-tumbleweed`  | whole partitioned disk  | U-Boot + EFI                 | Aliases `opensuse`/`tumbleweed`/`suse`/`jeos`. JeOS minimal rolling-release; interactive `jeos-firstboot` on console (no cloud-init) |
 
-All registered images are whole partitioned disks: GPT + an EFI System
-Partition with a kernel installed in `/boot`. The daemon loads U-Boot
-at the kernel offset, U-Boot reads the GPT, runs the EFI shim, shim
-chainloads GRUB, GRUB loads the in-disk kernel + initrd. End-to-end
-UEFI on RISC-V; nothing kernel-specific on the host side.
+There are two boot shapes in the catalog, and `bhx boot` picks the
+right path automatically based on the registry entry:
 
-`bhx` also supports booting bare ext4 single-FS images via the patched
-direct-kernel path (`--kernel <Image>` + `--disk rootfs.ext4`, OpenSBI
-jumps straight at the kernel, kernel mounts `/dev/vda` as root).
-Convenient when you've built your own kernel; not represented in the
-registry — bring your own `.ext4` and `Image`.
+**Whole partitioned disks** (everything except `tt-debian`) carry a
+GPT partition table with an EFI System Partition and a kernel
+installed in `/boot`. The daemon loads U-Boot at the kernel offset,
+U-Boot reads the GPT, runs the EFI shim, shim chainloads GRUB, GRUB
+loads the in-disk kernel + initrd. End-to-end UEFI on RISC-V; nothing
+kernel-specific on the host side. Bumping the kernel inside the guest
+just works.
+
+**Single-FS images** (`tt-debian`, plus any bare ext4 you bring
+yourself) are raw filesystems with no partition table. The host loads
+`Image` (a raw Linux kernel) + initrd + DTB, OpenSBI jumps straight at
+the kernel, and the kernel mounts `/dev/vda` as root. You have to
+provide `Image` yourself with `--kernel <path>` (defaults to
+`./Image`). Convenient when you've built your own kernel and want a
+quick boot; less hands-off than the whole-disk path because the host
+owns the kernel artifact.
 
 `bhx boot` resolves `u-boot.bin`, `fw_jump.bin`, and `blackhole-card.dtb`
 through the search path described in [Prerequisites](#prerequisites)
