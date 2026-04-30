@@ -348,14 +348,14 @@ mod tests {
     #[test]
     fn user_data_uses_custom_user() {
         let spec = SeedSpec {
-            user: Some("olof".into()),
+            user: Some("operator".into()),
             ..SeedSpec::default()
         };
         let ud = spec.render_user_data();
         // Custom user must appear in BOTH the users[] block and the
         // chpasswd.users[] block (otherwise we create the user but
         // set the password for "bhx").
-        assert_eq!(ud.matches("name: olof").count(), 2);
+        assert_eq!(ud.matches("name: operator").count(), 2);
         assert!(!ud.contains("name: bhx"));
     }
 
