@@ -287,21 +287,17 @@ pub fn modify_dtb(
         None => fdt.add_subnode(0, "chosen")?,
     };
     let bootargs = match boot_device {
-        BootDevice::Vda(dev) => format!(
-            "rw console=hvc0 earlycon=sbi keep_bootcon root=/dev/{}",
-            dev
-        ),
+        BootDevice::Vda(dev) => {
+            format!("rw console=hvc0 earlycon=sbi root=/dev/{}", dev)
+        }
         BootDevice::Initramfs { addr, len } => {
-            format!(
-                "rw console=hvc0 earlycon=sbi keep_bootcon initrd=0x{:x},{}",
-                addr, len
-            )
+            format!("rw console=hvc0 earlycon=sbi initrd=0x{:x},{}", addr, len)
         }
         BootDevice::InitramfsAndVda { addr, len, dev } => format!(
-            "rw console=hvc0 earlycon=sbi keep_bootcon initrd=0x{:x},{} root=/dev/{}",
+            "rw console=hvc0 earlycon=sbi initrd=0x{:x},{} root=/dev/{}",
             addr, len, dev
         ),
-        BootDevice::Uboot => "console=hvc0 earlycon=sbi keep_bootcon".to_string(),
+        BootDevice::Uboot => "console=hvc0 earlycon=sbi".to_string(),
     };
     crate::dlog!("[modify_dtb]   bootargs = {:?}", bootargs);
     let mut bootargs_bytes = bootargs.into_bytes();
