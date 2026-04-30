@@ -281,15 +281,32 @@ impl TensixEngine {
             .into());
         }
         let firmware_version = tile.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_VERSION);
-        // We adopt the protocol version from the stats page; in the
-        // current firmware the version isn't separately exposed, so
-        // we conservatively report the protocol version we expect to
-        // see — callers don't currently inspect it post-bring-up.
-        let protocol_version = proto::PROTOCOL_VERSION;
+        // Firmware encodes BRISC_VIRTIO_FW_VERSION as
+        // 0x000601<protocol>; the low byte tracks TENSIX_PROTOCOL_VERSION.
+        // A daemon built against a different protocol than what's
+        // currently resident in BRISC L1 will read shadow state from
+        // the wrong offset (#81 moved SHADOW_BASE), silently drop
+        // every kick, and the operator gets a "Device 0: unknown
+        // device" from U-Boot. Refuse to adopt and force a fresh
+        // firmware load instead.
+        let firmware_protocol = firmware_version & 0xff;
+        if firmware_protocol != proto::PROTOCOL_VERSION {
+            return Err(crate::Error::internal(format!(
+                "BRISC firmware on tile ({}, {}) is protocol v{} but daemon expects v{} \
+                 (firmware_version={:#010x}); chip needs `tt-smi -r` to reload firmware",
+                picked.x,
+                picked.y,
+                firmware_protocol,
+                proto::PROTOCOL_VERSION,
+                firmware_version
+            ))
+            .into());
+        }
+        let protocol_version = firmware_protocol;
         eprintln!(
             "[tensix-engine] adopted running firmware on card {} tile NOC0 ({}, {}); \
-             firmware version {:#010x}",
-            card, picked.x, picked.y, firmware_version,
+             firmware version {:#010x} (protocol v{})",
+            card, picked.x, picked.y, firmware_version, protocol_version,
         );
         // Same as `bring_up`: republish the reservation. The previous
         // daemon may have left a stale file behind (or none, if it

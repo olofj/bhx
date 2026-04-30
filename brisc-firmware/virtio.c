@@ -58,7 +58,13 @@
 //              4× better, and there's one ring per L2CPU so they
 //              don't compete for capacity. Goes with TENSIX_PROTOCOL_
 //              VERSION = 3.
-#define BRISC_VIRTIO_FW_VERSION 0x00060103u
+//   v6.1.4 (#81) extends DEVS_PER_L2CPU from 4 to 8 (6 populated +
+//              2 padding for power-of-two modulo) and shifts the
+//              SHADOW region base from 0x20000 to 0x40000. A v6.1.3
+//              daemon talking to v6.1.4 firmware reads/writes shadow
+//              state at the wrong offset — the kick poller silently
+//              drops every kick. Goes with TENSIX_PROTOCOL_VERSION = 4.
+#define BRISC_VIRTIO_FW_VERSION 0x00060104u
 
 #define FENCE_W() __asm__ volatile("fence w, w" ::: "memory")
 

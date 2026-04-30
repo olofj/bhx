@@ -84,7 +84,12 @@
 // daemon polls those rings directly through the chip-side TLB. BRISC
 // is no longer in the UART data path. Kick ring stays virtio-only at
 // its original 64-entry size and layout.
-#define TENSIX_PROTOCOL_VERSION 3u
+// v4 (#81) extends DEVS_PER_L2CPU from 4 to 8 (6 populated + 2
+// padding for power-of-two modulo) and shifts SHADOW_BASE from
+// 0x20000 to 0x40000 to clear the larger reg-file region. A v3
+// daemon talking to v4 firmware (or vice versa) reads/writes shadow
+// state at the wrong address — every kick gets silently dropped.
+#define TENSIX_PROTOCOL_VERSION 4u
 
 // L1 control-plane region (within the BRISC firmware tile's L1).
 //

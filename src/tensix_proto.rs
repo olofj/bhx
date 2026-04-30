@@ -46,7 +46,14 @@
 /// the daemon polls those rings directly through the chip-side TLB
 /// (4 bytes per slot, 1024 slots per ring, one ring per L2CPU). The
 /// kick ring is virtio-only at v3, original 64-entry layout.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// v4 (#81) extends DEVS_PER_L2CPU from 4 to 8 (6 populated + 2
+/// padding for power-of-two modulo) and shifts SHADOW_BASE from
+/// 0x20000 to 0x40000 to clear the larger reg-file region. A v3
+/// daemon talking to v4 firmware (or vice versa) reads/writes shadow
+/// state at the wrong address — the kick poller silently drops every
+/// kick. Warm-resume on a `firmware_version` mismatch must refuse to
+/// adopt and force a fresh firmware load.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 // ----- L1 control-plane region (BRISC L1) -----
 //
@@ -196,7 +203,7 @@ impl CompletionEntry {
 
 // Lock the wire-format protocol version against the firmware. A bump to
 // PROTOCOL_VERSION must be matched on both sides simultaneously.
-const _PROTOCOL_VERSION_PINNED: () = assert!(PROTOCOL_VERSION == 3);
+const _PROTOCOL_VERSION_PINNED: () = assert!(PROTOCOL_VERSION == 4);
 
 #[cfg(test)]
 mod tests {

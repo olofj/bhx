@@ -35,3 +35,6 @@ tests/alma/
 
 # Python bytecode cache (scripts/bench/lib.py is invoked as a module).
 __pycache__/
+
+# Default cidata seed path used by the README walk-through.
+/seed.iso
