@@ -96,7 +96,8 @@ What each step does:
      image and auto-selects the U-Boot + EFI boot path (uses the
      `u-boot.bin` from the search path described above).
    - `-n` enables slirp networking — TCP 2222 on the host forwards to
-     port 22 in the guest, so `ssh -p 2222 debian@localhost` works.
+     port 22 in the guest, so `ssh -p 2222 bhx@localhost` works
+     (once you've seeded a user; see below).
    - virtio-console (`/dev/hvc0`) is attached by default — the DTB
      bootargs send the kernel console there. Pass `--no-virtio-console`
      only when bisecting.
@@ -104,9 +105,42 @@ What each step does:
      so you see the OpenSBI banner, U-Boot, GRUB, and kernel printk
      live. `Ctrl-A x` to detach.
 
-First boot of a cloud image runs cloud-init through to a login
-prompt in ~30 s. Default credentials live in `bhx image info <name>`
-(for `debian-13`: user `debian`, password `debian`).
+This gets you to a `login:` prompt — but it's a bit boring, because
+the upstream Debian cloud image ships with no default user and no
+default password. Without cloud-init data, there's nothing to log in
+as. You can watch the boot, then detach.
+
+### Logging in: cloud-init seed ISO
+
+To actually use the guest, generate a NoCloud seed ISO that cloud-init
+will consume on first boot to create a user, set a password, and
+optionally install your SSH key. With no flags, `bhx cloud-init seed`
+creates a `bhx` user with password `bhx` on hostname `bhx-guest`:
+
+```bash
+bhx cloud-init seed -o seed.iso
+bhx boot -l 0 -d images/debian-13.img -n -a --cloud-init seed.iso
+```
+
+cloud-init's `local` stage runs before sshd starts, so by the time
+the login prompt appears the user already exists. Log in as `bhx`
+with password `bhx` (or `ssh -p 2222 bhx@localhost` if you used `-n`).
+
+For production use, override the defaults — pin a stable instance-id,
+install your operator key, drop the password:
+
+```bash
+bhx cloud-init seed -o seed.iso \
+    --no-password \
+    --ssh-key ~/.ssh/id_ed25519.pub \
+    --hostname dev-l0 \
+    --instance-id dev-l0-2026-04
+```
+
+`--user-data <path>` appends arbitrary cloud-config YAML
+(`packages:`, `runcmd:`, …) on top of the bhx-generated stanza,
+which is enough to bootstrap most dev boxes without further CLI
+churn.
 
 When you're done:
 
