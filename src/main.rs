@@ -1892,6 +1892,18 @@ fn run_tensix_virtio(card: u32, x: u16, y: u16) -> std::io::Result<()> {
         errors += 1;
     }
 
+    // BRISC's poll loop is gated on `CTRL_OFF_ACTIVE_SLOTS` (#71
+    // M5.5b) — slots whose bit isn't set are skipped on every sweep.
+    // The smoke test below drives writes on slots 0, 1, 5, 7 and
+    // expects BRISC to observe each one, so set every virtio bit
+    // (UART bits 16..19 stay clear since we're not exercising
+    // TRISC0 here).
+    {
+        use tensix_proto as proto;
+        tile.write_l1_u32(proto::CTRL_BASE + proto::CTRL_OFF_ACTIVE_SLOTS, 0x0000FFFF);
+        sleep(Duration::from_millis(2));
+    }
+
     // STATUS state machine: write ACK, poll for status_changes counter
     // to bump.
     eprintln!("[tensix-virtio] driving STATUS write on slot 0");
@@ -2011,19 +2023,25 @@ fn run_tensix_virtio(card: u32, x: u16, y: u16) -> std::io::Result<()> {
             );
             errors += 1;
         }
-        // Switch back to low half — DEVICE_FEATURES should now
-        // read 0 (no low-half features advertised).
+        // Switch back to SEL=0 (low half). The firmware intentionally
+        // keeps DEVICE_FEATURES static at 0x1 regardless of SEL to
+        // dodge the readl-after-writel race with stock Linux virtio
+        // drivers (see virtio.c around DEVICE_FEATURES handling) —
+        // bit 0 in the low half is undefined and stock drivers
+        // ignore unknown bits, so VIRTIO_F_VERSION_1 still
+        // negotiates correctly. The test mirrors that behavior.
         tile.write_l1_u32(slot0_dev_feat_sel, 0);
         sleep(Duration::from_millis(5));
         let low_half = tile.read_l1_u32(slot0_dev_feat);
-        if low_half == 0 {
+        if low_half == 1 {
             eprintln!(
-                "  DEVICE_FEATURES (low half) = {:#010x} — correct",
+                "  DEVICE_FEATURES (low half) = {:#010x} — static-by-design — PASS",
                 low_half
             );
         } else {
             eprintln!(
-                "  FEATURES FAIL: DEVICE_FEATURES (low half) = {:#010x}, expected 0",
+                "  FEATURES FAIL: DEVICE_FEATURES (low half) = {:#010x}, expected 1 \
+                 (firmware keeps DEVICE_FEATURES static across SEL switches)",
                 low_half
             );
             errors += 1;

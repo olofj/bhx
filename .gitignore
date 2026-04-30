@@ -30,3 +30,5 @@
 # Claude Code session state (plans, agent notes).
 /.claude/
 tests/alma/
+/u-boot.bin
+/soak_endurance-*.csv
