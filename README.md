@@ -131,6 +131,7 @@ install your operator key, drop the password:
 
 ```bash
 bhx cloud-init seed -o seed.iso \
+    --user bhx \
     --no-password \
     --ssh-key ~/.ssh/id_ed25519.pub \
     --hostname dev-l0 \
