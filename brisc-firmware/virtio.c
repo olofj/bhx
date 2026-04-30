@@ -752,21 +752,7 @@ static void poll_one_device(unsigned slot) {
     update_max_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_MAX_PRECAP_CYCLES,
                    t_pre_cap - t_entry);
 
-    // Skip BLINDCAP if the kernel has finished probing this device:
-    // STATUS_DRIVER_OK means probe completed and the kernel won't
-    // write QUEUE_NUM / DESC_LO / DESC_HI / etc. again until it
-    // tears the device down (which writes STATUS=0 first, observed
-    // by handle_status_change). Saves ~117 cycles per stable slot
-    // per iter; on a typical 4-active-slot boot 3 of 4 slots are
-    // at DRIVER_OK, cutting ~350 cycles from the steady-state sweep
-    // (~1100 → ~750 cycles, ~0.8 µs → ~0.55 µs at 1.35 GHz).
-    //
-    // Variable name `status_at_skip` documents that we're using the
-    // STATUS observed at the top of THIS poll, before any handler
-    // ran. If a handler races and writes STATUS, that lands on the
-    // next iter's diff and BLINDCAP runs again then.
-    int skip_blindcap = (status & VIRTIO_STATUS_DRIVER_OK) != 0;
-    if (!skip_blindcap && sel < BRISC_VIRTIO_MAX_QUEUES) {
+    if (sel < BRISC_VIRTIO_MAX_QUEUES) {
         // Per-queue setup: blind-capture every iteration into
         // shadow[sel]. The earlier snapshot-diff approach broke for
         // virtio-net's TX setup, where queue 1's DESC_HIGH is the
