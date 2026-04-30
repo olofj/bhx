@@ -106,10 +106,10 @@ impl RegEntry {
         }
     }
 
-    /// Diagnostic helper used in dlog output during debugging. Kept
-    /// behind the registry so a future log-line addition can name the
-    /// device kind without re-deriving the enum->string match.
-    #[allow(dead_code)]
+    /// Diagnostic helper used in dlog output during debugging. Used
+    /// by the kick-poller's per-slot probe-status logging (#123) so
+    /// operators can grep daemon logs for "[probe-status] slot N
+    /// (virtio_net) reached STATUS_DRIVER_OK".
     pub fn interrupt_kind_name(&self) -> &'static str {
         match self.interrupt_kind {
             InterruptKind::Block => "block",
@@ -318,8 +318,28 @@ fn run_poll_loop(
     // than waiting for a future-restart-then-zero rollover.
     let mut last_kick_drops: u32 = 0;
     let mut last_sel_ready_races: u32 = 0;
+    let mut last_max_sweep_cycles: u32 = 0;
+    let mut last_max_sel_path_cycles: u32 = 0;
     let mut last_uart_drops: [u32; uart::UART_NUM_SLOTS as usize] =
         [0; uart::UART_NUM_SLOTS as usize];
+    // Track per-slot STATUS transitions. Bench harnesses (and
+    // operators debugging probe failures — see #123) need a
+    // definitive "kernel finished probing this device" signal.
+    //
+    // We can't just log the first DRIVER_OK per slot: U-Boot's own
+    // virtio_blk driver probes and reaches DRIVER_OK before the
+    // kernel even loads, then the kernel writes STATUS=0 (reset)
+    // and runs its own probe. If that re-probe fails, the snap
+    // would still be at U-Boot's DRIVER_OK and a "first DRIVER_OK"
+    // log would mask the kernel-side failure.
+    //
+    // Instead we track per-slot last-seen status and log every
+    // DRIVER_OK transition (i.e., bit 4 going from 0 to 1) and every
+    // reset (status going to 0). On a healthy debian-13 + uboot
+    // boot, virtio_blk produces 2 DRIVER_OK lines (U-Boot + kernel)
+    // and the others produce 1 (kernel only). A failed kernel-side
+    // probe shows as zero DRIVER_OK lines after the reset.
+    let mut last_status: HashMap<u32, u32> = HashMap::new();
 
     while !exit.load(Ordering::Relaxed) {
         let producer = engine.kick_producer_seq();
@@ -525,6 +545,83 @@ fn run_poll_loop(
             );
             crate::daemon::metrics::SEL_READY_RACES_TOTAL.add(delta as u64);
             last_sel_ready_races = sel_ready_races;
+        }
+        // #124 timing probe. Log on ratchet-up only (each new max
+        // since last log). 1.35 GHz BRISC ≈ 0.74 ns/cycle, so cycle
+        // counts ÷ 1.35 ≈ ns. Surface both in the log line for
+        // operator readability.
+        let max_sweep = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAX_SWEEP_CYCLES);
+        if max_sweep > last_max_sweep_cycles {
+            crate::dlog!(
+                "[brisc-timing] new max main-loop sweep: {} cycles (~{} ns @ 1.35 GHz)",
+                max_sweep,
+                max_sweep * 1000 / 1350
+            );
+            last_max_sweep_cycles = max_sweep;
+        }
+        let max_sel_path = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAX_SEL_PATH_CYCLES);
+        if max_sel_path > last_max_sel_path_cycles {
+            crate::dlog!(
+                "[brisc-timing] new max SEL→READY critical-path: {} cycles \
+                 (~{} ns @ 1.35 GHz)",
+                max_sel_path,
+                max_sel_path * 1000 / 1350
+            );
+            last_max_sel_path_cycles = max_sel_path;
+        }
+        // Per-slot STATUS transitions. Snapshot registry under lock,
+        // then do chip-side L1 reads outside the lock.
+        let snapshot: Vec<(u32, &'static str)> = {
+            let map = registry.lock().unwrap();
+            map.iter()
+                .map(|(&s, e)| (s, e.interrupt_kind_name()))
+                .collect()
+        };
+        for (slot, kind) in snapshot {
+            let status = engine.read_l1_u32(ve::snap_addr(slot, ve::SNAP_OFF_STATUS));
+            let prev = last_status.get(&slot).copied().unwrap_or(0);
+            if status == prev {
+                continue;
+            }
+            // Reset: status went to 0 from non-zero. Indicates a probe
+            // restart — the kernel's reset before its own probe attempt,
+            // or any later device-needs-reset cycle.
+            if status == 0 && prev != 0 {
+                crate::dlog!(
+                    "[probe-status] slot {} ({}) STATUS reset to 0 \
+                     (was 0x{:02x}) — probe restart",
+                    slot,
+                    kind,
+                    prev
+                );
+            }
+            // DRIVER_OK transition (bit going 0 → 1). One log line per
+            // probe completion, including U-Boot's pre-kernel
+            // virtio_blk probe. Bench harness counts these per slot to
+            // distinguish kernel-side success from U-Boot-only success.
+            if status & ve::STATUS_DRIVER_OK != 0 && prev & ve::STATUS_DRIVER_OK == 0 {
+                crate::dlog!(
+                    "[probe-status] slot {} ({}) reached STATUS_DRIVER_OK \
+                     (status=0x{:02x})",
+                    slot,
+                    kind,
+                    status
+                );
+            }
+            // FAILED bit set: probe gave up. Log on every transition
+            // into FAILED (rare; kernel only sets this on hard probe
+            // errors, not on the SEL→READY -ENOENT case which silently
+            // unwinds without setting STATUS_FAILED).
+            if status & ve::STATUS_FAILED != 0 && prev & ve::STATUS_FAILED == 0 {
+                crate::dlog!(
+                    "[probe-status] slot {} ({}) STATUS_FAILED set \
+                     (status=0x{:02x}) — kernel-side probe gave up",
+                    slot,
+                    kind,
+                    status
+                );
+            }
+            last_status.insert(slot, status);
         }
         {
             let map = uart_registry.lock().unwrap();

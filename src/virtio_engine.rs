@@ -171,6 +171,24 @@ pub const STATS_OFF_KICK_DROPS: u32 = 0x02c;
 /// `handle_queue_sel_change`. Mirrored on the firmware side as
 /// `STATS_OFF_SEL_READY_RACES` in `brisc-firmware/virtio.c`.
 pub const STATS_OFF_SEL_READY_RACES: u32 = 0x030;
+/// #124 BRISC timing probe (BRISC mcycle CSR samples). All in cycles
+/// at the BRISC clock — convert to ns by dividing by AICLK in GHz
+/// (1.35 GHz at MAX_AI_CLK ⟹ ~0.74 ns/cycle).
+///
+/// `MAX_SWEEP_CYCLES`: worst-case top-of-main-loop to top-of-main-loop
+/// duration since stats reset. The relevant number for racing the
+/// kernel's `writel(QUEUE_SEL); readl(QUEUE_READY)` gap.
+///
+/// `MAX_SEL_PATH_CYCLES`: worst-case `handle_queue_sel_change` entry
+/// to right-after-FENCE_W (the moment QUEUE_READY=0 is published).
+/// The duration BRISC holds the kernel waiting on its readl response.
+///
+/// `LAST_SWEEP_CYCLES`: most recent sweep period. Useful when MAX
+/// looks suspicious (e.g., a single early outlier from cold-cache
+/// effects swamps everything).
+pub const STATS_OFF_MAX_SWEEP_CYCLES: u32 = 0x034;
+pub const STATS_OFF_MAX_SEL_PATH_CYCLES: u32 = 0x038;
+pub const STATS_OFF_LAST_SWEEP_CYCLES: u32 = 0x03c;
 
 // ----- Per-queue shadow region (BRISC L1, M5.5b firmware) -----
 //
@@ -207,6 +225,19 @@ pub const SHADOW_Q_OFF_DEVICE_HI: u32 = 0x1c;
 #[inline]
 pub fn shadow_queue_addr(slot: u32, queue_idx: u32, off: u32) -> u32 {
     SHADOW_BASE + slot * SHADOW_PER_DEVICE + queue_idx * SHADOW_PER_QUEUE + off
+}
+
+// Per-slot snapshot region inside the shadow block. BRISC's
+// `poll_one_device` snapshots the visible regs here so subsequent
+// iterations can detect "did the kernel write anything since last
+// poll?" via diff. The daemon reads `SNAP_OFF_STATUS` to surface
+// per-device "kernel completed probe" signals (#123 debugging).
+pub const SNAP_BASE_OFF: u32 = 0x200;
+pub const SNAP_OFF_STATUS: u32 = 0x00;
+
+#[inline]
+pub fn snap_addr(slot: u32, off: u32) -> u32 {
+    SHADOW_BASE + slot * SHADOW_PER_DEVICE + SNAP_BASE_OFF + off
 }
 
 pub const STATS_MAGIC_LOADED: u32 = 0x0000_B155;

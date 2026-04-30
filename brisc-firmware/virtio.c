@@ -91,6 +91,25 @@
 // side. Goes with TENSIX_PROTOCOL_VERSION (no bump — the field is
 // purely additive read-only stats).
 #define STATS_OFF_SEL_READY_RACES 0x030
+// #124 timing probe: BRISC samples `mcycle` to put real numbers on
+// loop period and SEL→READY critical-path duration. Stored as the
+// MAX seen since stats reset. mcycle low-32 wraps every ~3.2 s at
+// 1.35 GHz; per-iteration deltas are in the hundreds-to-low-thousands
+// of cycles so wrap doesn't bother subtraction (uint wraps cleanly).
+//
+// MAX_SWEEP_CYCLES: top-of-loop to top-of-loop. Worst case sweep
+// period — the relevant number for racing the kernel's writel→readl
+// gap (kernel's writel can land just after BRISC starts a slow sweep).
+//
+// MAX_SEL_PATH_CYCLES: handle_queue_sel_change entry to right after
+// the QUEUE_READY=0 + FENCE_W. The actual time BRISC holds the
+// kernel waiting on its readl response after a SEL write.
+//
+// LAST_SWEEP_CYCLES: most recent sweep. Helpful when MAX is suspect
+// (e.g., a single early outlier from cold-cache effects).
+#define STATS_OFF_MAX_SWEEP_CYCLES    0x034
+#define STATS_OFF_MAX_SEL_PATH_CYCLES 0x038
+#define STATS_OFF_LAST_SWEEP_CYCLES   0x03c
 
 #define STATS_MAGIC_LOADED        0x0000B155u
 
@@ -164,6 +183,27 @@
 
 static inline volatile uint32_t *l1_u32(uintptr_t addr) {
     return (volatile uint32_t *)addr;
+}
+
+// Read the low 32 bits of mcycle. Tensix BRISC implements the
+// standard RV32 cycle counter; csrr is a single-cycle local op.
+// Wraps every ~3.2 s at 1.35 GHz — fine for our use because we only
+// take per-iteration deltas (uint32 subtraction wraps cleanly), never
+// absolute timestamps. See #124.
+static inline uint32_t mcycle_low(void) {
+    uint32_t v;
+    __asm__ volatile("csrr %0, mcycle" : "=r"(v));
+    return v;
+}
+
+// Bump a u32 stat to `v` if v > current. Used by the #124 timing
+// probe. Plain L1 read + cmp + conditional store; no fence (we read
+// the same word back, and reads on BRISC are locally consistent).
+static inline void update_max_u32(uintptr_t addr, uint32_t v) {
+    uint32_t cur = *l1_u32(addr);
+    if (v > cur) {
+        *l1_u32(addr) = v;
+    }
 }
 
 static inline uint32_t read_u32(uintptr_t addr) {
@@ -362,36 +402,41 @@ static void handle_queue_sel_change(unsigned slot, uint32_t sel) {
     if (sel >= BRISC_VIRTIO_MAX_QUEUES) {
         return;
     }
-    uint32_t num   = *l1_u32(shadow_queue_addr(slot, sel, SHADOW_Q_OFF_NUM));
 
-    // QueueNumMax is always BRISC_VIRTIO_QUEUE_NUM_MAX for queues we
-    // support; it's 0 for queues past `num_queues` to tell the guest
-    // "this queue doesn't exist."
-    uint32_t num_max = (sel < device_for_slot(slot)->num_queues) ? BRISC_VIRTIO_QUEUE_NUM_MAX : 0;
+    // #124 timing probe: t0 = entry, t1 = right after the FENCE_W
+    // that publishes QUEUE_READY=0. (t1 - t0) is the race-budget
+    // duration BRISC holds the kernel waiting after its writel(SEL).
+    uint32_t t0 = mcycle_low();
 
-    *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NUM_MAX)) = num_max;
-    *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NUM))     = num;
-    // Always clear visible QUEUE_READY=0 on SEL change. Stock Linux's
-    // vm_setup_vq for queue N+1 starts with `writel(SEL=N+1);
-    // readl(QUEUE_READY)` expecting 0 — but if we mirror
-    // shadow[N+1].READY (which might legitimately be 1 if a previous
-    // setup left the queue ready), the kernel sees stale 1 and bails
-    // with -ENOENT. The eager clear elsewhere handles the
-    // SAME-SEL-window race; this addresses the SEL-transition window.
-    // Setting READY=0 here is safe: the kernel never reads READY
-    // after writing 1 (only on next vm_setup_vq cycle), and del_vq's
-    // `writel(0); WARN_ON(readl !=0)` sees 0 (= what it just wrote).
+    // Clear visible QUEUE_READY=0 FIRST, before anything else, to
+    // minimize the time from "BRISC observed new SEL" to "QUEUE_READY=0
+    // is visible to the kernel." Stock Linux's vm_setup_vq for queue
+    // N+1 starts with `writel(SEL=N+1); readl(QUEUE_READY)` expecting
+    // 0; if we don't beat the kernel's readl with this clear, it sees
+    // stale 1 and bails with -ENOENT. NUM_MAX/NUM updates and the
+    // race-counter bookkeeping happen after the fence — they're not
+    // on the critical path for the kernel's readl response.
     //
     // Sample the prior READY value first so we can count the race
     // window: if it was 1, BRISC is processing the SEL change AFTER
-    // the previous queue was set up. A stock kernel doing
-    // `writel(SEL=N+1); readl(QUEUE_READY)` with no SW_IMPL handshake
-    // can race through that window and see the stale 1. Daemon
-    // surfaces this counter; non-zero means our sweep is borderline
-    // even if no race lost in this run.
-    uint32_t prev_ready = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY));
-    *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY))   = 0;
+    // the previous queue was set up. Daemon surfaces this counter;
+    // non-zero means our sweep is borderline even if no race lost in
+    // this run.
+    uint32_t prev_ready = *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY));
+    *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY)) = 0;
     FENCE_W();
+
+    uint32_t t1 = mcycle_low();
+    update_max_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_MAX_SEL_PATH_CYCLES,
+                   t1 - t0);
+
+    // QueueNumMax is always BRISC_VIRTIO_QUEUE_NUM_MAX for queues we
+    // support; it's 0 for queues past `num_queues` to tell the guest
+    // "this queue doesn't exist." NUM comes from shadow.
+    uint32_t num     = *l1_u32(shadow_queue_addr(slot, sel, SHADOW_Q_OFF_NUM));
+    uint32_t num_max = (sel < device_for_slot(slot)->num_queues) ? BRISC_VIRTIO_QUEUE_NUM_MAX : 0;
+    *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NUM_MAX)) = num_max;
+    *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NUM))     = num;
 
     if (prev_ready != 0) {
         inc_stat(STATS_OFF_SEL_READY_RACES);
@@ -506,7 +551,14 @@ static void handle_status_change(unsigned slot, uint32_t status, uint32_t prev) 
 static void poll_completion_ring(void) {
     uint32_t producer = read_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_PRODUCER_SEQ));
     uint32_t consumer = read_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_CONSUMER_SEQ));
-    while (consumer != producer) {
+    if (consumer == producer) {
+        // Steady state: nothing to drain. Skip the publish — writing
+        // the same CONSUMER_SEQ back with a FENCE_W on every main-loop
+        // iteration is pure overhead and widens the SEL→READY race
+        // window we're trying to shrink (#123).
+        return;
+    }
+    do {
         uint32_t idx = consumer & (COMPL_RING_ENTRIES - 1u);
         uintptr_t entry = ctrl_addr(CTRL_OFF_COMPL_RING + idx * COMPL_ENTRY_SIZE);
         uint32_t slot_q = *l1_u32(entry);  // [15:0] slot, [31:16] queue
@@ -514,7 +566,7 @@ static void poll_completion_ring(void) {
         *l1_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_LAST_COMPL) = slot_q;
         inc_stat(STATS_OFF_COMPL_EVENTS);
         consumer += 1u;
-    }
+    } while (consumer != producer);
     write_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_CONSUMER_SEQ), consumer);
 }
 
@@ -1034,7 +1086,22 @@ void main(void) {
     // AND per loop iteration; the per-slot init only runs on actual
     // transitions (rare during steady state).
     uint32_t prev_active = 0;
+    // #124 timing probe: top-of-loop timestamp from previous iter, so
+    // each iter computes (now - prev) = sweep period in cycles. First
+    // iter is skipped (no valid prev sample).
+    uint32_t prev_sweep_t = mcycle_low();
+    int sweep_t_valid = 0;
     for (;;) {
+        uint32_t now_t = mcycle_low();
+        if (sweep_t_valid) {
+            uint32_t sweep_cycles = now_t - prev_sweep_t;
+            *l1_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_LAST_SWEEP_CYCLES) = sweep_cycles;
+            update_max_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_MAX_SWEEP_CYCLES,
+                           sweep_cycles);
+        }
+        prev_sweep_t = now_t;
+        sweep_t_valid = 1;
+
         // Only poll slots the daemon has marked active. With one
         // L2CPU booted, that's 4 of 16 (or 32, post-#81) slots —
         // sweep period drops from ~4µs to ~1µs, narrow enough to
