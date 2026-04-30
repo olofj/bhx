@@ -224,17 +224,24 @@ pub const KNOWN_IMAGES: &[KnownImage] = &[
     // chainloads /boot/EFI. URL is a stable symlink to the latest
     // snapshot — fetch.rs's HTTP-conditional cache re-pulls only when
     // upstream's ETag/Last-Modified changes.
+    //
+    // First-boot UX is different from the other generic-cloud images
+    // here: no cloud-init in the image, and no preset root password.
+    // Instead, the `jeos-firstboot` systemd service runs on the
+    // console on first boot and walks the operator through license,
+    // locale, keyboard, timezone, root password, and network. Walk
+    // it via `bhx connect` immediately after `bhx boot`.
     KnownImage {
         name: "opensuse-tumbleweed",
         url: "https://download.opensuse.org/ports/riscv/tumbleweed/appliances/openSUSE-Tumbleweed-RISC-V-JeOS-efi.riscv64.raw.xz",
-        description: "openSUSE Tumbleweed JeOS — minimal rolling-release image, riscv64",
+        description: "openSUSE Tumbleweed JeOS — minimal rolling-release image (interactive firstboot via console)",
         aliases: &["opensuse", "tumbleweed", "suse", "jeos"],
         format: ImageFormat::RawDisk,
         compression: Compression::Xz,
         default_size: "10G",
         default_user: "",
         default_password: "",
-        cloud_init: true,
+        cloud_init: false,
         extract_partition: false,
         needs_bootloader: true,
     },
