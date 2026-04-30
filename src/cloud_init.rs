@@ -128,20 +128,13 @@ impl SeedSpec {
         // reachable from the slirp forwarder.
         if password.is_some() {
             s.push_str("ssh_pwauth: true\n");
-            s.push_str("chpasswd:\n  expire: false\n");
         }
         s.push_str("users:\n");
         s.push_str(&format!("  - name: {}\n", user));
         s.push_str("    sudo: ALL=(ALL) NOPASSWD:ALL\n");
         s.push_str("    shell: /bin/bash\n");
-        if let Some(p) = password {
+        if password.is_some() {
             s.push_str("    lock_passwd: false\n");
-            // YAML double-quoted string. The password is operator-
-            // controlled; if it contains \" or \\ the operator's
-            // input is invalid YAML and cloud-init will reject the
-            // seed at parse time — surface that early rather than
-            // trying to escape on the operator's behalf.
-            s.push_str(&format!("    plain_text_passwd: \"{}\"\n", p));
         } else {
             s.push_str("    lock_passwd: true\n");
         }
@@ -150,6 +143,23 @@ impl SeedSpec {
             for key in &self.ssh_keys {
                 s.push_str(&format!("      - \"{}\"\n", key.trim()));
             }
+        }
+        // Set the password via the modern `chpasswd.users` schema
+        // (cloud-init 22.2+). The older `users[].plain_text_passwd`
+        // path triggers a `chpasswd.list:  Deprecated in version 22.2`
+        // warning on Ubuntu 24.04's cloud-init 24.x and the password
+        // ends up unset, breaking first-boot login. YAML double-quoted
+        // string: if the operator's password contains " or \ the
+        // resulting YAML is invalid and cloud-init will reject the
+        // seed at parse time — surfaces the bad input early instead
+        // of us silently escaping it.
+        if let Some(p) = password {
+            s.push_str("chpasswd:\n");
+            s.push_str("  expire: false\n");
+            s.push_str("  users:\n");
+            s.push_str(&format!("    - name: {}\n", user));
+            s.push_str(&format!("      password: \"{}\"\n", p));
+            s.push_str("      type: text\n");
         }
 
         // Detach /etc/resolv.conf from systemd-resolved's stub so
@@ -290,10 +300,18 @@ mod tests {
         let ud = spec.render_user_data();
         assert!(ud.starts_with("#cloud-config\n"));
         assert!(ud.contains("name: bhx"));
-        assert!(ud.contains("plain_text_passwd: \"bhx\""));
+        // Modern chpasswd.users schema (cloud-init 22.2+).
+        assert!(ud.contains("chpasswd:"));
+        assert!(ud.contains("password: \"bhx\""));
+        assert!(ud.contains("type: text"));
         assert!(ud.contains("ssh_pwauth: true"));
         // No ssh_authorized_keys block when none supplied.
         assert!(!ud.contains("ssh_authorized_keys"));
+        // The deprecated path must not reappear — cloud-init 24.x
+        // routes plain_text_passwd through chpasswd.list internally
+        // and warns / drops the password.
+        assert!(!ud.contains("plain_text_passwd"));
+        assert!(!ud.contains("chpasswd.list"));
     }
 
     #[test]
@@ -306,6 +324,8 @@ mod tests {
         assert!(ud.contains("ssh_authorized_keys:"));
         assert!(ud.contains("ssh-ed25519 AAAA test@host"));
         assert!(ud.contains("lock_passwd: true"));
+        // No password set → no chpasswd block at all.
+        assert!(!ud.contains("chpasswd:"));
         assert!(!ud.contains("plain_text_passwd"));
         // Without a password, ssh_pwauth stays at the cloud-init
         // default (off) — operators who supply keys want key-only.
@@ -320,7 +340,8 @@ mod tests {
             ..SeedSpec::default()
         };
         let ud = spec.render_user_data();
-        assert!(ud.contains("plain_text_passwd: \"hunter2\""));
+        assert!(ud.contains("password: \"hunter2\""));
+        assert!(ud.contains("type: text"));
         assert!(ud.contains("ssh-ed25519 AAAA"));
     }
 
@@ -331,7 +352,10 @@ mod tests {
             ..SeedSpec::default()
         };
         let ud = spec.render_user_data();
-        assert!(ud.contains("name: olof"));
+        // Custom user must appear in BOTH the users[] block and the
+        // chpasswd.users[] block (otherwise we create the user but
+        // set the password for "bhx").
+        assert_eq!(ud.matches("name: olof").count(), 2);
         assert!(!ud.contains("name: bhx"));
     }
 
