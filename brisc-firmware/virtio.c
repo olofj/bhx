@@ -94,7 +94,11 @@
 // per-queue storage rather than a single field that depends on the
 // current QUEUE_SEL. This eliminates the SEL-multiplexing race that
 // motivated #58, #61, #63, #65.
-#define SHADOW_BASE               0x00020000u
+// Bumped from 0x00020000 to 0x00040000 when DEVS_PER_L2CPU went 4 → 6.
+// The reg-file region grew from 64 KiB (0x10000..0x20000) to 96 KiB
+// (0x10000..0x28000), so the old 0x20000 shadow base now overlaps.
+// Mirrored on the Rust side as `SHADOW_BASE` in `src/virtio_engine.rs`.
+#define SHADOW_BASE               0x00040000u
 #define SHADOW_PER_DEVICE         0x00000400u  // 1 KiB per slot
 
 // Within a per-device shadow block, queue `q` lives at offset
@@ -169,11 +173,21 @@ struct device_init {
     uint32_t extra_features_low;    // bits we OR into DEVICE_FEATURES
 };
 
+// Indexed by `slot % BRISC_VIRTIO_DEVS_PER_L2CPU` (see `device_for_slot`).
+// BLK1 / BLK2 mirror BLK exactly — they're additional blk slots used
+// for cloud-init seeds (#82) and persistent data volumes (#81).
+// Indices 6 and 7 are padding (DEVS_PER_L2CPU is 8 = power of two so
+// the modulo stays a bitmask AND); they're unused, leaving the entries
+// zeroed which keeps `init_device` planting `device_id = 0` so a
+// guest probing those slots sees no device. Static-initialized
+// uninitialized members of an indexed designator are zero per C99.
 static const struct device_init DEVICE_TEMPLATE[BRISC_VIRTIO_DEVS_PER_L2CPU] = {
     [BRISC_VIRTIO_DEV_BLK]     = { VIRTIO_ID_BLOCK,   BRISC_VIRTIO_QUEUES_BLK,     0 },
     [BRISC_VIRTIO_DEV_NET]     = { VIRTIO_ID_NET,     BRISC_VIRTIO_QUEUES_NET,     VIRTIO_NET_F_MAC_BIT },
     [BRISC_VIRTIO_DEV_CONSOLE] = { VIRTIO_ID_CONSOLE, BRISC_VIRTIO_QUEUES_CONSOLE, 0 },
     [BRISC_VIRTIO_DEV_RNG]     = { VIRTIO_ID_ENTROPY, BRISC_VIRTIO_QUEUES_RNG,     0 },
+    [BRISC_VIRTIO_DEV_BLK1]    = { VIRTIO_ID_BLOCK,   BRISC_VIRTIO_QUEUES_BLK,     0 },
+    [BRISC_VIRTIO_DEV_BLK2]    = { VIRTIO_ID_BLOCK,   BRISC_VIRTIO_QUEUES_BLK,     0 },
 };
 
 static const struct device_init *device_for_slot(unsigned slot) {

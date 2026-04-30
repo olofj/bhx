@@ -75,41 +75,48 @@ pub mod boot_image {
 }
 
 /// VirtIO MMIO regions inside the L2CPU's DRAM window: each device
-/// occupies 2 MiB; we currently expose disk + net (and reserve two
-/// slots for future expansion). The reservation is `RESERVED_SIZE`
-/// counted backwards from the end of memory.
+/// occupies 2 MiB; the layout reserves room for six devices (one each
+/// of disk / net / console / rng plus two extra disk slots used for
+/// data volumes and the cloud-init seed — see #81). The reservation
+/// is `RESERVED_SIZE` counted backwards from the end of memory.
 ///
-/// `boot::modify_dtb` lays out four `virtio,mmio` nodes at addresses
-/// `mem_end - (i+1) * MMIO_SLOT_SIZE` for `i = 0..4`, with IRQ
-/// `DISK_IRQ - i`. The disk device occupies slot 0 (closest to
-/// `mem_end`, IRQ 33); the network device occupies slot 1 (IRQ 32).
-/// Slots 2 and 3 are reserved.
+/// In the engine-driven boot path the actual MMIO PAs come from the
+/// Tensix engine's L1 reg files via the per-L2CPU TLB, not from the
+/// L2CPU's own DRAM-end region. The OFFSET constants below are the
+/// historical reservation map preserved so a guest kernel still sees
+/// the top-of-DRAM range as `reserved-memory` and doesn't allocate
+/// over it; they're not used to compute actual MMIO PAs anymore.
 ///
 /// The values exposed here are the *region offsets* in the form
 /// `mem_end - region_offset` — i.e. the number of bytes to subtract
-/// from `mem_end` to get the region's base. `virtio::run_device`
-/// computes the absolute MMIO base as
-/// `starting_address + memory_size - region_offset`.
+/// from `mem_end` to get the region's base.
 pub mod virtio_mmio {
-    /// Total reservation at the top of an L2CPU's DRAM for the four
-    /// `virtio,mmio` regions (4 × 2 MiB plus padding).
-    pub const RESERVED_SIZE: u64 = 0x80_0000;
+    /// Total reservation at the top of an L2CPU's DRAM for the six
+    /// `virtio,mmio` regions (6 × 2 MiB).
+    pub const RESERVED_SIZE: u64 = 0xC0_0000;
     /// Per-device MMIO region size (2 MiB).
     pub const MMIO_SLOT_SIZE: u64 = 0x20_0000;
 
-    /// Disk device region offset: 2 MiB before `mem_end`.
+    /// Primary disk device region offset: 2 MiB before `mem_end`.
     pub const DISK_OFFSET: u64 = MMIO_SLOT_SIZE;
     /// Network device region offset: 4 MiB before `mem_end`.
     pub const NET_OFFSET: u64 = 2 * MMIO_SLOT_SIZE;
-    /// Console device region offset: 6 MiB before `mem_end`. Slot 3 in
-    /// `boot::modify_dtb`'s `i = 0..4` loop, paired with IRQ 31. See
-    /// #51 for rationale.
+    /// Console device region offset: 6 MiB before `mem_end`. Paired
+    /// with IRQ 31. See #51 for rationale.
     pub const CONSOLE_OFFSET: u64 = 3 * MMIO_SLOT_SIZE;
-    /// RNG device region offset: 8 MiB before `mem_end`. Slot 4 in
-    /// `boot::modify_dtb`'s `i = 0..4` loop, paired with IRQ 30.
-    /// Required for the AlmaLinux EFI shim's `EFI_RNG_PROTOCOL`
-    /// during the U-Boot+GRUB+shim chained-boot path. See #62.
+    /// RNG device region offset: 8 MiB before `mem_end`. Paired with
+    /// IRQ 30. Required for the AlmaLinux EFI shim's
+    /// `EFI_RNG_PROTOCOL` during the U-Boot+GRUB+shim chained-boot
+    /// path. See #62.
     pub const RNG_OFFSET: u64 = 4 * MMIO_SLOT_SIZE;
+    /// Second disk slot (10 MiB before `mem_end`). Used for cloud-init
+    /// NoCloud seed images (#82) and any 2nd virtio-blk an operator
+    /// attaches via `add-disk --name`.
+    pub const DISK1_OFFSET: u64 = 5 * MMIO_SLOT_SIZE;
+    /// Third disk slot (12 MiB before `mem_end`). Reserved for a 3rd
+    /// virtio-blk (e.g. persistent data volume alongside rootfs +
+    /// seed).
+    pub const DISK2_OFFSET: u64 = 6 * MMIO_SLOT_SIZE;
 
     /// PLIC interrupt for virtio-disk. DTB ties together as
     /// `virtio@<addr> { interrupts = <DISK_IRQ>; }`.
@@ -120,6 +127,10 @@ pub mod virtio_mmio {
     pub const CONSOLE_IRQ: u32 = 31;
     /// PLIC interrupt for virtio-rng.
     pub const RNG_IRQ: u32 = 30;
+    /// PLIC interrupt for the second virtio-blk slot (#81).
+    pub const DISK1_IRQ: u32 = 29;
+    /// PLIC interrupt for the third virtio-blk slot (#81).
+    pub const DISK2_IRQ: u32 = 28;
 
     /// PLIC interrupt for the M6 (#78) 16550 UART. Disjoint from the
     /// virtio range (30..33) so it doesn't share with virtio-console.
@@ -182,31 +193,33 @@ mod tests {
     // strictly better — a future edit that breaks the layout never
     // reaches a tested binary.
     const _VIRTIO_MMIO_LAYOUT_INVARIANTS: () = {
-        // Disk and net regions are distinct, slot-aligned, and inside
-        // the reservation.
-        assert!(virtio_mmio::DISK_OFFSET != virtio_mmio::NET_OFFSET);
-        assert!(virtio_mmio::DISK_OFFSET.is_multiple_of(virtio_mmio::MMIO_SLOT_SIZE));
-        assert!(virtio_mmio::NET_OFFSET.is_multiple_of(virtio_mmio::MMIO_SLOT_SIZE));
-        assert!(virtio_mmio::DISK_OFFSET <= virtio_mmio::RESERVED_SIZE);
-        assert!(virtio_mmio::NET_OFFSET <= virtio_mmio::RESERVED_SIZE);
-        // DTB walks i=0..4 with offset = (i+1)*MMIO_SLOT_SIZE and
-        // IRQ = DISK_IRQ - i. Disk = i=0; net = i=1.
+        // Reservation holds all six slots end-to-end.
+        assert!(virtio_mmio::RESERVED_SIZE == 6 * virtio_mmio::MMIO_SLOT_SIZE);
+        // Each region is at a unique slot-aligned offset inside the
+        // reservation. Indices are i=1..6 (slot 0 == top-of-DRAM is
+        // unused so the reservation never touches mem_end itself).
         assert!(virtio_mmio::DISK_OFFSET == virtio_mmio::MMIO_SLOT_SIZE);
         assert!(virtio_mmio::NET_OFFSET == 2 * virtio_mmio::MMIO_SLOT_SIZE);
-        assert!(virtio_mmio::NET_IRQ == virtio_mmio::DISK_IRQ - 1);
-        // Console gets slot index 2 (0 = disk, 1 = net, 2 = console).
         assert!(virtio_mmio::CONSOLE_OFFSET == 3 * virtio_mmio::MMIO_SLOT_SIZE);
-        assert!(virtio_mmio::CONSOLE_OFFSET <= virtio_mmio::RESERVED_SIZE);
-        assert!(virtio_mmio::CONSOLE_OFFSET != virtio_mmio::DISK_OFFSET);
-        assert!(virtio_mmio::CONSOLE_OFFSET != virtio_mmio::NET_OFFSET);
-        assert!(virtio_mmio::CONSOLE_IRQ == virtio_mmio::DISK_IRQ - 2);
-        // RNG gets slot index 3 (last slot the DTB walk produces).
         assert!(virtio_mmio::RNG_OFFSET == 4 * virtio_mmio::MMIO_SLOT_SIZE);
-        assert!(virtio_mmio::RNG_OFFSET <= virtio_mmio::RESERVED_SIZE);
-        assert!(virtio_mmio::RNG_OFFSET != virtio_mmio::DISK_OFFSET);
-        assert!(virtio_mmio::RNG_OFFSET != virtio_mmio::NET_OFFSET);
-        assert!(virtio_mmio::RNG_OFFSET != virtio_mmio::CONSOLE_OFFSET);
+        assert!(virtio_mmio::DISK1_OFFSET == 5 * virtio_mmio::MMIO_SLOT_SIZE);
+        assert!(virtio_mmio::DISK2_OFFSET == 6 * virtio_mmio::MMIO_SLOT_SIZE);
+        assert!(virtio_mmio::DISK_OFFSET.is_multiple_of(virtio_mmio::MMIO_SLOT_SIZE));
+        assert!(virtio_mmio::NET_OFFSET.is_multiple_of(virtio_mmio::MMIO_SLOT_SIZE));
+        assert!(virtio_mmio::CONSOLE_OFFSET.is_multiple_of(virtio_mmio::MMIO_SLOT_SIZE));
+        assert!(virtio_mmio::RNG_OFFSET.is_multiple_of(virtio_mmio::MMIO_SLOT_SIZE));
+        assert!(virtio_mmio::DISK1_OFFSET.is_multiple_of(virtio_mmio::MMIO_SLOT_SIZE));
+        assert!(virtio_mmio::DISK2_OFFSET.is_multiple_of(virtio_mmio::MMIO_SLOT_SIZE));
+        assert!(virtio_mmio::DISK_OFFSET <= virtio_mmio::RESERVED_SIZE);
+        assert!(virtio_mmio::DISK2_OFFSET <= virtio_mmio::RESERVED_SIZE);
+        // IRQs march down 33..28; primary 4 are 33..30 (disk/net/console/rng);
+        // extra disk slots use 29 and 28. UART_IRQ=35 stays disjoint above.
+        assert!(virtio_mmio::NET_IRQ == virtio_mmio::DISK_IRQ - 1);
+        assert!(virtio_mmio::CONSOLE_IRQ == virtio_mmio::DISK_IRQ - 2);
         assert!(virtio_mmio::RNG_IRQ == virtio_mmio::DISK_IRQ - 3);
+        assert!(virtio_mmio::DISK1_IRQ == virtio_mmio::DISK_IRQ - 4);
+        assert!(virtio_mmio::DISK2_IRQ == virtio_mmio::DISK_IRQ - 5);
+        // The blackhole DTB has riscv,ndev = 128, plenty of headroom.
     };
 
     // Compile-time invariants on the boot-image layout: each must be

@@ -12,19 +12,27 @@
 // L1 layout:
 //   0x0000_0000 .. 0x0000_4000   firmware code (16 KiB max, see Makefile)
 //   0x0000_4000 .. 0x0000_5000   stats page (M3.6, 4 KiB)
-//   0x0001_0000 .. 0x0002_0000   virtio register files
-//                                  16 slots × 4 KiB = 64 KiB
-//                                  slot = l2cpu_idx*4 + device_idx
+//   0x0001_0000 .. 0x0003_0000   virtio register files
+//                                  32 slots × 4 KiB = 128 KiB
+//                                  slot = l2cpu_idx*8 + device_idx
+//                                  (8 = power-of-2 padding; 6 populated
+//                                   + 2 unused per L2CPU)
 //                                    L2CPU 0 blk      → slot  0  → 0x10000
 //                                    L2CPU 0 net      → slot  1  → 0x11000
 //                                    L2CPU 0 console  → slot  2  → 0x12000
 //                                    L2CPU 0 rng      → slot  3  → 0x13000
-//                                    L2CPU 1 blk      → slot  4  → 0x14000
+//                                    L2CPU 0 blk1     → slot  4  → 0x14000
+//                                    L2CPU 0 blk2     → slot  5  → 0x15000
+//                                    L2CPU 0 (unused) → slots 6..7
+//                                    L2CPU 1 blk      → slot  8  → 0x18000
 //                                    ...
-//                                    L2CPU 3 rng      → slot 15  → 0x1F000
-//   0x0002_0000 .. 0x0002_4000   per-queue shadow state (BRISC-private,
+//                                    L2CPU 3 blk2     → slot 29  → 0x2D000
+//                                    L2CPU 3 (unused) → slots 30..31
+//   0x0004_0000 .. 0x0004_8000   per-queue shadow state (BRISC-private,
 //                                  not visible-as-MMIO; M3.5)
-//                                  16 × 1 KiB
+//                                  32 × 1 KiB
+//                                  Bumped from 0x20000 when the reg-file
+//                                  region grew past the old shadow base.
 //
 // The 4 KiB per device matches virtio 1.2 §4.2.2's MMIO spec (last
 // reg ConfigGeneration is at 0x0fc, config space starts at 0x100 and
@@ -66,7 +74,19 @@
 #define BRISC_VIRTIO_REGS_PER_DEV   0x00001000u  // 4 KiB per device
 
 #define BRISC_VIRTIO_NUM_L2CPUS     4u
-#define BRISC_VIRTIO_DEVS_PER_L2CPU 4u
+// 8 device slots per L2CPU, 6 populated: blk / net / console / rng
+// (the original four) plus two extra blk slots (BLK1 / BLK2) for the
+// cloud-init NoCloud seed (#82) and persistent data volumes (#81).
+// The remaining two indices (6, 7) are reserved padding so the value
+// stays a power of two — `slot % DEVS_PER_L2CPU` then compiles to a
+// bitmask AND instead of an __umodsi3 libgcc call (the bare-metal
+// BRISC toolchain doesn't link the soft-divide runtime).
+//
+// Bumping requires a matching bump on the Rust side
+// (`DEVS_PER_L2CPU` in `src/virtio_engine.rs`) and a refresh of the
+// prebuilt binaries under `prebuilt/` so the no-sfpi build path picks
+// up the layout.
+#define BRISC_VIRTIO_DEVS_PER_L2CPU 8u
 #define BRISC_VIRTIO_NUM_SLOTS      (BRISC_VIRTIO_NUM_L2CPUS * BRISC_VIRTIO_DEVS_PER_L2CPU)
 
 // Each L2CPU's view of the reg files is a contiguous 16 KiB window
@@ -92,6 +112,9 @@
 #define BRISC_VIRTIO_DEV_NET       1
 #define BRISC_VIRTIO_DEV_CONSOLE   2
 #define BRISC_VIRTIO_DEV_RNG       3
+// Extra blk slots — same shape as DEV_BLK in DEVICE_TEMPLATE[].
+#define BRISC_VIRTIO_DEV_BLK1      4
+#define BRISC_VIRTIO_DEV_BLK2      5
 
 static inline unsigned brisc_virtio_slot(unsigned l2cpu_idx, unsigned device_idx) {
     return l2cpu_idx * BRISC_VIRTIO_DEVS_PER_L2CPU + device_idx;

@@ -33,7 +33,21 @@ pub const REGS_BASE: u32 = 0x0001_0000;
 pub const REGS_PER_DEV: u32 = 0x0000_1000;
 
 pub const NUM_L2CPUS: u32 = 4;
-pub const DEVS_PER_L2CPU: u32 = 4;
+/// Eight device slots per L2CPU. Six are populated: blk / net / console
+/// / rng (the original four) plus two extra blk slots (BLK1 / BLK2)
+/// used for the cloud-init NoCloud seed (#82) and a persistent data
+/// volume (#81). The remaining two slots are unused.
+///
+/// The bump from 4 to 8 (rather than 6) keeps the value a power of
+/// two so `slot % DEVS_PER_L2CPU` stays a bitmask AND on the BRISC
+/// firmware side — modulo by a non-power-of-two would generate an
+/// `__umodsi3` libgcc call the bare-metal toolchain doesn't link.
+///
+/// Mirrored in `BRISC_VIRTIO_DEVS_PER_L2CPU` in
+/// `brisc-firmware/include/virtio_layout.h`. SHADOW_BASE moved to
+/// 0x40000 to clear the larger reg-file region — see
+/// `_LAYOUT_INVARIANTS` below.
+pub const DEVS_PER_L2CPU: u32 = 8;
 pub const NUM_SLOTS: u32 = NUM_L2CPUS * DEVS_PER_L2CPU;
 
 pub const PER_L2CPU_WINDOW_SIZE: u32 = DEVS_PER_L2CPU * REGS_PER_DEV;
@@ -44,6 +58,12 @@ pub const DEV_BLK: u32 = 0;
 pub const DEV_NET: u32 = 1;
 pub const DEV_CONSOLE: u32 = 2;
 pub const DEV_RNG: u32 = 3;
+/// Second virtio-blk slot — used for the cloud-init NoCloud seed
+/// (serial="cidata") and as the first attach surface for an
+/// operator-supplied data disk.
+pub const DEV_BLK1: u32 = 4;
+/// Third virtio-blk slot — additional operator-supplied data disk.
+pub const DEV_BLK2: u32 = 5;
 
 #[inline]
 pub fn slot(l2cpu_idx: u32, device_idx: u32) -> u32 {
@@ -144,7 +164,12 @@ pub const STATS_OFF_KICK_DROPS: u32 = 0x02c;
 // walk in guest DRAM. These offsets MUST match the C firmware's
 // `SHADOW_Q_OFF_*` constants in `brisc-firmware/virtio.c`.
 
-pub const SHADOW_BASE: u32 = 0x0002_0000;
+/// Base of the per-slot shadow region. Moved from 0x20000 to 0x40000
+/// when DEVS_PER_L2CPU went from 4 to 6 — with 24 reg files of 4 KiB
+/// each the reg region now extends to 0x28000, so the old 0x20000
+/// shadow base would overlap. Mirrored on the firmware side as
+/// `SHADOW_BASE` in `brisc-firmware/virtio.c`.
+pub const SHADOW_BASE: u32 = 0x0004_0000;
 pub const SHADOW_PER_DEVICE: u32 = 0x400;
 pub const SHADOW_PER_QUEUE: u32 = 0x40;
 pub const SHADOW_Q_OFF_NUM: u32 = 0x00;
@@ -173,7 +198,7 @@ pub const QUEUES_RNG: u32 = 1;
 #[inline]
 pub fn num_queues_for_device(device_idx: u32) -> u32 {
     match device_idx {
-        DEV_BLK => QUEUES_BLK,
+        DEV_BLK | DEV_BLK1 | DEV_BLK2 => QUEUES_BLK,
         DEV_NET => QUEUES_NET,
         DEV_CONSOLE => QUEUES_CONSOLE,
         DEV_RNG => QUEUES_RNG,
@@ -184,7 +209,7 @@ pub fn num_queues_for_device(device_idx: u32) -> u32 {
 #[inline]
 pub fn device_id_for_index(device_idx: u32) -> u32 {
     match device_idx {
-        DEV_BLK => VIRTIO_ID_BLOCK,
+        DEV_BLK | DEV_BLK1 | DEV_BLK2 => VIRTIO_ID_BLOCK,
         DEV_NET => VIRTIO_ID_NET,
         DEV_CONSOLE => VIRTIO_ID_CONSOLE,
         DEV_RNG => VIRTIO_ID_ENTROPY,
@@ -199,11 +224,17 @@ const _LAYOUT_INVARIANTS: () = {
     // overlap with the shadow region.
     assert!(STATS_BASE >= CODE_BASE + CODE_SIZE);
     assert!(REGS_BASE >= STATS_BASE + STATS_SIZE);
-    // 16 reg files fit inside the 64 KiB region [REGS_BASE,
-    // REGS_BASE+0x10000).
-    assert!(NUM_SLOTS * REGS_PER_DEV == 16 * 0x1000);
-    // Each L2CPU's window is exactly 4 contiguous device reg files.
+    // 32 reg files (4 L2CPUs × 8 devices, 6 populated + 2 padding) of
+    // 4 KiB each = 128 KiB, occupying [REGS_BASE, REGS_BASE+0x20000).
+    assert!(NUM_SLOTS * REGS_PER_DEV == 32 * 0x1000);
+    // Each L2CPU's window is DEVS_PER_L2CPU contiguous device reg files.
     assert!(PER_L2CPU_WINDOW_SIZE == DEVS_PER_L2CPU * REGS_PER_DEV);
+    // DEVS_PER_L2CPU must stay a power of two so the firmware's
+    // `slot % DEVS_PER_L2CPU` is a bitmask AND, not an __umodsi3 call.
+    assert!(DEVS_PER_L2CPU.is_power_of_two());
+    // Shadow region must sit above the reg-file region (SHADOW_BASE
+    // moved to 0x40000 when the engine grew past 64 KiB of reg files).
+    assert!(SHADOW_BASE >= REGS_BASE + NUM_SLOTS * REGS_PER_DEV);
 };
 
 /// Pure-Rust simulator of the BRISC virtio firmware (`virtio.c`).
@@ -247,7 +278,7 @@ pub mod sim {
 
     // Per-device shadow region layout — matches the C firmware's
     // SHADOW_BASE / SHADOW_PER_DEVICE / SHADOW_PER_QUEUE.
-    const SHADOW_BASE: u32 = 0x0002_0000;
+    const SHADOW_BASE: u32 = 0x0004_0000;
     const SHADOW_PER_DEVICE: u32 = 0x400;
     const SHADOW_PER_QUEUE: u32 = 0x40;
     const SHADOW_Q_OFF_NUM: u32 = 0x00;
@@ -518,17 +549,24 @@ mod tests {
 
     #[test]
     fn slot_indices_match_layout() {
+        // 8 slots per L2CPU (6 populated + 2 padding for power-of-2):
+        // blk / net / console / rng / blk1 / blk2 / unused / unused.
         assert_eq!(slot(0, DEV_BLK), 0);
         assert_eq!(slot(0, DEV_RNG), 3);
-        assert_eq!(slot(1, DEV_BLK), 4);
-        assert_eq!(slot(3, DEV_RNG), 15);
+        assert_eq!(slot(0, DEV_BLK1), 4);
+        assert_eq!(slot(0, DEV_BLK2), 5);
+        // L2CPU 1's blk skips L2CPU 0's two padding slots (6, 7).
+        assert_eq!(slot(1, DEV_BLK), 8);
+        // Highest populated slot: L2CPU 3, BLK2.
+        assert_eq!(slot(3, DEV_BLK2), 29);
     }
 
     #[test]
     fn slot_regs_base_matches_layout() {
         assert_eq!(slot_regs_base(0), 0x10000);
         assert_eq!(slot_regs_base(1), 0x11000);
-        assert_eq!(slot_regs_base(15), 0x1f000);
+        // Last slot (NUM_SLOTS - 1 = 31): REGS_BASE + 31*0x1000 = 0x2F000.
+        assert_eq!(slot_regs_base(NUM_SLOTS - 1), 0x2F000);
     }
 
     #[test]
