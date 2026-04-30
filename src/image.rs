@@ -319,6 +319,11 @@ pub fn pull_image(name: &str, output: Option<&Path>, force_refetch: bool) -> Res
     if final_path.exists() && !force_refetch {
         eprintln!("Image already exists at {}", final_path.display());
         eprintln!("Delete it first or pass --refetch if you want to re-download.");
+        // Still ensure the cidata sidecar exists for cloud-init
+        // images (#115): an upgrade from a pre-#115 install where
+        // the image was pulled previously without a seed should
+        // get the default seed on first re-pull.
+        ensure_cidata_seed(image, &final_path)?;
         return Ok(final_path);
     }
 
@@ -369,11 +374,62 @@ pub fn pull_image(name: &str, output: Option<&Path>, force_refetch: bool) -> Res
             eprintln!("  Default password: {}", image.default_password);
         }
     }
-    if image.cloud_init {
-        eprintln!("  Cloud-init: supported (use --cloud-init for custom setup)");
-    }
+
+    ensure_cidata_seed(image, &final_path)?;
 
     Ok(final_path)
+}
+
+/// Ensure a default NoCloud seed sits next to the disk image (#115).
+///
+/// For images flagged `cloud_init=true` in the registry, write
+/// `<basename>.cidata.img` if it doesn't already exist. The boot
+/// path looks for this sibling and auto-attaches it as the
+/// `--cloud-init` seed unless the operator passes `--no-cidata` or
+/// an explicit `--cloud-init <other-path>`.
+///
+/// Idempotent: an existing seed is left alone (an operator may have
+/// edited it). No-op for images without `cloud_init=true` — those
+/// already ship with usable default credentials, so we don't need a
+/// seed at all.
+fn ensure_cidata_seed(image: &KnownImage, disk: &Path) -> Result<()> {
+    if !image.cloud_init {
+        return Ok(());
+    }
+    let seed_path = cidata_seed_path_for(disk);
+    if seed_path.exists() {
+        eprintln!(
+            "  Cloud-init seed: {} (existing, not overwritten)",
+            seed_path.display()
+        );
+        return Ok(());
+    }
+    crate::cloud_init::SeedSpec::default()
+        .write_iso(&seed_path)
+        .map_err(|e| Error::internal(format!("write default seed ISO: {}", e)))?;
+    eprintln!(
+        "  Cloud-init seed: {} (default user '{}' / password '{}')",
+        seed_path.display(),
+        crate::cloud_init::DEFAULT_USER,
+        crate::cloud_init::DEFAULT_PASSWORD,
+    );
+    Ok(())
+}
+
+/// Default sibling path for the auto-generated NoCloud seed. The
+/// boot path looks here when `--cloud-init` isn't explicitly given
+/// and `--no-cidata` isn't set. See #115.
+///
+/// `images/debian-13.img` → `images/debian-13.cidata.img`. Strips
+/// any final extension and appends `.cidata.img`.
+pub fn cidata_seed_path_for(disk: &Path) -> PathBuf {
+    let stem = disk
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "image".to_string());
+    let mut p = disk.to_path_buf();
+    p.set_file_name(format!("{}.cidata.img", stem));
+    p
 }
 
 /// Download a file via fetch::download_to and run any requested decompression.

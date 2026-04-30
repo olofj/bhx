@@ -208,7 +208,7 @@ enum Commands {
             conflicts_with_all = ["kernel", "uboot", "memory", "hostname"],
         )]
         profile: Option<String>,
-        /// Path to a cloud-init NoCloud seed image (#82).
+        /// Path to a cloud-init NoCloud seed image.
         ///
         /// Attached as a 2nd virtio-blk with `serial="cidata"` so
         /// cloud-init's NoCloud datasource finds it during the
@@ -220,6 +220,14 @@ enum Commands {
         /// loses that race and the seed never gets read.
         #[arg(long = "cloud-init")]
         cloud_init: Option<String>,
+        /// Suppress auto-attach of a sibling `<disk>.cidata.img`
+        /// seed. By default `bhx image pull` writes a default
+        /// NoCloud seed next to each cloud-init image, and this boot
+        /// path picks it up unless the operator passes `--cloud-init
+        /// <other-path>` (explicit override) or this flag (skip
+        /// auto-attach entirely).
+        #[arg(long = "no-cidata")]
+        no_cidata: bool,
     },
     /// Attach a terminal to a booted L2CPU's console via the daemon.
     Connect {
@@ -774,6 +782,7 @@ fn main() -> std::process::ExitCode {
             hostname,
             profile,
             cloud_init,
+            no_cidata,
         }) => {
             let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
             if let Some(profile_name) = profile {
@@ -813,6 +822,41 @@ fn main() -> std::process::ExitCode {
                 (Some(p), None) => daemon::protocol::BootPayload::Kernel(p),
                 (None, None) => default_boot_payload(disk.as_deref()),
             };
+            // #115 auto-cidata: if no explicit `--cloud-init` was
+            // given and `--no-cidata` isn't set, look for the sibling
+            // seed `<disk>.cidata.img` written by `bhx image pull`.
+            // Picks up the default `bhx`/`bhx` user automatically.
+            let (cloud_init, cloud_init_source) = match (cloud_init, no_cidata) {
+                (Some(p), _) => (Some(p), "explicit --cloud-init"),
+                (None, true) => (None, "suppressed by --no-cidata"),
+                (None, false) => match disk.as_deref().and_then(|d| {
+                    let candidate = image::cidata_seed_path_for(std::path::Path::new(d));
+                    if candidate.exists() {
+                        Some(candidate.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    }
+                }) {
+                    Some(p) => (Some(p), "auto-attached sibling"),
+                    None => (None, "no seed found"),
+                },
+            };
+            // Print what we're attaching (or not) so the operator
+            // isn't surprised by an invisible 2nd virtio-blk slot,
+            // or by a missing one if they expected the auto-attach.
+            match (&cloud_init, cloud_init_source) {
+                (Some(p), src) => eprintln!("Cloud-init seed: {} ({})", p, src),
+                (None, "no seed found") if disk.is_some() => {
+                    // Only mention the absence when there's actually
+                    // a disk in the picture — initramfs-only boots
+                    // don't care.
+                    eprintln!(
+                        "Cloud-init seed: none (no `<disk>.cidata.img` sibling; \
+                         pass --cloud-init <path> if needed)"
+                    );
+                }
+                (None, _) => {}
+            }
             run_boot_client(
                 card,
                 l2cpu,

@@ -253,6 +253,14 @@ pub struct L2CpuStatus {
     pub idx: u8,
     pub state: L2CpuState,
     pub disk: Option<String>,
+    /// All attached virtio-blk disks (rootfs, cloud-init seed, data
+    /// volumes). Empty for stopped slots. The first entry typically
+    /// matches `disk` above; the rest are #81 multi-disk slots
+    /// including the cloud-init seed (#82, #115) at `name="cidata"`.
+    /// `#[serde(default)]` keeps pre-#115 status clients
+    /// wire-compatible.
+    #[serde(default)]
+    pub disks: Vec<DiskAttach>,
     pub net: bool,
     /// Whether a virtio-console device is attached to this slot
     /// (#54). Defaults to `true` when missing — matches the
@@ -263,6 +271,15 @@ pub struct L2CpuStatus {
     #[serde(default = "default_true")]
     pub virtio_console: bool,
     pub clients: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskAttach {
+    pub path: String,
+    /// Operator-supplied serial. `None` = primary rootfs (legacy
+    /// single-disk shape, slot 0). `Some("cidata")` = cloud-init
+    /// NoCloud seed (#82). Other values are user-named data disks.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -441,6 +458,10 @@ mod tests {
                 idx: 0,
                 state: L2CpuState::Running,
                 disk: Some("rootfs-0.ext4".into()),
+                disks: vec![DiskAttach {
+                    path: "rootfs-0.ext4".into(),
+                    name: None,
+                }],
                 net: true,
                 virtio_console: true,
                 clients: 1,

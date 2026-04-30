@@ -269,6 +269,19 @@ pub fn status(card: u32) -> io::Result<()> {
                         "  l2cpu {}: {:?} disk={} net={} vconsole={} clients={}",
                         l.idx, l.state, disk, net, vc, l.clients
                     );
+                    // Per-disk lines for everything beyond the
+                    // primary rootfs (already printed above as
+                    // `disk=`). Most commonly the cloud-init seed
+                    // (#82, #115); also any data disks added via
+                    // `bhx add-disk`.
+                    for d in l.disks.iter().skip(1) {
+                        let label = match d.name.as_deref() {
+                            Some("cidata") => "cloud-init seed",
+                            Some(other) => other,
+                            None => "data disk",
+                        };
+                        println!("    + {}: {}", label, d.path);
+                    }
                 }
                 Ok(())
             }
