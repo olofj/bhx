@@ -79,7 +79,7 @@ L2CPU 0:
 ```bash
 bhx image pull debian-13
 bhx daemon start
-bhx boot -l 0 -d ~/.local/share/bhx/images/debian-13.img -n -a
+bhx boot -l 0 -i debian-13 -n -a
 ```
 
 What each step does:
@@ -93,11 +93,14 @@ What each step does:
    no-op (pass `--refetch` to force).
 2. `daemon start` forks the per-card daemon. Owns the chip;
    everything else is RPC.
-3. `boot -l 0 -d ~/.local/share/bhx/images/debian-13.img -n -a`:
+3. `boot -l 0 -i debian-13 -n -a`:
    - `-l 0` selects L2CPU 0.
-   - `-d` points at the disk; the daemon notices it's a whole-disk
-     image and auto-selects the U-Boot + EFI boot path (uses the
-     `u-boot.bin` from the search path described above).
+   - `-i debian-13` looks the registry name up and resolves to the
+     canonical pulled path (`-d <path>` works too if you want to
+     point at a custom disk image outside the canonical tree). The
+     daemon notices it's a whole-disk image and auto-selects the
+     U-Boot + EFI boot path (uses the `u-boot.bin` from the search
+     path described above).
    - `-n` enables slirp networking — TCP 2222 on the host forwards to
      port 22 in the guest, so `ssh -p 2222 bhx@localhost` works once
      cloud-init has finished its first-boot run.

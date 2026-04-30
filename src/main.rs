@@ -74,9 +74,19 @@ struct Cli {
     #[arg(short = 'l', long = "l2cpu", default_value = "0", global = true)]
     l2cpu: String,
 
-    /// Path to disk image (defaults to rootfs.ext4 if present)
+    /// Path to disk image (defaults to rootfs.ext4 if present).
+    /// Mutually exclusive with `--image`.
     #[arg(short = 'd', long = "disk", global = true)]
     disk: Option<String>,
+
+    /// Boot a registry image by name (e.g. `debian-13`,
+    /// `fedora-42`). Resolves to the canonical pulled location
+    /// (`$XDG_DATA_HOME/bhx/images/<name>.<ext>`) so an operator
+    /// doesn't have to remember or type the full path. The image
+    /// must have been pulled first via `bhx image pull <name>`.
+    /// Mutually exclusive with `--disk`.
+    #[arg(short = 'i', long = "image", global = true, conflicts_with = "disk")]
+    image: Option<String>,
 
     /// Enable virtio-net (requires the slirp feature)
     #[arg(short = 'n', long = "network", global = true)]
@@ -689,6 +699,39 @@ fn resolve_disk_path(
 /// path that `make -C third_party/uboot` produces). If neither
 /// exists, uses `third_party/uboot/u-boot.bin` so the daemon-side
 /// error names a concrete path.
+/// Resolve a `--image <name>` reference to the canonical on-disk
+/// path. Looks up `name` in the registry (so aliases like
+/// `debian` → `debian-13` work), derives the canonical artifact
+/// filename via the registry's format flags, and confirms the
+/// file actually exists. Errors if the image is unknown or hasn't
+/// been pulled yet, so the operator gets an actionable message
+/// instead of a downstream "no such file" from the boot path.
+fn resolve_image_name(name: &str) -> std::io::Result<String> {
+    let img = image::get_known_image(name).ok_or_else(|| {
+        crate::Error::bad_request(format!(
+            "unknown image '{}' — see `bhx image list` for available names",
+            name
+        ))
+    })?;
+    let ext = if image::is_single_fs_artifact(img) {
+        "ext4"
+    } else {
+        "img"
+    };
+    let path = image::image_dir().join(format!("{}.{}", img.name, ext));
+    if !path.exists() {
+        return Err(crate::Error::bad_request(format!(
+            "image '{}' not pulled yet — run `bhx image pull {}` first \
+             (expected at {})",
+            name,
+            img.name,
+            path.display()
+        ))
+        .into());
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
 fn default_boot_payload(disk: Option<&str>) -> daemon::protocol::BootPayload {
     if let Some(d) = disk {
         if let Some(img) = image::known_image_for_disk(std::path::Path::new(d)) {
@@ -785,6 +828,16 @@ fn main() -> std::process::ExitCode {
             no_cidata,
         }) => {
             let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
+            // `--image <name>` is a registry-name shortcut: resolve
+            // it to the canonical pulled path and feed the rest of
+            // the boot flow as if the operator had typed
+            // `--disk <full-path>`. clap's `conflicts_with = "disk"`
+            // already enforces mutual exclusion.
+            let disk_arg: Option<String> = match (cli.image.as_deref(), cli.disk) {
+                (Some(_), Some(_)) => unreachable!("clap conflicts_with"),
+                (Some(name), None) => Some(resolve_image_name(name)?),
+                (None, d) => d,
+            };
             if let Some(profile_name) = profile {
                 run_boot_via_profile(
                     card,
@@ -796,7 +849,7 @@ fn main() -> std::process::ExitCode {
                     root_device,
                     force_reset_pcie,
                     force,
-                    cli.disk.as_deref(),
+                    disk_arg.as_deref(),
                     cli.network,
                 )?;
                 if attach {
@@ -805,7 +858,7 @@ fn main() -> std::process::ExitCode {
                 return Ok(());
             }
             let disk = resolve_disk_path(
-                cli.disk,
+                disk_arg,
                 DEFAULT_DISK_PATH,
                 std::path::Path::new(DEFAULT_DISK_PATH).exists(),
             );
