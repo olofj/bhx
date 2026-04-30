@@ -64,14 +64,24 @@ Build flags pinned in `Makefile`:
   boot. Useful when triaging "is the firmware actually rebuilt"
   questions over the chip console.
 
-## Why upstream OpenSBI, not the Tenstorrent fork
+## Why upstream OpenSBI plus a Tenstorrent patch
 
 `tt-bh-linux` builds OpenSBI from `github.com/tenstorrent/opensbi`
-branch `tt-blackhole`. As of v1.7 that branch carries a single commit
-on top of upstream — a CI workflow file. There are zero functional
-patches against the C source, so we pin upstream `riscv-software-src/opensbi`
-v1.7 directly. If patches accumulate later, drop `*.patch` files in
-`patches/` and the Makefile picks them up alphabetically.
+branch `tt-blackhole`. As of v1.7 the functional delta against
+upstream is one feature: a `debug_descriptor` placed at a fixed
+offset (0x80) of `fw_jump.bin` plus a virtual-UART driver that
+reads/writes through it. The daemon's chip-side console pump
+(`src/daemon/chip_console.rs`) probes that descriptor on warm-resume
+to recover a still-running L2CPU's UART base, so this patch is
+load-bearing — without it `daemon stop` + `daemon start` against a
+live core can't re-adopt the slot and reports `Wedged`.
+
+Rather than vendoring the entire `tt-blackhole` branch, we pin
+upstream `riscv-software-src/opensbi` v1.7 and apply the
+Tenstorrent diff as `patches/0001-tenstorrent-debug-descriptor-
+virtual-uart.patch`. The Makefile picks up any `*.patch` in that
+directory in alphabetical order, idempotently (`patch -N`), so
+adding more later is drop-in.
 
 ## Bumping OpenSBI
 

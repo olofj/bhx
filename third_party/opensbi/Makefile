@@ -12,11 +12,12 @@
 # FW_JUMP_FDT_OFFSET (+0x10_0000). Those offsets match the addresses
 # in `boot::OPENSBI_OFFSET` + `boot_image::*_OFFSET` on the Rust side.
 #
-# Tenstorrent maintains a `tt-blackhole` branch on their opensbi fork,
-# but as of v1.7 it carries only a CI workflow on top of upstream —
-# zero functional changes. So we pin upstream directly. If patches
-# accumulate later, drop them in patches/ and the build picks them up
-# (alphabetical order, idempotent).
+# Tenstorrent maintains a `tt-blackhole` branch on their opensbi fork.
+# Its functional delta against upstream (v1.7) is the debug_descriptor
+# at offset 0x80 of fw_jump.bin plus a virtual-UART driver — load-
+# bearing for daemon warm-resume (chip_console::probe_warm_resume).
+# We pin upstream and apply the Tenstorrent diff as a patch in
+# patches/. The build applies *.patch alphabetically, idempotently.
 #
 # Usage:
 #   make             # download + verify + build fw_jump.bin
