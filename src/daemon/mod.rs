@@ -195,13 +195,32 @@ impl DaemonState {
         // unwinding from a panic, so just skip the PLL step rather than
         // propagating. Either path leaves the chip in a recoverable state
         // because the next reset_x280 unconditionally steps the PLL up.
+        //
+        // Both predicates have to hold:
+        //   1. No daemon-side slot is alive (no workers polling chip
+        //      state at 1750 MHz).
+        //   2. No L2CPU has its release bit set on `L2CPU_RESET`.
+        //      Stepping the PLL while a core is mid-execution corrupts
+        //      its OpenSBI state — symptomatic on `daemon stop` (which
+        //      tears down workers but leaves the core released) where
+        //      the next warm-resume's OSBIdbug eye-catcher probe came
+        //      back as 0xbd instead of 0x4f. See #95 + soak hardware
+        //      runs after #93.
         let any_booted = self
             .l2cpus
             .iter()
             .any(|m| m.lock().map(|g| g.is_some()).unwrap_or(true));
-        if !any_booted {
-            self.shared_chip.idle_pll();
+        if any_booted {
+            return;
         }
+        for idx in 0..4usize {
+            match self.shared_chip.l2cpu_is_running(idx) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(_) => return, // chip access failed — be conservative.
+            }
+        }
+        self.shared_chip.idle_pll();
     }
 
     /// Build daemon state with a ready-made `SharedChip`. The server
