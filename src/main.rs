@@ -2528,6 +2528,7 @@ fn cmd_cloud_init_seed(
         ssh_keys,
         hostname,
         instance_id,
+        nameservers: Vec::new(),
         extra_user_data: extra,
     };
 

@@ -35,6 +35,18 @@ pub const DEFAULT_USER: &str = "bhx";
 /// `password` as `None` to keep the account key-only.
 pub const DEFAULT_PASSWORD: &str = "bhx";
 
+/// Default DNS resolver baked into the seed when [`SeedSpec::nameservers`]
+/// is empty. Slirp's built-in DNS proxy at `10.0.2.3` forwards to
+/// the host's `/etc/resolv.conf`; on hosts where resolv.conf points
+/// at a host-only IP (Tailscale MagicDNS at `100.100.100.100`,
+/// dnsmasq, etc.) slirp's NAT can't reach the target and DNS dies.
+/// Pointing the guest's resolv.conf at `8.8.8.8` directly sidesteps
+/// the proxy: queries go through slirp's normal UDP NAT to the
+/// public internet. Operators who actually want host-DNS forwarding
+/// (split-horizon zones, internal corp resolvers) supply their own
+/// seed via `--cloud-init <path>`.
+pub const DEFAULT_NAMESERVER: &str = "8.8.8.8";
+
 /// User-supplied parameters for a NoCloud seed image. Fields default
 /// to "sensible for a dev box" so a bare
 /// `SeedSpec::default().write_iso(out)` produces a working image.
@@ -60,6 +72,24 @@ pub struct SeedSpec {
     /// at write time so re-imaging the rootfs without rebuilding
     /// the seed re-runs everything.
     pub instance_id: Option<String>,
+    /// DNS resolvers the guest should use. Empty = bake the
+    /// [`DEFAULT_NAMESERVER`] (`8.8.8.8`). Emitted as a `bootcmd`
+    /// that replaces `/etc/resolv.conf` (which on Debian/Ubuntu/
+    /// Fedora is a symlink to `/run/systemd/resolve/stub-resolv.conf`
+    /// pointing at systemd-resolved's `127.0.0.53` stub) with a
+    /// plain file containing the configured nameservers. This
+    /// detaches glibc's resolver from systemd-resolved's stub —
+    /// stub forwarding fails when slirp's DNS proxy at `10.0.2.3`
+    /// can't reach the host's resolv.conf target (Tailscale,
+    /// dnsmasq), but a direct nameserver entry takes the normal
+    /// slirp UDP NAT path which works.
+    ///
+    /// `bootcmd` runs on every boot before networkd brings up
+    /// interfaces, so it survives DHCP renewals that would
+    /// otherwise let the symlink reappear. systemd-resolved keeps
+    /// running for any service that talks to it explicitly; we just
+    /// stop glibc's default lookup path from going through it.
+    pub nameservers: Vec<String>,
     /// Extra cloud-config YAML to merge with the generated user-data.
     /// Concatenated verbatim after the auto-generated stanzas; the
     /// caller is responsible for keeping it valid YAML. Useful for
@@ -121,6 +151,25 @@ impl SeedSpec {
                 s.push_str(&format!("      - \"{}\"\n", key.trim()));
             }
         }
+
+        // Detach /etc/resolv.conf from systemd-resolved's stub so
+        // glibc lookups bypass the broken slirp DNS proxy at
+        // 10.0.2.3 (which fails on Tailscale hosts) and go through
+        // slirp's normal UDP NAT to the configured nameservers.
+        // `bootcmd` runs every boot before networkd brings up
+        // interfaces, so a DHCP renewal can't re-establish the
+        // systemd-resolved symlink on subsequent boots.
+        let nameservers: Vec<&str> = if self.nameservers.is_empty() {
+            vec![DEFAULT_NAMESERVER]
+        } else {
+            self.nameservers.iter().map(String::as_str).collect()
+        };
+        s.push_str("bootcmd:\n");
+        s.push_str("  - [ sh, -c, 'rm -f /etc/resolv.conf && (\n");
+        for ns in &nameservers {
+            s.push_str(&format!("      echo nameserver {}\n", ns));
+        }
+        s.push_str("    ) > /etc/resolv.conf' ]\n");
 
         if let Some(extra) = &self.extra_user_data {
             // Caller's responsibility to keep extras valid YAML.
