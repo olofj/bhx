@@ -196,13 +196,14 @@ impl TensixEngine {
 
         eprintln!(
             "[tensix-engine] up on card {} tile NOC0 ({}, {}), translated ({}, {}); \
-             firmware version {:#010x}, protocol version {}",
+             firmware version {:#010x} (build_id {:#08x}, protocol v{})",
             card,
             picked.x,
             picked.y,
             translated_x,
             translated_y,
             firmware_version,
+            (firmware_version >> 8) & 0x00ff_ffff,
             protocol_version,
         );
 
@@ -282,14 +283,34 @@ impl TensixEngine {
         }
         let firmware_version = tile.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_VERSION);
         // Firmware encodes BRISC_VIRTIO_FW_VERSION as
-        // 0x000601<protocol>; the low byte tracks TENSIX_PROTOCOL_VERSION.
-        // A daemon built against a different protocol than what's
-        // currently resident in BRISC L1 will read shadow state from
-        // the wrong offset (#81 moved SHADOW_BASE), silently drop
-        // every kick, and the operator gets a "Device 0: unknown
-        // device" from U-Boot. Refuse to adopt and force a fresh
-        // firmware load instead.
+        // `<build_id 24-bit><protocol 8-bit>`. The low byte tracks
+        // `TENSIX_PROTOCOL_VERSION` (the wire-format protocol), the
+        // upper 24 bits are the build_id (git short hash / sha256
+        // prefix of firmware sources). The daemon refuses to adopt
+        // unless BOTH match — protocol mismatch is a wire-format
+        // break, build_id mismatch means the chip's firmware is from
+        // a different daemon build than ours and may have different
+        // behavior even at the same protocol version.
         let firmware_protocol = firmware_version & 0xff;
+        let firmware_build_id = (firmware_version >> 8) & 0x00ff_ffff;
+        let expected_build_id = ve::FW_BUILD_ID & 0x00ff_ffff;
+        // ALWAYS log what we found on the chip so the operator has a
+        // breadcrumb even when adoption succeeds, fails, or we end up
+        // having to reject mid-run with active L2CPUs (in which case
+        // the next cold-boot RPC's `bring_up` does the actual reload).
+        eprintln!(
+            "[tensix-engine] chip-side firmware on card {} tile NOC0 ({}, {}): \
+             version {:#010x} (build_id {:#08x}, protocol v{}); \
+             daemon embeds build_id {:#08x}, protocol v{}",
+            card,
+            picked.x,
+            picked.y,
+            firmware_version,
+            firmware_build_id,
+            firmware_protocol,
+            expected_build_id,
+            proto::PROTOCOL_VERSION,
+        );
         if firmware_protocol != proto::PROTOCOL_VERSION {
             return Err(crate::Error::internal(format!(
                 "BRISC firmware on tile ({}, {}) is protocol v{} but daemon expects v{} \
@@ -302,11 +323,20 @@ impl TensixEngine {
             ))
             .into());
         }
+        if firmware_build_id != expected_build_id {
+            return Err(crate::Error::internal(format!(
+                "BRISC firmware on tile ({}, {}) build_id {:#08x} != daemon's embedded build_id {:#08x} \
+                 (chip is running a stale firmware from a prior daemon build); \
+                 chip needs `tt-smi -r` to reload firmware",
+                picked.x, picked.y, firmware_build_id, expected_build_id
+            ))
+            .into());
+        }
         let protocol_version = firmware_protocol;
         eprintln!(
             "[tensix-engine] adopted running firmware on card {} tile NOC0 ({}, {}); \
-             firmware version {:#010x} (protocol v{})",
-            card, picked.x, picked.y, firmware_version, protocol_version,
+             build_id {:#08x}, protocol v{}",
+            card, picked.x, picked.y, firmware_build_id, protocol_version,
         );
         // Same as `bring_up`: republish the reservation. The previous
         // daemon may have left a stale file behind (or none, if it

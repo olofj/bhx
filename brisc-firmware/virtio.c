@@ -37,34 +37,31 @@
 #include "uart_layout.h"
 #include "virtio_layout.h"
 
-// Firmware version, inspected via the stats page. Bump for any
-// wire-protocol change between daemon ↔ BRISC. Format: 0xAABBCCDD
-// where AA=major, BB=minor, CC=patch, DD=reserved/build.
+// Firmware version, inspected via the stats page. Format:
+// `<build_id 24-bit><protocol 8-bit>`. Both sides verify a match
+// before adopting a running engine across a daemon restart.
 //
-// 0x00060001 — M6 (#78): adds 16550 UART (TX-only) on BRISC poll
-// 0x00060101 — M6.1 (#79) Phase A: TRISC0 skeleton + active-slots-
-//              driven reset lifecycle (BRISC owns TRISC0's soft-reset
-//              bit). UART poll still on BRISC at this step.
-// 0x00060102 — M6.1 (#79) Phase B (initial): UART poll moves to
-//              TRISC0; per-L2CPU SPSC byte-feed ring carries TX bytes
-//              from TRISC0 to BRISC, BRISC drains and re-emits to the
-//              kick ring. Hardware testing showed the kick ring (64 ×
-//              16-byte entries) overflowed during boot bursts → silent
-//              ring-overwrite drops downstream.
-// 0x00060103 — M6.1 (#79) Phase B (revised): daemon polls the per-
-//              L2CPU feed rings directly via the chip-side TLB; BRISC
-//              is no longer in the UART data path. Each ring slot is
-//              4 bytes (vs the kick entry's 16 bytes) so density is
-//              4× better, and there's one ring per L2CPU so they
-//              don't compete for capacity. Goes with TENSIX_PROTOCOL_
-//              VERSION = 3.
-//   v6.1.4 (#81) extends DEVS_PER_L2CPU from 4 to 8 (6 populated +
-//              2 padding for power-of-two modulo) and shifts the
-//              SHADOW region base from 0x20000 to 0x40000. A v6.1.3
-//              daemon talking to v6.1.4 firmware reads/writes shadow
-//              state at the wrong offset — the kick poller silently
-//              drops every kick. Goes with TENSIX_PROTOCOL_VERSION = 4.
-#define BRISC_VIRTIO_FW_VERSION 0x00060104u
+// `BRISC_VIRTIO_FW_BUILD_ID` is computed at compile time from
+// `git log` short hash of the firmware sources (clean tree) or a
+// sha256 prefix of the source bytes (dirty tree / no git). The
+// Makefile computes it; the daemon's `build.rs` recomputes the same
+// value and embeds it as a Rust const so adoption can compare. Any
+// change to firmware sources changes the build_id, which causes
+// `adopt_running` to refuse a stale chip-side firmware and force
+// `tt-smi -r` reload.
+//
+// `TENSIX_PROTOCOL_VERSION` is the explicit wire-format protocol
+// version, bumped only when the daemon↔BRISC byte layout changes.
+//
+// History (build_id era starts at TENSIX_PROTOCOL_VERSION = 4):
+//   * Pre-build_id versions used a hand-edited 0x000601XX layout.
+//     The protocol-version low byte was the only meaningful part;
+//     the upper bytes were arbitrary.
+#ifndef BRISC_VIRTIO_FW_BUILD_ID
+#define BRISC_VIRTIO_FW_BUILD_ID 0x00000000u
+#endif
+#define BRISC_VIRTIO_FW_VERSION  \
+    (((BRISC_VIRTIO_FW_BUILD_ID) << 8) | (TENSIX_PROTOCOL_VERSION & 0xFFu))
 
 #define FENCE_W() __asm__ volatile("fence w, w" ::: "memory")
 

@@ -38,6 +38,38 @@ CFLAGS := \
     -Iinclude \
     -std=c11
 
+# Firmware build identity (4 bytes embedded in `BRISC_VIRTIO_FW_VERSION`'s
+# upper 24 bits — the low byte stays `TENSIX_PROTOCOL_VERSION`). The
+# daemon's `adopt_running` path matches this against the chip's running
+# firmware to detect drift across daemon-binary updates: if the daemon
+# is rebuilt with new firmware sources but the chip's BRISC is still
+# running the prior build, adoption refuses and the operator gets a
+# clear error pointing at `tt-smi -r`.
+#
+# Algorithm: if the tree is clean against HEAD for our sources, use
+# `git log` short hash of the most-recent commit touching them.
+# Otherwise fall back to a sha256 prefix of the source bytes — that
+# also catches the no-git-checkout case (tarball builds, etc.) at the
+# cost of changing whenever any whitespace shifts. See #122 for the
+# tarball-build follow-up.
+FW_SOURCES := $(sort hello.c link.ld start.S virtio.c $(wildcard include/*.h))
+
+GIT_TREE_CLEAN := $(shell git diff --quiet HEAD -- $(FW_SOURCES) 2>/dev/null && \
+                          git diff --cached --quiet HEAD -- $(FW_SOURCES) 2>/dev/null && \
+                          echo yes)
+
+ifeq ($(GIT_TREE_CLEAN),yes)
+FW_BUILD_ID := $(shell git log -1 --pretty=format:%h --abbrev=6 -- $(FW_SOURCES) 2>/dev/null)
+else
+FW_BUILD_ID := $(shell cat $(FW_SOURCES) 2>/dev/null | sha256sum | head -c 6)
+endif
+
+ifeq ($(strip $(FW_BUILD_ID)),)
+FW_BUILD_ID := 000000
+endif
+
+CFLAGS += -DBRISC_VIRTIO_FW_BUILD_ID=0x$(FW_BUILD_ID)u
+
 OUT_DIR := build
 
 LDFLAGS_BASE := \
