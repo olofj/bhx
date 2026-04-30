@@ -31,6 +31,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -363,6 +364,170 @@ pub fn parse_memory_str(s: &str) -> Result<u64> {
     Ok((num * mult as f64) as u64)
 }
 
+// ============================================================================
+// Per-instance disks (#93)
+// ============================================================================
+
+/// Resolve `~/.local/share/bhx/instances`. Honors `$XDG_DATA_HOME`,
+/// falls back to `$HOME/.local/share`. Pure path construction.
+pub fn instances_dir() -> Result<PathBuf> {
+    let base = match std::env::var_os("XDG_DATA_HOME") {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => {
+            let home = std::env::var_os("HOME").ok_or_else(|| {
+                Error::internal(
+                    "neither XDG_DATA_HOME nor HOME set; can't locate instance disk dir",
+                )
+            })?;
+            PathBuf::from(home).join(".local").join("share")
+        }
+    };
+    Ok(base.join("bhx").join("instances"))
+}
+
+/// Per-(profile, l2cpu) instance directory. Each pair gets its own
+/// writable disk so two L2CPUs running the same profile in parallel
+/// don't trample each other's filesystem.
+pub fn instance_dir(profile_name: &str, l2cpu_idx: u8) -> Result<PathBuf> {
+    Ok(instances_dir()?.join(format!("{}-l{}", profile_name, l2cpu_idx)))
+}
+
+/// `disk.img` inside the instance directory. Test-time helper today;
+/// production code reaches the disk via `clone_template_if_missing`'s
+/// return value, so building without `--tests` sees this as unused.
+#[allow(dead_code)]
+pub fn instance_disk_path(profile_name: &str, l2cpu_idx: u8) -> Result<PathBuf> {
+    Ok(instance_dir(profile_name, l2cpu_idx)?.join("disk.img"))
+}
+
+/// `meta.json` inside the instance directory. Records the template
+/// the disk was cloned from so a future `profile reset` or staleness
+/// detector has the provenance to compare against.
+#[allow(dead_code)]
+pub fn instance_meta_path(profile_name: &str, l2cpu_idx: u8) -> Result<PathBuf> {
+    Ok(instance_dir(profile_name, l2cpu_idx)?.join("meta.json"))
+}
+
+/// Provenance for a cloned instance disk. Saved as `meta.json`
+/// alongside `disk.img`. The sha is recorded at clone time so a
+/// future operator running `bhx image pull <same>` to refresh the
+/// template can be warned that their instance disks are stale.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InstanceMeta {
+    pub template_path: String,
+    pub template_sha256_at_clone: Option<String>,
+    pub cloned_at_unix_secs: u64,
+}
+
+/// Read the instance's `meta.json`. Returns Ok(None) if the file is
+/// absent (no instance disk exists). Currently only the test exercise
+/// it; the field set is shaped for a future stale-template warning.
+#[allow(dead_code)]
+pub fn read_instance_meta(profile_name: &str, l2cpu_idx: u8) -> Result<Option<InstanceMeta>> {
+    let path = instance_meta_path(profile_name, l2cpu_idx)?;
+    let bytes = match fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(Error::Io {
+                ctx: format!("read {}", path.display()),
+                source: e,
+            })
+        }
+    };
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+fn write_instance_meta_to(path: &Path, meta: &InstanceMeta) -> Result<()> {
+    let json = serde_json::to_vec_pretty(meta)?;
+    fs::write(path, json).map_err(Error::io_ctx(format!("write {}", path.display())))?;
+    Ok(())
+}
+
+/// Clone `template` to `<instance_dir>/disk.img` if not already
+/// present. Records `meta.json` alongside the disk. Returns
+/// `(disk_path, was_cloned)` — `was_cloned == true` on the first
+/// invocation, false on subsequent ones (idempotent).
+///
+/// Phase A uses a plain `fs::copy`; #83 will replace it with a
+/// qcow2 backing-file overlay.
+pub fn clone_template_if_missing(
+    template_path: &Path,
+    profile_name: &str,
+    l2cpu_idx: u8,
+) -> Result<(PathBuf, bool)> {
+    let dir = instance_dir(profile_name, l2cpu_idx)?;
+    let disk = dir.join("disk.img");
+    let meta_path = dir.join("meta.json");
+    if disk.exists() {
+        return Ok((disk, false));
+    }
+    fs::create_dir_all(&dir).map_err(Error::io_ctx(format!("create dir {}", dir.display())))?;
+    if !template_path.exists() {
+        return Err(Error::bad_request(format!(
+            "template image {} not found; run `bhx image pull` first",
+            template_path.display()
+        )));
+    }
+    fs::copy(template_path, &disk).map_err(Error::io_ctx(format!(
+        "copy {} -> {}",
+        template_path.display(),
+        disk.display()
+    )))?;
+    let meta = InstanceMeta {
+        template_path: template_path.display().to_string(),
+        template_sha256_at_clone: None, // Hashing a 16 GiB file at every clone
+        // is wasteful; defer to a follow-up if staleness detection
+        // matters in practice (#83's qcow2 work makes the clone
+        // near-zero-cost and the hash cheap).
+        cloned_at_unix_secs: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    };
+    write_instance_meta_to(&meta_path, &meta)?;
+    Ok((disk, true))
+}
+
+/// Remove the instance directory(ies) for a profile. Returns the
+/// list of directories actually removed so the CLI can print a
+/// diagnostic. With `l2cpu_filter == None`, sweeps every
+/// `<profile>-l*/` directory in `instances_dir()`. With
+/// `Some(idx)`, only removes that one.
+pub fn reset_instances(profile_name: &str, l2cpu_filter: Option<u8>) -> Result<Vec<PathBuf>> {
+    let dir = instances_dir()?;
+    let mut removed = Vec::new();
+    if !dir.exists() {
+        return Ok(removed);
+    }
+    if let Some(idx) = l2cpu_filter {
+        let target = instance_dir(profile_name, idx)?;
+        if target.exists() {
+            fs::remove_dir_all(&target)
+                .map_err(Error::io_ctx(format!("remove {}", target.display())))?;
+            removed.push(target);
+        }
+        return Ok(removed);
+    }
+    // Sweep every <profile>-l<n> subdir.
+    for entry in fs::read_dir(&dir).map_err(Error::io_ctx(format!("read dir {}", dir.display())))? {
+        let entry = entry.map_err(Error::io_ctx("readdir entry"))?;
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if let Some((p_name, suffix)) = name.rsplit_once("-l") {
+            if p_name == profile_name && suffix.parse::<u8>().is_ok() {
+                let path = entry.path();
+                fs::remove_dir_all(&path)
+                    .map_err(Error::io_ctx(format!("remove {}", path.display())))?;
+                removed.push(path);
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// Pick the operator's preferred editor: `$VISUAL` → `$EDITOR` → `vi`.
 /// Plain string return so tests can inject without spawning anything.
 pub fn pick_editor() -> String {
@@ -461,6 +626,146 @@ mod tests {
     }
 
     // ---- ProfilesFile round-trip ----
+
+    /// Process-wide mutex serialising every test that mutates env
+    /// vars. `cargo test` runs tests in parallel by default and
+    /// `std::env::set_var` is globally visible — without this lock,
+    /// two tests setting `XDG_DATA_HOME` race and clobber each
+    /// other's tmpdir.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Override `$XDG_DATA_HOME` for the duration of a test so
+    /// `instances_dir()` lands inside our tempdir instead of the
+    /// operator's real `~/.local/share`. Holds `ENV_LOCK` for the
+    /// guard's lifetime.
+    struct DataHomeGuard {
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl DataHomeGuard {
+        fn set(value: &Path) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os("XDG_DATA_HOME");
+            unsafe {
+                std::env::set_var("XDG_DATA_HOME", value);
+            }
+            DataHomeGuard { prev, _lock: lock }
+        }
+    }
+
+    impl Drop for DataHomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                    None => std::env::remove_var("XDG_DATA_HOME"),
+                }
+            }
+        }
+    }
+
+    // ---- Per-instance disks (#93) ----
+
+    #[test]
+    fn instance_path_layout_includes_profile_and_l2cpu() {
+        let dir = tmp_dir();
+        let _g = DataHomeGuard::set(dir.path());
+        let path = instance_disk_path("alma-dev", 2).unwrap();
+        let expected = dir
+            .path()
+            .join("bhx")
+            .join("instances")
+            .join("alma-dev-l2")
+            .join("disk.img");
+        assert_eq!(path, expected);
+
+        let meta = instance_meta_path("alma-dev", 2).unwrap();
+        assert_eq!(meta, expected.parent().unwrap().join("meta.json"));
+    }
+
+    #[test]
+    fn clone_template_creates_disk_and_meta_first_time() {
+        let dir = tmp_dir();
+        let _g = DataHomeGuard::set(dir.path());
+        let template = dir.path().join("template.img");
+        fs::write(&template, b"template-bytes").unwrap();
+
+        let (disk, was_cloned) = clone_template_if_missing(&template, "alma", 0).unwrap();
+        assert!(was_cloned);
+        assert!(disk.exists());
+        assert_eq!(fs::read(&disk).unwrap(), b"template-bytes");
+
+        let meta = read_instance_meta("alma", 0).unwrap().unwrap();
+        assert_eq!(meta.template_path, template.display().to_string());
+        assert!(meta.cloned_at_unix_secs > 0);
+    }
+
+    #[test]
+    fn clone_template_is_idempotent_on_existing_disk() {
+        let dir = tmp_dir();
+        let _g = DataHomeGuard::set(dir.path());
+        let template = dir.path().join("template.img");
+        fs::write(&template, b"v1").unwrap();
+        let (disk, first) = clone_template_if_missing(&template, "alma", 0).unwrap();
+        assert!(first);
+        // Mutate the template — second call must NOT re-copy.
+        fs::write(&template, b"v2-different-bytes").unwrap();
+        let (_, second) = clone_template_if_missing(&template, "alma", 0).unwrap();
+        assert!(!second);
+        assert_eq!(fs::read(&disk).unwrap(), b"v1");
+    }
+
+    #[test]
+    fn clone_template_errors_when_template_missing() {
+        let dir = tmp_dir();
+        let _g = DataHomeGuard::set(dir.path());
+        let template = dir.path().join("does-not-exist.img");
+        let err = clone_template_if_missing(&template, "alma", 0).unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)));
+    }
+
+    #[test]
+    fn reset_instances_removes_only_matching_subdirs() {
+        let dir = tmp_dir();
+        let _g = DataHomeGuard::set(dir.path());
+        let template = dir.path().join("template.img");
+        fs::write(&template, b"x").unwrap();
+        clone_template_if_missing(&template, "alma", 0).unwrap();
+        clone_template_if_missing(&template, "alma", 1).unwrap();
+        clone_template_if_missing(&template, "debian", 0).unwrap();
+
+        let removed = reset_instances("alma", None).unwrap();
+        assert_eq!(removed.len(), 2);
+        // alma instances gone, debian survives.
+        assert!(!instance_dir("alma", 0).unwrap().exists());
+        assert!(!instance_dir("alma", 1).unwrap().exists());
+        assert!(instance_dir("debian", 0).unwrap().exists());
+    }
+
+    #[test]
+    fn reset_instances_with_l2cpu_filter_only_removes_one() {
+        let dir = tmp_dir();
+        let _g = DataHomeGuard::set(dir.path());
+        let template = dir.path().join("template.img");
+        fs::write(&template, b"x").unwrap();
+        clone_template_if_missing(&template, "alma", 0).unwrap();
+        clone_template_if_missing(&template, "alma", 1).unwrap();
+
+        let removed = reset_instances("alma", Some(0)).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(!instance_dir("alma", 0).unwrap().exists());
+        assert!(instance_dir("alma", 1).unwrap().exists());
+    }
+
+    #[test]
+    fn reset_instances_on_missing_dir_is_noop() {
+        let dir = tmp_dir();
+        let _g = DataHomeGuard::set(dir.path());
+        // No instances dir exists yet.
+        let removed = reset_instances("alma", None).unwrap();
+        assert!(removed.is_empty());
+    }
 
     #[test]
     fn empty_profiles_file_round_trips() {
@@ -636,6 +941,7 @@ mod tests {
 
     #[test]
     fn pick_editor_prefers_visual_then_editor_then_vi() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Save + restore env so test order doesn't leak state.
         let prev_visual = std::env::var_os("VISUAL");
         let prev_editor = std::env::var_os("EDITOR");

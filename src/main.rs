@@ -80,10 +80,6 @@ struct Cli {
     /// Enable virtio-net (requires the slirp feature)
     #[arg(short = 'n', long = "network", global = true)]
     network: bool,
-
-    /// Path to cloud-init image (optional)
-    #[arg(short = 'c', long = "cloud-init", global = true)]
-    cloud_init: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -190,6 +186,22 @@ enum Commands {
         /// re-images so SSH known_hosts caches.
         #[arg(long = "hostname", value_parser = parse_hostname)]
         hostname: Option<String>,
+        /// Boot a saved profile (#93).
+        ///
+        /// Resolves `<name>` against `~/.config/bhx/profiles.yaml`,
+        /// clones the profile's image template into a per-(profile,
+        /// l2cpu) writable disk under `~/.local/share/bhx/instances/`
+        /// on first boot, and translates the profile's other fields
+        /// into the equivalent inline flags. Mutually exclusive with
+        /// `--kernel`, `--uboot`, `--memory`, and `--hostname`. When
+        /// `-c` is set, the global `-d/--disk` and `-n/--network`
+        /// flags are ignored — the profile owns those.
+        #[arg(
+            short = 'c',
+            long = "profile",
+            conflicts_with_all = ["kernel", "uboot", "memory", "hostname"],
+        )]
+        profile: Option<String>,
     },
     /// Attach a terminal to a booted L2CPU's console via the daemon.
     Connect {
@@ -527,12 +539,22 @@ enum ProfileAction {
     },
     /// Remove a profile from the catalog.
     ///
-    /// Phase A (#92): only removes the YAML stanza. Per-instance
-    /// disks (the `~/.local/share/bhx/instances/<name>-l<idx>/`
-    /// directories) are left in place — `bhx profile reset` lands in
-    /// #93 and will offer to clean them up.
+    /// Removes the YAML stanza. Per-instance disks under
+    /// `~/.local/share/bhx/instances/<name>-l*/` are left in place —
+    /// run `bhx profile reset <name>` first if you want them gone.
     Rm {
         /// Profile name to remove.
+        name: String,
+    },
+    /// Delete instance disks for a profile (next boot re-clones).
+    ///
+    /// Without `-l`, sweeps every L2CPU's instance directory for the
+    /// profile. With `-l <idx>`, only that one. The profile's YAML
+    /// stanza is left in place; only the writable copy(s) get
+    /// removed. Useful when the template has been re-pulled or the
+    /// guest's filesystem has drifted in a way you want to undo.
+    Reset {
+        /// Profile name to reset.
         name: String,
     },
 }
@@ -617,7 +639,28 @@ fn main() -> std::process::ExitCode {
             attach,
             memory,
             hostname,
+            profile,
         }) => {
+            let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
+            if let Some(profile_name) = profile {
+                run_boot_via_profile(
+                    card,
+                    l2cpu,
+                    &profile_name,
+                    opensbi,
+                    dtb,
+                    initramfs,
+                    root_device,
+                    force_reset_pcie,
+                    force,
+                    cli.disk.as_deref(),
+                    cli.network,
+                )?;
+                if attach {
+                    run_connect_client(card, l2cpu, daemon::protocol::ConsoleMode::Rw)?;
+                }
+                return Ok(());
+            }
             let disk = resolve_disk_path(
                 cli.disk,
                 DEFAULT_DISK_PATH,
@@ -636,7 +679,6 @@ fn main() -> std::process::ExitCode {
                 (Some(p), None) => daemon::protocol::BootPayload::Kernel(p),
                 (None, None) => default_boot_payload(disk.as_deref()),
             };
-            let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
             run_boot_client(
                 card,
                 l2cpu,
@@ -741,6 +783,20 @@ fn main() -> std::process::ExitCode {
             ProfileAction::List => cmd_profile_list(),
             ProfileAction::Show { name } => cmd_profile_show(&name),
             ProfileAction::Rm { name } => cmd_profile_rm(&name),
+            ProfileAction::Reset { name } => {
+                // `-l` is the global L2CPU locator. With `-l <plain
+                // N>` it scopes to one l2cpu; with the unset/default
+                // locator we still got `Some((card, 0))` back, so
+                // distinguish "user didn't set -l" from "user said
+                // -l 0" by checking the raw locator string.
+                let l2cpu_filter =
+                    if cli.l2cpu == "0" && std::env::args().all(|a| a != "-l" && a != "--l2cpu") {
+                        None
+                    } else {
+                        Some(resolve_target(&cli.l2cpu, cli.ttdevice)?.1)
+                    };
+                cmd_profile_reset(&name, l2cpu_filter)
+            }
         },
         Some(Commands::Debug { action }) => {
             let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
@@ -2238,13 +2294,178 @@ fn cmd_profile_rm(name: &str) -> std::io::Result<()> {
     }
     profile::save_profiles_to(&profiles, &path)?;
     eprintln!("profile {:?} removed", name);
-    eprintln!(
-        "(Phase A: per-instance disks under \
-         ~/.local/share/bhx/instances/{}-l*/ are NOT removed; \
-         clean those up manually until #93 lands `profile reset`.)",
-        name
-    );
+    // Surface any instance disks that survived. The operator can
+    // `bhx profile reset <name>` to clear them — they're now
+    // disconnected from any catalog entry.
+    if let Ok(dir) = profile::instances_dir() {
+        let mut leftover: Vec<String> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Ok(n) = entry.file_name().into_string() {
+                    if let Some((p, suffix)) = n.rsplit_once("-l") {
+                        if p == name && suffix.parse::<u8>().is_ok() {
+                            leftover.push(n);
+                        }
+                    }
+                }
+            }
+        }
+        if !leftover.is_empty() {
+            eprintln!(
+                "note: instance disks left in {}: {}",
+                dir.display(),
+                leftover.join(", ")
+            );
+            eprintln!("  remove them with: bhx profile reset {}", name);
+        }
+    }
     Ok(())
+}
+
+/// Delete the instance disk(s) for a profile.
+fn cmd_profile_reset(name: &str, l2cpu_filter: Option<u8>) -> std::io::Result<()> {
+    profile::validate_profile_name(name)?;
+    let removed = profile::reset_instances(name, l2cpu_filter)?;
+    if removed.is_empty() {
+        match l2cpu_filter {
+            Some(idx) => eprintln!("no instance disk for {:?} on l2cpu {}", name, idx),
+            None => eprintln!("no instance disks for {:?}", name),
+        }
+    } else {
+        for p in &removed {
+            eprintln!("removed {}", p.display());
+        }
+    }
+    Ok(())
+}
+
+/// Profile-driven boot. Compiles the named profile into the same
+/// arguments `run_boot_client` takes, then delegates. Honors the
+/// global `-d/--disk` (override the cloned instance disk) and
+/// `-n/--network` (force-on even if the profile has it disabled,
+/// since `--network` is presence-only) flags.
+#[allow(clippy::too_many_arguments)]
+fn run_boot_via_profile(
+    card: u32,
+    l2cpu: u8,
+    name: &str,
+    opensbi: String,
+    dtb: String,
+    initramfs: Option<String>,
+    root_device: String,
+    force_reset_pcie: bool,
+    force: bool,
+    cli_disk: Option<&str>,
+    cli_network: bool,
+) -> std::io::Result<()> {
+    let profiles = profile::load_profiles()?;
+    let p = profiles.profiles.get(name).ok_or_else(|| {
+        crate::Error::bad_request(format!(
+            "no such profile {:?}; run `bhx profile list` for available",
+            name
+        ))
+    })?;
+    profile::validate_profile(name, p)?;
+    let img = image::get_known_image(&p.image).ok_or_else(|| {
+        crate::Error::internal(format!(
+            "profile {:?}: image {:?} validates but didn't resolve",
+            name, p.image
+        ))
+    })?;
+
+    // Locate the template the operator pulled. `bhx image pull` lands
+    // artifacts at `images/<name>.<ext>` — re-derive the filename here.
+    let ext = if img.needs_bootloader { "img" } else { "ext4" };
+    let template = std::path::PathBuf::from(format!("images/{}.{}", img.name, ext));
+
+    // Clone-or-reuse the instance disk. cli_disk overrides the
+    // clone (operator wants to point at a different writable file).
+    let (disk_path, was_cloned) = match cli_disk {
+        Some(d) => (std::path::PathBuf::from(d), false),
+        None => profile::clone_template_if_missing(&template, name, l2cpu)?,
+    };
+    if was_cloned {
+        eprintln!(
+            "profile {}: cloned {} -> {}",
+            name,
+            template.display(),
+            disk_path.display()
+        );
+    }
+
+    // Pick the boot payload. Profile bootloader override wins; else
+    // image's needs_bootloader; else direct-kernel.
+    let payload = match p.bootloader.as_deref() {
+        Some("uboot") => daemon::protocol::BootPayload::Uboot(default_uboot_path()),
+        Some("kernel") => daemon::protocol::BootPayload::Kernel("Image".to_string()),
+        Some(other) => {
+            return Err(crate::Error::bad_request(format!(
+                "profile {:?}: invalid bootloader {:?}",
+                name, other
+            ))
+            .into());
+        }
+        None => {
+            if img.needs_bootloader {
+                daemon::protocol::BootPayload::Uboot(default_uboot_path())
+            } else {
+                daemon::protocol::BootPayload::Kernel("Image".to_string())
+            }
+        }
+    };
+
+    let memory_override = match &p.memory {
+        Some(s) => Some(profile::parse_memory_str(s)?),
+        None => None,
+    };
+    let hostname_override = p.network.hostname.clone();
+    let mut fwd: Vec<(u16, u16)> = Vec::new();
+    for raw in &p.network.forwards {
+        // The schema is operator-readable strings; profile
+        // validation already accepted them, so unwrap_or here is
+        // belt-and-braces.
+        let (h_str, g_str) = raw.split_once(':').ok_or_else(|| {
+            crate::Error::internal(format!("profile {}: post-validate parse: {:?}", name, raw))
+        })?;
+        let h: u16 = h_str.parse().map_err(|_| {
+            crate::Error::internal(format!("profile {}: post-validate parse h", name))
+        })?;
+        let g: u16 = g_str.parse().map_err(|_| {
+            crate::Error::internal(format!("profile {}: post-validate parse g", name))
+        })?;
+        fwd.push((h, g));
+    }
+
+    // Profile network setting + cli_network: union (positive). The
+    // CLI flag is presence-only so a passed `-n` plus a profile
+    // with network disabled still enables network. Warn when they
+    // disagree.
+    let network = p.network.enabled || cli_network;
+    if cli_network && !p.network.enabled {
+        eprintln!(
+            "note: profile {} has network disabled, but -n was passed; enabling for this boot",
+            name
+        );
+    }
+
+    run_boot_client(
+        card,
+        l2cpu,
+        opensbi,
+        payload,
+        dtb,
+        initramfs.or_else(|| p.initramfs.clone()),
+        root_device,
+        force_reset_pcie,
+        Some(disk_path.display().to_string()),
+        network,
+        fwd,
+        p.console.virtio,
+        p.console.rng,
+        force,
+        memory_override,
+        hostname_override,
+    )
 }
 
 #[cfg(test)]
