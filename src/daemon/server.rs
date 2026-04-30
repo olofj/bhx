@@ -323,6 +323,8 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             console,
             rng,
             force,
+            memory_override,
+            hostname_override,
         } => dispatch_boot(
             &sock,
             &state,
@@ -339,6 +341,8 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             console,
             rng,
             force,
+            memory_override,
+            hostname_override,
         ),
         Request::AttachConsole { l2cpu, mode } => {
             dispatch_attach_console(&sock, &state, l2cpu, mode)
@@ -604,6 +608,8 @@ fn dispatch_boot(
     console: bool,
     rng: bool,
     force: bool,
+    memory_override: Option<u64>,
+    hostname_override: Option<String>,
 ) -> crate::Result<()> {
     // U-Boot mode reads kernel + initrd from disk at runtime, so the
     // daemon's preloaded initramfs would be unreachable. Reject up
@@ -617,8 +623,8 @@ fn dispatch_boot(
         initramfs
     };
     dlog!(
-        "[boot l2cpu {}] dispatch_boot entry: opensbi={} payload={:?} dtb={} initramfs={:?} root={} force_reset_pcie={} disk={:?} network={} console={} rng={} force={}",
-        l2cpu_idx, opensbi, payload, dtb, initramfs, root_device, force_reset_pcie, disk, network, console, rng, force
+        "[boot l2cpu {}] dispatch_boot entry: opensbi={} payload={:?} dtb={} initramfs={:?} root={} force_reset_pcie={} disk={:?} network={} console={} rng={} force={} mem_override={:?} hostname_override={:?}",
+        l2cpu_idx, opensbi, payload, dtb, initramfs, root_device, force_reset_pcie, disk, network, console, rng, force, memory_override, hostname_override
     );
     validate_l2cpu(l2cpu_idx)?;
     handle_existing_slot(state, l2cpu_idx, force).map_err(crate::Error::slot_state)?;
@@ -643,6 +649,7 @@ fn dispatch_boot(
         network,
         console,
         rng,
+        memory_override,
     )
     .map_err(|e| {
         dlog!("[boot l2cpu {}] boot sequence failed: {}", l2cpu_idx, e);
@@ -789,7 +796,12 @@ fn dispatch_boot(
                 let ssh_port = crate::regs::slirp::ssh_port(state.card, l2cpu_idx);
                 let mut forwards = vec![(ssh_port, 22u16)];
                 forwards.extend(extra_fwd.iter().copied());
-                match crate::virtio::network::VirtioNet::new(&forwards, state.card, l2cpu_idx) {
+                match crate::virtio::network::VirtioNet::new(
+                    &forwards,
+                    state.card,
+                    l2cpu_idx,
+                    hostname_override.as_deref(),
+                ) {
                     Ok(net) => {
                         register(
                             dev_slot(crate::virtio_engine::DEV_NET),
@@ -963,12 +975,34 @@ fn run_boot_sequence(
     has_network: bool,
     has_console: bool,
     has_rng: bool,
+    memory_override: Option<u64>,
 ) -> io::Result<BootArtifacts> {
     use crate::regs::boot_image;
 
     let card = state.card;
     let starting_address = crate::l2cpu::L2CPU_STARTING_ADDRESS[l2cpu_idx as usize];
-    let memory_size = crate::l2cpu::L2CPU_MEMORY_SIZE[l2cpu_idx as usize];
+    let physical_size = crate::l2cpu::L2CPU_MEMORY_SIZE[l2cpu_idx as usize];
+    // #91: clamp the operator's override to the L2CPU's physical DRAM
+    // size so a too-large value can't drive the guest into MMIO space.
+    // Round down to a 2 MiB page boundary so the reservation math at
+    // mem_end stays aligned.
+    let memory_size = match memory_override {
+        Some(req) => {
+            let aligned = req & !((2 * 1024 * 1024) - 1);
+            let clamped = aligned.min(physical_size);
+            if clamped != req {
+                dlog!(
+                    "[run_boot l2cpu {}] memory override {:#x} clamped to {:#x} (physical {:#x})",
+                    l2cpu_idx,
+                    req,
+                    clamped,
+                    physical_size
+                );
+            }
+            clamped
+        }
+        None => physical_size,
+    };
 
     let opensbi_addr = starting_address + boot_image::OPENSBI_OFFSET;
     let kernel_addr = starting_address + boot_image::KERNEL_OFFSET;
@@ -1645,7 +1679,9 @@ fn dispatch_add_net(
 
     {
         if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
-            match crate::virtio::network::VirtioNet::new(&forwards, state.card, l2cpu_idx) {
+            // add-net is a hot-add post-boot path: no profile-pinned
+            // hostname here; `format_dhcp_hostname` is fine.
+            match crate::virtio::network::VirtioNet::new(&forwards, state.card, l2cpu_idx, None) {
                 Ok(net) => {
                     let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
                         + crate::virtio_engine::DEV_NET;

@@ -262,8 +262,21 @@ impl VirtioNet {
     /// `card` + `l2cpu_idx` are used to derive a stable MAC via
     /// [`derive_mac`] that is published in config space and announced
     /// via `VIRTIO_NET_F_MAC`.
-    pub fn new(forwards: &[(u16, u16)], card: u32, l2cpu_idx: u8) -> std::io::Result<Self> {
-        let hostname = std::ffi::CString::new(format_dhcp_hostname(card, l2cpu_idx))
+    ///
+    /// `hostname_override` (#91) replaces the derived
+    /// `format_dhcp_hostname(card, l2cpu_idx)` value when set —
+    /// profile-pinned hostnames so a guest's SSH known_hosts caches
+    /// across re-images. Passed verbatim to the slirp DHCP server;
+    /// the caller is responsible for RFC-952 validation.
+    pub fn new(
+        forwards: &[(u16, u16)],
+        card: u32,
+        l2cpu_idx: u8,
+        hostname_override: Option<&str>,
+    ) -> std::io::Result<Self> {
+        let hostname_str =
+            hostname_override.map_or_else(|| format_dhcp_hostname(card, l2cpu_idx), str::to_string);
+        let hostname = std::ffi::CString::new(hostname_str)
             .expect("hostname is plain ASCII, no embedded NULs");
         let mut cfg: SlirpConfig = unsafe { std::mem::zeroed() };
         unsafe {

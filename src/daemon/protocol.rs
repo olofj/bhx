@@ -79,6 +79,21 @@ pub enum Request {
         /// Default false → duplicate boots are rejected with an error.
         #[serde(default)]
         force: bool,
+        /// Override the L2CPU's DRAM size advertised in `/memory`'s reg
+        /// property (#91). Bytes; `None` means "use the L2CPU's
+        /// physical size from `L2CPU_MEMORY_SIZE`". Clamped to the
+        /// physical max so a misconfiguration can't make the guest
+        /// allocate past the end of its DRAM. Older clients omit the
+        /// field via `serde(default)`.
+        #[serde(default)]
+        memory_override: Option<u64>,
+        /// Override the slirp DHCP hostname (#91). RFC-952-clean string;
+        /// `None` means "use `format_dhcp_hostname(card, l2cpu_idx)`".
+        /// Used so a profile (#90) can pin a stable hostname for SSH
+        /// known_hosts caching across re-images. Older clients omit
+        /// the field via `serde(default)`.
+        #[serde(default)]
+        hostname_override: Option<String>,
     },
     /// Attach a console fd. Daemon replies with `ok` and sends the fd via
     /// SCM_RIGHTS; client pumps bytes between its tty and the passed fd.
@@ -336,6 +351,8 @@ mod tests {
             console: false,
             rng: false,
             force: false,
+            memory_override: None,
+            hostname_override: None,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).unwrap();
@@ -366,6 +383,8 @@ mod tests {
             console: false,
             rng: false,
             force: false,
+            memory_override: None,
+            hostname_override: None,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).unwrap();
@@ -510,6 +529,8 @@ mod tests {
                 console: false,
                 rng: false,
                 force,
+                memory_override: None,
+                hostname_override: None,
             };
             let mut buf = Vec::new();
             write_frame(&mut buf, &req).unwrap();
@@ -580,7 +601,57 @@ mod tests {
         let json = r#"{"op":"boot","l2cpu":0,"opensbi":"a","payload":{"kind":"kernel","path":"b"},"dtb":"c","root_device":"vda"}"#;
         let req: Request = serde_json::from_str(json).unwrap();
         match req {
-            Request::Boot { force, .. } => assert!(!force),
+            Request::Boot {
+                force,
+                memory_override,
+                hostname_override,
+                ..
+            } => {
+                assert!(!force);
+                // #91: backwards-compat — the new optional fields
+                // must default to None so a v0.1.0 client talking to
+                // this daemon doesn't fail wire-decode.
+                assert!(memory_override.is_none());
+                assert!(hostname_override.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn boot_overrides_roundtrip_via_wire() {
+        // Verify both new override fields survive a wire round-trip.
+        // Eight bytes for memory, a clean hostname for the slirp dhcp
+        // server.
+        let req = Request::Boot {
+            l2cpu: 0,
+            opensbi: "a".into(),
+            payload: BootPayload::Kernel("b".into()),
+            dtb: "c".into(),
+            initramfs: None,
+            root_device: "vda".into(),
+            force_reset_pcie: false,
+            disk: None,
+            network: false,
+            extra_fwd: vec![],
+            console: false,
+            rng: false,
+            force: false,
+            memory_override: Some(0x4000_0000),
+            hostname_override: Some("debian-bench".into()),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &req).unwrap();
+        let decoded: Request = read_frame(Cursor::new(&buf)).unwrap();
+        match decoded {
+            Request::Boot {
+                memory_override,
+                hostname_override,
+                ..
+            } => {
+                assert_eq!(memory_override, Some(0x4000_0000));
+                assert_eq!(hostname_override.as_deref(), Some("debian-bench"));
+            }
             _ => panic!("wrong variant"),
         }
     }

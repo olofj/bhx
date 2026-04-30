@@ -173,6 +173,22 @@ enum Commands {
         /// than as scrollback. Ctrl-A x to detach.
         #[arg(short = 'a', long)]
         attach: bool,
+        /// Override the L2CPU's advertised DRAM size.
+        ///
+        /// Accepts SI (`MB` / `GB`) and IEC binary (`MiB` / `GiB`)
+        /// suffixes. Clamped to the L2CPU's physical size and rounded
+        /// down to a 2 MiB boundary daemon-side. Empty means "use the
+        /// physical size."
+        #[arg(long = "memory", value_parser = parse_memory)]
+        memory: Option<u64>,
+        /// Override the slirp DHCP hostname.
+        ///
+        /// RFC-952-clean (`a-z0-9-`, no underscore, ≤63 chars).
+        /// Replaces the per-(card, l2cpu) `bhx-cardN-l2cpuM` default
+        /// — useful when a profile (#90) wants a stable name across
+        /// re-images so SSH known_hosts caches.
+        #[arg(long = "hostname", value_parser = parse_hostname)]
+        hostname: Option<String>,
     },
     /// Attach a terminal to a booted L2CPU's console via the daemon.
     Connect {
@@ -551,6 +567,8 @@ fn main() -> std::process::ExitCode {
             no_virtio_rng,
             fwd,
             attach,
+            memory,
+            hostname,
         }) => {
             let disk = resolve_disk_path(
                 cli.disk,
@@ -586,6 +604,8 @@ fn main() -> std::process::ExitCode {
                 virtio_console,
                 !no_virtio_rng,
                 force,
+                memory,
+                hostname,
             )?;
             if attach {
                 run_connect_client(card, l2cpu, daemon::protocol::ConsoleMode::Rw)?;
@@ -776,6 +796,81 @@ fn parse_console_mode(s: &str) -> std::io::Result<daemon::protocol::ConsoleMode>
 /// Parse `HOST:GUEST` for `add-net --fwd`. Both sides must be in the
 /// 1..=65535 range; bare numbers, leading whitespace, and missing
 /// halves all error out cleanly.
+/// Parse an operator-friendly memory size string into a byte count.
+/// Accepts plain integers (interpreted as bytes) and suffixed forms
+/// in either SI (`KB`/`MB`/`GB`) or IEC binary (`KiB`/`MiB`/`GiB`)
+/// notation. The number portion can carry a decimal point; the
+/// daemon clamps to the L2CPU's physical size and 2 MiB-aligns.
+///
+/// Examples:
+///   - "2GB"   -> 2_000_000_000
+///   - "2GiB"  -> 2_147_483_648
+///   - "2048MB" -> 2_048_000_000
+///   - "1.5GiB" -> 1_610_612_736
+fn parse_memory(s: &str) -> std::io::Result<u64> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(crate::Error::bad_request("empty --memory value").into());
+    }
+    let (num_part, mult) = if let Some(rest) = trimmed.strip_suffix("GiB") {
+        (rest, 1u64 << 30)
+    } else if let Some(rest) = trimmed.strip_suffix("MiB") {
+        (rest, 1u64 << 20)
+    } else if let Some(rest) = trimmed.strip_suffix("KiB") {
+        (rest, 1u64 << 10)
+    } else if let Some(rest) = trimmed.strip_suffix("GB") {
+        (rest, 1_000_000_000u64)
+    } else if let Some(rest) = trimmed.strip_suffix("MB") {
+        (rest, 1_000_000u64)
+    } else if let Some(rest) = trimmed.strip_suffix("KB") {
+        (rest, 1_000u64)
+    } else if let Some(rest) = trimmed.strip_suffix('B') {
+        (rest, 1u64)
+    } else {
+        (trimmed, 1u64)
+    };
+    let num: f64 = num_part.trim().parse().map_err(|_| {
+        std::io::Error::from(crate::Error::bad_request(format!(
+            "invalid --memory {:?}; expected e.g. 2GB or 2GiB",
+            s
+        )))
+    })?;
+    if !num.is_finite() || num <= 0.0 {
+        return Err(
+            crate::Error::bad_request(format!("--memory must be positive: {:?}", s)).into(),
+        );
+    }
+    Ok((num * mult as f64) as u64)
+}
+
+/// RFC-952 hostname check: 1..=63 chars from `a-z0-9-`, lowercase,
+/// no leading/trailing `-`. Strict so a malformed override doesn't
+/// trip the slirp DHCP server's parser silently. Per RFC-1123 we
+/// also allow leading digits.
+fn parse_hostname(s: &str) -> std::io::Result<String> {
+    let bad = |reason: &str| -> std::io::Error {
+        std::io::Error::from(crate::Error::bad_request(format!(
+            "invalid --hostname {:?}: {}",
+            s, reason
+        )))
+    };
+    if s.is_empty() {
+        return Err(bad("empty"));
+    }
+    if s.len() > 63 {
+        return Err(bad("longer than 63 chars (RFC 952)"));
+    }
+    if s.starts_with('-') || s.ends_with('-') {
+        return Err(bad("must not start or end with '-'"));
+    }
+    for c in s.chars() {
+        if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+            return Err(bad("only lowercase a-z, 0-9, '-' allowed"));
+        }
+    }
+    Ok(s.to_string())
+}
+
 fn parse_fwd_pair(s: &str) -> std::io::Result<(u16, u16)> {
     let (h, g) = s.split_once(':').ok_or_else(|| {
         std::io::Error::from(crate::Error::bad_request(format!(
@@ -821,6 +916,8 @@ fn run_boot_client(
     console: bool,
     rng: bool,
     force: bool,
+    memory_override: Option<u64>,
+    hostname_override: Option<String>,
 ) -> std::io::Result<()> {
     // Bundle disk + network into the Boot RPC so the virtio workers come up
     // together with the L2CPU reset release. The guest kernel hits its VFS
@@ -857,6 +954,8 @@ fn run_boot_client(
         console,
         rng,
         force,
+        memory_override,
+        hostname_override,
     )
 }
 
@@ -2032,6 +2131,61 @@ mod tests {
         assert!(format!("{}", err).contains("nope"));
         let err = parse_fwd_pair("5201:notaport").unwrap_err();
         assert!(format!("{}", err).contains("notaport"));
+    }
+
+    // --- parse_memory + parse_hostname (#91) -------------------------------
+
+    #[test]
+    fn parse_memory_accepts_si_and_iec_suffixes() {
+        assert_eq!(parse_memory("2GB").unwrap(), 2_000_000_000);
+        assert_eq!(parse_memory("2GiB").unwrap(), 2_147_483_648);
+        assert_eq!(parse_memory("2048MB").unwrap(), 2_048_000_000);
+        assert_eq!(parse_memory("512MiB").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_memory("1024KB").unwrap(), 1_024_000);
+        assert_eq!(parse_memory("1024KiB").unwrap(), 1_024 * 1024);
+        // Bare integer = bytes.
+        assert_eq!(parse_memory("4096").unwrap(), 4096);
+        assert_eq!(parse_memory("4096B").unwrap(), 4096);
+    }
+
+    #[test]
+    fn parse_memory_accepts_decimal_with_iec_suffix() {
+        // 1.5 GiB = 1.5 * 2^30 = 1_610_612_736
+        assert_eq!(parse_memory("1.5GiB").unwrap(), 1_610_612_736);
+    }
+
+    #[test]
+    fn parse_memory_rejects_malformed() {
+        assert!(parse_memory("").is_err());
+        assert!(parse_memory("abc").is_err());
+        assert!(parse_memory("0").is_err());
+        assert!(parse_memory("-1GB").is_err());
+        assert!(parse_memory("2 GB ").is_ok()); // trim
+        assert!(parse_memory("GB").is_err());
+    }
+
+    #[test]
+    fn parse_hostname_accepts_rfc952_clean() {
+        assert_eq!(parse_hostname("debian-bench").unwrap(), "debian-bench");
+        assert_eq!(parse_hostname("alma01").unwrap(), "alma01");
+        assert_eq!(parse_hostname("a").unwrap(), "a");
+    }
+
+    #[test]
+    fn parse_hostname_rejects_invalid() {
+        // empty
+        assert!(parse_hostname("").is_err());
+        // too long (>63)
+        assert!(parse_hostname(&"a".repeat(64)).is_err());
+        // leading / trailing dash
+        assert!(parse_hostname("-foo").is_err());
+        assert!(parse_hostname("foo-").is_err());
+        // uppercase rejected (RFC 952 strict)
+        assert!(parse_hostname("Foo").is_err());
+        // underscores rejected
+        assert!(parse_hostname("foo_bar").is_err());
+        // dots rejected (this is the per-label part, not FQDN)
+        assert!(parse_hostname("foo.bar").is_err());
     }
 
     // --- parse_l2cpu_locator + resolve_target (#98) ------------------------

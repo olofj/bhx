@@ -474,6 +474,20 @@ mod tests {
     }
 
     #[test]
+    fn modify_dtb_honors_memory_size_override() {
+        // #91: when the daemon receives a memory_override smaller than
+        // the L2CPU's physical size, the operator wants the guest to
+        // see only that much DRAM. modify_dtb just patches /memory's
+        // reg with whatever mem_size the caller passes, so this test
+        // exercises the boundary the override hits.
+        let mem_start = 0x4000_3000_0000u64;
+        let override_size = 0x4000_0000u64; // 1 GiB instead of physical 4 GiB
+        let dev = BootDevice::Vda("vda".to_string());
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, override_size, &[], None).unwrap();
+        assert_eq!(read_memory_reg(&out, mem_start), (mem_start, override_size));
+    }
+
+    #[test]
     fn modify_dtb_renames_memory_node_for_l2cpu_3_base() {
         // L2CPU 3 starts at 0x4000_b000_0000 — different from the input
         // fixture's baked-in `/memory@400030000000`. After modify_dtb

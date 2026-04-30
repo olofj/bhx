@@ -64,6 +64,8 @@ pub fn boot(
     console: bool,
     rng: bool,
     force: bool,
+    memory_override: Option<u64>,
+    hostname_override: Option<String>,
 ) -> io::Result<()> {
     write_frame(
         &mut *sock,
@@ -81,6 +83,8 @@ pub fn boot(
             console,
             rng,
             force,
+            memory_override,
+            hostname_override,
         },
     )?;
     expect_ok(read_frame(&mut *sock)?)
