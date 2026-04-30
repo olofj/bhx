@@ -26,6 +26,9 @@ thiserror = "2"
 # Native HTTP client used by `bhx image pull` / `bhx ramdisk pull`.
 # rustls-only TLS to avoid pulling in OpenSSL. See src/fetch.rs and #87.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+# YAML loader for `~/.config/bhx/profiles.yaml` (#92). serde_yaml_ng is the
+# actively-maintained fork of dtolnay/serde_yaml (deprecated in 2024).
+serde_yaml_ng = "0.10"
 
 # Sandbox crates (Linux-only). seccompiler builds + installs BPF
 # syscall filters; landlock restricts filesystem reach. Both are

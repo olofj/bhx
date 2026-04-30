@@ -23,6 +23,7 @@ mod fetch;
 mod image;
 mod kmd;
 mod l2cpu;
+mod profile;
 mod ramdisk;
 mod regs;
 mod shared_chip;
@@ -263,6 +264,15 @@ enum Commands {
         #[command(subcommand)]
         action: RamdiskAction,
     },
+    /// Manage named boot profiles (#90 / #92).
+    ///
+    /// Profiles let an operator save a long `bhx boot` flag bundle as
+    /// a named YAML stanza in `~/.config/bhx/profiles.yaml` and recall
+    /// it later. Boot integration (`bhx boot -c <name>`) lands in #93.
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -489,6 +499,44 @@ enum RamdiskAction {
     },
 }
 
+#[derive(Subcommand)]
+enum ProfileAction {
+    /// Add a new profile.
+    ///
+    /// Appends a templated stanza for `<name>` to the catalog, then
+    /// opens `$VISUAL`/`$EDITOR`/vi on the file so the operator can
+    /// fill in the image / network / etc. Validates on save with a
+    /// visudo-style retry — broken YAML or a schema violation
+    /// re-opens the editor preserving the operator's text.
+    Add {
+        /// Profile name. Must match `[a-zA-Z][a-zA-Z0-9_-]*`, ≤32
+        /// chars. Reserved: must not collide with an existing profile.
+        name: String,
+    },
+    /// Edit the profile catalog.
+    ///
+    /// Opens `~/.config/bhx/profiles.yaml` in `$EDITOR`. Same
+    /// visudo-style retry as `add`.
+    Edit,
+    /// List all profiles in tabular form.
+    List,
+    /// Pretty-print one profile's YAML stanza.
+    Show {
+        /// Profile name to look up.
+        name: String,
+    },
+    /// Remove a profile from the catalog.
+    ///
+    /// Phase A (#92): only removes the YAML stanza. Per-instance
+    /// disks (the `~/.local/share/bhx/instances/<name>-l<idx>/`
+    /// directories) are left in place — `bhx profile reset` lands in
+    /// #93 and will offer to clean them up.
+    Rm {
+        /// Profile name to remove.
+        name: String,
+    },
+}
+
 const DEFAULT_DISK_PATH: &str = "rootfs.ext4";
 
 /// Resolve the disk path to serve to the guest.
@@ -687,6 +735,13 @@ fn main() -> std::process::ExitCode {
             }
             Ok(())
         }
+        Some(Commands::Profile { action }) => match action {
+            ProfileAction::Add { name } => cmd_profile_add(&name),
+            ProfileAction::Edit => cmd_profile_edit(),
+            ProfileAction::List => cmd_profile_list(),
+            ProfileAction::Show { name } => cmd_profile_show(&name),
+            ProfileAction::Rm { name } => cmd_profile_rm(&name),
+        },
         Some(Commands::Debug { action }) => {
             let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
             run_debug_cmd(card, l2cpu as usize, action)
@@ -2085,6 +2140,110 @@ fn print_ssh_ports(card: u32) -> std::io::Result<()> {
         };
         println!("  l2cpu {}: 127.0.0.1:{} — {}", idx, port, status);
     }
+    Ok(())
+}
+
+// ============================================================================
+// Profile CRUD CLI (#92)
+// ============================================================================
+
+/// Append a templated stanza for `<name>` to the catalog, then drop
+/// into the operator's editor with visudo-style retry.
+fn cmd_profile_add(name: &str) -> std::io::Result<()> {
+    profile::validate_profile_name(name)?;
+    let path = profile::profiles_path()?;
+    let mut profiles = profile::load_profiles_from(&path)?;
+    if profiles.profiles.contains_key(name) {
+        return Err(crate::Error::bad_request(format!(
+            "profile {:?} already exists; edit with `bhx profile edit` or remove with `bhx profile rm`",
+            name
+        ))
+        .into());
+    }
+    profiles.profiles.insert(
+        name.to_string(),
+        profile::Profile {
+            // Templated: empty image so the operator must fill it in.
+            // Validation will reject the save until they do.
+            image: String::new(),
+            ..Default::default()
+        },
+    );
+    profile::save_profiles_to(&profiles, &path)?;
+    let mut runner = profile::ProcessEditor;
+    let edited = profile::edit_with_retry(&mut runner, &path, 5)?;
+    profile::save_profiles_to(&edited, &path)?;
+    eprintln!("profile {:?} added", name);
+    Ok(())
+}
+
+/// Drop into the editor on the catalog file with visudo-style retry.
+fn cmd_profile_edit() -> std::io::Result<()> {
+    let path = profile::profiles_path()?;
+    // Make sure the file exists so the editor doesn't open an empty
+    // buffer with no path context.
+    if !path.exists() {
+        let empty = profile::ProfilesFile::default();
+        profile::save_profiles_to(&empty, &path)?;
+    }
+    let mut runner = profile::ProcessEditor;
+    let edited = profile::edit_with_retry(&mut runner, &path, 5)?;
+    profile::save_profiles_to(&edited, &path)?;
+    Ok(())
+}
+
+/// Print every known profile, one row per profile.
+fn cmd_profile_list() -> std::io::Result<()> {
+    let profiles = profile::load_profiles()?;
+    if profiles.profiles.is_empty() {
+        println!("(no profiles defined; use `bhx profile add <name>` to create one)");
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:<24} {:<8} {:<7} {:<7}",
+        "NAME", "IMAGE", "MEMORY", "NETWORK", "VCONSOLE"
+    );
+    for (name, p) in &profiles.profiles {
+        let mem = p.memory.as_deref().unwrap_or("(default)");
+        let net = if p.network.enabled { "yes" } else { "no" };
+        let vc = if p.console.virtio { "yes" } else { "no" };
+        println!(
+            "{:<24} {:<24} {:<8} {:<7} {:<7}",
+            name, p.image, mem, net, vc
+        );
+    }
+    Ok(())
+}
+
+/// Pretty-print one profile's YAML stanza.
+fn cmd_profile_show(name: &str) -> std::io::Result<()> {
+    let profiles = profile::load_profiles()?;
+    let p = profiles
+        .profiles
+        .get(name)
+        .ok_or_else(|| crate::Error::bad_request(format!("no such profile {:?}", name)))?;
+    let yaml = serde_yaml_ng::to_string(p)
+        .map_err(|e| crate::Error::internal(format!("serialize profile: {}", e)))?;
+    println!("# {}", name);
+    print!("{}", yaml);
+    Ok(())
+}
+
+/// Remove a profile from the catalog.
+fn cmd_profile_rm(name: &str) -> std::io::Result<()> {
+    let path = profile::profiles_path()?;
+    let mut profiles = profile::load_profiles_from(&path)?;
+    if profiles.profiles.remove(name).is_none() {
+        return Err(crate::Error::bad_request(format!("no such profile {:?}", name)).into());
+    }
+    profile::save_profiles_to(&profiles, &path)?;
+    eprintln!("profile {:?} removed", name);
+    eprintln!(
+        "(Phase A: per-instance disks under \
+         ~/.local/share/bhx/instances/{}-l*/ are NOT removed; \
+         clean those up manually until #93 lands `profile reset`.)",
+        name
+    );
     Ok(())
 }
 
