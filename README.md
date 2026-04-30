@@ -79,7 +79,7 @@ L2CPU 0:
 ```bash
 bhx image pull debian-13
 bhx daemon start
-bhx boot -l 0 -d images/debian-13.img -n --virtio-console -a
+bhx boot -l 0 -d images/debian-13.img -n -a
 ```
 
 What each step does:
@@ -90,16 +90,16 @@ What each step does:
    the artifact present is a no-op (pass `--refetch` to force).
 2. `daemon start` forks the per-card daemon. Owns the chip;
    everything else is RPC.
-3. `boot -l 0 -d images/debian-13.img -n --virtio-console -a`:
+3. `boot -l 0 -d images/debian-13.img -n -a`:
    - `-l 0` selects L2CPU 0.
    - `-d` points at the disk; the daemon notices it's a whole-disk
      image and auto-selects the U-Boot + EFI boot path (uses the
      `u-boot.bin` from the search path described above).
    - `-n` enables slirp networking — TCP 2222 on the host forwards to
      port 22 in the guest, so `ssh -p 2222 debian@localhost` works.
-   - `--virtio-console` attaches `/dev/hvc0`. The DTB-baked bootargs
-     direct the kernel's console to `hvc0`, so without this flag a
-     stock distro kernel boots silently and looks hung.
+   - virtio-console (`/dev/hvc0`) is attached by default — the DTB
+     bootargs send the kernel console there. Pass `--no-virtio-console`
+     only when bisecting.
    - `-a` (`--attach`) drops you straight into the console after boot
      so you see the OpenSBI banner, U-Boot, GRUB, and kernel printk
      live. `Ctrl-A x` to detach.

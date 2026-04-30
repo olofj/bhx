@@ -131,15 +131,16 @@ enum Commands {
         /// explicit `stop` first.
         #[arg(long)]
         force: bool,
-        /// Attach a virtio-console device alongside the boot.
+        /// Skip attaching virtio-console.
         ///
-        /// Stock distro kernels with `CONFIG_VIRTIO_CONSOLE` register
-        /// this as `/dev/hvc0` and direct their console output through
-        /// it instead of the OpenSBI debug UART (which often requires
-        /// `CONFIG_HVC_RISCV_SBI`, not enabled in upstream-portable
-        /// distro kernels).
-        #[arg(long = "virtio-console")]
-        virtio_console: bool,
+        /// By default the daemon attaches a virtio-console device
+        /// alongside the boot — the DTB-baked bootargs direct the
+        /// kernel's console to `/dev/hvc0`, and stock distro kernels
+        /// (which usually lack `CONFIG_HVC_RISCV_SBI`) have nowhere
+        /// else to send output. Pass this only to bisect a virtio-
+        /// console regression or to test SBI debug-console paths.
+        #[arg(long = "no-virtio-console")]
+        no_virtio_console: bool,
         /// Skip attaching virtio-rng.
         ///
         /// By default the daemon brings up virtio-rng alongside the
@@ -675,7 +676,7 @@ fn main() -> std::process::ExitCode {
             root_device,
             force_reset_pcie,
             force,
-            virtio_console,
+            no_virtio_console,
             no_virtio_rng,
             fwd,
             attach,
@@ -733,7 +734,7 @@ fn main() -> std::process::ExitCode {
                 disk,
                 cli.network,
                 fwd,
-                virtio_console,
+                !no_virtio_console,
                 !no_virtio_rng,
                 force,
                 memory,

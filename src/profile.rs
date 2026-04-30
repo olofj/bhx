@@ -99,8 +99,13 @@ pub struct NetworkConfig {
 /// Console sub-block.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConsoleConfig {
-    /// Attach a virtio-console alongside the SBI console.
-    #[serde(default)]
+    /// Attach a virtio-console (`/dev/hvc0`). Default true — the DTB
+    /// bootargs direct the kernel console to hvc0, and stock distro
+    /// kernels usually can't fall back to the SBI debug console
+    /// (CONFIG_HVC_RISCV_SBI is not in upstream-portable builds), so
+    /// without virtio-console the boot is silent. Set to false only
+    /// to bisect virtio-console issues.
+    #[serde(default = "default_true")]
     pub virtio: bool,
     /// Attach virtio-rng. Default true — the AlmaLinux EFI shim
     /// requires `EFI_RNG_PROTOCOL` (see #62).
@@ -111,7 +116,7 @@ pub struct ConsoleConfig {
 impl Default for ConsoleConfig {
     fn default() -> Self {
         ConsoleConfig {
-            virtio: false,
+            virtio: true,
             rng: true,
         }
     }
@@ -164,13 +169,11 @@ profiles: {}
 #       forwards:
 #         - \"5201:5201\"
 #
-#   # Fedora boot via U-Boot + EFI shim, 8 GiB, virtio-console attached.
+#   # Fedora boot via U-Boot + EFI shim, 8 GiB.
 #   fedora-uboot:
 #     image: fedora-42
 #     memory: 8GB
 #     bootloader: uboot
-#     console:
-#       virtio: true
 ";
 
 /// Resolve `~/.config/bhx/profiles.yaml`. Honors `$XDG_CONFIG_HOME`,
