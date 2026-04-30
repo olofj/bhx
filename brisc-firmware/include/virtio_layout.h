@@ -28,11 +28,17 @@
 //                                    ...
 //                                    L2CPU 3 blk2     → slot 29  → 0x2D000
 //                                    L2CPU 3 (unused) → slots 30..31
-//   0x0004_0000 .. 0x0004_8000   per-queue shadow state (BRISC-private,
+//   0x0003_0000 .. 0x0003_8000   per-queue shadow state (BRISC-private,
 //                                  not visible-as-MMIO; M3.5)
 //                                  32 × 1 KiB
-//                                  Bumped from 0x20000 when the reg-file
-//                                  region grew past the old shadow base.
+//                                  Sits immediately after the reg-file
+//                                  region. Originally 0x20000 (with the
+//                                  4-dev-per-L2CPU layout, reg files
+//                                  ended at 0x20000); now 0x30000 to
+//                                  stay contiguous with the larger
+//                                  reg-file region. MUST NOT collide
+//                                  with `BRISC_UART_BASE = 0x40000` in
+//                                  `uart_layout.h`.
 //
 // The 4 KiB per device matches virtio 1.2 §4.2.2's MMIO spec (last
 // reg ConfigGeneration is at 0x0fc, config space starts at 0x100 and

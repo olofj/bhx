@@ -164,12 +164,18 @@ pub const STATS_OFF_KICK_DROPS: u32 = 0x02c;
 // walk in guest DRAM. These offsets MUST match the C firmware's
 // `SHADOW_Q_OFF_*` constants in `brisc-firmware/virtio.c`.
 
-/// Base of the per-slot shadow region. Moved from 0x20000 to 0x40000
-/// when DEVS_PER_L2CPU went from 4 to 6 — with 24 reg files of 4 KiB
-/// each the reg region now extends to 0x28000, so the old 0x20000
-/// shadow base would overlap. Mirrored on the firmware side as
+/// Base of the per-slot shadow region. Sits immediately after the
+/// reg-file region so writes by BRISC to reg files and shadow stay in
+/// the same Tensix L1 bank — banked L1 doesn't enforce store ordering
+/// across banks, even with `fence w,w`, so a shadow write followed by
+/// a kick-ring write (CTRL_BASE = 0x5000) becomes visible to the
+/// daemon out-of-order whenever the two regions land on different
+/// banks. With 32 reg files (4 L2CPUs × 8 devs × 4 KiB) the reg region
+/// ends at 0x30000; SHADOW_BASE picks up there. Originally 0x20000
+/// when there were only 16 reg files; the bump to 0x30000 keeps
+/// shadow contiguous with reg files. Mirrored on the firmware side as
 /// `SHADOW_BASE` in `brisc-firmware/virtio.c`.
-pub const SHADOW_BASE: u32 = 0x0004_0000;
+pub const SHADOW_BASE: u32 = 0x0003_0000;
 pub const SHADOW_PER_DEVICE: u32 = 0x400;
 pub const SHADOW_PER_QUEUE: u32 = 0x40;
 pub const SHADOW_Q_OFF_NUM: u32 = 0x00;
@@ -232,9 +238,16 @@ const _LAYOUT_INVARIANTS: () = {
     // DEVS_PER_L2CPU must stay a power of two so the firmware's
     // `slot % DEVS_PER_L2CPU` is a bitmask AND, not an __umodsi3 call.
     assert!(DEVS_PER_L2CPU.is_power_of_two());
-    // Shadow region must sit above the reg-file region (SHADOW_BASE
-    // moved to 0x40000 when the engine grew past 64 KiB of reg files).
+    // Shadow region must sit above the reg-file region.
     assert!(SHADOW_BASE >= REGS_BASE + NUM_SLOTS * REGS_PER_DEV);
+    // Shadow must end before BRISC_UART_BASE (0x40000 in
+    // uart_layout.h) — a previous bump put SHADOW at 0x40000 which
+    // overlapped the host-facing UART register file and caused
+    // BRISC's shadow writes to land on top of UART regs (and vice
+    // versa). The kick poller saw partial avail addresses on every
+    // boot. Mirrored on the firmware side as `SHADOW_BASE` in
+    // `brisc-firmware/virtio.c`.
+    assert!(SHADOW_BASE + NUM_SLOTS * SHADOW_PER_DEVICE <= 0x0004_0000);
 };
 
 /// Pure-Rust simulator of the BRISC virtio firmware (`virtio.c`).
@@ -278,7 +291,7 @@ pub mod sim {
 
     // Per-device shadow region layout — matches the C firmware's
     // SHADOW_BASE / SHADOW_PER_DEVICE / SHADOW_PER_QUEUE.
-    const SHADOW_BASE: u32 = 0x0004_0000;
+    const SHADOW_BASE: u32 = 0x0003_0000;
     const SHADOW_PER_DEVICE: u32 = 0x400;
     const SHADOW_PER_QUEUE: u32 = 0x40;
     const SHADOW_Q_OFF_NUM: u32 = 0x00;

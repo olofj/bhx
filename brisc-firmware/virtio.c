@@ -100,11 +100,22 @@
 // per-queue storage rather than a single field that depends on the
 // current QUEUE_SEL. This eliminates the SEL-multiplexing race that
 // motivated #58, #61, #63, #65.
-// Bumped from 0x00020000 to 0x00040000 when DEVS_PER_L2CPU went 4 → 6.
-// The reg-file region grew from 64 KiB (0x10000..0x20000) to 96 KiB
-// (0x10000..0x28000), so the old 0x20000 shadow base now overlaps.
+// Sits immediately after the reg-file region (which ends at 0x30000
+// with DEVS_PER_L2CPU = 8) so shadow + reg writes stay in the same
+// Tensix L1 bank — Tensix L1 is banked, and `fence w, w` is a
+// hart-local store fence that does not enforce global ordering of
+// stores across banks. When SHADOW_BASE was at 0x40000 (a bank apart
+// from the reg files and the kick ring at 0x5000), a shadow write
+// followed by a kick-ring producer-seq bump appeared out-of-order to
+// the daemon: it saw the kick first and read a half-formed avail
+// address, dropping the kick.
+//
+// Originally 0x20000 (with NUM_SLOTS=16 → reg files ended at
+// 0x20000); new bump puts shadow at 0x30000 (NUM_SLOTS=32 → reg
+// files end at 0x30000). Keep contiguous.
+//
 // Mirrored on the Rust side as `SHADOW_BASE` in `src/virtio_engine.rs`.
-#define SHADOW_BASE               0x00040000u
+#define SHADOW_BASE               0x00030000u
 #define SHADOW_PER_DEVICE         0x00000400u  // 1 KiB per slot
 
 // Within a per-device shadow block, queue `q` lives at offset
