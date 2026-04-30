@@ -121,6 +121,58 @@ fn default_true() -> bool {
     true
 }
 
+/// First-run seed for `~/.config/bhx/profiles.yaml`. Written by
+/// `bhx profile edit` when no catalog exists yet (#111). Operators
+/// see real example stanzas to crib from instead of an empty
+/// `profiles: {}` they have to build from memory.
+///
+/// Every example is commented so the seeded file parses to an empty
+/// `ProfilesFile` (the active line is `profiles: {}`). Comments
+/// don't survive a `save_profiles_to` round-trip — once the
+/// operator defines a real profile, the templates fall away
+/// naturally. That's fine; their job is done after the first edit.
+pub const FIRST_RUN_TEMPLATE: &str = "\
+# bhx profile catalog (~/.config/bhx/profiles.yaml).
+#
+# Each stanza under `profiles:` is a named override set for `bhx boot`,
+# applied with `bhx boot -c <name>`. See:
+#   - `bhx image list`   for valid `image:` values
+#   - `bhx profile add`  for the imperative path that skips this file
+#
+# The map below is empty by default. Uncomment one of the templates,
+# replace `profiles: {}` with the new stanza(s), and save.
+
+profiles: {}
+
+# ---------------------------------------------------------------------
+# Templates — copy, uncomment, edit, remove the `profiles: {}` above.
+# ---------------------------------------------------------------------
+#
+# profiles:
+#
+#   # Minimal: tt-debian smoke (no network, console-only).
+#   tt-smoke:
+#     image: tt-debian
+#
+#   # Debian + slirp networking + iperf3 forward.
+#   debian-net:
+#     image: debian-13
+#     memory: 4GB
+#     network:
+#       enabled: true
+#       hostname: deb-l0
+#       forwards:
+#         - \"5201:5201\"
+#
+#   # Fedora boot via U-Boot + EFI shim, 8 GiB, virtio-console attached.
+#   fedora-uboot:
+#     image: fedora-42
+#     memory: 8GB
+#     bootloader: uboot
+#     console:
+#       virtio: true
+";
+
 /// Resolve `~/.config/bhx/profiles.yaml`. Honors `$XDG_CONFIG_HOME`,
 /// falls back to `$HOME/.config`. Pure path construction; doesn't
 /// touch the filesystem.
@@ -1052,5 +1104,75 @@ mod tests {
         let err = edit_with_retry(&mut editor, &path, 3).unwrap_err();
         assert!(matches!(err, Error::BadRequest(_)));
         assert_eq!(editor.idx, 3);
+    }
+
+    // ---- FIRST_RUN_TEMPLATE (#111) ----
+
+    #[test]
+    fn first_run_template_parses_to_empty_profiles() {
+        // Saving the seeded file as-is must round-trip cleanly: the
+        // active line is `profiles: {}` and the rest is comments.
+        let dir = tmp_dir();
+        let path = dir.path().join("profiles.yaml");
+        fs::write(&path, FIRST_RUN_TEMPLATE).unwrap();
+        let pf = load_profiles_from(&path).unwrap();
+        assert!(
+            pf.profiles.is_empty(),
+            "seeded template should parse to no profiles, got: {:?}",
+            pf.profiles.keys().collect::<Vec<_>>(),
+        );
+        validate_all(&pf).unwrap();
+    }
+
+    /// Strip a single leading "# " (or "#" for `#`-only lines) from
+    /// each line of the template's example block. Used to verify the
+    /// commented examples don't drift away from the live `Profile`
+    /// schema.
+    fn uncomment_examples(template: &str) -> String {
+        let marker = "# Templates";
+        let body = template
+            .split_once(marker)
+            .map(|(_, rest)| rest)
+            .expect("template missing `# Templates` marker");
+        // Skip the rest of the marker line (everything up to \n).
+        let body = body.split_once('\n').map(|(_, r)| r).unwrap_or(body);
+        // And the trailing `# ----` divider line that follows the marker.
+        let body = body.split_once('\n').map(|(_, r)| r).unwrap_or(body);
+        body.lines()
+            .map(|l| {
+                l.strip_prefix("# ")
+                    .or_else(|| l.strip_prefix("#"))
+                    .unwrap_or(l)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn first_run_template_examples_parse_and_validate_when_uncommented() {
+        // The template is operator-facing documentation as much as it
+        // is YAML. If a future Profile field rename leaves the
+        // commented examples pointing at a key that no longer exists,
+        // the operator follows broken instructions. Detect that drift
+        // by un-commenting the examples and feeding them through the
+        // real load + validate path.
+        let raw = uncomment_examples(FIRST_RUN_TEMPLATE);
+        let dir = tmp_dir();
+        let path = dir.path().join("profiles.yaml");
+        fs::write(&path, &raw).unwrap();
+        let pf = load_profiles_from(&path).unwrap_or_else(|e| {
+            panic!("uncommented template failed to parse:\n{}\nerr: {}", raw, e)
+        });
+        // We expect every templated stanza to come through.
+        for expected in ["tt-smoke", "debian-net", "fedora-uboot"] {
+            assert!(
+                pf.profiles.contains_key(expected),
+                "uncommented template missing expected profile {:?}; got {:?}",
+                expected,
+                pf.profiles.keys().collect::<Vec<_>>(),
+            );
+        }
+        validate_all(&pf)
+            .unwrap_or_else(|e| panic!("uncommented template fails validation: {}", e));
     }
 }

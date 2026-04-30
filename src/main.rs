@@ -2254,11 +2254,15 @@ fn cmd_profile_add(name: &str) -> std::io::Result<()> {
 /// Drop into the editor on the catalog file with visudo-style retry.
 fn cmd_profile_edit() -> std::io::Result<()> {
     let path = profile::profiles_path()?;
-    // Make sure the file exists so the editor doesn't open an empty
-    // buffer with no path context.
+    // First-run UX: seed with commented example stanzas so the
+    // operator has something to crib from. Comments don't survive a
+    // save_profiles_to round-trip, so once the operator defines a
+    // real profile the templates naturally fall away (#111).
     if !path.exists() {
-        let empty = profile::ProfilesFile::default();
-        profile::save_profiles_to(&empty, &path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, profile::FIRST_RUN_TEMPLATE)?;
     }
     let mut runner = profile::ProcessEditor;
     let edited = profile::edit_with_retry(&mut runner, &path, 5)?;
