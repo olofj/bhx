@@ -15,6 +15,7 @@
 mod boot;
 mod chip;
 mod clock;
+mod cloud_init;
 mod console;
 mod daemon;
 mod error;
@@ -307,6 +308,17 @@ enum Commands {
         #[command(subcommand)]
         action: RamdiskAction,
     },
+    /// Generate cloud-init NoCloud seed images for stock cloud distros.
+    ///
+    /// Produces a `cidata`-labeled ISO containing user-data +
+    /// meta-data that cloud-init's NoCloud datasource consumes on
+    /// first boot. Pair with `bhx boot --cloud-init <path>` to seed
+    /// users / SSH keys / hostname into a Debian / Fedora / Ubuntu /
+    /// AlmaLinux cloud image.
+    CloudInit {
+        #[command(subcommand)]
+        action: CloudInitAction,
+    },
     /// Manage named boot profiles.
     ///
     /// Profiles let an operator save a long `bhx boot` flag bundle as
@@ -522,6 +534,54 @@ enum DebugAction {
         /// Skip the LSR.THRE poll between writes (stress race window).
         #[arg(long)]
         no_lsr_poll: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CloudInitAction {
+    /// Build a NoCloud seed ISO suitable for `bhx boot --cloud-init`.
+    ///
+    /// All fields default to "sensible for a dev box" — running
+    /// `bhx cloud-init seed -o seed.iso` with no other flags creates
+    /// a `bhx` user with password `bhx`, hostname `bhx-guest`, and a
+    /// random instance-id. Override fields explicitly for
+    /// production use (operator's SSH key, fixed hostname, etc.).
+    Seed {
+        /// Output path for the generated ISO.
+        #[arg(short = 'o', long)]
+        output: String,
+        /// Login name to create. Default `bhx`.
+        #[arg(long)]
+        user: Option<String>,
+        /// Plain-text password for the user. cloud-init hashes it
+        /// before writing /etc/shadow. Default `bhx`. Pass `--no-
+        /// password` to keep the user key-only (requires `--ssh-
+        /// key`).
+        #[arg(long, conflicts_with = "no_password")]
+        password: Option<String>,
+        /// Don't set a password — user is key-only. Requires at
+        /// least one `--ssh-key`.
+        #[arg(long)]
+        no_password: bool,
+        /// SSH public key file to install (repeatable). Each file's
+        /// contents become an entry in the user's
+        /// `authorized_keys`.
+        #[arg(long = "ssh-key", value_name = "PATH")]
+        ssh_keys: Vec<String>,
+        /// Guest hostname. Default `bhx-guest`.
+        #[arg(long)]
+        hostname: Option<String>,
+        /// cloud-init instance-id. cloud-init re-runs config modules
+        /// when this changes; pin a stable value to avoid that.
+        /// Default: random.
+        #[arg(long = "instance-id")]
+        instance_id: Option<String>,
+        /// Path to a YAML file whose contents are appended verbatim
+        /// to the generated user-data. Use for arbitrary
+        /// cloud-config knobs (`packages:`, `runcmd:`, etc.) without
+        /// extending bhx's CLI for every field.
+        #[arg(long = "user-data", value_name = "PATH")]
+        user_data: Option<String>,
     },
 }
 
@@ -839,6 +899,27 @@ fn main() -> std::process::ExitCode {
             }
             Ok(())
         }
+        Some(Commands::CloudInit { action }) => match action {
+            CloudInitAction::Seed {
+                output,
+                user,
+                password,
+                no_password,
+                ssh_keys,
+                hostname,
+                instance_id,
+                user_data,
+            } => cmd_cloud_init_seed(
+                &output,
+                user,
+                password,
+                no_password,
+                ssh_keys,
+                hostname,
+                instance_id,
+                user_data.as_deref(),
+            ),
+        },
         Some(Commands::Ramdisk { action }) => {
             match action {
                 RamdiskAction::List => ramdisk::cmd_list(),
@@ -2296,6 +2377,65 @@ fn print_ssh_ports(card: u32) -> std::io::Result<()> {
         };
         println!("  l2cpu {}: 127.0.0.1:{} — {}", idx, port, status);
     }
+    Ok(())
+}
+
+// ============================================================================
+// Cloud-init seed CLI (#82)
+// ============================================================================
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_cloud_init_seed(
+    output: &str,
+    user: Option<String>,
+    password: Option<String>,
+    no_password: bool,
+    ssh_key_files: Vec<String>,
+    hostname: Option<String>,
+    instance_id: Option<String>,
+    user_data: Option<&str>,
+) -> std::io::Result<()> {
+    if no_password && ssh_key_files.is_empty() {
+        return Err(
+            crate::Error::bad_request("--no-password requires at least one --ssh-key").into(),
+        );
+    }
+
+    // Read each --ssh-key file into a flat list of pubkey lines.
+    // Empty lines and #-comments are filtered (a typical
+    // authorized_keys file has neither, but accepting them lets
+    // operators point at /etc/ssh/sshd-trusted-keys-style files).
+    let mut ssh_keys: Vec<String> = Vec::new();
+    for f in &ssh_key_files {
+        let content = std::fs::read_to_string(f)
+            .map_err(crate::Error::io_ctx(format!("read --ssh-key file {}", f)))?;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                ssh_keys.push(trimmed.to_string());
+            }
+        }
+    }
+
+    let extra = match user_data {
+        Some(p) => Some(
+            std::fs::read_to_string(p)
+                .map_err(crate::Error::io_ctx(format!("read --user-data file {}", p)))?,
+        ),
+        None => None,
+    };
+
+    let spec = cloud_init::SeedSpec {
+        user,
+        password: if no_password { None } else { password },
+        ssh_keys,
+        hostname,
+        instance_id,
+        extra_user_data: extra,
+    };
+
+    spec.write_iso(std::path::Path::new(output))?;
+    eprintln!("seed ISO written to {}", output);
     Ok(())
 }
 
