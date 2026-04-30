@@ -32,3 +32,6 @@
 tests/alma/
 /u-boot.bin
 /soak_endurance-*.csv
+
+# Python bytecode cache (scripts/bench/lib.py is invoked as a module).
+__pycache__/
