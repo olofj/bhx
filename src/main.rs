@@ -2689,9 +2689,11 @@ fn run_boot_via_profile(
     })?;
 
     // Locate the template the operator pulled. `bhx image pull` lands
-    // artifacts at `images/<name>.<ext>` — re-derive the filename here.
+    // artifacts in the canonical XDG image dir — re-derive the
+    // filename here through the same helper so we stay in lock-step
+    // with the pull side.
     let ext = if img.needs_bootloader { "img" } else { "ext4" };
-    let template = std::path::PathBuf::from(format!("images/{}.{}", img.name, ext));
+    let template = image::image_dir().join(format!("{}.{}", img.name, ext));
 
     // Clone-or-reuse the instance disk. cli_disk overrides the
     // clone (operator wants to point at a different writable file).

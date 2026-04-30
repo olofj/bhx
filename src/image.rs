@@ -282,9 +282,28 @@ pub fn is_single_fs_artifact(image: &KnownImage) -> bool {
 // Download and conversion pipeline
 // ============================================================================
 
-/// Default directory for storing downloaded images.
+/// Canonical directory for downloaded image artifacts.
+///
+/// `$XDG_DATA_HOME/bhx/images/`, falling back to
+/// `~/.local/share/bhx/images/` per the XDG Base Directory spec.
+/// Pull always writes here regardless of cwd, so an operator
+/// running `bhx image pull` from any directory lands artifacts in
+/// one place rather than scattering multi-GB image trees across
+/// every dev shell. Mirrors the `xdg_firmware_dir` pattern in
+/// `main.rs` for `u-boot.bin` / `fw_jump.bin` / `blackhole-card.dtb`.
+///
+/// Boot-time `--disk <path>` is independent — operators can point
+/// at any path they like, including a custom location they curate
+/// outside the canonical tree.
 pub fn image_dir() -> PathBuf {
-    let dir = PathBuf::from("images");
+    let base: PathBuf = match std::env::var_os("XDG_DATA_HOME") {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => match std::env::var_os("HOME") {
+            Some(h) => PathBuf::from(h).join(".local/share"),
+            None => PathBuf::from(".local/share"),
+        },
+    };
+    let dir = base.join("bhx/images");
     let _ = fs::create_dir_all(&dir);
     dir
 }

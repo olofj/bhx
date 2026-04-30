@@ -79,18 +79,21 @@ L2CPU 0:
 ```bash
 bhx image pull debian-13
 bhx daemon start
-bhx boot -l 0 -d images/debian-13.img -n -a
+bhx boot -l 0 -d ~/.local/share/bhx/images/debian-13.img -n -a
 ```
 
 What each step does:
 
 1. `image pull debian-13` downloads the official Debian 13 (Trixie)
    riscv64 cloud image (~700 MB compressed → ~10 GB resized) and
-   lands it at `images/debian-13.img`. Idempotent — re-running with
-   the artifact present is a no-op (pass `--refetch` to force).
+   lands it in the canonical XDG image dir
+   (`$XDG_DATA_HOME/bhx/images/`, defaulting to
+   `~/.local/share/bhx/images/`). Pull always writes here regardless
+   of cwd. Idempotent — re-running with the artifact present is a
+   no-op (pass `--refetch` to force).
 2. `daemon start` forks the per-card daemon. Owns the chip;
    everything else is RPC.
-3. `boot -l 0 -d images/debian-13.img -n -a`:
+3. `boot -l 0 -d ~/.local/share/bhx/images/debian-13.img -n -a`:
    - `-l 0` selects L2CPU 0.
    - `-d` points at the disk; the daemon notices it's a whole-disk
      image and auto-selects the U-Boot + EFI boot path (uses the
@@ -174,16 +177,17 @@ bhx remove-net  -l 0
 bhx add-net     -l 0
 
 # Re-image a running core in place (tears down workers first):
-bhx boot -l 0 -d images/debian-13.img -n --force
+bhx boot -l 0 -d ~/.local/share/bhx/images/debian-13.img -n --force
 ```
 
 Run all four L2CPUs at once — each wants its own disk to avoid
 filesystem corruption from concurrent writers:
 
 ```bash
+IMG=~/.local/share/bhx/images/debian-13.img
 for i in 0 1 2 3; do
-    cp --reflink=auto images/debian-13.img images/debian-13-l$i.img
-    bhx boot -l $i -d images/debian-13-l$i.img -n
+    cp --reflink=auto "$IMG" "$IMG.l$i"
+    bhx boot -l $i -d "$IMG.l$i" -n
 done
 ```
 
