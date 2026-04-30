@@ -50,18 +50,6 @@ extern "C" {
     /// call — the caller (currently `VirtioNet::new`) holds a
     /// `CString` field for that. See #60.
     pub fn tt_slirp_set_vhostname(cfg: *mut SlirpConfig, vhostname: *const libc::c_char);
-
-    /// Override the IPv4 DNS server libslirp hands out via DHCP and
-    /// listens on for proxied queries. Default is `10.0.2.3`
-    /// (slirp's built-in proxy that forwards to the host's
-    /// `/etc/resolv.conf`). On hosts where resolv.conf points at a
-    /// host-only IP (Tailscale MagicDNS, systemd-resolved stub,
-    /// dnsmasq) slirp's NAT can't reach that target — DNS dies even
-    /// though everything else routes fine. Setting this to a public
-    /// resolver (`8.8.8.8`) makes the guest query it directly via
-    /// slirp's NAT, sidestepping the host's resolv.conf entirely.
-    /// `addr` is in network byte order.
-    pub fn bhx_slirp_set_vnameserver(cfg: *mut SlirpConfig, addr: u32);
 }
 
 impl InAddr {

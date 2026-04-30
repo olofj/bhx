@@ -287,22 +287,6 @@ impl VirtioNet {
             // `vdeslirp_open` (which copies / consumes the config).
             // See #60.
             tt_slirp_set_vhostname(&mut cfg, hostname.as_ptr());
-            // Override the DHCP-advertised DNS resolver. Default is
-            // slirp's built-in proxy at 10.0.2.3 which forwards to
-            // the host's /etc/resolv.conf — that breaks on hosts
-            // running Tailscale, systemd-resolved, or other
-            // host-only nameservers because slirp's NAT can't reach
-            // those targets. Pointing the guest at a public resolver
-            // sidesteps the issue entirely; queries go via slirp's
-            // NAT to the public internet, no host-resolv.conf
-            // round-trip.
-            //
-            // 8.8.8.8 in network byte order: 0x08080808 → htonl
-            // gives 0x08080808 (palindromic), but write the explicit
-            // conversion so a future swap to a non-palindromic addr
-            // (1.1.1.1, 9.9.9.9) doesn't silently break.
-            let dns = u32::from_be_bytes([8, 8, 8, 8]);
-            bhx_slirp_set_vnameserver(&mut cfg, dns);
         }
         let slirp = unsafe { vdeslirp_open(&mut cfg) };
         if slirp.is_null() {
