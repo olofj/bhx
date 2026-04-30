@@ -147,6 +147,10 @@ fn default_root_device() -> String {
     "vda".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// What sits at L2CPU DRAM `KERNEL_OFFSET` (start+0x20_0000) — either a
 /// Linux `Image` (OpenSBI fw_jump lands directly on it, classic boot) or
 /// the U-Boot S-mode payload (which then loads the actual kernel +
@@ -226,9 +230,12 @@ pub struct L2CpuStatus {
     pub disk: Option<String>,
     pub net: bool,
     /// Whether a virtio-console device is attached to this slot
-    /// (#54). `#[serde(default)]` keeps this wire-compatible with
-    /// pre-#54 clients that don't send the field; they get `false`.
-    #[serde(default)]
+    /// (#54). Defaults to `true` when missing — matches the
+    /// virtio-console-default-on boot mode (#113), so a status
+    /// payload from a pre-#54 daemon (which never produced this
+    /// field) decodes to the operationally-correct value rather
+    /// than to a confusing `false`.
+    #[serde(default = "default_true")]
     pub virtio_console: bool,
     pub clients: u32,
 }
@@ -428,15 +435,16 @@ mod tests {
     }
 
     #[test]
-    fn status_payload_decodes_pre_54_clients_with_default_virtio_console() {
-        // Wire compatibility: a pre-#54 client sends a StatusPayload
-        // without `virtio_console`. `#[serde(default)]` must default
-        // it to false rather than failing to parse.
+    fn status_payload_decodes_pre_54_daemon_to_virtio_console_on() {
+        // Wire compatibility: a pre-#54 daemon writes a StatusPayload
+        // without `virtio_console`. The serde default is `true` so the
+        // missing field decodes to the post-#113-flip operational
+        // default (virtio-console-on), not to a misleading `false`.
         let json = r#"{"pid":1,"uptime_secs":0,"l2cpus":[
             {"idx":0,"state":"stopped","disk":null,"net":false,"clients":0}
         ]}"#;
         let s: StatusPayload = serde_json::from_str(json).expect("legacy frame must decode");
-        assert!(!s.l2cpus[0].virtio_console);
+        assert!(s.l2cpus[0].virtio_console);
     }
 
     #[test]
