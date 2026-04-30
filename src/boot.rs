@@ -334,27 +334,15 @@ pub fn modify_dtb(
     fdt.setprop(virtio_reserved, "reg", &reserved_reg)?;
     fdt.setprop(virtio_reserved, "no-map", &[])?;
 
-    // Protect OpenSBI's M-mode runtime + the DTB itself. Without this
-    // the kernel sees [mem_start, mem_end) as available system RAM
-    // (per the /memory patch above) and is free to recycle the bottom
-    // 2 MiB — clobbering fw_jump.bin's text/data, OpenSBI's BSS and
-    // M-mode stack, the OSBIdbug debug_descriptor at fw_jump.bin
-    // offset 0x80, and the DTB. Reproducible with Debian's distro
-    // kernel; not seen with buildroot, but only because buildroot's
-    // smaller init happens not to allocate from the bottom 2 MiB
-    // before warm-resume probes — coincidence, not correctness. See
-    // #110.
-    let opensbi_node_name = format!("opensbi@{:x}", mem_start);
-    let opensbi_reserved = fdt.add_subnode(reserved, &opensbi_node_name)?;
-    let opensbi_reg = {
-        use crate::regs::boot_image::KERNEL_OFFSET;
-        let mut buf = Vec::with_capacity(16);
-        buf.extend_from_slice(&mem_start.to_be_bytes());
-        buf.extend_from_slice(&KERNEL_OFFSET.to_be_bytes());
-        buf
-    };
-    fdt.setprop(opensbi_reserved, "reg", &opensbi_reg)?;
-    fdt.setprop(opensbi_reserved, "no-map", &[])?;
+    // We used to add an `opensbi@<mem_start>` reservation here covering
+    // the bottom 2 MiB to protect fw_jump.bin and the OSBIdbug
+    // descriptor (#110). Turns out OpenSBI's generic platform fixup
+    // already plants `mmode_resv0` (BSS/heap) and `mmode_resv1`
+    // (text/rodata) into the same DTB, covering 384 KiB starting at
+    // mem_start — the descriptor at fw_jump.bin+0x80 is inside
+    // mmode_resv1 already. Adding our coarser reservation only
+    // produced two `OF: reserved mem: OVERLAP DETECTED!` warnings on
+    // every boot. See #119.
 
     // /soc and PLIC phandle
     let soc = fdt
@@ -506,11 +494,13 @@ mod tests {
     }
 
     #[test]
-    fn modify_dtb_reserves_opensbi_region_with_no_map() {
-        // #110: without an /reserved-memory entry covering the bottom
-        // 2 MiB, the kernel can recycle pages there and clobber
-        // OpenSBI's M-mode runtime — including the OSBIdbug debug
-        // descriptor at fw_jump.bin offset 0x80, breaking warm-resume.
+    fn modify_dtb_does_not_add_opensbi_subnode_overlapping_mmode_resv() {
+        // #119: we used to add an `opensbi@<mem_start>` subnode here
+        // (#110), but OpenSBI's generic platform fixup already plants
+        // `mmode_resv0`/`mmode_resv1` covering the same M-mode region.
+        // The redundant entry produced `OF: reserved mem: OVERLAP
+        // DETECTED!` warnings in the guest dmesg. Make sure we don't
+        // regress and start adding it back.
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x1_0000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
@@ -518,40 +508,19 @@ mod tests {
 
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let path = format!("/reserved-memory/opensbi@{:x}", mem_start);
-        let node = fdt
-            .path_offset(&path)
-            .unwrap()
-            .unwrap_or_else(|| panic!("expected {} subnode", path));
-
-        let reg = fdt.getprop(node, "reg").unwrap();
-        assert_eq!(reg.len(), 16, "reg should be (start_u64, size_u64)");
-        assert_eq!(
-            u64::from_be_bytes(reg[0..8].try_into().unwrap()),
-            mem_start,
-            "reservation must start at L2CPU DRAM base",
-        );
-        assert_eq!(
-            u64::from_be_bytes(reg[8..16].try_into().unwrap()),
-            crate::regs::boot_image::KERNEL_OFFSET,
-            "reservation must extend up to (but not including) the kernel load address",
+        assert!(
+            fdt.path_offset(&path).unwrap().is_none(),
+            "{} should not exist — OpenSBI's mmode_resv* covers this range",
+            path,
         );
 
-        // no-map: kernel must not even create a linear-map PTE for the range.
-        let no_map = fdt.getprop(node, "no-map").unwrap();
-        assert_eq!(
-            no_map.len(),
-            0,
-            "no-map is a boolean property (empty value)"
-        );
-
-        // Sibling reservation for the virtio MMIO carve-out at top of
-        // DRAM must still be present (we add ours alongside, not in
-        // place of it).
+        // The virtio MMIO carve-out at top of DRAM is still ours and
+        // must remain.
         assert!(
             fdt.path_offset("/reserved-memory/memory@4000afa00000")
                 .unwrap()
                 .is_some(),
-            "virtio MMIO reservation must remain alongside the new opensbi one",
+            "virtio MMIO reservation must still be present",
         );
     }
 
