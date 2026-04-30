@@ -121,6 +121,7 @@ impl SeedSpec {
                 s.push_str(&format!("      - \"{}\"\n", key.trim()));
             }
         }
+
         if let Some(extra) = &self.extra_user_data {
             // Caller's responsibility to keep extras valid YAML.
             // Concatenated raw with a leading newline so the operator
