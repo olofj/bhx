@@ -94,6 +94,15 @@ pub enum Request {
         /// the field via `serde(default)`.
         #[serde(default)]
         hostname_override: Option<String>,
+        /// Path to a cloud-init NoCloud seed image. When set, attached
+        /// as a 2nd virtio-blk at `DEV_BLK1` with `serial="cidata"` so
+        /// cloud-init's NoCloud datasource finds it. Bundled at boot
+        /// rather than added post-boot because cloud-init's `local`
+        /// stage runs before the kernel finishes block probe — issuing
+        /// `add-disk` after boot loses that race. See #82. Older
+        /// clients deserialize without this field via `serde(default)`.
+        #[serde(default)]
+        cloud_init: Option<String>,
     },
     /// Attach a console fd. Daemon replies with `ok` and sends the fd via
     /// SCM_RIGHTS; client pumps bytes between its tty and the passed fd.
@@ -102,13 +111,29 @@ pub enum Request {
         #[serde(default)]
         mode: ConsoleMode,
     },
-    /// Add a virtio-block device to a running L2CPU.
-    AddDisk { l2cpu: u8, path: String },
-    /// Remove the virtio-block device from a running L2CPU (Phase A: only
-    /// one disk per L2CPU, so no selector). Joins the worker thread and
-    /// drops the disk handle. The image file is unlocked and available
-    /// to the host again.
-    RemoveDisk { l2cpu: u8 },
+    /// Add a virtio-block device to a running L2CPU. Up to three
+    /// disks can be attached per L2CPU after boot — they land at the
+    /// next free `DEV_BLK*` slot in order. `name` becomes the disk's
+    /// virtio serial (returned via `VIRTIO_BLK_T_GET_ID`); `None`
+    /// keeps the legacy auto-derived `bhx-l2cpu-XX` serial. See #81.
+    AddDisk {
+        l2cpu: u8,
+        path: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// Remove a virtio-block device from a running L2CPU. Joins the
+    /// worker thread and drops the disk handle.
+    ///
+    /// `name` selects which disk to remove by serial. `None` removes
+    /// every disk attached to the slot (the legacy single-disk
+    /// shape's behavior — keeps existing scripts working). Multi-disk
+    /// callers should always pass an explicit selector.
+    RemoveDisk {
+        l2cpu: u8,
+        #[serde(default)]
+        name: Option<String>,
+    },
     /// Add a virtio-net device to a running L2CPU.
     ///
     /// `ssh_port` is the host TCP port for the implicit SSH forward
@@ -360,6 +385,7 @@ mod tests {
             force: false,
             memory_override: None,
             hostname_override: None,
+            cloud_init: None,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).unwrap();
@@ -392,6 +418,7 @@ mod tests {
             force: false,
             memory_override: None,
             hostname_override: None,
+            cloud_init: None,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).unwrap();
@@ -463,6 +490,7 @@ mod tests {
         let req = Request::AddDisk {
             l2cpu: 0,
             path: String::from_utf8(huge).unwrap(),
+            name: None,
         };
         let mut buf = Vec::new();
         assert!(write_frame(&mut buf, &req).is_err());
@@ -504,11 +532,55 @@ mod tests {
 
     #[test]
     fn request_roundtrip_remove_disk() {
-        let req = Request::RemoveDisk { l2cpu: 3 };
+        let req = Request::RemoveDisk {
+            l2cpu: 3,
+            name: None,
+        };
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).unwrap();
         let decoded: Request = read_frame(Cursor::new(&buf)).unwrap();
-        assert!(matches!(decoded, Request::RemoveDisk { l2cpu: 3 }));
+        assert!(matches!(
+            decoded,
+            Request::RemoveDisk {
+                l2cpu: 3,
+                name: None
+            }
+        ));
+    }
+
+    #[test]
+    fn request_roundtrip_remove_disk_by_name() {
+        let req = Request::RemoveDisk {
+            l2cpu: 0,
+            name: Some("cidata".into()),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &req).unwrap();
+        let decoded: Request = read_frame(Cursor::new(&buf)).unwrap();
+        match decoded {
+            Request::RemoveDisk { l2cpu, name } => {
+                assert_eq!(l2cpu, 0);
+                assert_eq!(name.as_deref(), Some("cidata"));
+            }
+            other => panic!("expected RemoveDisk, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn add_disk_request_decodes_pre_81_clients_with_default_name() {
+        // Pre-#81 clients send `{l2cpu, path}` without a `name` field.
+        // `#[serde(default)]` must default it to `None` so the legacy
+        // call site keeps working.
+        let json = r#"{"op":"add_disk","l2cpu":0,"path":"/tmp/x.ext4"}"#;
+        let req: Request = serde_json::from_str(json).expect("legacy frame must decode");
+        match req {
+            Request::AddDisk { l2cpu, path, name } => {
+                assert_eq!(l2cpu, 0);
+                assert_eq!(path, "/tmp/x.ext4");
+                assert!(name.is_none());
+            }
+            other => panic!("expected AddDisk, got {:?}", other),
+        }
     }
 
     #[test]
@@ -539,6 +611,7 @@ mod tests {
                 force,
                 memory_override: None,
                 hostname_override: None,
+                cloud_init: None,
             };
             let mut buf = Vec::new();
             write_frame(&mut buf, &req).unwrap();
@@ -647,6 +720,7 @@ mod tests {
             force: false,
             memory_override: Some(0x4000_0000),
             hostname_override: Some("debian-bench".into()),
+            cloud_init: None,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).unwrap();

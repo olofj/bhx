@@ -66,6 +66,7 @@ pub fn boot(
     force: bool,
     memory_override: Option<u64>,
     hostname_override: Option<String>,
+    cloud_init: Option<String>,
 ) -> io::Result<()> {
     write_frame(
         &mut *sock,
@@ -85,6 +86,7 @@ pub fn boot(
             force,
             memory_override,
             hostname_override,
+            cloud_init,
         },
     )?;
     expect_ok(read_frame(&mut *sock)?)
@@ -100,13 +102,18 @@ pub fn remove_console(sock: &mut UnixStream, l2cpu: u8) -> io::Result<()> {
     expect_ok(read_frame(&mut *sock)?)
 }
 
-pub fn add_disk(sock: &mut UnixStream, l2cpu: u8, path: String) -> io::Result<()> {
-    write_frame(&mut *sock, &Request::AddDisk { l2cpu, path })?;
+pub fn add_disk(
+    sock: &mut UnixStream,
+    l2cpu: u8,
+    path: String,
+    name: Option<String>,
+) -> io::Result<()> {
+    write_frame(&mut *sock, &Request::AddDisk { l2cpu, path, name })?;
     expect_ok(read_frame(&mut *sock)?)
 }
 
-pub fn remove_disk(sock: &mut UnixStream, l2cpu: u8) -> io::Result<()> {
-    write_frame(&mut *sock, &Request::RemoveDisk { l2cpu })?;
+pub fn remove_disk(sock: &mut UnixStream, l2cpu: u8, name: Option<String>) -> io::Result<()> {
+    write_frame(&mut *sock, &Request::RemoveDisk { l2cpu, name })?;
     expect_ok(read_frame(&mut *sock)?)
 }
 

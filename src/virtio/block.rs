@@ -70,6 +70,17 @@ pub struct VirtioBlk {
     /// L2CPU index this device serves. Stored only for metric labels;
     /// not used in the I/O path itself.
     l2cpu_idx: u8,
+    /// Operator-supplied serial string returned by `VIRTIO_BLK_T_GET_ID`.
+    /// `None` falls back to the auto-derived `bhx-l2cpu-XX` form (the
+    /// legacy default — preserved so single-disk boots that don't set
+    /// a serial behave exactly as before).
+    ///
+    /// Set this to `"cidata"` for the cloud-init NoCloud seed disk —
+    /// cloud-init's NoCloud datasource finds the seed by filesystem
+    /// label, but `serial="cidata"` also makes
+    /// `/dev/disk/by-id/virtio-cidata` stable for operator
+    /// scripts (#82).
+    serial: Option<String>,
 }
 
 unsafe impl Send for VirtioBlk {}
@@ -93,6 +104,17 @@ impl VirtioBlk {
     /// caller is freed from any close responsibility. `mmap` derives
     /// the file size via `fstat` on the file's fd.
     pub fn from_file(file: File, l2cpu_idx: u8) -> std::io::Result<Self> {
+        Self::from_file_with_serial(file, l2cpu_idx, None)
+    }
+
+    /// Like `from_file` but with an operator-supplied serial string
+    /// that overrides the default `bhx-l2cpu-XX` form. See the
+    /// `serial` field's doc comment.
+    pub fn from_file_with_serial(
+        file: File,
+        l2cpu_idx: u8,
+        serial: Option<String>,
+    ) -> std::io::Result<Self> {
         let stat = nix::sys::stat::fstat(&file)
             .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
         let file_size = stat.st_size as usize;
@@ -120,6 +142,7 @@ impl VirtioBlk {
             data_offset: 0,
             req_status: VIRTIO_BLK_S_OK,
             l2cpu_idx,
+            serial,
         })
     }
 
@@ -198,8 +221,14 @@ impl VirtioDeviceImpl for VirtioBlk {
                 // we return UNSUPP the kernel stalls before mount_root.
                 // Buildroot ignores the failure, which is why we got
                 // away with leaving it unimplemented.
-                let serial = format!("bhx-l2cpu-{:02}", self.l2cpu_idx);
-                let bytes = serial.as_bytes();
+                let derived;
+                let bytes: &[u8] = match self.serial.as_deref() {
+                    Some(s) => s.as_bytes(),
+                    None => {
+                        derived = format!("bhx-l2cpu-{:02}", self.l2cpu_idx);
+                        derived.as_bytes()
+                    }
+                };
                 let n = (len as usize).min(VIRTIO_BLK_ID_BYTES);
                 unsafe {
                     ptr::write_bytes(addr, 0, n);

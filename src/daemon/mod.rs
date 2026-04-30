@@ -125,6 +125,18 @@ pub struct VirtioConsoleSlot {
 
 pub struct DiskWorker {
     pub path: String,
+    /// Engine slot (`l2cpu_idx * DEVS_PER_L2CPU + dev_idx`) the disk
+    /// occupies — needed so `RemoveDisk` can unregister exactly the
+    /// kick-poller entry that backs this worker. Stored explicitly
+    /// rather than recomputed because multi-disk support means a
+    /// given (l2cpu, disk) tuple can land at any of `DEV_BLK`,
+    /// `DEV_BLK1`, or `DEV_BLK2`.
+    pub slot_idx: u32,
+    /// Operator-supplied serial — `cidata` for cloud-init seeds,
+    /// arbitrary string for data disks, `None` for the legacy
+    /// rootfs-only single-disk shape (which derives its serial from
+    /// the L2CPU index).
+    pub name: Option<String>,
     pub worker: WorkerHandle,
 }
 

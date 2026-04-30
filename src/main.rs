@@ -82,6 +82,10 @@ struct Cli {
     network: bool,
 }
 
+// clap-derived subcommand enum. Variants vary in size (Boot has ~16
+// fields), but boxing them just to satisfy `large_enum_variant`
+// would add an allocation per parsed CLI invocation for no real win.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     /// Boot an L2CPU via the daemon.
@@ -203,6 +207,18 @@ enum Commands {
             conflicts_with_all = ["kernel", "uboot", "memory", "hostname"],
         )]
         profile: Option<String>,
+        /// Path to a cloud-init NoCloud seed image (#82).
+        ///
+        /// Attached as a 2nd virtio-blk with `serial="cidata"` so
+        /// cloud-init's NoCloud datasource finds it during the
+        /// `local` boot stage and seeds users / SSH keys / hostname
+        /// before sshd starts. Generate one with `bhx cloud-init
+        /// seed`. Bundling at boot (rather than `add-disk` after) is
+        /// required — cloud-init's local stage runs before the
+        /// kernel finishes block probe; an add-disk arriving later
+        /// loses that race and the seed never gets read.
+        #[arg(long = "cloud-init")]
+        cloud_init: Option<String>,
     },
     /// Attach a terminal to a booted L2CPU's console via the daemon.
     Connect {
@@ -223,12 +239,26 @@ enum Commands {
     AddDisk {
         /// Path to the disk image (.ext4 / .img).
         path: String,
+        /// Operator-supplied serial returned by the guest's
+        /// `VIRTIO_BLK_T_GET_ID`. Used by the guest's udev rules to
+        /// assemble `/dev/disk/by-id/virtio-<name>` so the device has
+        /// a stable identity across reboots and between rootfs and
+        /// data disks. `cidata` is reserved for cloud-init seed
+        /// disks. Omit to keep the legacy auto-derived
+        /// `bhx-l2cpu-XX` serial.
+        #[arg(long)]
+        name: Option<String>,
     },
-    /// Detach the disk from a running L2CPU.
+    /// Detach disks from a running L2CPU.
     ///
-    /// Joins the worker thread and releases the image file (Phase A:
-    /// one disk per L2CPU, no selector).
-    RemoveDisk,
+    /// Without `--name`, removes every disk attached to the slot
+    /// (matches the legacy single-disk shape). With `--name X`,
+    /// detaches only the disk whose serial matches `X`.
+    RemoveDisk {
+        /// Disk name (serial) to remove. Omit to remove all disks.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Attach virtio-net (slirp) to a running L2CPU.
     AddNet {
         /// Override the host-side port forwarded to the guest's :22.
@@ -683,6 +713,7 @@ fn main() -> std::process::ExitCode {
             memory,
             hostname,
             profile,
+            cloud_init,
         }) => {
             let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
             if let Some(profile_name) = profile {
@@ -739,6 +770,7 @@ fn main() -> std::process::ExitCode {
                 force,
                 memory,
                 hostname,
+                cloud_init,
             )?;
             if attach {
                 run_connect_client(card, l2cpu, daemon::protocol::ConsoleMode::Rw)?;
@@ -756,19 +788,19 @@ fn main() -> std::process::ExitCode {
             daemon::client::stop_l2cpu(&mut sock, l2cpu)
         }
         Some(Commands::Status) => daemon::runner::status(resolve_card(&cli.l2cpu, cli.ttdevice)?),
-        Some(Commands::AddDisk { path }) => {
+        Some(Commands::AddDisk { path, name }) => {
             // Canonicalize client-side — daemon runs with cwd=/ after
             // double-fork, so relative paths from the user's shell would
             // resolve against the wrong base otherwise.
             let path = absolutize(&path)?;
             let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
             let mut sock = daemon::client::connect(card)?;
-            daemon::client::add_disk(&mut sock, l2cpu, path)
+            daemon::client::add_disk(&mut sock, l2cpu, path, name)
         }
-        Some(Commands::RemoveDisk) => {
+        Some(Commands::RemoveDisk { name }) => {
             let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
             let mut sock = daemon::client::connect(card)?;
-            daemon::client::remove_disk(&mut sock, l2cpu)
+            daemon::client::remove_disk(&mut sock, l2cpu, name)
         }
         Some(Commands::AddNet { ssh_port, fwd }) => {
             let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
@@ -1072,6 +1104,7 @@ fn run_boot_client(
     force: bool,
     memory_override: Option<u64>,
     hostname_override: Option<String>,
+    cloud_init: Option<String>,
 ) -> std::io::Result<()> {
     // Bundle disk + network into the Boot RPC so the virtio workers come up
     // together with the L2CPU reset release. The guest kernel hits its VFS
@@ -1096,6 +1129,7 @@ fn run_boot_client(
     let dtb = absolutize(&resolve_firmware_path(&dtb, "third_party/dtb"))?;
     let initramfs = initramfs.map(|p| absolutize(&p)).transpose()?;
     let disk = disk.map(|p| absolutize(&p)).transpose()?;
+    let cloud_init = cloud_init.map(|p| absolutize(&p)).transpose()?;
     let mut sock = daemon::client::connect(card)?;
     daemon::client::boot(
         &mut sock,
@@ -1114,6 +1148,7 @@ fn run_boot_client(
         force,
         memory_override,
         hostname_override,
+        cloud_init,
     )
 }
 
@@ -2561,6 +2596,11 @@ fn run_boot_via_profile(
         force,
         memory_override,
         hostname_override,
+        // Profile-driven cloud-init seed integration is tracked in the
+        // sibling issue (see #115); for now profile boots don't pass a
+        // seed. Operators wanting a seed should use the explicit
+        // `--cloud-init` flag rather than going through a profile.
+        None,
     )
 }
 

@@ -325,6 +325,7 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             force,
             memory_override,
             hostname_override,
+            cloud_init,
         } => dispatch_boot(
             &sock,
             &state,
@@ -343,12 +344,15 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             force,
             memory_override,
             hostname_override,
+            cloud_init,
         ),
         Request::AttachConsole { l2cpu, mode } => {
             dispatch_attach_console(&sock, &state, l2cpu, mode)
         }
-        Request::AddDisk { l2cpu, path } => dispatch_add_disk(&sock, &state, l2cpu, path),
-        Request::RemoveDisk { l2cpu } => dispatch_remove_disk(&sock, &state, l2cpu),
+        Request::AddDisk { l2cpu, path, name } => {
+            dispatch_add_disk(&sock, &state, l2cpu, path, name)
+        }
+        Request::RemoveDisk { l2cpu, name } => dispatch_remove_disk(&sock, &state, l2cpu, name),
         Request::AddNet {
             l2cpu,
             ssh_port,
@@ -506,13 +510,36 @@ fn decide_boot_slot(slot_present: bool, force: bool, l2cpu_idx: u8) -> BootSlotD
 /// `add-disk` calls fail with "a disk is already attached". The
 /// `disks_empty` argument is the `slot.disks.is_empty()` reading taken
 /// under the slot mutex.
+/// Maximum disks per L2CPU. Three blk slots: DEV_BLK (rootfs by
+/// convention), DEV_BLK1 (cloud-init seed if --cloud-init was set,
+/// else first add-disk), DEV_BLK2 (additional data disk).
+pub const MAX_DISKS_PER_L2CPU: usize = 3;
+
 fn validate_add_disk_request(
-    disks_empty: bool,
+    current_count: usize,
+    name: Option<&str>,
+    existing_names: impl IntoIterator<Item = Option<String>>,
     path: &std::path::Path,
 ) -> crate::Result<std::fs::File> {
-    if !disks_empty {
-        // Phase A: one disk per L2CPU. Phase B+: multi-disk with indexed MMIO.
-        return Err(crate::Error::slot_state("a disk is already attached"));
+    if current_count >= MAX_DISKS_PER_L2CPU {
+        return Err(crate::Error::slot_state(format!(
+            "L2CPU already has {} disks attached (max {})",
+            current_count, MAX_DISKS_PER_L2CPU
+        )));
+    }
+    // Reject duplicate names — guest udev would otherwise see two
+    // virtio-blk devices with the same /dev/disk/by-id/virtio-* link
+    // and the operator's selector logic in remove-disk would be
+    // ambiguous.
+    if let Some(n) = name {
+        for existing in existing_names {
+            if existing.as_deref() == Some(n) {
+                return Err(crate::Error::slot_state(format!(
+                    "L2CPU already has a disk with name {:?}",
+                    n
+                )));
+            }
+        }
     }
     std::fs::OpenOptions::new()
         .read(true)
@@ -533,6 +560,31 @@ fn validate_remove_disk_request(disks_empty: bool) -> Result<(), &'static str> {
         Err("no disk attached")
     } else {
         Ok(())
+    }
+}
+
+/// Pick the first free `DEV_BLK*` slot index for a new attach, given
+/// the slots already in use. Returns `None` if all three are taken.
+/// Tied to `MAX_DISKS_PER_L2CPU`; bumping that requires extending the
+/// list here in lockstep.
+fn pick_free_blk_slot(used: &[u32]) -> Option<u32> {
+    use crate::virtio_engine::{DEV_BLK, DEV_BLK1, DEV_BLK2};
+    [DEV_BLK, DEV_BLK1, DEV_BLK2]
+        .into_iter()
+        .find(|s| !used.contains(s))
+}
+
+fn irq_for_blk_dev_idx(dev_idx: u32) -> u32 {
+    use crate::regs::virtio_mmio::{DISK1_IRQ, DISK2_IRQ, DISK_IRQ};
+    use crate::virtio_engine::{DEV_BLK, DEV_BLK1, DEV_BLK2};
+    match dev_idx {
+        x if x == DEV_BLK => DISK_IRQ,
+        x if x == DEV_BLK1 => DISK1_IRQ,
+        x if x == DEV_BLK2 => DISK2_IRQ,
+        _ => panic!(
+            "irq_for_blk_dev_idx called with non-blk dev_idx {}",
+            dev_idx
+        ),
     }
 }
 
@@ -610,6 +662,7 @@ fn dispatch_boot(
     force: bool,
     memory_override: Option<u64>,
     hostname_override: Option<String>,
+    cloud_init: Option<String>,
 ) -> crate::Result<()> {
     // U-Boot mode reads kernel + initrd from disk at runtime, so the
     // daemon's preloaded initramfs would be unreachable. Reject up
@@ -623,8 +676,8 @@ fn dispatch_boot(
         initramfs
     };
     dlog!(
-        "[boot l2cpu {}] dispatch_boot entry: opensbi={} payload={:?} dtb={} initramfs={:?} root={} force_reset_pcie={} disk={:?} network={} console={} rng={} force={} mem_override={:?} hostname_override={:?}",
-        l2cpu_idx, opensbi, payload, dtb, initramfs, root_device, force_reset_pcie, disk, network, console, rng, force, memory_override, hostname_override
+        "[boot l2cpu {}] dispatch_boot entry: opensbi={} payload={:?} dtb={} initramfs={:?} root={} force_reset_pcie={} disk={:?} network={} console={} rng={} force={} mem_override={:?} hostname_override={:?} cloud_init={:?}",
+        l2cpu_idx, opensbi, payload, dtb, initramfs, root_device, force_reset_pcie, disk, network, console, rng, force, memory_override, hostname_override, cloud_init
     );
     validate_l2cpu(l2cpu_idx)?;
     handle_existing_slot(state, l2cpu_idx, force).map_err(crate::Error::slot_state)?;
@@ -649,6 +702,7 @@ fn dispatch_boot(
         network,
         console,
         rng,
+        cloud_init.is_some(),
         memory_override,
     )
     .map_err(|e| {
@@ -739,51 +793,94 @@ fn dispatch_boot(
                     "rng",
                 );
             }
-            if let Some(disk_path) = disk.as_ref() {
-                match std::fs::OpenOptions::new()
+            // Helper: open the disk image, build a VirtioBlk with the
+            // operator-supplied serial, register it with the kick
+            // poller at `dev_idx`, and append a stub DiskWorker so
+            // `daemon status` reports the attachment. Logs and
+            // swallows errors at this site (a failed cloud-init
+            // attach shouldn't block the rest of the boot).
+            let mut attach_disk = |disk_path: &str,
+                                   serial: Option<String>,
+                                   dev_idx: u32,
+                                   irq: u32,
+                                   label: &'static str| {
+                let file = match std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
                     .open(disk_path)
                 {
-                    Ok(file) => match crate::virtio::block::VirtioBlk::from_file(file, l2cpu_idx) {
-                        Ok(blk) => {
-                            register(
-                                dev_slot(crate::virtio_engine::DEV_BLK),
-                                Box::new(blk),
-                                crate::regs::virtio_mmio::DISK_IRQ,
-                                crate::virtio::InterruptKind::Block,
-                                "blk",
-                            );
-                            // Stub DiskWorker so `daemon status` shows
-                            // `disk=<path>` instead of `disk=-`. The
-                            // kick poller owns the actual dispatch;
-                            // there is no thread to join.
-                            slot.disks.push(DiskWorker {
-                                path: disk_path.clone(),
-                                worker: WorkerHandle {
-                                    exit: Arc::new(AtomicBool::new(false)),
-                                    thread: None,
-                                    description: format!(
-                                        "disk l2cpu {} @ {} (engine)",
-                                        l2cpu_idx, disk_path
-                                    ),
-                                },
-                            });
-                        }
-                        Err(e) => dlog!(
-                            "[run_boot l2cpu {}] virtio-engine: VirtioBlk::from_file \
+                    Ok(f) => f,
+                    Err(e) => {
+                        dlog!(
+                            "[run_boot l2cpu {}] virtio-engine: open {} for {} failed: {}",
+                            l2cpu_idx,
+                            disk_path,
+                            label,
+                            e
+                        );
+                        return;
+                    }
+                };
+                let blk = match crate::virtio::block::VirtioBlk::from_file_with_serial(
+                    file,
+                    l2cpu_idx,
+                    serial.clone(),
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        dlog!(
+                            "[run_boot l2cpu {}] virtio-engine: VirtioBlk::from_file({}) for {} \
                                  failed: {}",
                             l2cpu_idx,
+                            disk_path,
+                            label,
                             e
+                        );
+                        return;
+                    }
+                };
+                let slot_idx = dev_slot(dev_idx);
+                register(
+                    slot_idx,
+                    Box::new(blk),
+                    irq,
+                    crate::virtio::InterruptKind::Block,
+                    label,
+                );
+                slot.disks.push(DiskWorker {
+                    path: disk_path.to_string(),
+                    slot_idx,
+                    name: serial,
+                    worker: WorkerHandle {
+                        exit: Arc::new(AtomicBool::new(false)),
+                        thread: None,
+                        description: format!(
+                            "{} l2cpu {} @ {} (engine)",
+                            label, l2cpu_idx, disk_path
                         ),
                     },
-                    Err(e) => dlog!(
-                        "[run_boot l2cpu {}] virtio-engine: open disk image {} failed: {}",
-                        l2cpu_idx,
-                        disk_path,
-                        e
-                    ),
-                }
+                });
+            };
+            if let Some(disk_path) = disk.as_ref() {
+                attach_disk(
+                    disk_path,
+                    None,
+                    crate::virtio_engine::DEV_BLK,
+                    crate::regs::virtio_mmio::DISK_IRQ,
+                    "blk",
+                );
+            }
+            if let Some(seed_path) = cloud_init.as_ref() {
+                // cloud-init's NoCloud datasource probes for a virtio
+                // device with serial="cidata"; pin it to DEV_BLK1 so
+                // the second virtio-blk index is stable across boots.
+                attach_disk(
+                    seed_path,
+                    Some("cidata".to_string()),
+                    crate::virtio_engine::DEV_BLK1,
+                    crate::regs::virtio_mmio::DISK1_IRQ,
+                    "cidata",
+                );
             }
             dlog!(
                 "[run_boot l2cpu {}] virtio-engine: net check (network={}, slirp_compiled={})",
@@ -975,6 +1072,7 @@ fn run_boot_sequence(
     has_network: bool,
     has_console: bool,
     has_rng: bool,
+    has_cidata: bool,
     memory_override: Option<u64>,
 ) -> io::Result<BootArtifacts> {
     use crate::regs::boot_image;
@@ -1118,7 +1216,7 @@ fn run_boot_sequence(
     let mut virtio_nodes: Vec<crate::boot::VirtioMmioNode> = Vec::with_capacity(8);
     let uart_addr_for_dtb: Option<u64> = None;
 
-    let any_host_device = has_rng || has_network || has_disk || has_console;
+    let any_host_device = has_rng || has_network || has_disk || has_console || has_cidata;
 
     // The L2CPU's virtio-mmio reg windows point at the tensix engine
     // tile's L1. The engine is brought up lazily —
@@ -1195,6 +1293,16 @@ fn run_boot_sequence(
             has_rng,
             crate::regs::virtio_mmio::RNG_IRQ,
             "rng",
+        );
+        // Cloud-init NoCloud seed (#82). DEV_BLK1 is reserved for it
+        // so the seed disk index is stable across boots and operator
+        // udev rules can rely on `serial=cidata` finding it at a
+        // predictable virtio-mmio address.
+        emit(
+            crate::virtio_engine::DEV_BLK1,
+            has_cidata,
+            crate::regs::virtio_mmio::DISK1_IRQ,
+            "cidata",
         );
         // M6 (#78) 16550 UART. Lives at a fixed offset within the
         // engine's small TLB window — no second TLB slot needed.
@@ -1510,13 +1618,31 @@ fn dispatch_add_disk(
     state: &Arc<DaemonState>,
     l2cpu_idx: u8,
     path: String,
+    name: Option<String>,
 ) -> crate::Result<()> {
     validate_l2cpu(l2cpu_idx)?;
     let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
     let slot = slot_guard
         .as_mut()
         .ok_or_else(|| crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx)))?;
-    let disk_image = validate_add_disk_request(slot.disks.is_empty(), std::path::Path::new(&path))?;
+    let disk_image = validate_add_disk_request(
+        slot.disks.len(),
+        name.as_deref(),
+        slot.disks.iter().map(|d| d.name.clone()),
+        std::path::Path::new(&path),
+    )?;
+    // Pick the first free DEV_BLK* slot. Each existing disk's slot_idx
+    // is in engine-slot space (l2cpu_idx * DEVS_PER_L2CPU + dev_idx);
+    // map back to dev_idx for the picker.
+    let l2cpu_base = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU;
+    let used: Vec<u32> = slot.disks.iter().map(|d| d.slot_idx - l2cpu_base).collect();
+    let dev_idx = pick_free_blk_slot(&used).ok_or_else(|| {
+        crate::Error::slot_state(format!(
+            "no free virtio-blk slots (max {})",
+            MAX_DISKS_PER_L2CPU
+        ))
+    })?;
+    let irq = irq_for_blk_dev_idx(dev_idx);
 
     // Engine path: register a fresh VirtioBlk with the kick poller
     // and push a stub DiskWorker so `daemon status` reflects the
@@ -1531,10 +1657,13 @@ fn dispatch_add_disk(
             state.kick_poller.lock_or_internal_error()?.as_ref(),
             state.tensix_engine.lock_or_internal_error()?.clone(),
         ) {
-            match crate::virtio::block::VirtioBlk::from_file(disk_image, l2cpu_idx) {
+            match crate::virtio::block::VirtioBlk::from_file_with_serial(
+                disk_image,
+                l2cpu_idx,
+                name.clone(),
+            ) {
                 Ok(blk) => {
-                    let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
-                        + crate::virtio_engine::DEV_BLK;
+                    let slot_idx = l2cpu_base + dev_idx;
                     let config_addr = crate::virtio_engine::slot_regs_base(slot_idx)
                         + crate::virtio_engine::MMIO_CONFIG;
                     crate::virtio::VirtioDeviceImpl::init_config(&blk, engine.l1_ptr(config_addr));
@@ -1543,12 +1672,14 @@ fn dispatch_add_disk(
                         Arc::clone(&slot.l2cpu),
                         Box::new(blk),
                         Arc::clone(&slot.interrupt),
-                        crate::regs::virtio_mmio::DISK_IRQ,
+                        irq,
                         crate::virtio::InterruptKind::Block,
                     );
                     poller.register_slot(entry);
                     slot.disks.push(DiskWorker {
                         path: path.clone(),
+                        slot_idx,
+                        name: name.clone(),
                         worker: WorkerHandle {
                             exit: Arc::new(AtomicBool::new(false)),
                             thread: None,
@@ -1556,10 +1687,11 @@ fn dispatch_add_disk(
                         },
                     });
                     dlog!(
-                        "[add_disk l2cpu {}] engine: registered blk on slot {} for {}",
+                        "[add_disk l2cpu {}] engine: registered blk on slot {} for {} (name={:?})",
                         l2cpu_idx,
                         slot_idx,
-                        path
+                        path,
+                        name
                     );
                     reply_ok(sock);
                     return Ok(());
@@ -1588,37 +1720,69 @@ fn dispatch_remove_disk(
     sock: &UnixStream,
     state: &Arc<DaemonState>,
     l2cpu_idx: u8,
+    name: Option<String>,
 ) -> crate::Result<()> {
-    dlog!("[remove_disk l2cpu {}] dispatch entry", l2cpu_idx);
+    dlog!(
+        "[remove_disk l2cpu {}] dispatch entry (name={:?})",
+        l2cpu_idx,
+        name
+    );
     validate_l2cpu(l2cpu_idx)?;
-    // Engine path: drop the kick poller's blk registration first so
-    // any in-flight kick lands as a "no registration" drop instead of
-    // a use-after-free against the Box<VirtioBlk> we're about to free.
-    // The legacy worker thread handles its own teardown via the exit
-    // flag in the for-loop below; this is a no-op there.
 
-    if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
-        let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
-            + crate::virtio_engine::DEV_BLK;
-        poller.unregister_slot(slot_idx);
-    }
-    // Take the disks out under the lock, then release and join outside.
-    // stop_and_join blocks until the worker's poll loop notices the exit
-    // flag (~100 ms worst case); holding the state mutex for that long
-    // would block every other RPC on other L2CPUs.
-    let disks = {
+    // Take the matching disks out under the lock; unregister their
+    // kick-poller slots while still holding the slot mutex (so the
+    // poller can't race a fresh kick against a half-detached
+    // VirtioBlk); release the lock; then join workers outside.
+    // `stop_and_join` blocks until the worker's poll loop notices its
+    // exit flag (~100 ms worst case) — holding the state mutex for
+    // that long would block every other RPC on other L2CPUs.
+    let disks_to_remove: Vec<DiskWorker> = {
         let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
         let slot = slot_guard.as_mut().ok_or_else(|| {
             crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx))
         })?;
         validate_remove_disk_request(slot.disks.is_empty()).map_err(crate::Error::slot_state)?;
-        std::mem::take(&mut slot.disks)
+        let mut taken: Vec<DiskWorker> = Vec::new();
+        match name.as_deref() {
+            None => {
+                // Legacy behavior: remove all disks. Kept for
+                // single-disk callers that don't pass a selector.
+                taken.append(&mut slot.disks);
+            }
+            Some(want) => {
+                let mut keep: Vec<DiskWorker> = Vec::with_capacity(slot.disks.len());
+                for d in std::mem::take(&mut slot.disks) {
+                    if d.name.as_deref() == Some(want) {
+                        taken.push(d);
+                    } else {
+                        keep.push(d);
+                    }
+                }
+                slot.disks = keep;
+                if taken.is_empty() {
+                    return Err(crate::Error::slot_state(format!(
+                        "no disk with name {:?} attached to l2cpu {}",
+                        want, l2cpu_idx
+                    )));
+                }
+            }
+        }
+        // Drop the kick-poller registrations for the slots we're
+        // taking. Done under the slot mutex so a concurrent boot RPC
+        // for this L2CPU can't observe a torn state.
+        if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
+            for d in &taken {
+                poller.unregister_slot(d.slot_idx);
+            }
+        }
+        taken
     };
-    for d in disks {
+    for d in disks_to_remove {
         dlog!(
-            "[remove_disk l2cpu {}] joining worker for {}",
+            "[remove_disk l2cpu {}] joining worker for {} (slot {})",
             l2cpu_idx,
-            d.path
+            d.path,
+            d.slot_idx
         );
         d.worker.stop_and_join();
     }
@@ -2041,6 +2205,7 @@ mod tests {
             &Request::AddDisk {
                 l2cpu: 0,
                 path: "/tmp/nonexistent.img".into(),
+                name: None,
             },
         )
         .unwrap();
@@ -2110,6 +2275,7 @@ mod tests {
             &Request::AddDisk {
                 l2cpu: 0,
                 path: "/tmp/nonexistent.img".into(),
+                name: None,
             },
         )
         .unwrap();
@@ -2158,24 +2324,36 @@ mod tests {
     // ---- validate_add_disk_request ----
 
     #[test]
-    fn add_disk_rejects_when_disk_already_attached() {
+    fn add_disk_rejects_when_max_disks_attached() {
         let tf = tempfile::NamedTempFile::new().unwrap();
-        let err = validate_add_disk_request(false, tf.path()).unwrap_err();
-        // SlotState variant for "already attached" — wire shape is bare.
+        // Fill all three blk slots.
+        let existing = vec![Some("rootfs".to_string()), Some("cidata".to_string()), None];
+        let err =
+            validate_add_disk_request(MAX_DISKS_PER_L2CPU, None, existing, tf.path()).unwrap_err();
         assert!(matches!(err, crate::Error::SlotState(_)));
         let msg = err.to_string();
-        assert!(msg.contains("already attached"), "got: {}", msg);
+        assert!(msg.contains("max"), "got: {}", msg);
     }
 
     #[test]
     fn add_disk_rejects_when_image_path_does_not_exist() {
         let dir = tempfile::tempdir().unwrap();
         let bogus = dir.path().join("nonexistent.ext4");
-        let err = validate_add_disk_request(true, &bogus).unwrap_err();
+        let err = validate_add_disk_request(0, None, Vec::new(), &bogus).unwrap_err();
         // Io variant for IO failures — wire shape "cannot open disk image <p>: <io>".
         assert!(matches!(err, crate::Error::Io { .. }));
         let msg = err.to_string();
         assert!(msg.contains("cannot open disk image"), "got: {}", msg);
+    }
+
+    #[test]
+    fn add_disk_rejects_duplicate_name() {
+        let tf = tempfile::NamedTempFile::new().unwrap();
+        let existing = vec![Some("cidata".to_string())];
+        let err = validate_add_disk_request(1, Some("cidata"), existing, tf.path()).unwrap_err();
+        assert!(matches!(err, crate::Error::SlotState(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("already has a disk with name"), "got: {}", msg);
     }
 
     #[test]
@@ -2186,8 +2364,21 @@ mod tests {
         // Returns the open File on success — the caller hands the same
         // fd to the worker so a path-resolved-twice TOCTOU can't redirect
         // the daemon at a different inode after this point.
-        let _file = validate_add_disk_request(true, tf.path())
+        let _file = validate_add_disk_request(0, None, Vec::new(), tf.path())
             .expect("valid path on empty slot must accept");
+    }
+
+    #[test]
+    fn pick_free_blk_slot_walks_dev_blk_first() {
+        use crate::virtio_engine::{DEV_BLK, DEV_BLK1, DEV_BLK2};
+        // No disks attached → DEV_BLK.
+        assert_eq!(pick_free_blk_slot(&[]), Some(DEV_BLK));
+        // Rootfs attached → next is DEV_BLK1 (cidata slot).
+        assert_eq!(pick_free_blk_slot(&[DEV_BLK]), Some(DEV_BLK1));
+        // Rootfs + cidata → DEV_BLK2.
+        assert_eq!(pick_free_blk_slot(&[DEV_BLK, DEV_BLK1]), Some(DEV_BLK2));
+        // All three taken → None.
+        assert_eq!(pick_free_blk_slot(&[DEV_BLK, DEV_BLK1, DEV_BLK2]), None);
     }
 
     // ---- validate_remove_disk_request ----
