@@ -38,3 +38,7 @@ __pycache__/
 
 # Default cidata seed path used by the README walk-through.
 /seed.iso
+
+# External checkouts kept in-tree for browsing; never committed
+luwen/
+tt-kmd/
