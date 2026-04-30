@@ -631,42 +631,63 @@ impl EditorRunner for ProcessEditor {
 /// caller persists it (atomically) via [`save_profiles_to`] —
 /// keeping the persist step out of the loop means tests can stub
 /// the editor without also stubbing the file system.
-pub fn edit_with_retry<E: EditorRunner>(
+///
+/// `confirm` runs between a failed save and the next editor reopen.
+/// Production passes [`stdin_retry_prompt`], which prints the
+/// failure and blocks on a stdin read so the operator can either
+/// press Enter to retry or Ctrl-C to abort. Tests pass a closure
+/// that returns `Ok(())` to auto-retry. Returning `Err(_)` from
+/// the closure aborts the loop with that error (so e.g. an
+/// abort-on-EOF check could surface as a clean shutdown).
+pub fn edit_with_retry<E, F>(
     editor: &mut E,
     path: &Path,
     max_attempts: usize,
-) -> Result<ProfilesFile> {
+    mut confirm: F,
+) -> Result<ProfilesFile>
+where
+    E: EditorRunner,
+    F: FnMut(usize, usize, &Error) -> Result<()>,
+{
     for attempt in 1..=max_attempts {
         editor.edit(path)?;
-        match load_profiles_from(path) {
-            Ok(profiles) => match validate_all(&profiles) {
-                Ok(()) => return Ok(profiles),
-                Err(e) => {
-                    eprintln!("validation failed: {}", e);
-                    if attempt == max_attempts {
-                        return Err(e);
-                    }
-                    eprintln!(
-                        "re-opening editor (attempt {} of {})",
-                        attempt + 1,
-                        max_attempts
-                    );
-                }
-            },
+        let outcome = match load_profiles_from(path) {
+            Ok(profiles) => validate_all(&profiles).map(|()| profiles),
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(profiles) => return Ok(profiles),
             Err(e) => {
-                eprintln!("parse failed: {}", e);
                 if attempt == max_attempts {
                     return Err(e);
                 }
-                eprintln!(
-                    "re-opening editor (attempt {} of {})",
-                    attempt + 1,
-                    max_attempts
-                );
+                confirm(attempt, max_attempts, &e)?;
             }
         }
     }
     unreachable!("loop body returns or errors at attempt == max_attempts")
+}
+
+/// Production retry prompt for `edit_with_retry`: print the
+/// rejected-save error, then block on a stdin read so the operator
+/// can review before re-entering the editor. Ctrl-C at the prompt
+/// raises SIGINT and tears the process down with the canonical
+/// catalog still untouched (we only edit a temp copy — see
+/// `cmd_profile_edit`).
+pub fn stdin_retry_prompt(attempt: usize, max_attempts: usize, error: &Error) -> Result<()> {
+    eprintln!();
+    eprintln!("save rejected: {}", error);
+    eprintln!();
+    eprintln!(
+        "press Enter to re-open the editor (attempt {} of {}), or Ctrl-C to abort.",
+        attempt + 1,
+        max_attempts
+    );
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_line(&mut buf)
+        .map_err(|e| Error::internal(format!("read stdin: {}", e)))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1045,6 +1066,13 @@ mod tests {
         }
     }
 
+    /// Test confirm callback that records every error it sees and
+    /// always returns Ok (auto-retry). Production replaces this with
+    /// `stdin_retry_prompt`.
+    fn auto_retry_confirm() -> impl FnMut(usize, usize, &Error) -> Result<()> {
+        |_attempt, _max, _err| Ok(())
+    }
+
     #[test]
     fn edit_with_retry_succeeds_on_first_clean_save() {
         let dir = tmp_dir();
@@ -1053,7 +1081,7 @@ mod tests {
             scripts: vec!["profiles:\n  alma:\n    image: debian-13\n"],
             idx: 0,
         };
-        let pf = edit_with_retry(&mut editor, &path, 3).unwrap();
+        let pf = edit_with_retry(&mut editor, &path, 3, auto_retry_confirm()).unwrap();
         assert!(pf.profiles.contains_key("alma"));
         assert_eq!(pf.profiles["alma"].image, "debian-13");
     }
@@ -1071,7 +1099,7 @@ mod tests {
             ],
             idx: 0,
         };
-        let pf = edit_with_retry(&mut editor, &path, 3).unwrap();
+        let pf = edit_with_retry(&mut editor, &path, 3, auto_retry_confirm()).unwrap();
         assert_eq!(pf.profiles["alma"].image, "debian-13");
         assert_eq!(editor.idx, 2);
     }
@@ -1089,7 +1117,7 @@ mod tests {
             ],
             idx: 0,
         };
-        let pf = edit_with_retry(&mut editor, &path, 3).unwrap();
+        let pf = edit_with_retry(&mut editor, &path, 3, auto_retry_confirm()).unwrap();
         assert_eq!(pf.profiles["debian"].image, "debian-13");
     }
 
@@ -1101,9 +1129,61 @@ mod tests {
             scripts: vec!["broken", "still broken", "yet broken"],
             idx: 0,
         };
-        let err = edit_with_retry(&mut editor, &path, 3).unwrap_err();
+        let err = edit_with_retry(&mut editor, &path, 3, auto_retry_confirm()).unwrap_err();
         assert!(matches!(err, Error::BadRequest(_)));
         assert_eq!(editor.idx, 3);
+    }
+
+    #[test]
+    fn edit_with_retry_calls_confirm_with_each_attempt_error_until_clean_save() {
+        // The confirm callback is the operator-facing prompt — it
+        // sees one (attempt, max, error) tuple per failed save.
+        // Capture them so we can assert the loop hands out the right
+        // attempt counter and the right error each time.
+        let dir = tmp_dir();
+        let path = dir.path().join("profiles.yaml");
+        let mut editor = StubEditor {
+            scripts: vec![
+                "profiles: { broken",
+                "profiles:\n  alma:\n    image: no-such-image\n",
+                "profiles:\n  alma:\n    image: debian-13\n",
+            ],
+            idx: 0,
+        };
+        let mut seen: Vec<(usize, usize, String)> = Vec::new();
+        let confirm = |attempt: usize, max: usize, err: &Error| -> Result<()> {
+            seen.push((attempt, max, format!("{}", err)));
+            Ok(())
+        };
+        let pf = edit_with_retry(&mut editor, &path, 5, confirm).unwrap();
+        assert_eq!(pf.profiles["alma"].image, "debian-13");
+        assert_eq!(seen.len(), 2, "confirm runs once per failed attempt");
+        assert_eq!((seen[0].0, seen[0].1), (1, 5));
+        assert!(seen[0].2.contains("parse"));
+        assert_eq!((seen[1].0, seen[1].1), (2, 5));
+        assert!(
+            seen[1].2.contains("no-such-image"),
+            "expected validation message, got: {}",
+            seen[1].2
+        );
+    }
+
+    #[test]
+    fn edit_with_retry_aborts_when_confirm_returns_err() {
+        // An operator who hits Ctrl-C at the prompt is modelled here
+        // as a confirm callback that returns Err. The loop must
+        // surface that error verbatim instead of re-running the
+        // editor.
+        let dir = tmp_dir();
+        let path = dir.path().join("profiles.yaml");
+        let mut editor = StubEditor {
+            scripts: vec!["broken", "broken-again-but-we-never-see-this"],
+            idx: 0,
+        };
+        let confirm = |_, _, _: &Error| -> Result<()> { Err(Error::internal("operator aborted")) };
+        let err = edit_with_retry(&mut editor, &path, 5, confirm).unwrap_err();
+        assert!(matches!(err, Error::Internal(ref m) if m.contains("operator aborted")));
+        assert_eq!(editor.idx, 1, "editor must run only once before the abort");
     }
 
     // ---- FIRST_RUN_TEMPLATE (#111) ----

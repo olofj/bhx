@@ -182,11 +182,11 @@ enum Commands {
         ///
         /// RFC-952-clean (`a-z0-9-`, no underscore, ≤63 chars).
         /// Replaces the per-(card, l2cpu) `bhx-cardN-l2cpuM` default
-        /// — useful when a profile (#90) wants a stable name across
+        /// — useful when a profile wants a stable name across
         /// re-images so SSH known_hosts caches.
         #[arg(long = "hostname", value_parser = parse_hostname)]
         hostname: Option<String>,
-        /// Boot a saved profile (#93).
+        /// Boot a saved profile.
         ///
         /// Resolves `<name>` against `~/.config/bhx/profiles.yaml`,
         /// clones the profile's image template into a per-(profile,
@@ -276,11 +276,11 @@ enum Commands {
         #[command(subcommand)]
         action: RamdiskAction,
     },
-    /// Manage named boot profiles (#90 / #92).
+    /// Manage named boot profiles.
     ///
     /// Profiles let an operator save a long `bhx boot` flag bundle as
     /// a named YAML stanza in `~/.config/bhx/profiles.yaml` and recall
-    /// it later. Boot integration (`bhx boot -c <name>`) lands in #93.
+    /// it later.
     Profile {
         #[command(subcommand)]
         action: ProfileAction,
@@ -2243,31 +2243,58 @@ fn cmd_profile_add(name: &str) -> std::io::Result<()> {
             ..Default::default()
         },
     );
-    profile::save_profiles_to(&profiles, &path)?;
-    let mut runner = profile::ProcessEditor;
-    let edited = profile::edit_with_retry(&mut runner, &path, 5)?;
+    let yaml = serde_yaml_ng::to_string(&profiles)
+        .map_err(|e| crate::Error::internal(format!("serialize profiles: {}", e)))?;
+    let edited = edit_via_temp_file(yaml.as_bytes())?;
     profile::save_profiles_to(&edited, &path)?;
     eprintln!("profile {:?} added", name);
     Ok(())
 }
 
 /// Drop into the editor on the catalog file with visudo-style retry.
+/// The catalog at `~/.config/bhx/profiles.yaml` isn't touched until
+/// the operator saves a clean edit — a Ctrl-C at the editor or the
+/// retry prompt leaves the original catalog intact (#112).
 fn cmd_profile_edit() -> std::io::Result<()> {
     let path = profile::profiles_path()?;
     // First-run UX: seed with commented example stanzas so the
     // operator has something to crib from. Comments don't survive a
     // save_profiles_to round-trip, so once the operator defines a
     // real profile the templates naturally fall away (#111).
-    if !path.exists() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    let initial: Vec<u8> = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            profile::FIRST_RUN_TEMPLATE.as_bytes().to_vec()
         }
-        std::fs::write(&path, profile::FIRST_RUN_TEMPLATE)?;
-    }
-    let mut runner = profile::ProcessEditor;
-    let edited = profile::edit_with_retry(&mut runner, &path, 5)?;
+        Err(e) => return Err(e),
+    };
+    let edited = edit_via_temp_file(&initial)?;
     profile::save_profiles_to(&edited, &path)?;
     Ok(())
+}
+
+/// Spawn `$EDITOR` against a private scratch copy of the catalog so
+/// a Ctrl-C at the visudo-style retry prompt leaves the canonical
+/// `~/.config/bhx/profiles.yaml` untouched. On a clean save, returns
+/// the parsed catalog for the caller to persist.
+///
+/// The temp file is cleaned up by `NamedTempFile::Drop` on the
+/// success path. SIGINT from the operator's Ctrl-C terminates the
+/// process before Drop runs, leaking the temp file — that's an
+/// acceptable cost; the canonical catalog is what we care about.
+fn edit_via_temp_file(initial: &[u8]) -> std::io::Result<profile::ProfilesFile> {
+    use std::io::Write;
+    let mut tmp = tempfile::Builder::new()
+        .prefix("bhx-profile-edit-")
+        .suffix(".yaml")
+        .tempfile()?;
+    tmp.write_all(initial)?;
+    tmp.flush()?;
+    let tmp_path = tmp.path().to_path_buf();
+
+    let mut runner = profile::ProcessEditor;
+    let edited = profile::edit_with_retry(&mut runner, &tmp_path, 5, profile::stdin_retry_prompt)?;
+    Ok(edited)
 }
 
 /// Print every known profile, one row per profile.

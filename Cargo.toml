@@ -29,6 +29,11 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # YAML loader for `~/.config/bhx/profiles.yaml` (#92). serde_yaml_ng is the
 # actively-maintained fork of dtolnay/serde_yaml (deprecated in 2024).
 serde_yaml_ng = "0.10"
+# Race-free named temp files. Used by `bhx profile edit/add` (#112) to
+# stage editor I/O so a Ctrl-C at the visudo-style retry prompt leaves
+# the canonical catalog untouched, and by tests for sandbox/runtime
+# fixtures.
+tempfile = "3"
 
 # Sandbox crates (Linux-only). seccompiler builds + installs BPF
 # syscall filters; landlock restricts filesystem reach. Both are
@@ -37,9 +42,6 @@ serde_yaml_ng = "0.10"
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.5"
 landlock = "0.4"
-
-[dev-dependencies]
-tempfile = "3"
 
 # Profiling-friendly opt build. Use as:
 #   cargo build --profile profiling
