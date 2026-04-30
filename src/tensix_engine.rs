@@ -161,6 +161,14 @@ impl TensixEngine {
             );
         }
 
+        // Same ritual for TRISC1 (#125 dedicated SEL-watch core).
+        // Skipped silently for pre-#125 firmware (entry word is 0).
+        let trisc1_pc = tile.read_trisc1_reset_entry();
+        if trisc1_pc != 0 {
+            tile.set_trisc1_reset_pc(trisc1_pc);
+            tile.enable_trisc1_reset_pc_override();
+        }
+
         tile.release_brisc_only();
 
         // Wait for the firmware to publish its stats-page magic.

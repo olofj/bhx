@@ -55,10 +55,16 @@ void main(void) {
     }
 }
 
-// Hello firmware doesn't release TRISC0, but the shared `start.S`'s
-// trisc0 reset stub references this symbol. If TRISC0 ever ran the
-// hello image, it'd just spin here.
+// Hello firmware doesn't release TRISC0/TRISC1, but the shared
+// `start.S` reset stubs reference these symbols. If either core ever
+// ran the hello image, it'd just spin here.
 void trisc0_main(void) {
+    for (;;) {
+        __asm__ volatile("wfi");
+    }
+}
+
+void trisc1_main(void) {
     for (;;) {
         __asm__ volatile("wfi");
     }

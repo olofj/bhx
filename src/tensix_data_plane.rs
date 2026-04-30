@@ -319,7 +319,11 @@ fn run_poll_loop(
     let mut last_kick_drops: u32 = 0;
     let mut last_sel_ready_races: u32 = 0;
     let mut last_max_sweep_cycles: u32 = 0;
+    let mut last_max_steady_sweep_cycles: u32 = 0;
     let mut last_max_sel_path_cycles: u32 = 0;
+    let mut last_max_precap_cycles: u32 = 0;
+    let mut last_max_blindcap_cycles: u32 = 0;
+    let mut last_max_postcap_cycles: u32 = 0;
     let mut last_uart_drops: [u32; uart::UART_NUM_SLOTS as usize] =
         [0; uart::UART_NUM_SLOTS as usize];
     // Track per-slot STATUS transitions. Bench harnesses (and
@@ -553,11 +557,21 @@ fn run_poll_loop(
         let max_sweep = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAX_SWEEP_CYCLES);
         if max_sweep > last_max_sweep_cycles {
             crate::dlog!(
-                "[brisc-timing] new max main-loop sweep: {} cycles (~{} ns @ 1.35 GHz)",
+                "[brisc-timing] new max main-loop sweep (incl init_device outliers): {} cycles (~{} ns)",
                 max_sweep,
                 max_sweep * 1000 / 1350
             );
             last_max_sweep_cycles = max_sweep;
+        }
+        let max_steady_sweep =
+            engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAX_STEADY_SWEEP_CYCLES);
+        if max_steady_sweep > last_max_steady_sweep_cycles {
+            crate::dlog!(
+                "[brisc-timing] new max STEADY sweep (race-relevant): {} cycles (~{} ns)",
+                max_steady_sweep,
+                max_steady_sweep * 1000 / 1350
+            );
+            last_max_steady_sweep_cycles = max_steady_sweep;
         }
         let max_sel_path = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAX_SEL_PATH_CYCLES);
         if max_sel_path > last_max_sel_path_cycles {
@@ -568,6 +582,34 @@ fn run_poll_loop(
                 max_sel_path * 1000 / 1350
             );
             last_max_sel_path_cycles = max_sel_path;
+        }
+        // poll_one_device sub-section maxes (PER-SLOT, not per-iter).
+        let max_precap = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAX_PRECAP_CYCLES);
+        if max_precap > last_max_precap_cycles {
+            crate::dlog!(
+                "[brisc-timing] new max poll PRECAP cycles (snap-diff): {} cycles (~{} ns)",
+                max_precap,
+                max_precap * 1000 / 1350
+            );
+            last_max_precap_cycles = max_precap;
+        }
+        let max_blindcap = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAX_BLINDCAP_CYCLES);
+        if max_blindcap > last_max_blindcap_cycles {
+            crate::dlog!(
+                "[brisc-timing] new max poll BLINDCAP cycles (7-field shadow capture): {} cycles (~{} ns)",
+                max_blindcap,
+                max_blindcap * 1000 / 1350
+            );
+            last_max_blindcap_cycles = max_blindcap;
+        }
+        let max_postcap = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAX_POSTCAP_CYCLES);
+        if max_postcap > last_max_postcap_cycles {
+            crate::dlog!(
+                "[brisc-timing] new max poll POSTCAP cycles (drv-feat + sel-gen): {} cycles (~{} ns)",
+                max_postcap,
+                max_postcap * 1000 / 1350
+            );
+            last_max_postcap_cycles = max_postcap;
         }
         // Per-slot STATUS transitions. Snapshot registry under lock,
         // then do chip-side L1 reads outside the lock.

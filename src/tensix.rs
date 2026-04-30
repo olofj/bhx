@@ -72,15 +72,23 @@ pub const SOFT_RESET_ALL_EXCEPT_BRISC: u32 = SOFT_RESET_ALL & !SOFT_RESET_BRISC;
 
 /// TRISC0 reset PC override value. 32-bit register.
 pub const RISCV_DEBUG_REG_TRISC0_RESET_PC: u64 = 0xFFB1_2228;
+/// TRISC1 reset PC override value (#125). Per the SoftReset.md doc
+/// the per-TRISC override registers are 4-byte spaced after T0.
+pub const RISCV_DEBUG_REG_TRISC1_RESET_PC: u64 = 0xFFB1_222C;
 /// Enable bits for the TRISC reset PC override. Bit 0 = TRISC0,
-/// bit 1 = TRISC1, bit 2 = TRISC2. We only set bit 0 in M6.1.
+/// bit 1 = TRISC1, bit 2 = TRISC2. M6.1 set bit 0; #125 also sets
+/// bit 1 for TRISC1's dedicated SEL-watch loop.
 pub const RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE: u64 = 0xFFB1_2234;
 pub const TRISC_RESET_PC_OVERRIDE_T0: u32 = 1 << 0;
+pub const TRISC_RESET_PC_OVERRIDE_T1: u32 = 1 << 1;
 
 /// L1 offset of the u32 word `start.S` plants holding the linker-
 /// resolved address of `trisc0_reset_entry`. Mirrored by the firmware
 /// header — keep in sync with `start.S` (`.word trisc0_reset_entry`).
 pub const TRISC0_RESET_ENTRY_PTR_L1_OFFSET: u32 = 0x4;
+/// L1 offset of `trisc1_reset_entry` (#125). Adjacent to TRISC0's
+/// slot in the start.S header.
+pub const TRISC1_RESET_ENTRY_PTR_L1_OFFSET: u32 = 0x8;
 
 /// Tensix L1 size in bytes (per `dev_mem_map.h::MEM_L1_SIZE`).
 pub const TENSIX_L1_SIZE: usize = 1536 * 1024;
@@ -248,6 +256,23 @@ impl TensixTile {
     /// to feed [`Self::set_trisc0_reset_pc`].
     pub fn read_trisc0_reset_entry(&self) -> u32 {
         self.read_l1_u32(TRISC0_RESET_ENTRY_PTR_L1_OFFSET)
+    }
+
+    /// TRISC1 (#125) variants of the same setup ritual.
+    pub fn set_trisc1_reset_pc(&self, pc: u32) {
+        let off = RISCV_DEBUG_REG_TRISC1_RESET_PC - TLB_BASE_DEBUG_REGS;
+        self.debug_regs_window.write32(off, pc);
+    }
+
+    pub fn enable_trisc1_reset_pc_override(&self) {
+        let off = RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE - TLB_BASE_DEBUG_REGS;
+        let prev = self.debug_regs_window.read32(off);
+        self.debug_regs_window
+            .write32(off, prev | TRISC_RESET_PC_OVERRIDE_T1);
+    }
+
+    pub fn read_trisc1_reset_entry(&self) -> u32 {
+        self.read_l1_u32(TRISC1_RESET_ENTRY_PTR_L1_OFFSET)
     }
 
     /// Copy `firmware` bytes into L1 starting at offset 0 using

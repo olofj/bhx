@@ -189,6 +189,22 @@ pub const STATS_OFF_SEL_READY_RACES: u32 = 0x030;
 pub const STATS_OFF_MAX_SWEEP_CYCLES: u32 = 0x034;
 pub const STATS_OFF_MAX_SEL_PATH_CYCLES: u32 = 0x038;
 pub const STATS_OFF_LAST_SWEEP_CYCLES: u32 = 0x03c;
+/// Per-slot poll_one_device sub-section maxes. Diagnostic added in
+/// the #124 follow-up after the fence-cut hypothesis turned out wrong
+/// (cutting 15 fences from 31 didn't move sweep_max). These pinpoint
+/// which part of the per-slot work actually owns the cycles.
+pub const STATS_OFF_MAX_PRECAP_CYCLES: u32 = 0x040;
+pub const STATS_OFF_MAX_BLINDCAP_CYCLES: u32 = 0x044;
+pub const STATS_OFF_MAX_POSTCAP_CYCLES: u32 = 0x048;
+/// Sweep-cycle histogram. Each bucket counts iterations whose sweep
+/// fell in the bucket's range (in BRISC cycles). Useful for
+/// distinguishing typical sweep cost from one-shot outliers like
+/// `init_device` running on STATUS=0 (~1200 cycles in a 320-store
+/// wipe, lands once per probe round per slot).
+/// Steady-state sweep max — same as `STATS_OFF_MAX_SWEEP_CYCLES`
+/// but excludes iters where `init_device` fired (one-shot ~1240-cycle
+/// wipe on STATUS=0). This is the race-relevant max.
+pub const STATS_OFF_MAX_STEADY_SWEEP_CYCLES: u32 = 0x068;
 
 // ----- Per-queue shadow region (BRISC L1, M5.5b firmware) -----
 //

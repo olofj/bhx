@@ -110,6 +110,36 @@
 #define STATS_OFF_MAX_SWEEP_CYCLES    0x034
 #define STATS_OFF_MAX_SEL_PATH_CYCLES 0x038
 #define STATS_OFF_LAST_SWEEP_CYCLES   0x03c
+// Per-slot poll_one_device sub-section maxes (#124 follow-up: fence
+// cuts didn't move sweep_max so we need to find what does). All in
+// BRISC cycles. Each is the max observed across all (slot, iter)
+// pairs since stats reset, NOT per-iter — so the three don't sum to
+// max_sweep (different slots/iters can dominate each).
+//   PRECAP:   poll_one_device entry → just before BLIND CAPTURE
+//   BLINDCAP: BLIND CAPTURE block (7 read+writes per active queue)
+//   POSTCAP:  after BLIND CAPTURE → end of poll_one_device
+#define STATS_OFF_MAX_PRECAP_CYCLES   0x040
+#define STATS_OFF_MAX_BLINDCAP_CYCLES 0x044
+#define STATS_OFF_MAX_POSTCAP_CYCLES  0x048
+// Sweep-cycle histogram (#124 follow-up). MAX is misleading because
+// `init_device` on STATUS=0 burns ~1200 cycles in a 320-store wipe
+// loop, dominating the max even though it runs before the kernel's
+// SEL→READY write sequence. The buckets give us the distribution
+// shape: how many fast iters, how many medium, how many slow. Each
+// bucket is a u32 counter incremented per sweep that falls in its
+// range; the bench harness reads them and computes typical / p99.
+//   B0: <  256 cycles  (~< 190 ns)  — idle / 0-active-slots iters
+//   B1:   256-511     (~190-380 ns) — 1-2 slots, no kernel writes
+//   B2:   512-1023    (~380-760 ns)
+//   B3:  1024-2047    (~760-1520 ns) — busy probe, multiple handlers
+//   B4: >= 2048       (~>= 1520 ns)  — the init_device outlier band
+// Steady-state sweep max — like STATS_OFF_MAX_SWEEP_CYCLES but
+// EXCLUDES iters where init_device fired (the kernel writing
+// STATUS=0 → handle_status_change wipes 320 words = ~1240 cycles
+// in PRECAP, which dominates max but is a one-shot that doesn't
+// overlap the SEL→READY race window). This is the race-relevant
+// number; the original max stays for context.
+#define STATS_OFF_MAX_STEADY_SWEEP_CYCLES 0x068
 
 #define STATS_MAGIC_LOADED        0x0000B155u
 
@@ -210,6 +240,22 @@ static inline uint32_t read_u32(uintptr_t addr) {
     return *l1_u32(addr);
 }
 
+// Plain L1 store, NO fence. Use for BRISC-private state (snap, stats,
+// ring entry payloads followed by a fenced producer-seq bump, etc.).
+// All targets the kernel or daemon reads asynchronously must use
+// `write_u32` (below) which includes a `fence w, w` so the store hits
+// L1 before any subsequent write completes — that's the
+// kernel-readability guarantee.
+static inline void store_u32(uintptr_t addr, uint32_t v) {
+    *l1_u32(addr) = v;
+}
+
+// Fenced store. Use ONLY when the next thing to happen is an
+// externally-observed write (kick ring producer_seq bump after a
+// kick entry; QUEUE_READY=0 clear on the SEL→READY race-critical
+// path; reset-vector handoff at boot). Each `fence w, w` costs
+// ~10-30 cycles on BRISC; chained fences (one per write) were
+// behind the worst-case sweep duration before #123's diagnosis.
 static inline void write_u32(uintptr_t addr, uint32_t v) {
     *l1_u32(addr) = v;
     FENCE_W();
@@ -251,8 +297,10 @@ static const struct device_init DEVICE_TEMPLATE[BRISC_VIRTIO_DEVS_PER_L2CPU] = {
     [BRISC_VIRTIO_DEV_NET]     = { VIRTIO_ID_NET,     BRISC_VIRTIO_QUEUES_NET,     VIRTIO_NET_F_MAC_BIT },
     [BRISC_VIRTIO_DEV_CONSOLE] = { VIRTIO_ID_CONSOLE, BRISC_VIRTIO_QUEUES_CONSOLE, 0 },
     [BRISC_VIRTIO_DEV_RNG]     = { VIRTIO_ID_ENTROPY, BRISC_VIRTIO_QUEUES_RNG,     0 },
+#if BRISC_VIRTIO_DEVS_PER_L2CPU >= 8
     [BRISC_VIRTIO_DEV_BLK1]    = { VIRTIO_ID_BLOCK,   BRISC_VIRTIO_QUEUES_BLK,     0 },
     [BRISC_VIRTIO_DEV_BLK2]    = { VIRTIO_ID_BLOCK,   BRISC_VIRTIO_QUEUES_BLK,     0 },
+#endif
 };
 
 static const struct device_init *device_for_slot(unsigned slot) {
@@ -380,10 +428,14 @@ static void init_stats(void) {
     FENCE_W();
 }
 
+// Bump a stats-page counter. NO fence — the daemon polls these at
+// ms timescales, so a microsecond-delayed visibility is fine and not
+// worth a per-call `fence w, w`. Pre-#123 the fence here was on the
+// hot path and contributed to the sweep variance the race-window
+// debugging chased for hours.
 static inline void inc_stat(unsigned off) {
     volatile uint32_t *p = l1_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + off);
     *p = *p + 1u;
-    FENCE_W();
 }
 
 // ----- Trigger handlers -----
@@ -463,7 +515,10 @@ static void handle_queue_ready_change(unsigned slot, uint32_t sel, uint32_t read
         *l1_u32(shadow_queue_addr(slot, sel, SHADOW_Q_OFF_DEVICE_LO)) = 0;
         *l1_u32(shadow_queue_addr(slot, sel, SHADOW_Q_OFF_DEVICE_HI)) = 0;
     }
-    FENCE_W();
+    // No FENCE_W here: shadow is BRISC-private and the next kick
+    // for this queue will fence inside `kick_ring_push` before the
+    // producer-seq bump, which transitively orders these stores
+    // against any daemon-side shadow read.
     inc_stat(STATS_OFF_READY_EVENTS);
 }
 
@@ -501,7 +556,8 @@ static void kick_ring_push(unsigned slot, uint32_t queue_idx) {
     uint32_t outstanding = seq - consumer;
     if (outstanding >= KICK_RING_ENTRIES) {
         uint32_t drops = read_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_KICK_DROPS);
-        write_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_KICK_DROPS, drops + 1u);
+        // Stat counter — no fence; daemon reads at ms timescale.
+        store_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_KICK_DROPS, drops + 1u);
         return;
     }
     uint32_t epoch = read_u32(epoch_addr(slot));
@@ -531,14 +587,22 @@ static void handle_queue_notify(unsigned slot, uint32_t q) {
 // device state, reinitialize the read-only regs, and bump the per-
 // slot epoch so any kicks recorded for the previous incarnation are
 // filterable on the daemon side.
+// Set when handle_status_change fires init_device this main-loop
+// iter, so the top-of-loop steady-state max doesn't get poisoned by
+// the ~1240-cycle wipe. Cleared after the per-iter max update.
+static int init_device_fired_this_iter;
+
 static void handle_status_change(unsigned slot, uint32_t status, uint32_t prev) {
     (void)prev;
     if (status == 0) {
         uint32_t e = read_u32(epoch_addr(slot));
         init_device(slot);
         // init_device wipes the shadow region, including epoch — so
-        // re-establish it after.
-        write_u32(epoch_addr(slot), e + 1u);
+        // re-establish it after. Daemon reads epoch on the next
+        // kick; the kick path's own fence orders this for it. No
+        // local fence.
+        store_u32(epoch_addr(slot), e + 1u);
+        init_device_fired_this_iter = 1;
     }
     inc_stat(STATS_OFF_STATUS_CHANGES);
 }
@@ -567,18 +631,25 @@ static void poll_completion_ring(void) {
         inc_stat(STATS_OFF_COMPL_EVENTS);
         consumer += 1u;
     } while (consumer != producer);
-    write_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_CONSUMER_SEQ), consumer);
+    // No fence: the daemon polls CONSUMER_SEQ for backpressure
+    // diagnostics, not for ordering with anything BRISC writes after.
+    // Microsecond visibility delay is fine.
+    store_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_CONSUMER_SEQ), consumer);
 }
 
 // ----- Main poll loop -----
 
 static void poll_one_device(unsigned slot) {
+    uint32_t t_entry = mcycle_low();
     // STATUS — RW. Detect by snapshot diff.
     uint32_t status = read_u32(reg_addr(slot, VIRTIO_MMIO_STATUS));
     uint32_t status_prev = read_u32(snap_addr(slot, SNAP_OFF_STATUS));
     if (status != status_prev) {
         handle_status_change(slot, status, status_prev);
-        write_u32(snap_addr(slot, SNAP_OFF_STATUS), status);
+        // Snap is BRISC-private; no fence needed. The next sweep's
+        // diff against snap is local to this hart so ordering is
+        // automatic; the daemon never reads snap_addr.
+        store_u32(snap_addr(slot, SNAP_OFF_STATUS), status);
     }
 
     // QUEUE_SEL — W. We don't reset visible-as-MMIO QUEUE_SEL, so
@@ -587,7 +658,7 @@ static void poll_one_device(unsigned slot) {
     uint32_t sel_prev = read_u32(snap_addr(slot, SNAP_OFF_QUEUE_SEL));
     if (sel != sel_prev) {
         handle_queue_sel_change(slot, sel);
-        write_u32(snap_addr(slot, SNAP_OFF_QUEUE_SEL), sel);
+        store_u32(snap_addr(slot, SNAP_OFF_QUEUE_SEL), sel);
     }
 
     // QUEUE_NOTIFY — W. The guest writes the queue index here. We
@@ -662,12 +733,12 @@ static void poll_one_device(unsigned slot) {
     uint32_t dfd_sel = read_u32(reg_addr(slot, VIRTIO_MMIO_DRIVER_FEATURES_SEL));
     uint32_t dfd_sel_prev = read_u32(snap_addr(slot, SNAP_OFF_DRV_FEAT_SEL));
     if (dfd_sel != dfd_sel_prev) {
-        write_u32(snap_addr(slot, SNAP_OFF_DRV_FEAT_SEL), dfd_sel);
+        store_u32(snap_addr(slot, SNAP_OFF_DRV_FEAT_SEL), dfd_sel);
     }
     uint32_t dfd = read_u32(reg_addr(slot, VIRTIO_MMIO_DRIVER_FEATURES));
     uint32_t dfd_prev = read_u32(snap_addr(slot, SNAP_OFF_DRV_FEAT));
     if (dfd != dfd_prev) {
-        write_u32(snap_addr(slot, SNAP_OFF_DRV_FEAT), dfd);
+        store_u32(snap_addr(slot, SNAP_OFF_DRV_FEAT), dfd);
     }
 
     // Per-queue setup registers — QUEUE_NUM + the three address
@@ -677,7 +748,25 @@ static void poll_one_device(unsigned slot) {
     // selected queue, so the daemon-side data plane (#71 M5.5b) can
     // read accurate per-queue state without racing the SEL
     // multiplexer.
-    if (sel < BRISC_VIRTIO_MAX_QUEUES) {
+    uint32_t t_pre_cap = mcycle_low();
+    update_max_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_MAX_PRECAP_CYCLES,
+                   t_pre_cap - t_entry);
+
+    // Skip BLINDCAP if the kernel has finished probing this device:
+    // STATUS_DRIVER_OK means probe completed and the kernel won't
+    // write QUEUE_NUM / DESC_LO / DESC_HI / etc. again until it
+    // tears the device down (which writes STATUS=0 first, observed
+    // by handle_status_change). Saves ~117 cycles per stable slot
+    // per iter; on a typical 4-active-slot boot 3 of 4 slots are
+    // at DRIVER_OK, cutting ~350 cycles from the steady-state sweep
+    // (~1100 → ~750 cycles, ~0.8 µs → ~0.55 µs at 1.35 GHz).
+    //
+    // Variable name `status_at_skip` documents that we're using the
+    // STATUS observed at the top of THIS poll, before any handler
+    // ran. If a handler races and writes STATUS, that lands on the
+    // next iter's diff and BLINDCAP runs again then.
+    int skip_blindcap = (status & VIRTIO_STATUS_DRIVER_OK) != 0;
+    if (!skip_blindcap && sel < BRISC_VIRTIO_MAX_QUEUES) {
         // Per-queue setup: blind-capture every iteration into
         // shadow[sel]. The earlier snapshot-diff approach broke for
         // virtio-net's TX setup, where queue 1's DESC_HIGH is the
@@ -711,6 +800,9 @@ static void poll_one_device(unsigned slot) {
             *l1_u32(shadow_queue_addr(slot, sel, FIELDS[f].shadow_off)) = v;
         }
     }
+    uint32_t t_post_cap = mcycle_low();
+    update_max_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_MAX_BLINDCAP_CYCLES,
+                   t_post_cap - t_pre_cap);
 
     // sel_generation handshake — done last so any SEL/SEL-multiplexed
     // register update above has already taken effect by the time the
@@ -722,9 +814,15 @@ static void poll_one_device(unsigned slot) {
     uint32_t last_echoed = read_u32(snap_addr(slot, SNAP_OFF_SEL_GEN_ECHO));
     if (curr_gen != last_echoed) {
         uint32_t next = curr_gen + 1u;
+        // Visible reg: kernel may read after a SEL write to detect
+        // the echo. Keep fenced.
         write_u32(reg_addr(slot, VIRTIO_MMIO_SEL_GENERATION), next);
-        write_u32(snap_addr(slot, SNAP_OFF_SEL_GEN_ECHO), next);
+        // Snap: BRISC-private. No fence.
+        store_u32(snap_addr(slot, SNAP_OFF_SEL_GEN_ECHO), next);
     }
+    uint32_t t_exit = mcycle_low();
+    update_max_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_MAX_POSTCAP_CYCLES,
+                   t_exit - t_post_cap);
 }
 
 // ----- M6 (#78) 16550 UART emulation, TX-only -----
@@ -939,8 +1037,10 @@ static void trisc0_uart_poll_one(unsigned l2cpu_idx) {
 
 #define TENSIX_SOFT_RESET_ADDR    0xFFB121B0u
 #define SOFT_RESET_TRISC0         (1u << 12)
+#define SOFT_RESET_TRISC1         (1u << 13)
 
 static int trisc0_running = 0;
+static int trisc1_running = 0;
 
 // Read-modify-write the soft-reset register from within the tile.
 // The register is per-tile MMIO at 0xFFB121B0, accessible as a regular
@@ -973,6 +1073,35 @@ static void brisc_drive_trisc0_lifecycle(uint32_t active_slots) {
     } else if (!want_running && trisc0_running) {
         brisc_set_trisc0_reset(1);
         trisc0_running = 0;
+    }
+}
+
+static void brisc_set_trisc1_reset(int asserted) {
+    volatile uint32_t *reg = (volatile uint32_t *)TENSIX_SOFT_RESET_ADDR;
+    uint32_t v = *reg;
+    if (asserted) {
+        v |= SOFT_RESET_TRISC1;
+    } else {
+        v &= ~SOFT_RESET_TRISC1;
+    }
+    *reg = v;
+    FENCE_W();
+    (void)*reg;
+}
+
+// TRISC1 lifecycle (#125): release when ANY virtio slot is active
+// (i.e. any non-UART bit in active_slots). UART bits (16..19) don't
+// concern TRISC1 — its job is the SEL→READY race-critical clear,
+// which is virtio-only.
+static void brisc_drive_trisc1_lifecycle(uint32_t active_slots) {
+    uint32_t virtio_active = active_slots & ~BRISC_UART_SLOT_MASK;
+    int want_running = virtio_active != 0;
+    if (want_running && !trisc1_running) {
+        brisc_set_trisc1_reset(0);
+        trisc1_running = 1;
+    } else if (!want_running && trisc1_running) {
+        brisc_set_trisc1_reset(1);
+        trisc1_running = 0;
     }
 }
 
@@ -1098,6 +1227,20 @@ void main(void) {
             *l1_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_LAST_SWEEP_CYCLES) = sweep_cycles;
             update_max_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_MAX_SWEEP_CYCLES,
                            sweep_cycles);
+            // Steady-state max excludes iters where init_device fired.
+            // The flag is set inside handle_status_change(STATUS=0)
+            // and consumed/cleared here. Note that the flag was set
+            // in the PREVIOUS iter's poll work (which produced this
+            // iter's sweep_cycles via prev_sweep_t — yes, the iter
+            // we're crediting includes the init_device cost). We
+            // clear after this update so the NEXT iter is again a
+            // candidate for the steady-state max.
+            if (!init_device_fired_this_iter) {
+                update_max_u32(
+                    (uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_MAX_STEADY_SWEEP_CYCLES,
+                    sweep_cycles);
+            }
+            init_device_fired_this_iter = 0;
         }
         prev_sweep_t = now_t;
         sweep_t_valid = 1;
@@ -1136,6 +1279,10 @@ void main(void) {
                     continue;
                 }
                 init_device(slot);
+                // Same outlier-tag as handle_status_change(STATUS=0):
+                // each init_device is a ~1240-cycle wipe and shouldn't
+                // pollute the steady-state max.
+                init_device_fired_this_iter = 1;
             }
         }
         prev_active = active;
@@ -1157,6 +1304,7 @@ void main(void) {
         // L2CPU's feed ring directly via the chip-side TLB; BRISC is
         // not in the UART data path beyond the lifecycle bit.
         brisc_drive_trisc0_lifecycle(active);
+        brisc_drive_trisc1_lifecycle(active);
         poll_completion_ring();
         heartbeat += 1u;
         // Don't fence on every iteration — heartbeat is observed at
@@ -1165,6 +1313,70 @@ void main(void) {
         if ((heartbeat & 0x3FFu) == 0) {
             *l1_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_HEARTBEAT) = heartbeat;
             FENCE_W();
+        }
+    }
+}
+
+// ----- TRISC1 entry (#125) -----
+//
+// Dedicated SEL-watch core. The hottest-loop part of the
+// kernel↔BRISC dance — `writel(QUEUE_SEL); readl(QUEUE_READY)` race
+// — is what limits BRISC's loop-period budget against probe
+// reliability (#123). Putting this single duty on TRISC1 lets the
+// race-critical sweep period drop to a handful of cycles per slot,
+// well below any plausible kernel writel→readl gap.
+//
+// What TRISC1 owns:
+//   * Read each active virtio slot's `MMIO_QUEUE_SEL`. On detected
+//     change vs `last_sel[slot]`, write `MMIO_QUEUE_READY = 0` plus
+//     a `fence w, w` so the kernel's next readl sees 0 instead of
+//     the prior queue's stale 1.
+//   * Update `last_sel[slot]`.
+//
+// What stays on BRISC:
+//   * The full `poll_one_device` per slot (NOTIFY/kick ring,
+//     STATUS, BLINDCAP, drv-feat snap, sel-gen echo, NUM_MAX/NUM
+//     mirroring on SEL change). BRISC's existing
+//     `handle_queue_sel_change` still also writes
+//     QUEUE_READY=0 on its own slower cadence — that's a harmless
+//     idempotent backstop (TRISC1 will usually have cleared it
+//     already).
+//
+// Lifecycle: BRISC's `brisc_drive_trisc1_lifecycle` releases TRISC1
+// from soft reset when any virtio slot becomes active and re-asserts
+// reset when no virtio slots are active.
+//
+// Diagnostic: TRISC1 keeps its own per-slot `last_sel` array in BSS
+// (BRISC zeroed it during boot). No fences on the snap update — it's
+// hart-local state and only TRISC1 reads it.
+void trisc1_main(void) {
+    volatile uint32_t *active_p =
+        (volatile uint32_t *)(uintptr_t)(CTRL_BASE + CTRL_OFF_ACTIVE_SLOTS);
+    static uint32_t last_sel[BRISC_VIRTIO_NUM_SLOTS];
+    for (;;) {
+        uint32_t active = *active_p;
+        // Skip the UART range — those are TRISC0's lifecycle bits,
+        // not virtio slots. Iterating them here would race-clear
+        // QUEUE_READY on slot indices that aren't real virtio
+        // devices when only a low-numbered L2CPU is booted.
+        uint32_t virtio_active = active & ~BRISC_UART_SLOT_MASK;
+        for (unsigned base = 0; base < BRISC_VIRTIO_NUM_SLOTS; base += 8u) {
+            uint32_t group = (virtio_active >> base) & 0xFFu;
+            if (group == 0u) {
+                continue;
+            }
+            for (unsigned i = 0; i < 8u; i++) {
+                if (((group >> i) & 1u) == 0u) {
+                    continue;
+                }
+                unsigned slot = base + i;
+                uint32_t sel = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_SEL));
+                if (sel != last_sel[slot]) {
+                    *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY)) = 0;
+                    FENCE_W();
+                    last_sel[slot] = sel;
+                }
+            }
         }
     }
 }

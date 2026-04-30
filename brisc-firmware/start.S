@@ -39,6 +39,9 @@ _start:
     j        brisc_main_entry      // PC=0:   BRISC reset entry
     .word    trisc0_reset_entry    // PC=4:   TRISC0 reset entry address
                                    //         (host reads, writes to PC override)
+    .word    trisc1_reset_entry    // PC=8:   TRISC1 reset entry address (#125)
+                                   //         dedicated SEL-watch core for the
+                                   //         SEL→READY race-critical path.
 
     // Aligned entry. Anything past here is the actual program.
     .org 0x80
@@ -78,5 +81,22 @@ trisc0_reset_entry:
     // can only happen after the daemon's hello — long past BSS init.)
     li       sp, 0xFFB01000
     call     trisc0_main
+1:  wfi
+    j        1b
+
+    .global  trisc1_reset_entry
+trisc1_reset_entry:
+    // TRISC1 private data RAM mirrors TRISC0's: each core sees its own
+    // 4 KiB at the same 0xFFB0_0000 base. Stack grows downward from
+    // the top. Same BSS guarantee — BRISC zeroed it before any TRISC
+    // is released.
+    //
+    // TRISC1 runs the dedicated SEL-watch loop (#125): the tightest
+    // possible polling of QUEUE_SEL across active slots, clearing
+    // QUEUE_READY=0 immediately on detected SEL change so the kernel's
+    // `writel(SEL); readl(QUEUE_READY)` race window collapses below
+    // BRISC's full sweep period.
+    li       sp, 0xFFB01000
+    call     trisc1_main
 1:  wfi
     j        1b
