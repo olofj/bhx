@@ -17,10 +17,11 @@ full bring-up:
   emulated from a per-card daemon backed by BRISC firmware on a
   reserved Tensix tile.
 - **Stock distro support**: U-Boot S-mode payload + EFI-loader chain
-  boots AlmaLinux Kitten 10, Debian generic, Ubuntu 24.04 LTS, Fedora
-  Cloud Base, and similar GPT-partitioned cloud images straight from
-  their published .raw / .qcow2 artifacts. Pre-extracted single-FS
-  rootfs images boot via the patched direct-kernel path.
+  boots Debian generic, Ubuntu 24.04 LTS, Fedora Server / Cloud Base,
+  AlmaLinux Kitten 10, and similar GPT-partitioned cloud images
+  straight from their published `.raw` / `.qcow2` artifacts.
+  Pre-extracted single-FS rootfs images boot via the patched
+  direct-kernel path.
 - **Operator UX**: a single `bhx` binary that runs as both the
   per-card daemon (`bhx daemon start`) and a thin RPC client
   (`bhx boot`, `bhx connect`, `bhx add-disk`, …). Console attach
@@ -44,121 +45,106 @@ full bring-up:
     `unzip`, `qemu-utils`, `fdisk`, `e2fsprogs`. (HTTP downloads
     themselves are native via the `ureq` crate.)
 
-Build the tool:
+Build and install the `bhx` binary into `~/.cargo/bin/` (make sure
+that's on your `PATH`):
 
 ```bash
-cd bhx
-cargo build --release       # or plain `cargo build` for a dev build
+cargo install --path .
 ```
 
-CI runs the full build/clippy/test gauntlet on every push that touches
-`bhx/`; see `.github/workflows/rust-ci.yml` (default and
-`--no-default-features` builds, plus `cargo fmt --check`).
-
-## Fetching the firmware + a rootfs
-
-For the U-Boot/EFI/GRUB path (any modern distro), all you need is the
-disk image:
+Then a one-time U-Boot build (needed for any whole-disk distro image —
+see [Images](#images) below for which images need it):
 
 ```bash
-cargo run -- image pull debian        # or fedora, ubuntu, almalinux, …
+make -C third_party/uboot check-deps
+make -C third_party/uboot           # ~5 min cold; idempotent
 ```
 
-Run `cargo run -- image list` to see the registry. The daemon resolves
-`u-boot.bin`, `fw_jump.bin`, and `blackhole-card.dtb` from the in-tree
-`third_party/{uboot,opensbi,dtb}/` build trees automatically — see
-their per-directory READMEs for `make`-based bumps and reproducibility
-notes.
-
-For the legacy direct-kernel boot path (`boot --kernel <path>`), you
-also need to provide `Image` yourself — most often a kernel you've
-just built from a checked-out Linux tree. The host symlink convention
-is `./Image` in the project root; pass `--kernel <path>` on `boot` to
-point elsewhere.
+Run `bhx` commands from the project root — default firmware paths
+(`fw_jump.bin`, `blackhole-card.dtb`, `third_party/uboot/u-boot.bin`,
+`Image`) are resolved relative to your CWD. The `images/` directory
+that `bhx image pull` writes into is the same way.
 
 ## Quick start
 
-Boot one L2CPU with disk and network, then connect a terminal to it:
+Three commands from a freshly built `bhx` to a Debian login prompt on
+L2CPU 0:
 
 ```bash
-# Start the per-card daemon (once per boot of the host). The log file
-# is pinned to this directory with O_DSYNC so every line is on disk
-# before write() returns — handy if the host ever crashes.
-./target/debug/bhx daemon start -t 0 --log-file ./daemon-card0.log
-
-# Boot L2CPU 0 with the rootfs in this directory and slirp networking.
-./target/debug/bhx boot -l 0 -d rootfs.ext4 -n
-
-# Attach a terminal. Ctrl-A x to detach.
-./target/debug/bhx connect -l 0
+bhx image pull debian-13
+bhx daemon start
+bhx boot -l 0 -d images/debian-13.img -n -a
 ```
 
-Log in as `debian` (no password). The `-n` flag enables slirp
-networking with TCP port 2222 on the host forwarded to port 22 inside
-the guest, so you can also `ssh -p 2222 debian@localhost`.
+What each step does:
 
-Check what's running:
+1. `image pull debian-13` downloads the official Debian 13 (Trixie)
+   riscv64 cloud image (~700 MB compressed → ~10 GB resized) and
+   lands it at `images/debian-13.img`. Idempotent — re-running with
+   the artifact present is a no-op (pass `--refetch` to force).
+2. `daemon start` forks the per-card daemon. Owns the chip;
+   everything else is RPC.
+3. `boot -l 0 -d images/debian-13.img -n -a`:
+   - `-l 0` selects L2CPU 0.
+   - `-d` points at the disk; the daemon notices it's a whole-disk
+     image and auto-selects the U-Boot + EFI boot path
+     (`third_party/uboot/u-boot.bin`).
+   - `-n` enables slirp networking — TCP 2222 on the host forwards to
+     port 22 in the guest, so `ssh -p 2222 debian@localhost` works.
+   - `-a` (`--attach`) drops you straight into the console after boot
+     so you see the OpenSBI banner, U-Boot, GRUB, and kernel printk
+     live. `Ctrl-A x` to detach.
 
-```bash
-./target/debug/bhx daemon status -t 0
-# daemon: running (card 0, pid ..., uptime Ns, sock /run/user/.../sock)
-#   l2cpu 0: Running disk=/.../rootfs.ext4 net=y clients=0
-#   l2cpu 1: Stopped disk=- net=- clients=0
-#   l2cpu 2: Stopped disk=- net=- clients=0
-#   l2cpu 3: Stopped disk=- net=- clients=0
-```
+First boot of a cloud image runs cloud-init through to a login
+prompt in ~30 s. Default credentials live in `bhx image info <name>`
+(for `debian-13`: user `debian`, password `debian`).
 
 When you're done:
 
 ```bash
-./target/debug/bhx daemon stop -t 0
+bhx daemon stop
 ```
 
-## Booting stock distro images via U-Boot
+## Images
 
-`boot --kernel <Image>` (the default with no `--uboot` flag) loads the
-host-provided `Image` into L2CPU DRAM and jumps OpenSBI straight at
-it. That works for the patched buildroot kernel and for
-pipeline-converted single-FS rootfs images, but stock distro cloud
-images (Debian generic, AlmaLinux Kitten, Ubuntu preinstalled-server,
-Fedora Cloud Base) ship as multi-partition disks with an EFI System
-Partition + grub-riscv64-efi + a kernel they install themselves —
-the host's `Image` is the wrong kernel to jump to.
-
-For those, run U-Boot as the S-mode payload and let it walk the disk:
+The image registry is queryable at runtime:
 
 ```bash
-# One-time: build U-Boot from source.
-cd third_party/uboot && make check-deps && make    # ~5 min cold; idempotent
-cd ../..
-
-# Pull a U-Boot-bootable cloud image. The pull pipeline lands a
-# whole-disk `.img` (with GPT + ESP intact) when the known image
-# entry has `needs_bootloader: true`:
-./target/debug/bhx image pull almalinux
-
-# Boot it. With no `--kernel` and no `--uboot`, the boot subcommand
-# detects from the disk's basename that this image needs U-Boot and
-# auto-defaults to `--uboot third_party/uboot/u-boot.bin`:
-./target/debug/bhx boot -l 0 -d images/almalinux-10-kitten.img -n
-
-# Or be explicit:
-./target/debug/bhx boot -l 0 \
-    --uboot third_party/uboot/u-boot.bin \
-    -d images/almalinux-10-kitten.img -n
+bhx image list                  # available images
+bhx image info <name>           # URL, layout, default user/pass
+bhx image pull <name>           # download + prepare
 ```
 
-OpenSBI hands control to U-Boot, U-Boot reads the GPT, finds the
-ESP, runs `EFI/<distro>/shimriscv64.efi`, shim chainloads grub, grub
-loads the kernel + initrd from `/boot`. End-to-end UEFI on RISC-V.
+Currently shipped:
 
-`cargo run -- image list` annotates each known image's boot path —
-`whole partitioned disk` images go through U-Boot, `single-FS .ext4`
-images go through `--kernel`.
+| Name                  | Layout                  | Boot path                   | Notes                                  |
+| --------------------- | ----------------------- | --------------------------- | -------------------------------------- |
+| `tt-debian`           | single-FS `.ext4`       | direct kernel (host `Image`)| Tenstorrent pre-built; needs a kernel  |
+| `debian-13`           | whole partitioned disk  | U-Boot + EFI                | Default; alias `debian`/`trixie`       |
+| `ubuntu-24.04`        | whole partitioned disk  | U-Boot + EFI                | Alias `ubuntu`/`noble`                 |
+| `fedora-42`           | whole partitioned disk  | U-Boot + EFI                | Server Host Generic                    |
+| `fedora-42-cloud`     | whole partitioned disk  | U-Boot + EFI                | Cloud Base; needs cloud-init           |
+| `almalinux-10-kitten` | whole partitioned disk  | U-Boot + EFI                | Alias `alma`/`kitten`                  |
 
-The U-Boot build is documented in `third_party/uboot/README.md`: pinned config,
-the three downstream patches we apply (closes #49 plus two RISC-V
-DRAM-init fixes), reproducibility workflow.
+**Single-FS** images are bare ext4 filesystems. The host loads `Image`
+(a raw Linux kernel) + initrd + DTB, OpenSBI jumps straight at the
+kernel, and the kernel mounts `/dev/vda` as root. Convenient when
+you've built your own kernel; you have to provide `Image` yourself
+(`--kernel <path>`, defaults to `./Image`).
+
+**Whole-disk** images carry a GPT partition table with an EFI System
+Partition and a kernel installed in `/boot`. The daemon loads U-Boot
+at the kernel offset, U-Boot reads the GPT, runs the EFI shim, shim
+chainloads GRUB, GRUB loads the in-disk kernel + initrd. End-to-end
+UEFI on RISC-V; nothing kernel-specific on the host side.
+
+The daemon resolves `u-boot.bin`, `fw_jump.bin`, and
+`blackhole-card.dtb` from the in-tree `third_party/{uboot,opensbi,dtb}/`
+build trees automatically — see their per-directory READMEs for
+`make`-based bumps and reproducibility notes. The U-Boot build is
+documented in [`third_party/uboot/README.md`](third_party/uboot/README.md):
+pinned config, the three downstream patches we apply, reproducibility
+workflow.
 
 ## Common operations
 
@@ -167,26 +153,47 @@ rebooting the guest:
 
 ```bash
 # Swap the disk image (the guest sees a short unmount/remount):
-./target/debug/bhx remove-disk -l 0
-./target/debug/bhx add-disk    -l 0 some-other-rootfs.ext4
+bhx remove-disk -l 0
+bhx add-disk    -l 0 some-other-image.img
 
 # Attach/detach networking:
-./target/debug/bhx remove-net  -l 0
-./target/debug/bhx add-net     -l 0
+bhx remove-net  -l 0
+bhx add-net     -l 0
 
 # Re-image a running core in place (tears down workers first):
-./target/debug/bhx boot -l 0 -d rootfs.ext4 -n --force
+bhx boot -l 0 -d images/debian-13.img -n --force
 ```
 
-Run all four L2CPUs at once — each wants its own rootfs to avoid
-ext4 corruption from concurrent writers:
+Run all four L2CPUs at once — each wants its own disk to avoid
+filesystem corruption from concurrent writers:
 
 ```bash
 for i in 0 1 2 3; do
-    cp --reflink=auto rootfs.ext4 rootfs-$i.ext4
-    ./target/debug/bhx boot -l $i -d rootfs-$i.ext4 -n
+    cp --reflink=auto images/debian-13.img images/debian-13-l$i.img
+    bhx boot -l $i -d images/debian-13-l$i.img -n
 done
 ```
+
+Check what's running:
+
+```bash
+bhx daemon status
+# daemon: running (card 0, pid ..., uptime Ns, sock /run/user/.../sock)
+#   l2cpu 0: Running disk=/.../debian-13.img net=y clients=0
+#   l2cpu 1: Stopped disk=- net=- clients=0
+#   l2cpu 2: Stopped disk=- net=- clients=0
+#   l2cpu 3: Stopped disk=- net=- clients=0
+```
+
+Reattach a console to a running core:
+
+```bash
+bhx connect -l 0       # Ctrl-A x to detach
+```
+
+Multiple `connect` clients fan out through the daemon's 64 KiB
+scrollback hub (default `Rw`; `Ro` / `Takeover` modes available via
+`--mode`).
 
 ## Scripting tips
 
@@ -194,12 +201,13 @@ Wrap `connect` with `timeout` when running non-interactively — it runs
 forever and only exits on Ctrl-A x:
 
 ```bash
-timeout 5 ./target/debug/bhx connect -l 0 </dev/null 2>/tmp/stderr.log
+timeout 5 bhx connect -l 0 </dev/null 2>/tmp/stderr.log
 ```
 
-For non-interactive log scraping, the daemon's log file (what you
-passed to `--log-file`) is `O_DSYNC` and contains boot-path events.
-The `daemon logs` subcommand tails it for you.
+For non-interactive log scraping, the daemon's log file (default
+`./bhx-daemon-card<idx>.log`, override with `--log-file`) is `O_DSYNC`
+and contains boot-path events. The `daemon logs` subcommand tails it
+for you.
 
 ## Troubleshooting
 
@@ -233,10 +241,10 @@ For poking the chip directly (requires the daemon stopped for this
 card):
 
 ```bash
-./target/debug/bhx debug read-reset-reg
-./target/debug/bhx debug reset-x280      -l 0
-./target/debug/bhx debug assert-reset    -l 0
-./target/debug/bhx debug deassert-reset  -l 0
+bhx debug read-reset-reg
+bhx debug reset-x280      -l 0
+bhx debug assert-reset    -l 0
+bhx debug deassert-reset  -l 0
 ```
 
 ## Going deeper
@@ -253,4 +261,3 @@ card):
   Includes a 4-way concurrent console I/O roundtrip test.
 - **Open design issues + roadmap**: the GitHub issue tracker at
   <https://github.com/olofj/bhx/issues>.
-
