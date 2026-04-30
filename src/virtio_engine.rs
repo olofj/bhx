@@ -154,6 +154,15 @@ pub const STATS_OFF_LAST_COMPL: u32 = 0x028;
 /// kick would be appended; the daemon polls this and surfaces deltas
 /// via `bhx_kick_drops_total`.
 pub const STATS_OFF_KICK_DROPS: u32 = 0x02c;
+/// Cumulative count of QUEUE_SEL changes BRISC processed while the
+/// previous SEL's QUEUE_READY was still 1 — i.e. the race window
+/// the M7.2 fix (#71, commit 1345f3e) was designed to close re-opened.
+/// During that window a stock kernel doing
+/// `writel(SEL=N+1); readl(QUEUE_READY)` back-to-back can read the
+/// stale 1 and bail with -ENOENT. Bumped by the firmware's
+/// `handle_queue_sel_change`. Mirrored on the firmware side as
+/// `STATS_OFF_SEL_READY_RACES` in `brisc-firmware/virtio.c`.
+pub const STATS_OFF_SEL_READY_RACES: u32 = 0x030;
 
 // ----- Per-queue shadow region (BRISC L1, M5.5b firmware) -----
 //

@@ -615,6 +615,17 @@ pub static RNG_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
 /// `tensix_data_plane::run_kick_consumer`.
 pub static KICK_DROPS_TOTAL: Counter = Counter::new();
 
+/// Cumulative count of QUEUE_SEL changes BRISC processed while the
+/// previous SEL's QUEUE_READY was still 1 — the race window the M7.2
+/// fix (#71, commit 1345f3e) was designed to close. Non-zero means
+/// BRISC's sweep is borderline against a stock kernel's
+/// `writel(SEL=N+1); readl(QUEUE_READY)` — that kernel can read the
+/// stale 1 and bail virtio probe with -ENOENT. Bumped from the daemon
+/// poller when `STATS_OFF_SEL_READY_RACES` advances. Surfaces as
+/// `bhx_sel_ready_races_total` in /metrics; pairs with the `[kick-
+/// poller] BRISC observed N SEL→READY race window(s)` log line.
+pub static SEL_READY_RACES_TOTAL: Counter = Counter::new();
+
 /// Per-L2CPU UART feed-ring drop counter. TRISC0 bumps the chip-side
 /// counter (`UART_PRIV_OFF_FEED_DROP_COUNT`) when its producer
 /// outpaces the daemon consumer; the daemon polls the chip-side
@@ -958,6 +969,16 @@ pub fn render_prometheus(state: &DaemonState) -> String {
         "Cumulative count of kick_ring_push calls dropped because the ring \
          was full (BRISC backpressure).",
         KICK_DROPS_TOTAL.get(),
+    );
+    write_counter(
+        &mut out,
+        "bhx_sel_ready_races_total",
+        "Cumulative count of QUEUE_SEL changes BRISC processed while the \
+         previous SEL's QUEUE_READY was still 1 — the race window M7.2 (#71) \
+         was designed to close. Non-zero means BRISC's sweep is borderline; \
+         a stock guest kernel can read stale QUEUE_READY=1 and bail virtio \
+         probe with -ENOENT.",
+        SEL_READY_RACES_TOTAL.get(),
     );
     let _ = writeln!(
         &mut out,

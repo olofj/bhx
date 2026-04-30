@@ -83,6 +83,17 @@
 #define STATS_OFF_COMPL_EVENTS    0x024  // count of completion entries consumed
 #define STATS_OFF_LAST_COMPL      0x028  // last (slot << 16 | queue_idx) consumed
 #define STATS_OFF_KICK_DROPS      0x02c  // count of kick_ring_push drops (#101)
+// SEL→READY race-window detector: number of times BRISC processed a
+// QUEUE_SEL change while the previous SEL's QUEUE_READY was still 1.
+// During that window, a guest doing `writel(SEL=N+1); readl(QUEUE_
+// READY)` back-to-back can read the stale 1 and bail with -ENOENT
+// from vp_modern's queue setup. Closing the window means BRISC's
+// sweep beats the guest's writel→readl gap; this counter lets the
+// daemon surface a non-zero count as "race window observed, sweep is
+// borderline." Mirrored as `STATS_OFF_SEL_READY_RACES` on the Rust
+// side. Goes with TENSIX_PROTOCOL_VERSION (no bump — the field is
+// purely additive read-only stats).
+#define STATS_OFF_SEL_READY_RACES 0x030
 
 #define STATS_MAGIC_LOADED        0x0000B155u
 
@@ -373,9 +384,21 @@ static void handle_queue_sel_change(unsigned slot, uint32_t sel) {
     // Setting READY=0 here is safe: the kernel never reads READY
     // after writing 1 (only on next vm_setup_vq cycle), and del_vq's
     // `writel(0); WARN_ON(readl !=0)` sees 0 (= what it just wrote).
+    //
+    // Sample the prior READY value first so we can count the race
+    // window: if it was 1, BRISC is processing the SEL change AFTER
+    // the previous queue was set up. A stock kernel doing
+    // `writel(SEL=N+1); readl(QUEUE_READY)` with no SW_IMPL handshake
+    // can race through that window and see the stale 1. Daemon
+    // surfaces this counter; non-zero means our sweep is borderline
+    // even if no race lost in this run.
+    uint32_t prev_ready = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY));
     *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY))   = 0;
     FENCE_W();
 
+    if (prev_ready != 0) {
+        inc_stat(STATS_OFF_SEL_READY_RACES);
+    }
     inc_stat(STATS_OFF_SEL_CHANGES);
 }
 
@@ -1002,18 +1025,66 @@ void main(void) {
     wait_for_hello_and_ack();
 
     uint32_t heartbeat = 0;
+    // Tracks the active-slots bitmap from the previous main-loop
+    // iteration so we can detect 0→1 transitions: a bit going from 0
+    // to 1 means the daemon just (re-)registered that slot, possibly
+    // because the L2CPU was rebooted. Re-run init_device for each
+    // newly-active slot to wipe whatever state the *previous* L2CPU's
+    // kernel left in the reg / shadow / snap regions. Without this,
+    // a fresh kernel reads stale snap values on the first sweep after
+    // its reset and the `STATUS=0` cleanup hasn't yet been observed
+    // by BRISC, so it can read nondeterministic state. Cheap: one
+    // AND per loop iteration; the per-slot init only runs on actual
+    // transitions (rare during steady state).
+    uint32_t prev_active = 0;
     for (;;) {
         // Only poll slots the daemon has marked active. With one
-        // L2CPU booted, that's 4 of 16 slots — sweep period drops
-        // from ~4µs to ~1µs, narrow enough to reliably win the
-        // SEL→READY race against stock kernels (Alma 10) that
-        // don't have the SW_IMPL handshake.
+        // L2CPU booted, that's 4 of 16 (or 32, post-#81) slots —
+        // sweep period drops from ~4µs to ~1µs, narrow enough to
+        // reliably win the SEL→READY race against stock kernels
+        // (Alma 10, etc.) that don't have the SW_IMPL handshake.
+        //
+        // We iterate by 8-bit groups so an empty group skips eight
+        // bits in one branch instead of eight per-bit checks. With
+        // NUM_SLOTS=32 (#81 multi-disk extended the slot space from
+        // 16 → 32), a per-bit loop adds ~80 ns of dead per-sweep
+        // overhead which is enough to lose the SEL→READY race for
+        // multi-queue devices (virtio-net, virtio-console). The
+        // grouped iteration keeps the per-sweep cost bounded by the
+        // number of *active* slots, not NUM_SLOTS.
         uint32_t active = read_u32(ctrl_addr(CTRL_OFF_ACTIVE_SLOTS));
-        for (unsigned slot = 0; slot < BRISC_VIRTIO_NUM_SLOTS; slot++) {
-            if (((active >> slot) & 1u) == 0) {
+        uint32_t newly_active = active & ~prev_active;
+        if (newly_active != 0u) {
+            // Don't re-init bits in the UART range (16..19) — those
+            // are TRISC0 lifecycle bits, not virtio slots, and
+            // re-running init_device on the UART range's collision
+            // partners (L2CPU 2 dev 0..3) would clobber state if
+            // L2CPU 2 happened to be booted alongside L2CPU 0's UART.
+            // Slot indices in 0..NUM_SLOTS only.
+            for (unsigned slot = 0; slot < BRISC_VIRTIO_NUM_SLOTS; slot++) {
+                if (((newly_active >> slot) & 1u) == 0u) {
+                    continue;
+                }
+                if (slot >= BRISC_KICK_UART_SLOT_BASE
+                    && slot < (BRISC_KICK_UART_SLOT_BASE + BRISC_KICK_UART_NUM_SLOTS)) {
+                    // UART activation, not a virtio slot
+                    // (re)registration. Skip the virtio re-init.
+                    continue;
+                }
+                init_device(slot);
+            }
+        }
+        prev_active = active;
+        for (unsigned base = 0; base < BRISC_VIRTIO_NUM_SLOTS; base += 8u) {
+            uint32_t group = (active >> base) & 0xFFu;
+            if (group == 0u) {
                 continue;
             }
-            poll_one_device(slot);
+            for (unsigned i = 0; i < 8u; i++) {
+                if ((group >> i) & 1u) {
+                    poll_one_device(base + i);
+                }
+            }
         }
         // UART slots live at 16..19 in the same bitmap. M6.1 (#79):
         // BRISC drives TRISC0's reset lifecycle from this mask —

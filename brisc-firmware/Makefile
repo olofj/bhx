@@ -25,7 +25,7 @@ SIZE    := $(TOOLCHAIN_BIN)/riscv-tt-elf-size
 CFLAGS := \
     -march=rv32i_zicsr \
     -mabi=ilp32 \
-    -Os \
+    -O3 \
     -ffreestanding \
     -fno-builtin \
     -fno-stack-protector \

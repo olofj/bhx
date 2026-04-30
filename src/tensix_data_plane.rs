@@ -317,6 +317,7 @@ fn run_poll_loop(
     // operator polling `/metrics` sees the actual drop count rather
     // than waiting for a future-restart-then-zero rollover.
     let mut last_kick_drops: u32 = 0;
+    let mut last_sel_ready_races: u32 = 0;
     let mut last_uart_drops: [u32; uart::UART_NUM_SLOTS as usize] =
         [0; uart::UART_NUM_SLOTS as usize];
 
@@ -512,6 +513,18 @@ fn run_poll_loop(
             );
             crate::daemon::metrics::KICK_DROPS_TOTAL.add(delta as u64);
             last_kick_drops = kick_drops;
+        }
+        let sel_ready_races = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_SEL_READY_RACES);
+        if sel_ready_races != last_sel_ready_races {
+            let delta = sel_ready_races.wrapping_sub(last_sel_ready_races);
+            crate::dlog!(
+                "[kick-poller] BRISC observed {} SEL→READY race window(s) (cumulative {}) — \
+                 sweep-margin warning; stock kernels can hit -ENOENT on virtio probe",
+                delta,
+                sel_ready_races
+            );
+            crate::daemon::metrics::SEL_READY_RACES_TOTAL.add(delta as u64);
+            last_sel_ready_races = sel_ready_races;
         }
         {
             let map = uart_registry.lock().unwrap();
