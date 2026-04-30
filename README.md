@@ -45,25 +45,31 @@ full bring-up:
     `unzip`, `qemu-utils`, `fdisk`, `e2fsprogs`. (HTTP downloads
     themselves are native via the `ureq` crate.)
 
-Build and install the `bhx` binary into `~/.cargo/bin/` (make sure
-that's on your `PATH`):
+Build and install `bhx` plus its firmware (`u-boot.bin`,
+`fw_jump.bin`, `blackhole-card.dtb`) under `~/.local/`:
 
 ```bash
-cargo install --path .
+make check-deps         # one-time: verify host build prerequisites
+make install            # ~5 min cold (downloads + builds U-Boot + OpenSBI); idempotent
 ```
 
-Then a one-time U-Boot build (needed for any whole-disk distro image —
-see [Images](#images) below for which images need it):
+`make install` lays out:
 
-```bash
-make -C third_party/uboot check-deps
-make -C third_party/uboot           # ~5 min cold; idempotent
-```
+- `~/.local/bin/bhx` — the binary (via `cargo install --path . --root ~/.local`).
+  Make sure `~/.local/bin` is on your `PATH`.
+- `~/.local/share/bhx/firmware/{u-boot.bin,fw_jump.bin,blackhole-card.dtb}` —
+  what `bhx boot` resolves at runtime when you don't pass
+  `--uboot` / `--opensbi` / `--dtb` explicitly.
 
-Run `bhx` commands from the project root — default firmware paths
-(`fw_jump.bin`, `blackhole-card.dtb`, `third_party/uboot/u-boot.bin`,
-`Image`) are resolved relative to your CWD. The `images/` directory
-that `bhx image pull` writes into is the same way.
+`make` (no target) builds without installing; `make uninstall` removes
+both the binary and the firmware tree. Override the install prefix with
+`make install PREFIX=/usr/local` (or any other directory).
+
+Path resolution at boot time looks in `./<filename>` (operator override),
+then `$XDG_DATA_HOME/bhx/firmware/<filename>` (the `make install`
+location), then the in-tree `third_party/<subdir>/<filename>` build
+output. So you can run `bhx` from anywhere after `make install`, or from
+the project root in a dev tree without installing.
 
 ## Quick start
 
@@ -87,8 +93,8 @@ What each step does:
 3. `boot -l 0 -d images/debian-13.img -n -a`:
    - `-l 0` selects L2CPU 0.
    - `-d` points at the disk; the daemon notices it's a whole-disk
-     image and auto-selects the U-Boot + EFI boot path
-     (`third_party/uboot/u-boot.bin`).
+     image and auto-selects the U-Boot + EFI boot path (uses the
+     `u-boot.bin` from the search path described above).
    - `-n` enables slirp networking — TCP 2222 on the host forwards to
      port 22 in the guest, so `ssh -p 2222 debian@localhost` works.
    - `-a` (`--attach`) drops you straight into the console after boot
@@ -138,13 +144,13 @@ at the kernel offset, U-Boot reads the GPT, runs the EFI shim, shim
 chainloads GRUB, GRUB loads the in-disk kernel + initrd. End-to-end
 UEFI on RISC-V; nothing kernel-specific on the host side.
 
-The daemon resolves `u-boot.bin`, `fw_jump.bin`, and
-`blackhole-card.dtb` from the in-tree `third_party/{uboot,opensbi,dtb}/`
-build trees automatically — see their per-directory READMEs for
-`make`-based bumps and reproducibility notes. The U-Boot build is
-documented in [`third_party/uboot/README.md`](third_party/uboot/README.md):
-pinned config, the three downstream patches we apply, reproducibility
-workflow.
+`bhx boot` resolves `u-boot.bin`, `fw_jump.bin`, and `blackhole-card.dtb`
+through the search path described in [Prerequisites](#prerequisites)
+(cwd → `~/.local/share/bhx/firmware/` → in-tree). See
+[`third_party/uboot/README.md`](third_party/uboot/README.md) for the
+U-Boot pinned config, the three downstream patches we apply, and the
+reproducibility workflow; the OpenSBI and DTB builds have their own
+per-directory READMEs.
 
 ## Common operations
 

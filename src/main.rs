@@ -602,16 +602,58 @@ fn default_boot_payload(disk: Option<&str>) -> daemon::protocol::BootPayload {
 }
 
 /// Pick a sensible default U-Boot binary path for the no-`--uboot`
-/// flow. Prefers `./u-boot.bin` if present (pre-#48 operator
-/// convention of symlinking into cwd), else
-/// `./third_party/uboot/u-boot.bin` (the in-tree
-/// `make -C third_party/uboot` build output).
+/// flow. Goes through the same firmware-file search the daemon-side
+/// resolver uses for `fw_jump.bin` and `blackhole-card.dtb`.
 fn default_uboot_path() -> String {
-    if std::path::Path::new("u-boot.bin").exists() {
-        "u-boot.bin".to_string()
-    } else {
-        "third_party/uboot/u-boot.bin".to_string()
+    resolve_firmware_path("u-boot.bin", "third_party/uboot")
+}
+
+/// Resolve a firmware filename ("u-boot.bin", "fw_jump.bin",
+/// "blackhole-card.dtb") to an actual on-disk path by searching
+/// the conventional locations in order:
+///
+///   1. The bare filename in the caller's cwd (operator override —
+///      a symlink in the project root takes precedence over an
+///      installed copy).
+///   2. `$XDG_DATA_HOME/bhx/firmware/<filename>` (defaults to
+///      `~/.local/share/bhx/firmware/`) — where `make install`
+///      lands artifacts so a system-wide `bhx` works from any cwd.
+///   3. The in-tree `<in_tree_subdir>/<filename>` build output —
+///      what `make -C third_party/...` produces, for dev workflows
+///      that haven't run `make install`.
+///
+/// If none of the candidates exist, returns the in-tree path so
+/// the daemon-side error names the most-actionable location.
+/// Absolute inputs short-circuit and pass through unchanged.
+fn resolve_firmware_path(filename: &str, in_tree_subdir: &str) -> String {
+    let p = std::path::Path::new(filename);
+    if p.is_absolute() {
+        return filename.to_string();
     }
+    if p.exists() {
+        return filename.to_string();
+    }
+    if let Some(xdg) = xdg_firmware_dir() {
+        let candidate = xdg.join(filename);
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    let intree = std::path::PathBuf::from(in_tree_subdir).join(filename);
+    if intree.exists() {
+        return intree.to_string_lossy().into_owned();
+    }
+    intree.to_string_lossy().into_owned()
+}
+
+/// `$XDG_DATA_HOME/bhx/firmware/`, falling back to
+/// `~/.local/share/bhx/firmware/` per the XDG Base Directory spec.
+fn xdg_firmware_dir() -> Option<std::path::PathBuf> {
+    let base: std::path::PathBuf = match std::env::var_os("XDG_DATA_HOME") {
+        Some(v) if !v.is_empty() => std::path::PathBuf::from(v),
+        _ => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".local/share"),
+    };
+    Some(base.join("bhx/firmware"))
 }
 
 fn main() -> std::process::ExitCode {
@@ -1037,16 +1079,20 @@ fn run_boot_client(
     //
     // Paths are canonicalized here (client side) because the daemon runs
     // from cwd=/, so relative paths from the user's shell wouldn't resolve.
-    let opensbi = absolutize(&opensbi)?;
+    // Firmware artifacts (opensbi/dtb/uboot) get a search-path lookup
+    // first so a `make install`-d bhx run from any cwd still finds them
+    // under `$XDG_DATA_HOME/bhx/firmware/`. User-supplied kernel/initramfs
+    // paths are taken verbatim — those are operator content, not firmware.
+    let opensbi = absolutize(&resolve_firmware_path(&opensbi, "third_party/opensbi"))?;
     let payload = match payload {
         daemon::protocol::BootPayload::Kernel(p) => {
             daemon::protocol::BootPayload::Kernel(absolutize(&p)?)
         }
-        daemon::protocol::BootPayload::Uboot(p) => {
-            daemon::protocol::BootPayload::Uboot(absolutize(&p)?)
-        }
+        daemon::protocol::BootPayload::Uboot(p) => daemon::protocol::BootPayload::Uboot(
+            absolutize(&resolve_firmware_path(&p, "third_party/uboot"))?,
+        ),
     };
-    let dtb = absolutize(&dtb)?;
+    let dtb = absolutize(&resolve_firmware_path(&dtb, "third_party/dtb"))?;
     let initramfs = initramfs.map(|p| absolutize(&p)).transpose()?;
     let disk = disk.map(|p| absolutize(&p)).transpose()?;
     let mut sock = daemon::client::connect(card)?;
@@ -2757,16 +2803,19 @@ mod tests {
     fn default_payload_for_known_uboot_image_picks_uboot() {
         // almalinux-10-kitten lands as a whole-disk `.img` with
         // needs_bootloader=true: default must flip to U-Boot mode.
-        // Path is either `u-boot.bin` (operator symlinked into cwd)
-        // or `third_party/uboot/u-boot.bin` (in-tree build) —
-        // `default_uboot_path` picks based on cwd, so test against
-        // the legal set rather than the cwd-dependent specific value.
+        // The path can be cwd-relative (`u-boot.bin` / `third_party/...`)
+        // or XDG-resolved (`~/.local/share/bhx/firmware/u-boot.bin`)
+        // depending on which of the search paths first matches in the
+        // dev's environment, so assert on the filename rather than the
+        // full path.
         match default_boot_payload(Some("images/almalinux-10-kitten.img")) {
-            daemon::protocol::BootPayload::Uboot(p) => assert!(
-                p == "u-boot.bin" || p == "third_party/uboot/u-boot.bin",
-                "expected u-boot.bin or third_party/uboot/u-boot.bin, got {:?}",
-                p
-            ),
+            daemon::protocol::BootPayload::Uboot(p) => {
+                let filename = std::path::Path::new(&p)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                assert_eq!(filename, "u-boot.bin", "got {:?}", p);
+            }
             other => panic!("expected Uboot(...), got {:?}", other),
         }
     }
