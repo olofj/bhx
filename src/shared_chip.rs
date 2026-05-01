@@ -4,13 +4,13 @@
 //! Daemon-owned shared chip access.
 //!
 //! The chip has register blocks that are **genuinely shared across all L2CPUs**
-//! — the PLL at `0x80020500+`, the reset unit at `0x80030000+`, and other AXI
-//! registers at `0x8000_xxxx` all live on NOC tile `(8, 0)`. If multiple
-//! independent fds each configure their own TLB window onto tile (8,0) at
-//! those addresses, concurrent writes race at the hardware level: read-modify-
-//! write on `L2CPU_RESET` tears, PLL step sequences interleave, and we've
-//! observed the host dying as a result (see
-//! <https://github.com/olofj/bhx/issues/1>).
+//! — the PLL at `0x80020500+`, the reset unit at `0x80030000+`, and other
+//! chip-wide control registers at `0x8000_xxxx` all live on NOC tile `(8, 0)`,
+//! the ARC tile + reset unit. If multiple independent fds each configure
+//! their own TLB window onto tile (8,0) at those addresses, concurrent writes
+//! race at the hardware level: read-modify-write on `L2CPU_RESET` tears, PLL
+//! step sequences interleave, and we've observed the host dying as a result
+//! (see <https://github.com/olofj/bhx/issues/1>).
 //!
 //! `SharedChip` fixes the structural part by owning the **one and only** TLB
 //! window to tile (8,0) per card for the daemon's lifetime, with an internal
@@ -46,20 +46,24 @@ use crate::clock::{self, PllAccess};
 use crate::kmd;
 use crate::tlb::TlbWindow;
 
-/// AXI tile on Blackhole — the one shared across all L2CPUs.
-const AXI_TILE_X: u16 = 8;
-const AXI_TILE_Y: u16 = 0;
+/// ARC tile + reset unit on Blackhole — the chip-wide tile shared
+/// across all L2CPUs. (Earlier comments called this the "AXI tile";
+/// that was an artifact of the syseng.git lift-over and is wrong —
+/// (8,0) is the ARC tile.)
+const ARC_TILE_X: u16 = 8;
+const ARC_TILE_Y: u16 = 0;
 
-/// Base of the 2 MiB TLB window that covers our AXI register accesses.
-/// The reset unit (`0x80030000+`), PLL control (`0x80020500+`), and all
-/// currently-used `0x8000_xxxx` registers live within this 2 MiB slot.
-const AXI_WINDOW_BASE: u64 = 0x8000_0000;
-const AXI_WINDOW_SIZE: u64 = 0x20_0000;
+/// Base of the 2 MiB TLB window that covers the chip-wide control
+/// registers — the reset unit (`0x80030000+`), PLL control
+/// (`0x80020500+`), and all other `0x8000_xxxx` registers — all on
+/// the ARC tile (8,0).
+const ARC_RESET_WINDOW_BASE: u64 = 0x8000_0000;
+const ARC_RESET_WINDOW_SIZE: u64 = 0x20_0000;
 
-/// `L2CPU_RESET` lives in the reset unit at this AXI address.
+/// `L2CPU_RESET` lives in the reset unit at this address.
 const L2CPU_RESET_ADDR: u64 = 0x8003_0014;
 
-/// ARC CSM RAM is at AXI `0x1000_0000` on tile (8,0). The ARC firmware
+/// ARC CSM RAM is at `0x1000_0000` on tile (8,0). The ARC firmware
 /// telemetry table lives somewhere in here (its base address is read
 /// from `SCRATCH_RAM[13]`). `tt-kmd/telemetry.h::ARC_CSM_SIZE` is
 /// `1<<19` = 512 KiB, so a single 2 MiB TLB window covers it with
@@ -74,9 +78,9 @@ const CSM_WINDOW_SIZE: u64 = 0x20_0000;
 /// an explicit `Drop` impl so the order is "drop windows, then close
 /// fd" regardless of Rust's default field-drop order.
 struct Inner {
-    /// 2 MiB AXI window over `0x8000_0000+` — PLL, reset unit, scratch,
-    /// MSI FIFO, all the things accessed via short MMIO-like addresses.
-    axi_window: ManuallyDrop<TlbWindow>,
+    /// 2 MiB ARC-tile reset/control window over `0x8000_0000+` — PLL,
+    /// reset unit, scratch, MSI FIFO, all the chip-wide config registers.
+    reset_window: ManuallyDrop<TlbWindow>,
     /// 2 MiB CSM window over `0x1000_0000+` — ARC firmware RAM, where
     /// the telemetry table lives.
     csm_window: ManuallyDrop<TlbWindow>,
@@ -87,7 +91,7 @@ impl Drop for Inner {
     fn drop(&mut self) {
         unsafe {
             ManuallyDrop::drop(&mut self.csm_window);
-            ManuallyDrop::drop(&mut self.axi_window);
+            ManuallyDrop::drop(&mut self.reset_window);
             libc::close(self.fd);
         }
     }
@@ -96,7 +100,7 @@ impl Drop for Inner {
 pub struct SharedChip {
     /// Holds the `Inner` across normal use; emptied to `None` only during
     /// `reset_board` while we rotate the fd and window. Readers
-    /// (`axi_read32` etc.) take the read lock; `reset_board` takes the write
+    /// (`arc_read32` etc.) take the read lock; `reset_board` takes the write
     /// lock.
     inner: RwLock<Option<Inner>>,
     /// Serializes multi-step sequences (PLL step + reset R-M-W) so concurrent
@@ -127,7 +131,7 @@ impl SharedChip {
     }
 
     /// Test-only constructor that builds a `SharedChip` with no backing fd
-    /// or window. Any attempt to call `axi_read32`/`axi_write32`/etc. will
+    /// or window. Any attempt to call `arc_read32`/`arc_write32`/etc. will
     /// panic — use only from tests that exercise surrounding state without
     /// touching the chip.
     #[cfg(test)]
@@ -156,19 +160,20 @@ impl SharedChip {
             );
         }
 
-        let axi_window = match TlbWindow::new_2m(fd, AXI_TILE_X, AXI_TILE_Y, AXI_WINDOW_BASE) {
-            Ok(w) => w,
-            Err(e) => {
-                unsafe {
-                    libc::close(fd);
+        let reset_window =
+            match TlbWindow::new_2m(fd, ARC_TILE_X, ARC_TILE_Y, ARC_RESET_WINDOW_BASE) {
+                Ok(w) => w,
+                Err(e) => {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-        };
-        let csm_window = match TlbWindow::new_2m(fd, AXI_TILE_X, AXI_TILE_Y, CSM_WINDOW_BASE) {
+            };
+        let csm_window = match TlbWindow::new_2m(fd, ARC_TILE_X, ARC_TILE_Y, CSM_WINDOW_BASE) {
             Ok(w) => w,
             Err(e) => {
-                drop(axi_window);
+                drop(reset_window);
                 unsafe {
                     libc::close(fd);
                 }
@@ -176,22 +181,22 @@ impl SharedChip {
             }
         };
         Ok(Inner {
-            axi_window: ManuallyDrop::new(axi_window),
+            reset_window: ManuallyDrop::new(reset_window),
             csm_window: ManuallyDrop::new(csm_window),
             fd,
         })
     }
 
-    fn axi_window_offset(addr: u64) -> u64 {
-        let range = AXI_WINDOW_BASE..AXI_WINDOW_BASE + AXI_WINDOW_SIZE;
+    fn reset_window_offset(addr: u64) -> u64 {
+        let range = ARC_RESET_WINDOW_BASE..ARC_RESET_WINDOW_BASE + ARC_RESET_WINDOW_SIZE;
         assert!(
             range.contains(&addr),
-            "SharedChip: addr 0x{:x} outside AXI window [0x{:x}..0x{:x})",
+            "SharedChip: addr 0x{:x} outside ARC reset window [0x{:x}..0x{:x})",
             addr,
             range.start,
             range.end,
         );
-        addr - AXI_WINDOW_BASE
+        addr - ARC_RESET_WINDOW_BASE
     }
 
     fn csm_window_offset(addr: u64) -> u64 {
@@ -213,30 +218,30 @@ impl SharedChip {
     /// Returns `Err(Internal)` if the inner fd has been rotated out by a
     /// concurrent `reset_board` (#102) — callers in dispatch handlers
     /// propagate via `?` so the daemon stays up.
-    pub fn axi_read32(&self, addr: u64) -> crate::Result<u32> {
-        let off = Self::axi_window_offset(addr);
+    pub fn arc_read32(&self, addr: u64) -> crate::Result<u32> {
+        let off = Self::reset_window_offset(addr);
         let guard = self.inner.read().unwrap();
         let inner = guard
             .as_ref()
             .ok_or_else(|| crate::Error::internal("SharedChip used while rotating fd"))?;
-        Ok(inner.axi_window.read32(off))
+        Ok(inner.reset_window.read32(off))
     }
 
-    /// Single-register u32 write. Same lock story as `axi_read32`.
-    pub fn axi_write32(&self, addr: u64, value: u32) -> crate::Result<()> {
-        let off = Self::axi_window_offset(addr);
+    /// Single-register u32 write. Same lock story as `arc_read32`.
+    pub fn arc_write32(&self, addr: u64, value: u32) -> crate::Result<()> {
+        let off = Self::reset_window_offset(addr);
         let guard = self.inner.read().unwrap();
         let inner = guard
             .as_ref()
             .ok_or_else(|| crate::Error::internal("SharedChip used while rotating fd"))?;
-        inner.axi_window.write32(off, value);
+        inner.reset_window.write32(off, value);
         Ok(())
     }
 
     /// Read a u32 from ARC CSM (the firmware's RAM, used for the
     /// telemetry table — see `src/telemetry.rs` and #75 for context).
     /// The address must lie within `[0x1000_0000, 0x1020_0000)`. A pure
-    /// read; same lock story as `axi_read32`.
+    /// read; same lock story as `arc_read32`.
     pub fn csm_read32(&self, addr: u64) -> crate::Result<u32> {
         let off = Self::csm_window_offset(addr);
         let guard = self.inner.read().unwrap();
@@ -249,7 +254,7 @@ impl SharedChip {
     /// Probe whether L2CPU `idx`'s release bit is set. Pure read; no
     /// `seq_lock`.
     pub fn l2cpu_is_running(&self, l2cpu_idx: usize) -> crate::Result<bool> {
-        let val = self.axi_read32(L2CPU_RESET_ADDR)?;
+        let val = self.arc_read32(L2CPU_RESET_ADDR)?;
         let bit_idx = l2cpu_idx + 4;
         Ok((val >> bit_idx) & 1 == 1)
     }
@@ -257,7 +262,7 @@ impl SharedChip {
     /// Read `L2CPU_RESET` raw — used by daemon startup probe to report all
     /// four cores' state in one shot.
     pub fn read_l2cpu_reset(&self) -> crate::Result<u32> {
-        self.axi_read32(L2CPU_RESET_ADDR)
+        self.arc_read32(L2CPU_RESET_ADDR)
     }
 
     /// Step the chip-wide L2CPU PLL down to 200 MHz. Caller is
@@ -283,7 +288,7 @@ impl SharedChip {
         crate::dlog!("[reset_x280] stepping PLL down to 200 MHz");
         clock::set_frequency(self, 200);
 
-        let reset_val_before = self.axi_read32(L2CPU_RESET_ADDR)?;
+        let reset_val_before = self.arc_read32(L2CPU_RESET_ADDR)?;
         let mut reset_val = reset_val_before;
         let mut mask: u32 = 0;
         for &idx in l2cpu_indices {
@@ -294,8 +299,8 @@ impl SharedChip {
             "[reset_x280] L2CPU_RESET@0x{:x}: {:#010x} | {:#010x} -> {:#010x} (releasing L2CPU {:?})",
             L2CPU_RESET_ADDR, reset_val_before, mask, reset_val, l2cpu_indices
         );
-        self.axi_write32(L2CPU_RESET_ADDR, reset_val)?;
-        let reset_val_after = self.axi_read32(L2CPU_RESET_ADDR)?;
+        self.arc_write32(L2CPU_RESET_ADDR, reset_val)?;
+        let reset_val_after = self.arc_read32(L2CPU_RESET_ADDR)?;
         crate::dlog!(
             "[reset_x280] L2CPU_RESET readback: {:#010x}",
             reset_val_after
@@ -333,11 +338,11 @@ impl PllAccess for SharedChip {
         // unrecoverable territory (concurrent reset_board mid-reset_x280,
         // which #102's invariants rule out). Surface as a clear panic
         // message rather than threading Result through the trait.
-        self.axi_read32(addr)
+        self.arc_read32(addr)
             .expect("PllAccess: SharedChip rotating during clock step")
     }
     fn pll_write32(&self, addr: u64, value: u32) {
-        self.axi_write32(addr, value)
+        self.arc_write32(addr, value)
             .expect("PllAccess: SharedChip rotating during clock step");
     }
 }
@@ -347,15 +352,15 @@ mod tests {
     use super::*;
 
     // Layout invariants — if these ever change, the assertions in
-    // `axi_window_offset` / `csm_window_offset` (and any hand-tuned
+    // `reset_window_offset` / `csm_window_offset` (and any hand-tuned
     // addresses) stop being valid. Compile-time because all inputs are
     // `const`.
     const _: () = {
-        // PLL register, reset register live inside the AXI window.
-        assert!(AXI_WINDOW_BASE <= 0x80020500);
-        assert!(0x80020500 < AXI_WINDOW_BASE + AXI_WINDOW_SIZE);
-        assert!(AXI_WINDOW_BASE <= L2CPU_RESET_ADDR);
-        assert!(L2CPU_RESET_ADDR < AXI_WINDOW_BASE + AXI_WINDOW_SIZE);
+        // PLL register, reset register live inside the ARC reset window.
+        assert!(ARC_RESET_WINDOW_BASE <= 0x80020500);
+        assert!(0x80020500 < ARC_RESET_WINDOW_BASE + ARC_RESET_WINDOW_SIZE);
+        assert!(ARC_RESET_WINDOW_BASE <= L2CPU_RESET_ADDR);
+        assert!(L2CPU_RESET_ADDR < ARC_RESET_WINDOW_BASE + ARC_RESET_WINDOW_SIZE);
         // The CSM window must cover ARC_CSM_BASE..ARC_CSM_BASE+ARC_CSM_SIZE
         // (0x10000000..0x10080000, 512 KiB) — the telemetry table can
         // live anywhere in there.
@@ -364,21 +369,21 @@ mod tests {
     };
 
     #[test]
-    fn axi_window_offset_maps_known_addresses() {
-        assert_eq!(SharedChip::axi_window_offset(0x80020500), 0x20500);
-        assert_eq!(SharedChip::axi_window_offset(L2CPU_RESET_ADDR), 0x30014);
+    fn reset_window_offset_maps_known_addresses() {
+        assert_eq!(SharedChip::reset_window_offset(0x80020500), 0x20500);
+        assert_eq!(SharedChip::reset_window_offset(L2CPU_RESET_ADDR), 0x30014);
     }
 
     #[test]
-    #[should_panic(expected = "outside AXI window")]
-    fn axi_window_offset_rejects_out_of_range_addr() {
-        SharedChip::axi_window_offset(AXI_WINDOW_BASE + AXI_WINDOW_SIZE);
+    #[should_panic(expected = "outside ARC reset window")]
+    fn reset_window_offset_rejects_out_of_range_addr() {
+        SharedChip::reset_window_offset(ARC_RESET_WINDOW_BASE + ARC_RESET_WINDOW_SIZE);
     }
 
     #[test]
-    #[should_panic(expected = "outside AXI window")]
-    fn axi_window_offset_rejects_below_base() {
-        SharedChip::axi_window_offset(AXI_WINDOW_BASE - 1);
+    #[should_panic(expected = "outside ARC reset window")]
+    fn reset_window_offset_rejects_below_base() {
+        SharedChip::reset_window_offset(ARC_RESET_WINDOW_BASE - 1);
     }
 
     #[test]
@@ -401,15 +406,15 @@ mod tests {
     }
 
     #[test]
-    fn axi_accessors_return_internal_error_during_fd_rotation() {
+    fn arc_accessors_return_internal_error_during_fd_rotation() {
         // SharedChip::placeholder leaves `inner: None` — the same
         // state reset_board uses while it's swapping the fd. Each
         // accessor must surface that as Internal rather than panic
         // (#102).
         let chip = SharedChip::placeholder();
-        let read_err = chip.axi_read32(L2CPU_RESET_ADDR).unwrap_err();
+        let read_err = chip.arc_read32(L2CPU_RESET_ADDR).unwrap_err();
         assert!(matches!(read_err, crate::Error::Internal(_)));
-        let write_err = chip.axi_write32(L2CPU_RESET_ADDR, 0).unwrap_err();
+        let write_err = chip.arc_write32(L2CPU_RESET_ADDR, 0).unwrap_err();
         assert!(matches!(write_err, crate::Error::Internal(_)));
         let csm_err = chip.csm_read32(CSM_WINDOW_BASE).unwrap_err();
         assert!(matches!(csm_err, crate::Error::Internal(_)));

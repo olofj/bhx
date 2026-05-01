@@ -6,7 +6,7 @@
 //! prefetchers.
 //!
 //! All per-core register / NOC access goes through [`crate::l2cpu::L2Cpu`]
-//! (persistent per-L2CPU fd + TLB windows). Chip-wide AXI tile (8,0) work
+//! (persistent per-L2CPU fd + TLB windows). Chip-wide ARC-tile (8,0) work
 //! (`L2CPU_RESET` R-M-W, PLL stepping, PCIe reset) lives in
 //! [`crate::shared_chip::SharedChip`].
 
@@ -31,8 +31,8 @@ pub fn read_bin_file(path: &Path) -> std::io::Result<Vec<u8>> {
 /// match the old `BootChip::noc_write_bulk` (UC stores are strictly ordered
 /// at the device), but the allocation goes through `L2Cpu`'s per-card fd
 /// and its `alloc_lock` — so concurrent bulk writes on different L2CPUs
-/// don't stomp each other's kmd state and no longer touch the shared AXI
-/// tile (8,0).
+/// don't stomp each other's kmd state and no longer touch the shared
+/// ARC tile (8,0).
 fn l2cpu_noc_write_bulk(l2cpu: &L2Cpu, addr: u64, data: &[u8]) -> std::io::Result<()> {
     const TWO_MEG: u64 = crate::tlb::TWO_MEG as u64;
     let mut written: u64 = 0;

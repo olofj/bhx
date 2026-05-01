@@ -20,7 +20,7 @@
 //! - Constants are grouped into submodules by the device they describe
 //!   (`l2cpu`, `plic`, `boot_image`, `slirp`, `virtio_mmio`).
 #![allow(dead_code)]
-//! - AXI tile (8,0) registers (PLL, reset unit, etc.) and the
+//! - ARC-tile (8,0) registers (PLL, reset unit, etc.) and the
 //!   `SharedChip` window over them stay in `shared_chip.rs` —
 //!   that's where the lock + access methods live, so locality of
 //!   reference wins over symmetry. Likewise PLL control offsets stay in

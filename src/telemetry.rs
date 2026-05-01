@@ -9,10 +9,11 @@
 //! boot. tt-kmd has the address cache internally but does not expose
 //! harvest data via ioctl/sysfs (see #75 for the full discovery story).
 //! `luwen`, `tt-smi` (via pyluwen), and `tt-metal` UMD all read it
-//! directly through AXI on tile (8,0); we do the same.
+//! directly through tile (8,0) — the ARC tile + reset unit; we do the
+//! same.
 //!
 //! Protocol:
-//!   1. Read `SCRATCH_RAM[13]` at AXI `0x80030434` → telem table base.
+//!   1. Read `SCRATCH_RAM[13]` at `0x80030434` → telem table base.
 //!   2. Header: `[base+0..3]` = version, `[base+4..7]` = entry count.
 //!   3. Tag table at `[base+8 .. base+8+count*4]`. Each entry is one
 //!      u32: low 16 bits = tag id, high 16 bits = data offset (in u32
@@ -27,7 +28,7 @@ use std::io;
 
 use crate::shared_chip::SharedChip;
 
-/// AXI address of `SCRATCH_RAM[13]` on tile (8,0). ARC firmware writes
+/// Address of `SCRATCH_RAM[13]` on tile (8,0). ARC firmware writes
 /// the telemetry table base address here when it finishes booting.
 /// Source: `tt-kmd/blackhole.c::ARC_TELEMETRY_PTR` and
 /// `tt-metal` UMD `blackhole_implementation.hpp::SCRATCH_RAM_13`.
@@ -120,7 +121,7 @@ pub enum TelemetryError {
 /// 60-ish entries × 8 bytes header + tags + data); the whole walk
 /// completes in one pass with no allocations beyond the result `Vec`.
 pub fn read_telemetry(chip: &SharedChip) -> Result<Telemetry, TelemetryError> {
-    let table_addr = chip.axi_read32(ARC_TELEMETRY_PTR_ADDR)?;
+    let table_addr = chip.arc_read32(ARC_TELEMETRY_PTR_ADDR)?;
     if table_addr == 0 {
         return Err(TelemetryError::ArcNotReady);
     }

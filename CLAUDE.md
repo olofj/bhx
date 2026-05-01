@@ -79,7 +79,7 @@ src/
 ├── tlb.rs            # TlbHandle (ioctl/mmap RAII) and TlbWindow (volatile r/w)
 ├── kmd.rs            # Manual FFI to tt-kmd ioctls (ALLOCATE/FREE/CONFIGURE_TLB, RESET_DEVICE, ...)
 ├── chip.rs           # Standalone PCIe LDS reset (reset_board); called by SharedChip during reset_board
-├── shared_chip.rs    # Daemon-owned AXI tile (8,0) access: persistent TLB + seq_lock for PLL/reset R-M-W
+├── shared_chip.rs    # Daemon-owned ARC tile (8,0) access: persistent TLB + seq_lock for PLL/reset R-M-W
 ├── fdt_ffi.rs        # Manual FFI to libfdt for DTB patching
 ├── clock.rs          # PLL stepping (200/1750 MHz) via SharedChip's PllAccess impl
 ├── boot.rs           # boot_l2cpu, modify_dtb, configure_prefetchers (all via Arc<L2Cpu>)
@@ -332,9 +332,10 @@ image/kernel/ramdisk downloaders.
   `Arc<L2Cpu>`. Persistent windows are set up at `new()` and never
   remapped — `write32` / `read32` / `get_persistent_2m_window` lock the
   mutex only for allocation, not the subsequent volatile ops.
-- **Chip-wide AXI access goes through exactly one place**: the daemon's
-  `SharedChip` (`src/shared_chip.rs`), holding a single persistent 2 MiB
-  TLB window to NOC tile (8,0). `SharedChip::seq_lock` serializes any
+- **Chip-wide ARC-tile (8,0) access goes through exactly one place**:
+  the daemon's `SharedChip` (`src/shared_chip.rs`), holding a single
+  persistent 2 MiB TLB window to NOC tile (8,0) — the ARC tile + reset
+  unit. `SharedChip::seq_lock` serializes any
   multi-step register sequence (PLL step + `L2CPU_RESET` R-M-W in
   `reset_x280`, fd-drop + PCIe reset + fd-reopen in `reset_board`).
   Do NOT create another mapping to tile (8,0) — concurrent accessors

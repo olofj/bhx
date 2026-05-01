@@ -146,7 +146,7 @@ pub fn serve(
 /// released (bit idx+4 == 1) — warm-resume candidates.
 ///
 /// Safe to call even when the chip is wedged: reading the reset register
-/// is a single AXI read to tile (8,0), no state change.
+/// is a single read to ARC tile (8,0), no state change.
 fn probe_initial_chip_state(shared: &crate::shared_chip::SharedChip, card: u32) -> Vec<u8> {
     let val = match shared.read_l2cpu_reset() {
         Ok(v) => v,

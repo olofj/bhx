@@ -172,8 +172,9 @@ pub struct DaemonState {
     /// but its OSBIdbug / VIRTUART magic is missing. Cleared on successful
     /// cold `boot`. Read by `dispatch_status` to report `Wedged`.
     pub wedged: [AtomicBool; 4],
-    /// Single shared access point for chip-wide AXI registers on NOC tile
-    /// (8,0) — PLL, reset unit, `L2CPU_RESET`. Concurrent boots serialize
+    /// Single shared access point for chip-wide control registers on NOC
+    /// tile (8,0) — the ARC tile + reset unit (PLL, reset unit,
+    /// `L2CPU_RESET`). Concurrent boots serialize
     /// their PLL steps and reset R-M-W through `SharedChip::seq_lock`
     /// instead of racing through independently-configured TLB windows.
     /// Kept as an `Arc` so worker threads can hold their own references

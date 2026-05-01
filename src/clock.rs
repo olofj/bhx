@@ -58,7 +58,8 @@ impl PllCntl5 {
     }
 }
 
-/// Trait for accessing PLL registers, abstracting over TLB windows vs AXI.
+/// Trait for accessing PLL registers, abstracting over real
+/// `SharedChip` MMIO and the in-memory mock used in unit tests.
 pub trait PllAccess {
     fn pll_read32(&self, addr: u64) -> u32;
     fn pll_write32(&self, addr: u64, value: u32);

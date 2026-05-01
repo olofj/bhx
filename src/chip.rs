@@ -4,8 +4,8 @@
 //! PCIe link-reset helper.
 //!
 //! Minimal chip-access surface: what used to be `BootChip` (ephemeral per-op
-//! TLB windows to AXI tile (8,0) + per-L2CPU NOC tiles) has been retired.
-//! AXI tile (8,0) access now lives in [`crate::shared_chip::SharedChip`] as
+//! TLB windows to the ARC tile (8,0) + per-L2CPU NOC tiles) has been retired.
+//! ARC-tile (8,0) access now lives in [`crate::shared_chip::SharedChip`] as
 //! a single persistent mapping with an internal mutex; per-L2CPU NOC writes
 //! use [`crate::l2cpu::L2Cpu`]'s persistent fd. What remains here is the raw
 //! `RESET_DEVICE` ioctl sequence that the kmd requires a fresh fd for.
