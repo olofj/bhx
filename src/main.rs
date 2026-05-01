@@ -1322,6 +1322,7 @@ fn run_boot_client(
     let initramfs = initramfs.map(|p| absolutize(&p)).transpose()?;
     let disk = disk.map(|p| absolutize(&p)).transpose()?;
     let cloud_init = cloud_init.map(|p| absolutize(&p)).transpose()?;
+    ensure_daemon_running(card)?;
     let mut sock = daemon::client::connect(card)?;
     daemon::client::boot(
         &mut sock,
@@ -1342,6 +1343,27 @@ fn run_boot_client(
         hostname_override,
         cloud_init,
     )
+}
+
+/// Auto-start the per-card daemon if it isn't already running. Limited
+/// to `bhx boot` (and the profile-driven boot path it shares); other
+/// subcommands are intentionally NOT covered — `connect`/`status`/
+/// `add-disk`/`stop` against a stopped daemon usually means
+/// "the daemon I expected just died" or "wrong shell," and silently
+/// starting one would mask that. `boot` is the natural session-start
+/// verb where auto-start is unsurprising. (#134)
+fn ensure_daemon_running(card: u32) -> std::io::Result<()> {
+    if daemon::lifetime::is_running(card) {
+        return Ok(());
+    }
+    eprintln!("[daemon] not running for card {} — auto-starting", card);
+    daemon::runner::start(daemon::runner::StartOpts {
+        card,
+        foreground: false,
+        log_file: None,
+        sandbox: true,
+        metrics_port: None,
+    })
 }
 
 fn absolutize(path: &str) -> std::io::Result<String> {
