@@ -703,8 +703,27 @@ fn parse_largest_partition(json: &str) -> Result<(u64, u64)> {
 /// images (`!is_single_fs`) we only grow the file; the guest's
 /// first-boot cloud-init growpart + systemd-growfs extend the
 /// partition + filesystem from inside the running guest.
+///
+/// Never shrinks. Some upstream qcow2s (e.g. openSUSE Minimal-VM
+/// at ~24 GiB virtual size) are already larger than the registry's
+/// `default_size`; truncating those down would chop off the GPT
+/// secondary header and leave the image with no readable partition
+/// table — booted-but-broken, U-Boot fails to find a partition and
+/// falls through to PXE. The right behavior is to leave the image
+/// alone if it's already at-or-above the requested size.
 fn resize_image(path: &Path, size: &str, is_single_fs: bool) -> Result<()> {
-    eprintln!("  Resizing to {}...", size);
+    let target_bytes = parse_size(size)?;
+    let current_bytes = fs::metadata(path)
+        .map_err(Error::io_ctx("Failed to stat image for resize"))?
+        .len();
+    if current_bytes >= target_bytes {
+        eprintln!(
+            "  Image already {} bytes (target {} = {} bytes); skipping resize.",
+            current_bytes, size, target_bytes
+        );
+        return Ok(());
+    }
+    eprintln!("  Growing to {}...", size);
 
     // First resize the file
     let status = Command::new("qemu-img")
@@ -716,13 +735,13 @@ fn resize_image(path: &Path, size: &str, is_single_fs: bool) -> Result<()> {
     match status {
         Ok(s) if s.success() => {}
         Ok(_) | Err(_) => {
-            // Fallback: use truncate
-            let size_bytes = parse_size(size)?;
+            // Fallback: use truncate (pure grow — already verified
+            // current < target above, so set_len won't shrink).
             let file = fs::OpenOptions::new()
                 .write(true)
                 .open(path)
                 .map_err(Error::io_ctx("Failed to open image for resize"))?;
-            file.set_len(size_bytes)
+            file.set_len(target_bytes)
                 .map_err(Error::io_ctx("Failed to resize image"))?;
         }
     }
