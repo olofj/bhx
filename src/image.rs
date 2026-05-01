@@ -233,15 +233,23 @@ pub const KNOWN_IMAGES: &[KnownImage] = &[
     // it via `bhx connect` immediately after `bhx boot`.
     KnownImage {
         name: "opensuse-tumbleweed",
-        url: "https://download.opensuse.org/ports/riscv/tumbleweed/appliances/openSUSE-Tumbleweed-RISC-V-JeOS-efi.riscv64.raw.xz",
-        description: "openSUSE Tumbleweed JeOS — minimal rolling-release image (interactive firstboot via console)",
-        aliases: &["opensuse", "tumbleweed", "suse", "jeos"],
-        format: ImageFormat::RawDisk,
-        compression: Compression::Xz,
+        url: "https://download.opensuse.org/ports/riscv/tumbleweed/appliances/openSUSE-Tumbleweed-Minimal-VM.riscv64-kvm-and-xen-grub-bls.qcow2",
+        description: "openSUSE Tumbleweed Minimal-VM — cloud-init-enabled minimal rolling-release, riscv64",
+        // Switched from JeOS to Minimal-VM: JeOS shipped jeos-firstboot
+        // for interactive console-based setup (#133), which expects
+        // /dev/tty1 and never reaches our hvc0/ttyS0 console out of the
+        // box. Minimal-VM uses cloud-init the same way Debian/Fedora/
+        // Ubuntu/Alma cloud images do, so the auto-attach default seed
+        // (#115, `ensure_cidata_seed`) gives a working first-boot login.
+        // The grub-bls variant is the right one for our U-Boot+EFI+GRUB
+        // chain; the sdboot variant uses systemd-boot (untested here).
+        aliases: &["opensuse", "tumbleweed", "suse"],
+        format: ImageFormat::Qcow2,
+        compression: Compression::None,
         default_size: "10G",
         default_user: "",
         default_password: "",
-        cloud_init: false,
+        cloud_init: true,
         extract_partition: false,
         needs_bootloader: true,
     },
