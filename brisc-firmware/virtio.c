@@ -118,9 +118,26 @@
 //   PRECAP:   poll_one_device entry → just before BLIND CAPTURE
 //   BLINDCAP: BLIND CAPTURE block (7 read+writes per active queue)
 //   POSTCAP:  after BLIND CAPTURE → end of poll_one_device
+//
+// All three are deprecated post-#120 — BLIND CAPTURE was removed in
+// favour of atomic capture-on-READY=1 in `handle_queue_ready_change`,
+// so PRECAP/POSTCAP no longer bracket meaningful work. Reads will be 0.
 #define STATS_OFF_MAX_PRECAP_CYCLES   0x040
 #define STATS_OFF_MAX_BLINDCAP_CYCLES 0x044
 #define STATS_OFF_MAX_POSTCAP_CYCLES  0x048
+// #120 atomic capture stats. handle_queue_ready_change snapshots the
+// 7 setup fields (NUM, DESC_LO/HI, DRIVER_LO/HI, DEVICE_LO/HI) on the
+// READY=0→1 transition. After the snapshot, BRISC re-reads SEL; if
+// it changed mid-capture the kernel raced past us and the snapshot
+// is mixed across queues — bail and bump SEL_RACES.
+//
+// SETUPS counts successful captures (queue activations). TEARDOWNS
+// counts READY=0 events (queue disable, kernel will rewrite addrs on
+// next vm_setup_vq). Together they replace the lumped READY_EVENTS
+// counter for "how many virtio commands has BRISC actually processed."
+#define STATS_OFF_READY_CAPTURE_SEL_RACES 0x04c
+#define STATS_OFF_QUEUE_SETUPS            0x050
+#define STATS_OFF_QUEUE_TEARDOWNS         0x054
 // Sweep-cycle histogram (#124 follow-up). MAX is misleading because
 // `init_device` on STATUS=0 burns ~1200 cycles in a 320-store wipe
 // loop, dominating the max even though it runs before the kernel's
@@ -501,9 +518,69 @@ static void handle_queue_sel_change(unsigned slot, uint32_t sel) {
 // the standard virtio rule "READY=0 disables the queue" by zeroing
 // the per-queue desc/avail/used pointers — the guest will rewrite
 // them on the next configure cycle.
+//
+// On READY=1 transitions this is also the atomic snapshot point for
+// the queue's setup fields (NUM, DESC/DRIVER/DEVICE LO+HI). Per
+// virtio-mmio the kernel writes all setup regs BEFORE writing
+// READY=1, so capturing here gives a consistent post-setup view —
+// no torn LO/HI reads (#120). The earlier per-iter BLIND CAPTURE
+// could write inconsistent halves into shadow[sel], and if the
+// kernel advanced SEL before BLIND CAPTURE re-ran with the same
+// sel, the torn state stuck around forever — that's the
+// "used=0x33842000 (high half missing)" failure mode.
 static void handle_queue_ready_change(unsigned slot, uint32_t sel, uint32_t ready) {
     if (sel >= BRISC_VIRTIO_MAX_QUEUES) {
         return;
+    }
+    if (ready != 0) {
+        // Snapshot all 7 setup fields, then re-read SEL. If SEL
+        // changed mid-capture, the kernel raced past us into the
+        // next queue's setup window — our reads are mixed across
+        // queues, so discard. Empirically the kernel's per-queue
+        // setup time through the MMIO bridge is ~50 µs while the
+        // capture loop is sub-µs, so this race is rare; the
+        // counter exists to surface it if the margin ever shrinks.
+        struct queue_field {
+            unsigned mmio_off;
+            unsigned shadow_off;
+        };
+        static const struct queue_field FIELDS[] = {
+            {VIRTIO_MMIO_QUEUE_NUM,         SHADOW_Q_OFF_NUM},
+            {VIRTIO_MMIO_QUEUE_DESC_LOW,    SHADOW_Q_OFF_DESC_LO},
+            {VIRTIO_MMIO_QUEUE_DESC_HIGH,   SHADOW_Q_OFF_DESC_HI},
+            {VIRTIO_MMIO_QUEUE_DRIVER_LOW,  SHADOW_Q_OFF_DRIVER_LO},
+            {VIRTIO_MMIO_QUEUE_DRIVER_HIGH, SHADOW_Q_OFF_DRIVER_HI},
+            {VIRTIO_MMIO_QUEUE_DEVICE_LOW,  SHADOW_Q_OFF_DEVICE_LO},
+            {VIRTIO_MMIO_QUEUE_DEVICE_HIGH, SHADOW_Q_OFF_DEVICE_HI},
+        };
+        const unsigned NF = sizeof(FIELDS) / sizeof(FIELDS[0]);
+        uint32_t cap[7];
+        for (unsigned f = 0; f < NF; f++) {
+            cap[f] = read_u32(reg_addr(slot, FIELDS[f].mmio_off));
+        }
+        uint32_t sel_post = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_SEL));
+        if (sel_post == sel) {
+            for (unsigned f = 0; f < NF; f++) {
+                *l1_u32(shadow_queue_addr(slot, sel, FIELDS[f].shadow_off)) = cap[f];
+            }
+            // Force the shadow writes to commit to their L1 bank
+            // before any subsequent kick reaches the daemon. fence w,w
+            // (already implicit in `write_u32` for visible regs above)
+            // is hart-local; it drains BRISC's store queue but does
+            // not order writes across L1 banks. Shadow lives at
+            // SHADOW_BASE (bank A); the kick ring + producer_seq live
+            // at CTRL_BASE (bank B). Without forcing bank commit, the
+            // daemon could see a producer_seq bump (bank B propagated)
+            // before the shadow stores (bank A still pending) — and
+            // read DESC_LO=0 with DESC_HI=0x4000 in the worst case.
+            // The load below blocks until the bank acknowledges, same
+            // pattern as `brisc_set_trisc0_reset`'s `(void)*reg`.
+            FENCE_W();
+            (void)*l1_u32(shadow_queue_addr(slot, sel, SHADOW_Q_OFF_DEVICE_HI));
+            inc_stat(STATS_OFF_QUEUE_SETUPS);
+        } else {
+            inc_stat(STATS_OFF_READY_CAPTURE_SEL_RACES);
+        }
     }
     *l1_u32(shadow_queue_addr(slot, sel, SHADOW_Q_OFF_READY)) = ready;
     if (ready == 0) {
@@ -514,6 +591,7 @@ static void handle_queue_ready_change(unsigned slot, uint32_t sel, uint32_t read
         *l1_u32(shadow_queue_addr(slot, sel, SHADOW_Q_OFF_DRIVER_HI)) = 0;
         *l1_u32(shadow_queue_addr(slot, sel, SHADOW_Q_OFF_DEVICE_LO)) = 0;
         *l1_u32(shadow_queue_addr(slot, sel, SHADOW_Q_OFF_DEVICE_HI)) = 0;
+        inc_stat(STATS_OFF_QUEUE_TEARDOWNS);
     }
     // No FENCE_W here: shadow is BRISC-private and the next kick
     // for this queue will fence inside `kick_ring_push` before the
@@ -640,7 +718,6 @@ static void poll_completion_ring(void) {
 // ----- Main poll loop -----
 
 static void poll_one_device(unsigned slot) {
-    uint32_t t_entry = mcycle_low();
     // STATUS — RW. Detect by snapshot diff.
     uint32_t status = read_u32(reg_addr(slot, VIRTIO_MMIO_STATUS));
     uint32_t status_prev = read_u32(snap_addr(slot, SNAP_OFF_STATUS));
@@ -659,6 +736,40 @@ static void poll_one_device(unsigned slot) {
     if (sel != sel_prev) {
         handle_queue_sel_change(slot, sel);
         store_u32(snap_addr(slot, SNAP_OFF_QUEUE_SEL), sel);
+    }
+
+    // QUEUE_READY — RW. Must run BEFORE QUEUE_NOTIFY: the kernel
+    // virtio-mmio sequence writes READY=1 then NOTIFY in tight
+    // succession, and BRISC observes both in a single sweep. The
+    // READY handler atomically captures the queue setup fields into
+    // shadow (#120); the NOTIFY handler pushes a kick-ring entry
+    // with FENCE_W around the producer-seq bump. Running NOTIFY
+    // first published the kick to the daemon BEFORE the capture
+    // committed shadow, so the daemon read the kick and saw stale
+    // setup values — the pointers-out-of-range drop seen in soak.
+    // Running READY first means the capture writes precede the
+    // NOTIFY-handler's fence, which transitively orders them
+    // against the daemon's view of `producer_seq`.
+    //
+    // Persisting any non-zero write to shadow then clears the
+    // visible reg back to 0. The legacy host-buffer path
+    // (src/virtio/mod.rs in the SEL/READY handshake) does the exact
+    // same eager clear: the kernel's vm_setup_vq for queue N+1 starts
+    // with `writel(QUEUE_SEL=N+1); readl(QUEUE_READY)` expecting 0 —
+    // but the visible reg still holds queue N's READY=1 from the
+    // immediately-prior setup. Without clearing, the kernel sees 1
+    // and bails with -ENOENT ("Queue shouldn't already be set up").
+    // Snapshot diff alone isn't enough: the kernel writes 1 once,
+    // we'd see the change and persist, but the visible reg keeps the
+    // 1 forever until something resets it. By zeroing on every poll
+    // (regardless of snapshot state), we keep the visible reg clean
+    // for the next vm_setup_vq cycle and rely on shadow for the
+    // "is this queue ready?" question that dispatch_chain asks.
+    uint32_t ready = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY));
+    if (ready != 0) {
+        handle_queue_ready_change(slot, sel, ready);
+        *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY)) = 0;
+        FENCE_W();
     }
 
     // QUEUE_NOTIFY — W. The guest writes the queue index here. We
@@ -683,27 +794,6 @@ static void poll_one_device(unsigned slot) {
     if (notify != 0xFFFFFFFFu) {
         handle_queue_notify(slot, notify);
         write_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NOTIFY), 0xFFFFFFFFu);
-    }
-
-    // QUEUE_READY — RW. Persist any non-zero write to shadow, then
-    // clear the visible reg back to 0. The legacy host-buffer path
-    // (src/virtio/mod.rs in the SEL/READY handshake) does the exact
-    // same eager clear: the kernel's vm_setup_vq for queue N+1 starts
-    // with `writel(QUEUE_SEL=N+1); readl(QUEUE_READY)` expecting 0 —
-    // but the visible reg still holds queue N's READY=1 from the
-    // immediately-prior setup. Without clearing, the kernel sees 1
-    // and bails with -ENOENT ("Queue shouldn't already be set up").
-    // Snapshot diff alone isn't enough: the kernel writes 1 once,
-    // we'd see the change and persist, but the visible reg keeps the
-    // 1 forever until something resets it. By zeroing on every poll
-    // (regardless of snapshot state), we keep the visible reg clean
-    // for the next vm_setup_vq cycle and rely on shadow for the
-    // "is this queue ready?" question that dispatch_chain asks.
-    uint32_t ready = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY));
-    if (ready != 0) {
-        handle_queue_ready_change(slot, sel, ready);
-        *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY)) = 0;
-        FENCE_W();
     }
 
     // DEVICE_FEATURES is statically set in `init_device` to
@@ -741,54 +831,13 @@ static void poll_one_device(unsigned slot) {
         store_u32(snap_addr(slot, SNAP_OFF_DRV_FEAT), dfd);
     }
 
-    // Per-queue setup registers — QUEUE_NUM + the three address
-    // pairs (DESC, DRIVER/AVAIL, DEVICE/USED). The guest writes these
-    // before QUEUE_READY=1 for each queue. We snapshot-diff each
-    // and capture into the shadow row indexed by the currently
-    // selected queue, so the daemon-side data plane (#71 M5.5b) can
-    // read accurate per-queue state without racing the SEL
-    // multiplexer.
-    uint32_t t_pre_cap = mcycle_low();
-    update_max_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_MAX_PRECAP_CYCLES,
-                   t_pre_cap - t_entry);
-
-    if (sel < BRISC_VIRTIO_MAX_QUEUES) {
-        // Per-queue setup: blind-capture every iteration into
-        // shadow[sel]. The earlier snapshot-diff approach broke for
-        // virtio-net's TX setup, where queue 1's DESC_HIGH is the
-        // same 0x40 word the kernel wrote for queue 0 — `v != prev`
-        // never fired, queue 1's shadow stayed at 0, and dispatch
-        // saw a desc address with the high half missing
-        // ("pointers out of L2CPU memory range").
-        //
-        // Blind-capture is safe AFTER the SEL handler above: that
-        // write-from-shadow happens before this loop, so on a fresh
-        // SEL change we either capture stale shadow values (a
-        // no-op; we just wrote them to visible) or freshly-written
-        // kernel values (the setup we want). Either way the shadow
-        // for the current sel converges to the kernel's intent
-        // within one or two poll iterations.
-        struct queue_field {
-            unsigned mmio_off;
-            unsigned shadow_off;
-        };
-        static const struct queue_field FIELDS[] = {
-            {VIRTIO_MMIO_QUEUE_NUM,         SHADOW_Q_OFF_NUM},
-            {VIRTIO_MMIO_QUEUE_DESC_LOW,    SHADOW_Q_OFF_DESC_LO},
-            {VIRTIO_MMIO_QUEUE_DESC_HIGH,   SHADOW_Q_OFF_DESC_HI},
-            {VIRTIO_MMIO_QUEUE_DRIVER_LOW,  SHADOW_Q_OFF_DRIVER_LO},
-            {VIRTIO_MMIO_QUEUE_DRIVER_HIGH, SHADOW_Q_OFF_DRIVER_HI},
-            {VIRTIO_MMIO_QUEUE_DEVICE_LOW,  SHADOW_Q_OFF_DEVICE_LO},
-            {VIRTIO_MMIO_QUEUE_DEVICE_HIGH, SHADOW_Q_OFF_DEVICE_HI},
-        };
-        for (unsigned f = 0; f < sizeof(FIELDS) / sizeof(FIELDS[0]); f++) {
-            uint32_t v = read_u32(reg_addr(slot, FIELDS[f].mmio_off));
-            *l1_u32(shadow_queue_addr(slot, sel, FIELDS[f].shadow_off)) = v;
-        }
-    }
-    uint32_t t_post_cap = mcycle_low();
-    update_max_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_MAX_BLINDCAP_CYCLES,
-                   t_post_cap - t_pre_cap);
+    // Per-queue setup registers (NUM + DESC/DRIVER/DEVICE LO+HI) are
+    // captured atomically in `handle_queue_ready_change` on the
+    // READY=0→1 transition, not per-iter. Per-iter BLIND CAPTURE used
+    // to live here but could write LO-fresh / HI-stale shadow halves
+    // and then leave them stuck if SEL advanced before re-capture
+    // (#120). Capture-on-READY=1 is the only point where the kernel
+    // guarantees the full setup is committed.
 
     // sel_generation handshake — done last so any SEL/SEL-multiplexed
     // register update above has already taken effect by the time the
@@ -806,9 +855,6 @@ static void poll_one_device(unsigned slot) {
         // Snap: BRISC-private. No fence.
         store_u32(snap_addr(slot, SNAP_OFF_SEL_GEN_ECHO), next);
     }
-    uint32_t t_exit = mcycle_low();
-    update_max_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_MAX_POSTCAP_CYCLES,
-                   t_exit - t_post_cap);
 }
 
 // ----- M6 (#78) 16550 UART emulation, TX-only -----

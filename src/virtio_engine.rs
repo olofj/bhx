@@ -193,9 +193,24 @@ pub const STATS_OFF_LAST_SWEEP_CYCLES: u32 = 0x03c;
 /// the #124 follow-up after the fence-cut hypothesis turned out wrong
 /// (cutting 15 fences from 31 didn't move sweep_max). These pinpoint
 /// which part of the per-slot work actually owns the cycles.
+///
+/// All three are deprecated post-#120 — BLIND CAPTURE was removed in
+/// favour of atomic capture-on-READY=1 in `handle_queue_ready_change`,
+/// so PRECAP/POSTCAP no longer bracket meaningful work and read 0.
 pub const STATS_OFF_MAX_PRECAP_CYCLES: u32 = 0x040;
 pub const STATS_OFF_MAX_BLINDCAP_CYCLES: u32 = 0x044;
 pub const STATS_OFF_MAX_POSTCAP_CYCLES: u32 = 0x048;
+/// #120 atomic capture stats. `READY_CAPTURE_SEL_RACES` counts cases
+/// where the kernel advanced SEL between BRISC's setup-field reads
+/// and BRISC's post-read SEL re-check (mixed-queue snapshot, discarded).
+/// `QUEUE_SETUPS` counts successful captures (queue activations);
+/// `QUEUE_TEARDOWNS` counts READY=0 events. Together they replace the
+/// lumped READY_EVENTS for "how many virtio commands has BRISC actually
+/// processed" — useful both as forward-progress evidence and as a
+/// soak-time sanity check that capture isn't quietly losing setups.
+pub const STATS_OFF_READY_CAPTURE_SEL_RACES: u32 = 0x04c;
+pub const STATS_OFF_QUEUE_SETUPS: u32 = 0x050;
+pub const STATS_OFF_QUEUE_TEARDOWNS: u32 = 0x054;
 /// Sweep-cycle histogram. Each bucket counts iterations whose sweep
 /// fell in the bucket's range (in BRISC cycles). Useful for
 /// distinguishing typical sweep cost from one-shot outliers like
@@ -452,6 +467,20 @@ pub mod sim {
                 self.handle_queue_sel_change(slot, sel);
                 self.l1.write(snap_addr(slot, SNAP_OFF_QUEUE_SEL), sel);
             }
+            // QUEUE_READY runs BEFORE QUEUE_NOTIFY. On READY=1 the handler
+            // atomically snapshots all 7 setup fields into shadow[sel]
+            // (#120). NOTIFY pushes a kick-ring entry with a fence; if
+            // it ran first, the daemon would read the kick and look up
+            // shadow before the capture committed. Reversing the order
+            // means the unfenced capture stores precede the NOTIFY
+            // handler's fence and are transitively ordered against the
+            // daemon's view of producer_seq.
+            let sel_after = self.l1.read(base + MMIO_QUEUE_SEL);
+            let ready = self.l1.read(base + MMIO_QUEUE_READY);
+            if ready != 0 {
+                self.handle_queue_ready_change(slot, sel_after, ready);
+                self.l1.write(base + MMIO_QUEUE_READY, 0);
+            }
             // QUEUE_NOTIFY
             let notify = self.l1.read(base + MMIO_QUEUE_NOTIFY);
             let notify_prev = self.l1.read(snap_addr(slot, SNAP_OFF_QUEUE_NOTIFY));
@@ -459,35 +488,6 @@ pub mod sim {
                 self.handle_queue_notify(slot, notify);
                 self.l1
                     .write(snap_addr(slot, SNAP_OFF_QUEUE_NOTIFY), notify);
-            }
-            // QUEUE_READY (uses the *current* SEL after the swap above)
-            let sel_after = self.l1.read(base + MMIO_QUEUE_SEL);
-            // Eager clear: persist any non-zero write to shadow then
-            // zero the visible reg, so the next vm_setup_vq cycle
-            // doesn't see stale READY=1 from the previous queue.
-            // Mirrors virtio.c's QUEUE_READY handling.
-            let ready = self.l1.read(base + MMIO_QUEUE_READY);
-            if ready != 0 {
-                self.handle_queue_ready_change(slot, sel_after, ready);
-                self.l1.write(base + MMIO_QUEUE_READY, 0);
-            }
-
-            // Per-queue setup blind capture into shadow[sel] —
-            // mirrors virtio.c's FIELDS loop.
-            if sel_after < 8 {
-                for (mmio_off, shadow_off) in [
-                    (MMIO_QUEUE_NUM, SHADOW_Q_OFF_NUM),
-                    (MMIO_QUEUE_DESC_LOW, SHADOW_Q_OFF_DESC_LO),
-                    (MMIO_QUEUE_DESC_HIGH, SHADOW_Q_OFF_DESC_HI),
-                    (MMIO_QUEUE_DRIVER_LOW, SHADOW_Q_OFF_DRIVER_LO),
-                    (MMIO_QUEUE_DRIVER_HIGH, SHADOW_Q_OFF_DRIVER_HI),
-                    (MMIO_QUEUE_DEVICE_LOW, SHADOW_Q_OFF_DEVICE_LO),
-                    (MMIO_QUEUE_DEVICE_HIGH, SHADOW_Q_OFF_DEVICE_HI),
-                ] {
-                    let v = self.l1.read(base + mmio_off);
-                    self.l1
-                        .write(shadow_queue_addr(slot, sel_after, shadow_off), v);
-                }
             }
 
             // sel_generation echo — last so all snapshots above are in
@@ -534,6 +534,45 @@ pub mod sim {
                 self.bump_stat(STATS_OFF_READY_EVENTS);
                 return;
             }
+            if ready != 0 {
+                let base = slot_regs_base(slot);
+                let cap: [(u32, u32); 7] = [
+                    (self.l1.read(base + MMIO_QUEUE_NUM), SHADOW_Q_OFF_NUM),
+                    (
+                        self.l1.read(base + MMIO_QUEUE_DESC_LOW),
+                        SHADOW_Q_OFF_DESC_LO,
+                    ),
+                    (
+                        self.l1.read(base + MMIO_QUEUE_DESC_HIGH),
+                        SHADOW_Q_OFF_DESC_HI,
+                    ),
+                    (
+                        self.l1.read(base + MMIO_QUEUE_DRIVER_LOW),
+                        SHADOW_Q_OFF_DRIVER_LO,
+                    ),
+                    (
+                        self.l1.read(base + MMIO_QUEUE_DRIVER_HIGH),
+                        SHADOW_Q_OFF_DRIVER_HI,
+                    ),
+                    (
+                        self.l1.read(base + MMIO_QUEUE_DEVICE_LOW),
+                        SHADOW_Q_OFF_DEVICE_LO,
+                    ),
+                    (
+                        self.l1.read(base + MMIO_QUEUE_DEVICE_HIGH),
+                        SHADOW_Q_OFF_DEVICE_HI,
+                    ),
+                ];
+                let sel_post = self.l1.read(slot_regs_base(slot) + MMIO_QUEUE_SEL);
+                if sel_post == sel {
+                    for (v, off) in cap {
+                        self.l1.write(shadow_queue_addr(slot, sel, off), v);
+                    }
+                    self.bump_stat(STATS_OFF_QUEUE_SETUPS);
+                } else {
+                    self.bump_stat(STATS_OFF_READY_CAPTURE_SEL_RACES);
+                }
+            }
             self.l1
                 .write(shadow_queue_addr(slot, sel, SHADOW_Q_OFF_READY), ready);
             if ready == 0 {
@@ -548,6 +587,7 @@ pub mod sim {
                 ] {
                     self.l1.write(shadow_queue_addr(slot, sel, off), 0);
                 }
+                self.bump_stat(STATS_OFF_QUEUE_TEARDOWNS);
             }
             self.bump_stat(STATS_OFF_READY_EVENTS);
         }
@@ -928,19 +968,27 @@ mod tests {
     }
 
     #[test]
-    fn firmware_per_queue_blind_capture_handles_repeated_high_half() {
-        // Regression for the M5.5e bug: snapshot-diff missed queue 1's
-        // DESC_HIGH=0x40 after queue 0 wrote the same 0x40, leaving
-        // queue 1's shadow.DESC_HI=0 and dispatch_chain dropping
-        // virtio-net's TX. The fix is blind capture every iteration.
+    fn firmware_capture_on_ready_snapshots_all_setup_fields() {
+        // #120: capture happens atomically on the READY=1 transition,
+        // not per-iter. Both queues' shadows must reflect their own
+        // LO+HI halves even when adjacent queues share the same HIGH
+        // value (the M5.5e snapshot-diff bug — queue 1's DESC_HIGH=0x40
+        // matching queue 0's 0x40 made the diff watcher miss the write).
+        //
+        // The sim ticks are coarser than real hardware: one step()
+        // call observes both SEL changes and READY writes if we batch
+        // them. Real BRISC observes SEL change in one sweep and READY=1
+        // in a later sweep, with kernel's intervening setup writes
+        // between sweeps. Step between SEL and the rest to mimic that.
         let mut sim = VirtioFwSim::new();
         sim.boot();
         let net = slot(0, DEV_NET);
         let base = slot_regs_base(net);
-        // Queue 0 setup: SEL=0 + DESC_HIGH=0x40
-        sim.write(base + MMIO_QUEUE_SEL, 0);
+        // Queue 0: SEL is already 0 (boot default). Write setup fields
+        // and READY=1, then step.
         sim.write(base + MMIO_QUEUE_DESC_HIGH, 0x40);
         sim.write(base + MMIO_QUEUE_DESC_LOW, 0x1000);
+        sim.write(base + MMIO_QUEUE_READY, 1);
         sim.step();
         assert_eq!(
             sim.read(shadow_queue_addr(net, 0, SHADOW_Q_OFF_DESC_HI)),
@@ -950,14 +998,15 @@ mod tests {
             sim.read(shadow_queue_addr(net, 0, SHADOW_Q_OFF_DESC_LO)),
             0x1000
         );
-        // Queue 1 setup: SEL=1 + DESC_HIGH=0x40 (SAME value as queue 0)
-        // + DESC_LOW=0x2000 (different).
+        // Queue 1: change SEL first, step, then write the rest.
+        // Mirrors kernel's writel(SEL); ...; writel(READY=1) sequence
+        // with BRISC sweeps interleaved.
         sim.write(base + MMIO_QUEUE_SEL, 1);
+        sim.step();
         sim.write(base + MMIO_QUEUE_DESC_HIGH, 0x40);
         sim.write(base + MMIO_QUEUE_DESC_LOW, 0x2000);
+        sim.write(base + MMIO_QUEUE_READY, 1);
         sim.step();
-        // Both halves must land in queue 1's shadow even though
-        // DESC_HIGH didn't change between the two setups.
         assert_eq!(
             sim.read(shadow_queue_addr(net, 1, SHADOW_Q_OFF_DESC_HI)),
             0x40
@@ -965,6 +1014,38 @@ mod tests {
         assert_eq!(
             sim.read(shadow_queue_addr(net, 1, SHADOW_Q_OFF_DESC_LO)),
             0x2000
+        );
+        // Both successful captures should have bumped QUEUE_SETUPS.
+        assert_eq!(sim.stat(STATS_OFF_QUEUE_SETUPS), 2);
+        assert_eq!(sim.stat(STATS_OFF_READY_CAPTURE_SEL_RACES), 0);
+    }
+
+    #[test]
+    fn firmware_capture_on_ready_no_capture_without_ready_write() {
+        // Setup fields without READY=1 must NOT land in shadow — the
+        // visible regs are write-through, but BRISC only commits to
+        // shadow at the kernel-signaled "queue setup complete" point.
+        let mut sim = VirtioFwSim::new();
+        sim.boot();
+        let blk = slot(0, DEV_BLK);
+        let base = slot_regs_base(blk);
+        sim.write(base + MMIO_QUEUE_SEL, 0);
+        sim.write(base + MMIO_QUEUE_DESC_LOW, 0xdeadbeef);
+        sim.write(base + MMIO_QUEUE_DESC_HIGH, 0x40);
+        sim.step();
+        // Mid-setup, before READY=1: shadow is still zero.
+        assert_eq!(sim.read(shadow_queue_addr(blk, 0, SHADOW_Q_OFF_DESC_LO)), 0);
+        assert_eq!(sim.read(shadow_queue_addr(blk, 0, SHADOW_Q_OFF_DESC_HI)), 0);
+        // After READY=1 fires: shadow is committed.
+        sim.write(base + MMIO_QUEUE_READY, 1);
+        sim.step();
+        assert_eq!(
+            sim.read(shadow_queue_addr(blk, 0, SHADOW_Q_OFF_DESC_LO)),
+            0xdeadbeef
+        );
+        assert_eq!(
+            sim.read(shadow_queue_addr(blk, 0, SHADOW_Q_OFF_DESC_HI)),
+            0x40
         );
     }
 

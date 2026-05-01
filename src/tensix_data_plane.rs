@@ -318,12 +318,12 @@ fn run_poll_loop(
     // than waiting for a future-restart-then-zero rollover.
     let mut last_kick_drops: u32 = 0;
     let mut last_sel_ready_races: u32 = 0;
+    let mut last_ready_capture_sel_races: u32 = 0;
+    let mut last_queue_setups: u32 = 0;
+    let mut last_queue_teardowns: u32 = 0;
     let mut last_max_sweep_cycles: u32 = 0;
     let mut last_max_steady_sweep_cycles: u32 = 0;
     let mut last_max_sel_path_cycles: u32 = 0;
-    let mut last_max_precap_cycles: u32 = 0;
-    let mut last_max_blindcap_cycles: u32 = 0;
-    let mut last_max_postcap_cycles: u32 = 0;
     let mut last_uart_drops: [u32; uart::UART_NUM_SLOTS as usize] =
         [0; uart::UART_NUM_SLOTS as usize];
     // Track per-slot STATUS transitions. Bench harnesses (and
@@ -583,33 +583,43 @@ fn run_poll_loop(
             );
             last_max_sel_path_cycles = max_sel_path;
         }
-        // poll_one_device sub-section maxes (PER-SLOT, not per-iter).
-        let max_precap = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAX_PRECAP_CYCLES);
-        if max_precap > last_max_precap_cycles {
+        // #120 capture-on-READY=1 stats. SETUPS counts queue activations
+        // BRISC has snapshotted; TEARDOWNS counts disable events.
+        // SEL_RACES counts mid-capture SEL changes that forced an abort
+        // (kernel raced past us into the next queue) — those leave the
+        // shadow at its prior value, which usually means the kick that
+        // follows will see stale or zero address halves.
+        let setups = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_QUEUE_SETUPS);
+        if setups != last_queue_setups {
+            let delta = setups.wrapping_sub(last_queue_setups);
             crate::dlog!(
-                "[brisc-timing] new max poll PRECAP cycles (snap-diff): {} cycles (~{} ns)",
-                max_precap,
-                max_precap * 1000 / 1350
+                "[capture] {} new queue setup(s) snapshotted (cumulative {})",
+                delta,
+                setups
             );
-            last_max_precap_cycles = max_precap;
+            last_queue_setups = setups;
         }
-        let max_blindcap = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAX_BLINDCAP_CYCLES);
-        if max_blindcap > last_max_blindcap_cycles {
+        let teardowns = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_QUEUE_TEARDOWNS);
+        if teardowns != last_queue_teardowns {
+            let delta = teardowns.wrapping_sub(last_queue_teardowns);
             crate::dlog!(
-                "[brisc-timing] new max poll BLINDCAP cycles (7-field shadow capture): {} cycles (~{} ns)",
-                max_blindcap,
-                max_blindcap * 1000 / 1350
+                "[capture] {} new queue teardown(s) (cumulative {})",
+                delta,
+                teardowns
             );
-            last_max_blindcap_cycles = max_blindcap;
+            last_queue_teardowns = teardowns;
         }
-        let max_postcap = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAX_POSTCAP_CYCLES);
-        if max_postcap > last_max_postcap_cycles {
+        let ready_capture_sel_races =
+            engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_READY_CAPTURE_SEL_RACES);
+        if ready_capture_sel_races != last_ready_capture_sel_races {
+            let delta = ready_capture_sel_races.wrapping_sub(last_ready_capture_sel_races);
             crate::dlog!(
-                "[brisc-timing] new max poll POSTCAP cycles (drv-feat + sel-gen): {} cycles (~{} ns)",
-                max_postcap,
-                max_postcap * 1000 / 1350
+                "[capture] BRISC aborted {} ready-capture(s) — SEL changed mid-snapshot \
+                 (cumulative {}); shadow may be stale for those queues",
+                delta,
+                ready_capture_sel_races
             );
-            last_max_postcap_cycles = max_postcap;
+            last_ready_capture_sel_races = ready_capture_sel_races;
         }
         // Per-slot STATUS transitions. Snapshot registry under lock,
         // then do chip-side L1 reads outside the lock.
