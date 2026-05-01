@@ -205,6 +205,18 @@ fn run_daemonized(
 
     // Grand-child: re-acquire pidfile and run the server loop.
     let _pid_guard = lifetime::acquire_pidfile(opts.card)?;
+    // Install last-resort handler for SIGBUS / SIGSEGV BEFORE the chip
+    // is touched, so a `tt-smi -r` against this daemon writes a
+    // diagnostic line to stderr (= the O_DSYNC log fd) and exits with
+    // 134/139 instead of vanishing silently. Foreground mode skips this
+    // — keeping the default disposition lets the operator see the
+    // panic / SIGBUS in their terminal directly. (#129)
+    if let Err(e) = crate::daemon::sigbus::install_chip_fault_handler() {
+        crate::dlog!(
+            "[daemon] warning: failed to install chip-fault handler: {}",
+            e
+        );
+    }
     if let Err(e) = server::serve(
         opts.card,
         listener,

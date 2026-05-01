@@ -25,6 +25,7 @@ pub mod protocol;
 pub mod runner;
 pub mod sandbox;
 pub mod server;
+pub mod sigbus;
 pub mod terminal;
 
 use std::sync::atomic::{AtomicBool, Ordering};

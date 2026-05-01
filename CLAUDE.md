@@ -252,6 +252,14 @@ If `tt-smi -r` doesn't recover the card, power-cycle the host.
   cold boot hazard is fixed (see issue #1); if a fresh crash lands on
   the boot path, check `SharedChip::seq_lock` holds + `L2Cpu`'s own
   `alloc_lock` holds before assuming it's a concurrency regression.
+- **Daemon log ends with `fatal: SIGBUS …` or `fatal: SIGSEGV …`**: the
+  per-card chip-fault handler caught an external invalidation
+  (`tt-smi -r`, PCIe link drop, hot-unplug, etc.) — not a daemon bug.
+  Daemon exits 134/139 (`128 + signum`) so any supervisor sees a
+  distinct kill code. Restart with `daemon start` once the card is
+  back. Foreground (`--foreground`) mode does not install the handler
+  on purpose, so a foreground-run daemon prints the panic / fault
+  context to the operator's terminal.
 
 ## Building & testing
 
