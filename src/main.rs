@@ -566,6 +566,20 @@ enum DebugAction {
         #[arg(long)]
         no_lsr_poll: bool,
     },
+    /// Dump the BRISC L1 shutdown register values for all 4 L2CPUs (#94).
+    ///
+    /// Reads the 4 per-L2CPU shutdown command registers in BRISC L1 and
+    /// prints raw u32 values + decoded magic. Useful when a guest
+    /// `poweroff -f` doesn't propagate to the daemon — non-zero magic
+    /// means BRISC has not yet observed/cleared it. Bypasses the daemon
+    /// (run after `daemon stop`); does NOT load or alter firmware.
+    DumpShutdownRegs {
+        /// Tensix tile X / Y. Defaults to the M2 picker output.
+        #[arg(long)]
+        x: Option<u16>,
+        #[arg(long)]
+        y: Option<u16>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1494,7 +1508,48 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
             gap_us,
             no_lsr_poll,
         } => run_uart_loopback(card, &chip, l2cpu as u8, count, gap_us, no_lsr_poll),
+        DebugAction::DumpShutdownRegs { x, y } => {
+            let (x, y) = resolve_tensix_coords(&chip, x, y)?;
+            drop(chip);
+            run_dump_shutdown_regs(card, x, y)
+        }
     }
+}
+
+fn run_dump_shutdown_regs(card: u32, x: u16, y: u16) -> std::io::Result<()> {
+    use tensix::TensixTile;
+    // Mirror the firmware's brisc_shutdown_regs_base / OFF_COMMAND.
+    const BRISC_SHUTDOWN_BASE: u32 = 0x0006_0000;
+    const BRISC_SHUTDOWN_PER_L2CPU_STRIDE: u32 = 0x0000_4000;
+    const MAGIC_POWEROFF: u32 = 0x5AFE_DEAD;
+    const MAGIC_REBOOT: u32 = 0xB007_BEEF;
+
+    let tile = TensixTile::new(card, x, y).map_err(|e| {
+        std::io::Error::from(crate::Error::Io {
+            ctx: format!("open tile ({}, {})", x, y),
+            source: e,
+        })
+    })?;
+
+    eprintln!(
+        "[dump-shutdown-regs] tile ({}, {}) on card {}",
+        x, y, card
+    );
+    for idx in 0..4u32 {
+        let off = BRISC_SHUTDOWN_BASE + idx * BRISC_SHUTDOWN_PER_L2CPU_STRIDE;
+        let val = tile.read_l1_u32(off);
+        let decoded = match val {
+            0 => "SENTINEL (no pending command)",
+            MAGIC_POWEROFF => "MAGIC_POWEROFF (kernel asked, BRISC has NOT observed yet)",
+            MAGIC_REBOOT => "MAGIC_REBOOT (kernel asked, BRISC has NOT observed yet)",
+            _ => "UNKNOWN",
+        };
+        println!(
+            "  L2CPU {}: shutdown reg @ L1[{:#08x}] = {:#010x}  [{}]",
+            idx, off, val, decoded
+        );
+    }
+    Ok(())
 }
 
 /// Bring up the Tensix virtio engine via `TensixEngine::bring_up` —
