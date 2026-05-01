@@ -1,0 +1,111 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: © 2026 Olof Johansson
+# SPDX-License-Identifier: MIT
+#
+# At-boot virtio_net unbind/bind cycler for #156. Runs after sysinit
+# but before getty so the operator-side capture is just `bhx connect`
+# pointed at the chip console — no interactive RX needed (which has
+# been a stability problem on stock Ubuntu under #155).
+#
+# Output is duplicated:
+#  * stdout via hvc0 — tail with `bhx connect`, parse `BHX_CYCLE_*`
+#    markers in real time.
+#  * /var/log/bhx-cycle.log on the rootfs — survives poweroff and is
+#    readable from the host by mounting the rootfs.ext4 image. Use
+#    this when the console goes away mid-test (e.g. a future
+#    virtio_console cycle test would lose stdout) or when writing a
+#    regression harness that needs deterministic log access.
+#
+# Tunable via VIRTIO_CYCLE_N env var (default 2000).
+
+N=${VIRTIO_CYCLE_N:-2000}
+LOG=/root/bhx-cycle.log  # buildroot's /var/log → /tmp = tmpfs (wiped on poweroff); use /root which is on the persistent ext4
+
+mkdir -p "$(dirname "$LOG")"
+: > "$LOG"
+
+# All `say` writes go to BOTH stdout (= hvc0) and $LOG.
+say() { echo "$*" | tee -a "$LOG"; }
+
+say "BHX_CYCLE_START n=$N"
+
+# Find the virtio_net device by VirtIO ID 0x0001 (NET).
+VDEV=""
+for d in /sys/bus/virtio/devices/virtio*; do
+    [ -e "$d" ] || continue
+    did=$(cat "$d/device" 2>/dev/null)
+    if [ "$did" = "0x0001" ]; then
+        VDEV=$(basename "$d")
+        break
+    fi
+done
+
+if [ -z "$VDEV" ]; then
+    say "BHX_CYCLE_NO_VIRTIO_NET"
+    say "BHX_CYCLE_END"
+    sync
+    poweroff -f
+    exit 0
+fi
+
+if [ ! -d /sys/bus/virtio/drivers/virtio_net ]; then
+    say "BHX_CYCLE_NO_DRIVER"
+    say "BHX_CYCLE_END"
+    sync
+    poweroff -f
+    exit 0
+fi
+
+say "BHX_CYCLE_DEV $VDEV"
+
+p=0
+f=0
+m=0
+i=1
+while [ "$i" -le "$N" ]; do
+    echo "$VDEV" > /sys/bus/virtio/drivers/virtio_net/unbind 2>/dev/null
+    echo "$VDEV" > /sys/bus/virtio/drivers/virtio_net/bind 2>/dev/null
+    # Settle: kernel probe completes synchronously inside `bind` write
+    # but post-probe IRQ wiring may add a touch of latency.
+    sleep 0.02
+
+    r=PASS
+    devc=0
+    st=
+    for d in /sys/bus/virtio/devices/virtio*; do
+        id=$(cat "$d/device" 2>/dev/null)
+        [ "$id" = "0x0001" ] || continue
+        devc=$((devc + 1))
+        s=$(cat "$d/status" 2>/dev/null)
+        st="$st $s"
+        sval=$((s + 0))
+        [ $((sval & 128)) -ne 0 ] && r=FAIL
+    done
+    [ "$devc" -eq 0 ] && r=MISSING
+    case "$r" in
+        PASS) p=$((p + 1)) ;;
+        FAIL) f=$((f + 1)) ;;
+        MISSING) m=$((m + 1)) ;;
+    esac
+
+    # Print every cycle if we want full per-cycle data. With N=2000
+    # that's 2000 lines of output -- chip console pumps comfortably
+    # at hvc0 rates so the noise is fine.
+    say "BHX_CYCLE $i status=$st result=$r"
+
+    i=$((i + 1))
+done
+
+say "BHX_CYCLE_SUMMARY pass=$p fail=$f missing=$m total=$N"
+say "BHX_CYCLE_END"
+
+# Clean termination: flush the log to disk, then poweroff via SBI
+# SRST → BRISC → daemon slot teardown (#94). The host harness can:
+#  * wait for `daemon status` to flip to Stopped, OR
+#  * watch the BHX_CYCLE_END marker on hvc0, OR
+#  * (if console goes away mid-test) mount the rootfs.ext4 read-only
+#    afterward and read $LOG.
+sync
+poweroff -f
+exit 0
+
