@@ -293,6 +293,15 @@ image/kernel/ramdisk downloaders.
   ./target/debug/bhx --help | grep -E '#[0-9]+'   # should be empty
   ./target/debug/bhx <subcommand> --help | grep -E '#[0-9]+'
   ```
+- When filing GitHub issues with `gh issue create --body "$(cat <<'EOF' ... EOF)"`,
+  do NOT pre-escape backticks, `"`, or `$`. The single-quoted heredoc
+  passes everything through verbatim — backslashes survive into the
+  body and GitHub renders them literally, breaking inline code spans
+  (`` \` `` shows up as `\` followed by a backtick instead of opening a
+  code span). Write markdown as-is: `` `bhx boot` ``, `"foo"`, `$VAR`.
+  Reflexive shell-style escaping is wrong here; the heredoc is its
+  own quoting. Same applies to `gh issue comment` and `gh pr create`
+  bodies.
 - Worker poll loops (`virtio::run_device`, `chip_console::uart_pass`)
   use a three-tier adaptive sleep: FAST (1 µs / 100 µs) while there's
   observable activity; SLOW (1 ms) after `FAST_WINDOW=200ms` quiet;
