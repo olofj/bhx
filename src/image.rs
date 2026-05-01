@@ -404,7 +404,100 @@ pub fn pull_image(name: &str, output: Option<&Path>, force_refetch: bool) -> Res
 
     ensure_cidata_seed(image, &final_path)?;
 
+    // #137 local-pristine sidecar. Computed against the bytes we just
+    // wrote — capturing the post-resize, post-cidata pull state — so a
+    // later `bhx image verify` can answer "is this image still in
+    // pull-time state, or has cloud-init mutated it?". Best-effort: a
+    // sha256sum failure is logged but doesn't fail the pull.
+    if let Err(e) = write_sha256_sidecar(&final_path) {
+        eprintln!("  Warning: sha256 sidecar not written: {}", e);
+    }
+
     Ok(final_path)
+}
+
+/// Sidecar path for the per-image local-pristine sha256 hash (#137).
+///
+/// `images/debian-13.img` → `images/debian-13.img.sha256`. Distinct
+/// suffix from `cidata_seed_path_for` so sibling-iteration works.
+pub fn sha256_sidecar_path_for(disk: &Path) -> PathBuf {
+    let mut s = disk.as_os_str().to_os_string();
+    s.push(".sha256");
+    PathBuf::from(s)
+}
+
+/// Compute the SHA-256 of a file by shelling out to `sha256sum`. The
+/// build.rs FW_BUILD_ID computation already requires `sha256sum` on
+/// PATH, so this doesn't widen the build-time dep set. Returns the
+/// 64-char lowercase hex digest with no whitespace.
+pub fn compute_sha256(path: &Path) -> Result<String> {
+    let output = Command::new("sha256sum").arg(path).output().map_err(|e| {
+        Error::internal(format!(
+            "Failed to run sha256sum: {}. Install with: apt install coreutils",
+            e
+        ))
+    })?;
+    if !output.status.success() {
+        return Err(Error::internal(format!(
+            "sha256sum failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let hash = stdout
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| Error::internal("sha256sum produced empty output"))?;
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::internal(format!(
+            "sha256sum produced unexpected output: {:?}",
+            hash
+        )));
+    }
+    Ok(hash.to_lowercase())
+}
+
+fn write_sha256_sidecar(disk: &Path) -> Result<()> {
+    eprintln!("  Computing sha256 sidecar...");
+    let hash = compute_sha256(disk)?;
+    let sidecar = sha256_sidecar_path_for(disk);
+    fs::write(&sidecar, format!("{}\n", hash))
+        .map_err(Error::io_ctx("Failed to write sha256 sidecar"))?;
+    eprintln!("  sha256: {} ({})", &hash[..16], sidecar.display());
+    Ok(())
+}
+
+/// Outcome of verifying a single image against its sha256 sidecar.
+pub enum VerifyOutcome {
+    /// Image bytes match the sidecar — still in pull-time state.
+    Match,
+    /// Image bytes differ. `expected` is what the sidecar says; `actual`
+    /// is what we just computed. Likely first-boot mutation; not
+    /// necessarily an error condition.
+    Modified { expected: String, actual: String },
+    /// No sidecar present (legacy pull predating #137). Operator can
+    /// re-pull to start tracking.
+    NoSidecar,
+}
+
+/// Recompute the SHA-256 of `disk` and compare against the sidecar.
+pub fn verify_sha256_sidecar(disk: &Path) -> Result<VerifyOutcome> {
+    let sidecar = sha256_sidecar_path_for(disk);
+    if !sidecar.exists() {
+        return Ok(VerifyOutcome::NoSidecar);
+    }
+    let expected = fs::read_to_string(&sidecar)
+        .map_err(Error::io_ctx("Failed to read sha256 sidecar"))?
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let actual = compute_sha256(disk)?;
+    if expected == actual {
+        Ok(VerifyOutcome::Match)
+    } else {
+        Ok(VerifyOutcome::Modified { expected, actual })
+    }
 }
 
 /// Ensure a default NoCloud seed sits next to the disk image (#115).
@@ -885,6 +978,103 @@ pub fn cmd_pull(name: &str, output: Option<&str>, force_refetch: bool) {
     }
 }
 
+/// Verify pulled images against their sha256 sidecars (#137).
+///
+/// With `name = Some(...)`, resolve the registry entry to its canonical
+/// path under `image_dir()` and verify just that one. With `name =
+/// None`, walk the canonical image dir and verify everything that has
+/// a sidecar.
+///
+/// Reports four outcomes per image: MATCH (still pristine), MODIFIED
+/// (mutated since pull — likely first-boot cloud-init), MISSING (the
+/// disk file isn't there at all), or NO SIDECAR (legacy pull predating
+/// #137; operator can re-pull to start tracking). Exits with status 0
+/// regardless — modification isn't an error condition.
+pub fn cmd_verify(name: Option<&str>) {
+    let entries: Vec<(String, PathBuf)> = match name {
+        Some(n) => match get_known_image(n) {
+            Some(img) => {
+                let suffix = if is_single_fs_artifact(img) {
+                    "ext4"
+                } else {
+                    "img"
+                };
+                let path = image_dir().join(format!("{}.{}", img.name, suffix));
+                vec![(img.name.to_string(), path)]
+            }
+            None => {
+                eprintln!(
+                    "Unknown image '{}'. Use 'image list' to see available images.",
+                    n
+                );
+                std::process::exit(1);
+            }
+        },
+        None => collect_pulled_artifacts(),
+    };
+    if entries.is_empty() {
+        println!("No pulled images found in {}", image_dir().display());
+        return;
+    }
+    for (label, path) in entries {
+        verify_one(&label, &path);
+    }
+}
+
+/// Walk `image_dir()` and pick out artifact files (.img / .ext4) that
+/// look like pulled images (skip cidata seeds and sha256 sidecars).
+fn collect_pulled_artifacts() -> Vec<(String, PathBuf)> {
+    let dir = image_dir();
+    let read = match fs::read_dir(&dir) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in read.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if !(name.ends_with(".img") || name.ends_with(".ext4")) {
+            continue;
+        }
+        if name.ends_with(".cidata.img") {
+            continue;
+        }
+        out.push((name, path));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn verify_one(label: &str, path: &Path) {
+    if !path.exists() {
+        println!("{:30} MISSING ({})", label, path.display());
+        return;
+    }
+    match verify_sha256_sidecar(path) {
+        Ok(VerifyOutcome::Match) => {
+            println!("{:30} MATCH (pristine)", label);
+        }
+        Ok(VerifyOutcome::Modified { expected, actual }) => {
+            println!(
+                "{:30} MODIFIED (likely first-boot mutation)\n  expected: {}\n  actual:   {}",
+                label, expected, actual
+            );
+        }
+        Ok(VerifyOutcome::NoSidecar) => {
+            println!(
+                "{:30} NO SIDECAR (pulled before #137; re-pull to start tracking)",
+                label
+            );
+        }
+        Err(e) => {
+            println!("{:30} ERROR {}", label, e);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1025,5 +1215,68 @@ mod tests {
         assert!(known_image_for_disk(Path::new("/tmp/random.img")).is_none());
         // No extension at all is fine — file_stem is the whole basename.
         assert!(known_image_for_disk(Path::new("almalinux-10-kitten")).is_some());
+    }
+
+    #[test]
+    fn sha256_sidecar_path_appends_suffix_to_disk() {
+        // Whole-disk shape — sidecar lives next to the artifact, with
+        // a `.sha256` suffix so siblings (cidata, the artifact itself)
+        // don't get confused.
+        let p = Path::new("/tmp/x/debian-13.img");
+        assert_eq!(
+            sha256_sidecar_path_for(p),
+            Path::new("/tmp/x/debian-13.img.sha256")
+        );
+        // Single-FS shape — same rule, just preserves .ext4.
+        let p = Path::new("/tmp/x/tt-debian.ext4");
+        assert_eq!(
+            sha256_sidecar_path_for(p),
+            Path::new("/tmp/x/tt-debian.ext4.sha256")
+        );
+    }
+
+    #[test]
+    fn verify_returns_no_sidecar_when_absent() {
+        // Use a tempdir to avoid leaning on real-world image-dir state.
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("phantom.img");
+        fs::write(&disk, b"x").unwrap();
+        match verify_sha256_sidecar(&disk).unwrap() {
+            VerifyOutcome::NoSidecar => {}
+            other => panic!("expected NoSidecar; got {:?}", outcome_label(&other)),
+        }
+    }
+
+    #[test]
+    fn verify_round_trips_match_and_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("rootfs.ext4");
+        fs::write(&disk, b"hello world").unwrap();
+        // Produce + write the sidecar, then verify — should match.
+        let hash = compute_sha256(&disk).unwrap();
+        let sidecar = sha256_sidecar_path_for(&disk);
+        fs::write(&sidecar, format!("{}\n", hash)).unwrap();
+        assert!(matches!(
+            verify_sha256_sidecar(&disk).unwrap(),
+            VerifyOutcome::Match
+        ));
+        // Mutate the disk; verify must report Modified with the
+        // pre-mutation hash as expected and a different actual.
+        fs::write(&disk, b"goodbye world").unwrap();
+        match verify_sha256_sidecar(&disk).unwrap() {
+            VerifyOutcome::Modified { expected, actual } => {
+                assert_eq!(expected, hash);
+                assert_ne!(actual, hash);
+            }
+            other => panic!("expected Modified; got {:?}", outcome_label(&other)),
+        }
+    }
+
+    fn outcome_label(o: &VerifyOutcome) -> &'static str {
+        match o {
+            VerifyOutcome::Match => "Match",
+            VerifyOutcome::Modified { .. } => "Modified",
+            VerifyOutcome::NoSidecar => "NoSidecar",
+        }
     }
 }

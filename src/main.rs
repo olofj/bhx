@@ -436,6 +436,19 @@ enum ImageAction {
         #[arg(long)]
         refetch: bool,
     },
+    /// Verify pulled images against their sha256 sidecars.
+    ///
+    /// With NAME, recompute the sha256 of that image's pulled artifact
+    /// and compare to the sidecar written at pull time. Without NAME,
+    /// walks the image directory and verifies everything pulled.
+    /// Reports MATCH / MODIFIED / MISSING / NO SIDECAR; modification
+    /// is informational (cloud-init mutates the disk on first boot),
+    /// not an error.
+    Verify {
+        /// Image name or alias (e.g., "debian-13"). Omit to verify all
+        /// pulled images in the image directory.
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1006,6 +1019,9 @@ fn main() -> std::process::ExitCode {
                     refetch,
                 } => {
                     image::cmd_pull(&name, output.as_deref(), refetch);
+                }
+                ImageAction::Verify { name } => {
+                    image::cmd_verify(name.as_deref());
                 }
             }
             Ok(())
