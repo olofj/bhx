@@ -2871,6 +2871,34 @@ fn run_boot_via_profile(
         );
     }
 
+    // #127 profile-driven cloud-init seed: materialize the SeedSpec
+    // into the per-instance dir as `cidata.img` and pass that path
+    // through. Re-rendered every boot — the seed is small (~10 KiB)
+    // and a fresh write avoids an explicit cache-invalidation rule for
+    // edits to `profile.cloud_init`. Per-(profile, l2cpu) location so
+    // concurrent boots of the same profile on different L2CPUs don't
+    // race on a single seed file.
+    let cloud_init_path: Option<String> = match &p.cloud_init {
+        Some(ci) => {
+            let dir = profile::instance_dir(name, l2cpu)?;
+            std::fs::create_dir_all(&dir).map_err(crate::Error::io_ctx(format!(
+                "create instance dir {}",
+                dir.display()
+            )))?;
+            let seed_path = dir.join("cidata.img");
+            ci.to_seed_spec()
+                .write_iso(&seed_path)
+                .map_err(|e| crate::Error::internal(format!("render profile seed: {}", e)))?;
+            eprintln!(
+                "profile {}: cloud-init seed -> {}",
+                name,
+                seed_path.display()
+            );
+            Some(seed_path.display().to_string())
+        }
+        None => None,
+    };
+
     run_boot_client(
         card,
         l2cpu,
@@ -2888,11 +2916,7 @@ fn run_boot_via_profile(
         force,
         memory_override,
         hostname_override,
-        // Profile-driven cloud-init seed integration is tracked in the
-        // sibling issue (see #115); for now profile boots don't pass a
-        // seed. Operators wanting a seed should use the explicit
-        // `--cloud-init` flag rather than going through a profile.
-        None,
+        cloud_init_path,
     )
 }
 

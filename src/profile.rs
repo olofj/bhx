@@ -79,6 +79,69 @@ pub struct Profile {
 
     #[serde(default)]
     pub console: ConsoleConfig,
+
+    /// Cloud-init NoCloud seed config. When `Some`, `bhx boot -c <name>`
+    /// renders a seed ISO into the per-instance dir and attaches it as
+    /// the second virtio-blk, same shape as `--cloud-init <path>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_init: Option<CloudInitConfig>,
+}
+
+/// Profile-side cloud-init knobs. Mirrors the on-disk shape of
+/// [`crate::cloud_init::SeedSpec`] so the materialize step is a
+/// straight field copy. Only the fields an operator typically wants to
+/// set; advanced corners (`extra_user_data`) are exposed verbatim.
+///
+/// Validation: hostname is RFC-952-clean if set; other fields are
+/// pass-through (passwords are sha512crypt'd at seed-build time, ssh
+/// keys go straight into authorized_keys).
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CloudInitConfig {
+    /// Login name. None ⇒ `cloud_init::DEFAULT_USER` ("bhx").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    /// Plain-text password. Hashed at seed build time. None +
+    /// non-empty `ssh_keys` ⇒ key-only auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+
+    /// SSH public keys (each entry is a single OpenSSH-format line).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_keys: Vec<String>,
+
+    /// Guest hostname. Must be RFC-952-clean if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+
+    /// cloud-init instance-id. None ⇒ random at seed-build time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+
+    /// DNS resolvers baked into /etc/resolv.conf via bootcmd.
+    /// Empty ⇒ `cloud_init::DEFAULT_NAMESERVER` (8.8.8.8).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nameservers: Vec<String>,
+
+    /// Extra YAML appended verbatim to user-data (operator's escape
+    /// hatch for `packages:`, `runcmd:`, `write_files:`, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_user_data: Option<String>,
+}
+
+impl CloudInitConfig {
+    /// Materialize the profile config into a [`crate::cloud_init::SeedSpec`].
+    pub fn to_seed_spec(&self) -> crate::cloud_init::SeedSpec {
+        crate::cloud_init::SeedSpec {
+            user: self.user.clone(),
+            password: self.password.clone(),
+            ssh_keys: self.ssh_keys.clone(),
+            hostname: self.hostname.clone(),
+            instance_id: self.instance_id.clone(),
+            nameservers: self.nameservers.clone(),
+            extra_user_data: self.extra_user_data.clone(),
+        }
+    }
 }
 
 /// Network sub-block.
@@ -291,6 +354,17 @@ pub fn validate_profile(name: &str, p: &Profile) -> Result<()> {
                 name, fwd, e
             ))
         })?;
+    }
+
+    if let Some(ci) = &p.cloud_init {
+        if let Some(host) = &ci.hostname {
+            validate_hostname(host).map_err(|e| {
+                Error::bad_request(format!(
+                    "profile {:?}: cloud_init.hostname invalid: {}",
+                    name, e
+                ))
+            })?;
+        }
     }
 
     Ok(())
@@ -873,6 +947,7 @@ mod tests {
                     virtio: true,
                     rng: true,
                 },
+                cloud_init: None,
             },
         );
         let dir = tmp_dir();
@@ -943,6 +1018,7 @@ mod tests {
                 forwards: vec!["5201:5201".to_string(), "8080:80".to_string()],
             },
             console: ConsoleConfig::default(),
+            cloud_init: None,
         }
     }
 
@@ -986,6 +1062,75 @@ mod tests {
         let mut p = good_profile();
         p.network.hostname = Some("BadHost_Name".to_string());
         assert!(validate_profile("alma-dev", &p).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_cloud_init_hostname() {
+        let mut p = good_profile();
+        p.cloud_init = Some(CloudInitConfig {
+            hostname: Some("BadHost_Name".to_string()),
+            ..CloudInitConfig::default()
+        });
+        let err = validate_profile("alma-dev", &p).unwrap_err().to_string();
+        assert!(
+            err.contains("cloud_init.hostname"),
+            "error didn't mention cloud_init.hostname: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_accepts_minimal_cloud_init() {
+        let mut p = good_profile();
+        p.cloud_init = Some(CloudInitConfig {
+            user: Some("operator".to_string()),
+            password: Some("hunter2".to_string()),
+            hostname: Some("dev-l0".to_string()),
+            ..CloudInitConfig::default()
+        });
+        validate_profile("alma-dev", &p).unwrap();
+    }
+
+    #[test]
+    fn cloud_init_config_to_seed_spec_is_a_field_copy() {
+        let ci = CloudInitConfig {
+            user: Some("alice".to_string()),
+            password: Some("p".to_string()),
+            ssh_keys: vec!["ssh-ed25519 AAAA test".to_string()],
+            hostname: Some("dev-l1".to_string()),
+            instance_id: Some("v42".to_string()),
+            nameservers: vec!["1.1.1.1".to_string()],
+            extra_user_data: Some("packages: [tmux]\n".to_string()),
+        };
+        let spec = ci.to_seed_spec();
+        assert_eq!(spec.user.as_deref(), Some("alice"));
+        assert_eq!(spec.password.as_deref(), Some("p"));
+        assert_eq!(spec.ssh_keys, ci.ssh_keys);
+        assert_eq!(spec.hostname.as_deref(), Some("dev-l1"));
+        assert_eq!(spec.instance_id.as_deref(), Some("v42"));
+        assert_eq!(spec.nameservers, ci.nameservers);
+        assert_eq!(spec.extra_user_data.as_deref(), Some("packages: [tmux]\n"));
+    }
+
+    #[test]
+    fn profile_yaml_round_trip_with_cloud_init() {
+        // Smoke: serialize → deserialize must preserve the cloud_init
+        // sub-block. Field skipping (`Option::is_none` etc.) is enabled,
+        // so absent sub-blocks don't pollute the output.
+        let p = Profile {
+            image: "debian-13".to_string(),
+            cloud_init: Some(CloudInitConfig {
+                user: Some("ops".to_string()),
+                hostname: Some("box".to_string()),
+                ..CloudInitConfig::default()
+            }),
+            ..Profile::default()
+        };
+        let yaml = serde_yaml_ng::to_string(&p).unwrap();
+        assert!(yaml.contains("cloud_init:"));
+        assert!(yaml.contains("ops"));
+        let back: Profile = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(back, p);
     }
 
     #[test]
