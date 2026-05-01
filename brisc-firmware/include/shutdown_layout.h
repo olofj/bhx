@@ -18,18 +18,21 @@
 //   value) triple. Pointing it at our virtio slot regs would
 //   collide with the kernel's virtio probe ordering.
 //
-// Per-L2CPU placement, mirroring the UART layout:
+// Per-L2CPU placement. The stride MUST match the L2CPU TLB
+// `PER_L2CPU_WINDOW_SIZE` (8 devices × 4 KiB regfile = 32 KiB), since
+// each L2CPU's view of "engine_base + OFFSET_FROM_ENGINE_BASE" is
+// computed by adding a fixed per-L2CPU `engine_base[idx]` (which
+// itself uses 32 KiB stride from the TLB programming) to a single
+// constant offset. If the BRISC-side stride here doesn't match the
+// L2CPU-side stride, the kernel's syscon write for L2CPU N lands at
+// L2CPU (N+1)'s register slot in BRISC L1 (or past the range entirely
+// for higher idx).
 //
 //   L2CPU 0 shutdown reg → BRISC L1 0x60000  (engine_base[0] = 0x10000,
 //                                              PA = engine_base + 0x50000)
-//   L2CPU 1 shutdown reg → BRISC L1 0x64000
-//   L2CPU 2 shutdown reg → BRISC L1 0x68000
-//   L2CPU 3 shutdown reg → BRISC L1 0x6C000
-//
-// The 16 KiB stride matches the per-L2CPU stride for UART regs
-// (0x4000) so the engine-base-relative offset (0x50000) is the same
-// for every L2CPU — operator-side DTB emission can use a single
-// constant.
+//   L2CPU 1 shutdown reg → BRISC L1 0x68000  (engine_base[1] = 0x18000)
+//   L2CPU 2 shutdown reg → BRISC L1 0x70000  (engine_base[2] = 0x20000)
+//   L2CPU 3 shutdown reg → BRISC L1 0x78000  (engine_base[3] = 0x28000)
 
 #ifndef BRISC_SHUTDOWN_LAYOUT_H
 #define BRISC_SHUTDOWN_LAYOUT_H
@@ -37,7 +40,7 @@
 #include <stdint.h>
 
 #define BRISC_SHUTDOWN_BASE                      0x00060000u
-#define BRISC_SHUTDOWN_PER_L2CPU_STRIDE          0x00004000u  // 16 KiB
+#define BRISC_SHUTDOWN_PER_L2CPU_STRIDE          0x00008000u  // 32 KiB — must match L2CPU TLB PER_L2CPU_WINDOW_SIZE
 #define BRISC_SHUTDOWN_REG_FILE_SIZE             0x00000010u  // 16 bytes (one u32 + slack)
 #define BRISC_SHUTDOWN_OFFSET_FROM_ENGINE_BASE   0x00050000u
 
