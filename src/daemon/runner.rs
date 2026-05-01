@@ -273,6 +273,20 @@ pub fn status(card: u32) -> io::Result<()> {
                     // DispatchCoreConfig — see docs/tt-metal-coexistence.md.
                     println!("  virtio-engine tile (NOC0): ({}, {})", x, y);
                 }
+                // Decode the L2CPU PLL into a human label. See clock.rs
+                // frequency_solution: 200 MHz = (128, 15), 1750 MHz =
+                // (140, 1). Anything else is mid-step or unsupported.
+                if let (Some(fbdiv), Some(postdiv0)) = (p.pll_fbdiv, p.pll_postdiv0) {
+                    let label = match (fbdiv, postdiv0) {
+                        (140, 1) => " (1750 MHz, active)",
+                        (128, 15) => " (200 MHz, idle)",
+                        _ => "",
+                    };
+                    println!(
+                        "  L2CPU PLL: fbdiv={} postdiv0={}{}",
+                        fbdiv, postdiv0, label
+                    );
+                }
                 for l in &p.l2cpus {
                     let disk = l.disk.as_deref().unwrap_or("-");
                     let net = if l.net { "y" } else { "-" };

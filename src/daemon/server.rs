@@ -638,11 +638,31 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Re
         .unwrap()
         .as_ref()
         .map(|e| (e.noc0_x, e.noc0_y));
+    // Read L2CPU PLL state via SharedChip ARC window. PLL4 lives at
+    // 0x80020500; CNTL1 (offset 0x4) packs fbdiv (high 16) + postdiv
+    // (byte 1) + refdiv (byte 0). For operator readability the CLI
+    // decodes (fbdiv, postdiv0) into a frequency label.
+    const PLL4_BASE: u64 = 0x80020500;
+    const PLL_CNTL_1_OFF: u64 = 0x4;
+    const PLL_CNTL_5_OFF: u64 = 0x14;
+    let (pll_fbdiv, pll_postdiv0) = match (
+        state.shared_chip.arc_read32(PLL4_BASE + PLL_CNTL_1_OFF),
+        state.shared_chip.arc_read32(PLL4_BASE + PLL_CNTL_5_OFF),
+    ) {
+        (Ok(cntl1), Ok(cntl5)) => {
+            let fbdiv = (cntl1 >> 16) as u16;
+            let postdiv0 = (cntl5 & 0xFF) as u8;
+            (Some(fbdiv), Some(postdiv0))
+        }
+        _ => (None, None),
+    };
     let payload = StatusPayload {
         pid: std::process::id(),
         uptime_secs: state.started.elapsed().as_secs(),
         l2cpus,
         engine_tile,
+        pll_fbdiv,
+        pll_postdiv0,
     };
     let _ = write_frame(&mut sock, &Response::Status(payload));
     Ok(())

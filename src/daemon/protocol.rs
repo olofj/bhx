@@ -246,6 +246,14 @@ pub struct StatusPayload {
     /// keeps pre-#74 clients wire-compatible.
     #[serde(default)]
     pub engine_tile: Option<(u16, u16)>,
+    /// Current L2CPU PLL state (fbdiv / postdiv0). 200 MHz idle is
+    /// (128, 15); 1750 MHz active is (140, 1). Decoded for operator
+    /// readability in the CLI. `None` if PLL read failed (chip in an
+    /// unrecoverable state).
+    #[serde(default)]
+    pub pll_fbdiv: Option<u16>,
+    #[serde(default)]
+    pub pll_postdiv0: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -467,6 +475,8 @@ mod tests {
                 clients: 1,
             }],
             engine_tile: Some((16, 11)),
+            pll_fbdiv: Some(140),
+            pll_postdiv0: Some(1),
         });
         let mut buf = Vec::new();
         write_frame(&mut buf, &resp).unwrap();
