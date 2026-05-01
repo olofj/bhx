@@ -102,7 +102,12 @@
 // interface (`0xFFB2_0000+`), which we punt on for now in favor of
 // landing the basic mechanism. See #71.
 #define CTRL_BASE                 0x00005000u
-#define CTRL_SIZE                 0x00001000u
+// 16 KiB control region. Bumped from 4 KiB when KICK_RING_ENTRIES
+// went 64 → 512 (8 KiB ring), since the prior 4 KiB region couldn't
+// hold the larger ring + COMPL_RING + headers. L1 has 40+ KiB of
+// unused space between the previous CTRL end (0x6000) and REGS_BASE
+// (0x10000), so growing the region is free.
+#define CTRL_SIZE                 0x00004000u
 
 #define CTRL_OFF_HELLO            0x0000u
 #define CTRL_OFF_HELLO_ACK        0x0040u
@@ -116,9 +121,9 @@
 // register_uart, BRISC uses them to drive TRISC0's reset lifecycle
 // (#79) AND TRISC0 uses them to know which UART reg files to poll.
 #define CTRL_OFF_ACTIVE_SLOTS     0x00C0u
-#define CTRL_OFF_KICK_RING        0x0100u
-#define CTRL_OFF_COMPL_RING_HDR   0x0500u
-#define CTRL_OFF_COMPL_RING       0x0600u
+#define CTRL_OFF_KICK_RING        0x0100u  // ends at 0x2100 (512 × 16)
+#define CTRL_OFF_COMPL_RING_HDR   0x2100u
+#define CTRL_OFF_COMPL_RING       0x2200u  // ends at 0x2600 (64 × 16)
 
 // Magic words. Both sides write the magic *last* in their respective
 // slot so a partial write is observable as "not yet ready" by the
@@ -192,7 +197,11 @@
 #define COMPL_ENTRY_OFF_USED_IDX  0x04u
 
 // Ring sizing. Powers of 2 so wrap is a mask.
-#define KICK_RING_ENTRIES        64u   // 64 × 16 = 1 KiB at CTRL_OFF_KICK_RING
+// Bumped from 64 (1 KiB) — dual-guest cold boot can burst-produce
+// >250 kicks while the daemon is still consuming, overflowing a 64-
+// entry ring and dropping kicks. 512 entries = 8 KiB absorbs the
+// burst comfortably; L1 budget after CTRL_SIZE bump to 16 KiB is fine.
+#define KICK_RING_ENTRIES        512u  // 512 × 16 = 8 KiB at CTRL_OFF_KICK_RING
 #define COMPL_RING_ENTRIES       64u   // 64 × 16 = 1 KiB at CTRL_OFF_COMPL_RING
 
 #endif  // BRISC_TENSIX_PROTO_H

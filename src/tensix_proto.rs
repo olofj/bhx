@@ -63,15 +63,20 @@ pub const PROTOCOL_VERSION: u32 = 4;
 // BRISC NoC-write capability via the NIU register interface).
 
 pub const CTRL_BASE: u32 = 0x0000_5000;
-pub const CTRL_SIZE: u32 = 0x0000_1000;
+/// 16 KiB control region. Bumped from 4 KiB when KICK_RING_ENTRIES
+/// grew 64 → 512 (8 KiB ring); the prior 4 KiB region couldn't hold
+/// the larger ring + COMPL_RING + headers. L1 has 40+ KiB of unused
+/// space between the previous CTRL end (0x6000) and REGS_BASE
+/// (0x10000), so growing the region is free.
+pub const CTRL_SIZE: u32 = 0x0000_4000;
 
 pub const CTRL_OFF_HELLO: u32 = 0x0000;
 pub const CTRL_OFF_HELLO_ACK: u32 = 0x0040;
 pub const CTRL_OFF_KICK_RING_HDR: u32 = 0x0080;
 pub const CTRL_OFF_ACTIVE_SLOTS: u32 = 0x00C0;
-pub const CTRL_OFF_KICK_RING: u32 = 0x0100;
-pub const CTRL_OFF_COMPL_RING_HDR: u32 = 0x0500;
-pub const CTRL_OFF_COMPL_RING: u32 = 0x0600;
+pub const CTRL_OFF_KICK_RING: u32 = 0x0100; // ends at 0x2100 (512 × 16)
+pub const CTRL_OFF_COMPL_RING_HDR: u32 = 0x2100;
+pub const CTRL_OFF_COMPL_RING: u32 = 0x2200; // ends at 0x2600 (64 × 16)
 
 // ----- Magic words (written last in each side's slot) -----
 
@@ -118,7 +123,11 @@ pub const COMPL_ENTRY_OFF_USED_IDX: u32 = 0x04;
 
 // ----- Ring sizing -----
 
-pub const KICK_RING_ENTRIES: u32 = 64;
+/// Bumped from 64 (1 KiB) — dual-guest cold boot can burst-produce
+/// 250+ kicks while the daemon is still consuming, overflowing a
+/// 64-entry ring and dropping kicks. 512 entries = 8 KiB absorbs the
+/// burst comfortably; L1 budget after CTRL_SIZE bump to 16 KiB is fine.
+pub const KICK_RING_ENTRIES: u32 = 512;
 pub const COMPL_RING_ENTRIES: u32 = 64;
 
 // Compile-time invariants.
