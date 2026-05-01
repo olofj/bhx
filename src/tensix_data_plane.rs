@@ -363,6 +363,7 @@ fn run_poll_loop(
     // than waiting for a future-restart-then-zero rollover.
     let mut last_kick_drops: u32 = 0;
     let mut last_sel_ready_races: u32 = 0;
+    let mut last_trisc1_sel_races: u32 = 0;
     let mut last_ready_capture_sel_races: u32 = 0;
     let mut last_queue_setups: u32 = 0;
     let mut last_queue_teardowns: u32 = 0;
@@ -640,6 +641,19 @@ fn run_poll_loop(
             );
             crate::daemon::metrics::SEL_READY_RACES_TOTAL.add(delta as u64);
             last_sel_ready_races = sel_ready_races;
+        }
+        let trisc1_sel_races = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_TRISC1_SEL_RACES);
+        if trisc1_sel_races != last_trisc1_sel_races {
+            let delta = trisc1_sel_races.wrapping_sub(last_trisc1_sel_races);
+            crate::dlog!(
+                "[kick-poller] TRISC1 cleaned up {} stale READY=1 on SEL change \
+                 (cumulative {}) — TRISC1's view of the same race window BRISC counts; \
+                 differential against [BRISC observed ... races] surfaces silent TRISC1 \
+                 wins/losses (#156)",
+                delta,
+                trisc1_sel_races
+            );
+            last_trisc1_sel_races = trisc1_sel_races;
         }
         // #124 timing probe. Log on ratchet-up only (each new max
         // since last log). 1.35 GHz BRISC ≈ 0.74 ns/cycle, so cycle

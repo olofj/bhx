@@ -144,6 +144,21 @@
 // SEL-watch is firing during distro probes — non-zero on any cold
 // boot is the expected, healthy state.
 #define STATS_OFF_DEV_FEAT_SEL_CHANGES    0x058
+// #156 TRISC1-side QUEUE_SEL race-window observations. Bumped each
+// time TRISC1's SEL-watch loop sees a SEL change AND the visible
+// QUEUE_READY for the prior SEL is still 1 (i.e. TRISC1's zero of
+// READY is the cleanup the kernel needs before its post-SEL readl
+// returns 0). Compare to the BRISC-side STATS_OFF_SEL_READY_RACES
+// counter:
+//   * BRISC counter > 0  → BOTH BRISC and TRISC1 were too slow; the
+//     kernel almost certainly read READY=1 and `vm_setup_vq` returned
+//     -ENOENT (counted race).
+//   * BRISC counter = 0 AND TRISC1 counter > 0 → TRISC1 cleaned up
+//     before BRISC saw, so BRISC's check came back to a clean slate.
+//     The kernel may have raced TRISC1 silently — gap is invisible
+//     from the firmware side but lives in the (TRISC1_RACES - BRISC_RACES)
+//     differential.
+#define STATS_OFF_TRISC1_SEL_RACES        0x05c
 // Sweep-cycle histogram (#124 follow-up). MAX is misleading because
 // `init_device` on STATUS=0 burns ~1200 cycles in a 320-store wipe
 // loop, dominating the max even though it runs before the kernel's
@@ -1493,9 +1508,21 @@ void trisc1_main(void) {
 
                 uint32_t qsel = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_SEL));
                 if (qsel != last_qsel[slot]) {
+                    // #156: read READY before zeroing so we can count
+                    // the cases where TRISC1's cleanup mattered. If
+                    // the visible cell still showed READY=1 here, that
+                    // means BRISC's main loop hasn't seen the SEL
+                    // change either yet — kernel's writel(SEL); readl(READY);
+                    // is racing both harts. Counter is a proxy for
+                    // "TRISC1 had to clean up" — useful diff against the
+                    // BRISC-side STATS_OFF_SEL_READY_RACES.
+                    uint32_t prev_ready = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY));
                     *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY)) = 0;
                     FENCE_W();
                     last_qsel[slot] = qsel;
+                    if (prev_ready != 0u) {
+                        inc_stat(STATS_OFF_TRISC1_SEL_RACES);
+                    }
                 }
 
                 uint32_t dfsel = read_u32(reg_addr(slot, VIRTIO_MMIO_DEVICE_FEATURES_SEL));
