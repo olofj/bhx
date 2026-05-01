@@ -723,7 +723,7 @@ fn resize_image(path: &Path, size: &str, is_single_fs: bool) -> Result<()> {
         );
         return Ok(());
     }
-    eprintln!("  Growing to {}...", size);
+    eprintln!("  Growing image file to {} (qemu-img resize)...", size);
 
     // First resize the file
     let status = Command::new("qemu-img")
@@ -757,6 +757,7 @@ fn resize_image(path: &Path, size: &str, is_single_fs: bool) -> Result<()> {
     }
 
     // Single-FS image — assumed ext4 by the caller. Grow the FS.
+    eprintln!("  Checking filesystem (e2fsck)...");
     let status = Command::new("e2fsck").args(["-f", "-y"]).arg(path).status();
     if let Ok(s) = status {
         if !s.success() && s.code() != Some(1) {
@@ -764,6 +765,7 @@ fn resize_image(path: &Path, size: &str, is_single_fs: bool) -> Result<()> {
         }
     }
 
+    eprintln!("  Growing filesystem (resize2fs)...");
     let status = Command::new("resize2fs").arg(path).status().map_err(|e| {
         Error::internal(format!(
             "Failed to run resize2fs: {}. Install with: apt install e2fsprogs",
