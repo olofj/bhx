@@ -19,9 +19,12 @@ pub const FOUR_GIG: usize = 1usize << 32;
 ///
 /// # Safety
 /// The caller must ensure that the file descriptor `fd` remains open for the
-/// entire lifetime of this `TlbHandle`. Closing the fd before dropping the
-/// handle will cause the FREE_TLB ioctl to fail (leaking kernel TLB resources)
-/// or, worse, to operate on a recycled fd.
+/// entire lifetime of this `TlbHandle`. The kernel does reclaim TLBs when
+/// the fd is closed, so leaking a TLB if `close()` happens early is not the
+/// problem; operating on a recycled fd is. If something else in the process
+/// has already reopened that fd number by the time we issue FREE_TLB, the
+/// ioctl lands on the wrong file. Keep the fd alive past every `TlbHandle`
+/// that references it.
 pub struct TlbHandle {
     fd: RawFd,
     tlb_id: u32,
