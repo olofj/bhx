@@ -295,9 +295,9 @@ pub fn reset_device(fd: RawFd, flags: u32) -> std::io::Result<()> {
 /// of 1350 MHz. Tensix baby-RISCs share that clock domain, so the
 /// difference shows up as a 1.7× slower poll loop.
 ///
-/// We deliberately don't request `MRISC_PHY_WAKEUP` — MRISC manages
-/// GDDR PHY, which `bhx` doesn't use (L2CPU runs out of host-
-/// allocated DRAM and Tensix uses its own L1).
+/// We also request `MRISC_PHY_WAKEUP`: L2CPU runs out of device GDDR
+/// (OpenSBI's `Firmware Base : 0x400030000000`), so the GDDR PHYs
+/// have to be powered on before we copy any firmware down.
 ///
 /// Best-effort: if the kmd is older than 2.6 it doesn't know this
 /// ioctl and returns ENOTTY/EINVAL. We log and continue rather than
@@ -305,12 +305,9 @@ pub fn reset_device(fd: RawFd, flags: u32) -> std::io::Result<()> {
 pub fn request_max_power(fd: RawFd) -> std::io::Result<()> {
     let mut state = PowerState {
         argsz: std::mem::size_of::<PowerState>() as u32,
-        // 4 valid flags so the kmd OR-aggregates ALL of bits 0..3 (we
-        // request 0=MAX_AI_CLK, 2=TENSIX_ENABLE, 3=L2CPU_ENABLE; bit 1
-        // / MRISC_PHY_WAKEUP intentionally left clear since we don't
-        // touch GDDR).
         validity: validity(4, 0),
         power_flags: TT_POWER_FLAG_MAX_AI_CLK
+            | TT_POWER_FLAG_MRISC_PHY_WAKEUP
             | TT_POWER_FLAG_TENSIX_ENABLE
             | TT_POWER_FLAG_L2CPU_ENABLE,
         ..Default::default()
