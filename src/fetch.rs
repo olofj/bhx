@@ -107,8 +107,9 @@ pub fn download_to(url: &str, dest_path: &Path) -> Result<PathBuf> {
     let elapsed = started.elapsed();
     fs::rename(&temp_path, dest_path).map_err(Error::io_ctx("rename download"))?;
 
-    // Final newline because the in-place \r progress line doesn't end
-    // with one. Then the summary on its own line.
+    // Force one final tick so the rendered progress reads "100.0%" instead
+    // of whatever the last 200-ms tick happened to catch (typically 99.9%).
+    print_progress(got, total, elapsed);
     eprintln!();
     eprintln!(
         "  Downloaded {} in {} (avg {}/s)",
