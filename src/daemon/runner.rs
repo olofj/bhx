@@ -273,18 +273,23 @@ pub fn status(card: u32) -> io::Result<()> {
                     // DispatchCoreConfig — see docs/tt-metal-coexistence.md.
                     println!("  virtio-engine tile (NOC0): ({}, {})", x, y);
                 }
-                // Decode the L2CPU PLL into a human label. See clock.rs
-                // frequency_solution: 200 MHz = (128, 15), 1750 MHz =
-                // (140, 1). Anything else is mid-step or unsupported.
+                // Decode the L2CPU PLL into a human label. The post-PLL
+                // chain on Blackhole effectively gives
+                // `freq_mhz = 25 * fbdiv / (postdiv0 + 1)` from the
+                // 25 MHz reference. Validates against the two known
+                // frequency_solution entries: (140, 1) → 1750 MHz,
+                // (128, 15) → 200 MHz. The "active"/"idle" tag is the
+                // operational shorthand used in clock.rs.
                 if let (Some(fbdiv), Some(postdiv0)) = (p.pll_fbdiv, p.pll_postdiv0) {
-                    let label = match (fbdiv, postdiv0) {
-                        (140, 1) => " (1750 MHz, active)",
-                        (128, 15) => " (200 MHz, idle)",
+                    let mhz = 25u32 * (fbdiv as u32) / ((postdiv0 as u32) + 1);
+                    let tag = match (fbdiv, postdiv0) {
+                        (140, 1) => ", active",
+                        (128, 15) => ", idle",
                         _ => "",
                     };
                     println!(
-                        "  L2CPU PLL: fbdiv={} postdiv0={}{}",
-                        fbdiv, postdiv0, label
+                        "  L2CPU PLL: fbdiv={} postdiv0={} ({} MHz{})",
+                        fbdiv, postdiv0, mhz, tag
                     );
                 }
                 for l in &p.l2cpus {
