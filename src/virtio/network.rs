@@ -286,7 +286,7 @@ impl VirtioNet {
             // `vdeslirp_init` (which populates defaults) and before
             // `vdeslirp_open` (which copies / consumes the config).
             // See #60.
-            tt_slirp_set_vhostname(&mut cfg, hostname.as_ptr());
+            bhx_slirp_set_vhostname(&mut cfg, hostname.as_ptr());
         }
         let slirp = unsafe { vdeslirp_open(&mut cfg) };
         if slirp.is_null() {

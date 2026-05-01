@@ -49,7 +49,7 @@ extern "C" {
     /// `vhostname` pointer must outlive `cfg`'s next `vdeslirp_open`
     /// call — the caller (currently `VirtioNet::new`) holds a
     /// `CString` field for that. See #60.
-    pub fn tt_slirp_set_vhostname(cfg: *mut SlirpConfig, vhostname: *const libc::c_char);
+    pub fn bhx_slirp_set_vhostname(cfg: *mut SlirpConfig, vhostname: *const libc::c_char);
 }
 
 impl InAddr {

@@ -16,6 +16,6 @@
 // Stash a hostname pointer into the config. The string must outlive
 // the libslirp instance; libslirp keeps the pointer verbatim. Caller
 // (`VirtioNet::new`) holds a `CString` field for that.
-void tt_slirp_set_vhostname(SlirpConfig *cfg, const char *vhostname) {
+void bhx_slirp_set_vhostname(SlirpConfig *cfg, const char *vhostname) {
     cfg->vhostname = vhostname;
 }

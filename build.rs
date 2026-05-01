@@ -232,7 +232,7 @@ fn build_slirp_size_probe() {
         println!("cargo:rerun-if-changed=src/slirp_helpers.c");
         cc::Build::new()
             .file("src/slirp_helpers.c")
-            .compile("tt_slirp_helpers");
+            .compile("bhx_slirp_helpers");
 
         // Verify that our opaque SlirpConfig buffer (512 bytes) is large
         // enough for the actual struct from libslirp. Fail at build time if
