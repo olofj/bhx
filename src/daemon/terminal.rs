@@ -74,6 +74,16 @@ fn reader_loop(stream: UnixStream, exit: Arc<AtomicBool>) {
 fn writer_loop(stream: &UnixStream, exit: &AtomicBool) -> io::Result<()> {
     let mut stream = stream;
     let mut ctrl_a = false;
+    // Filter cursor-position-report (CPR) replies coming from the host
+    // terminal: when we flip into raw mode (or anything else that the
+    // terminal interprets as needing a status report) the terminal can
+    // emit `ESC [ <row> ; <col> R` on stdin. With no filter, those bytes
+    // forward straight to the chip-side UART and end up at the guest's
+    // getty (#121). Drop CSI sequences whose final byte is `R` and
+    // whose intermediate bytes are only digits/`;` — that's the strict
+    // CPR shape per ECMA-48 §8.3.14, and not a sequence a user would
+    // ever type intentionally.
+    let mut esc = EscState::Idle;
     while !exit.load(Ordering::Relaxed) {
         // Poll stdin with 20 ms timeout so we notice `exit` without spinning.
         let mut rfds = unsafe { std::mem::zeroed::<libc::fd_set>() };
@@ -99,21 +109,165 @@ fn writer_loop(stream: &UnixStream, exit: &AtomicBool) -> io::Result<()> {
         if n <= 0 {
             break;
         }
-        if ctrl_a {
-            ctrl_a = false;
-            if b[0] == b'x' {
-                let _ = io::stdout().write_all(b"\n\n");
-                exit.store(true, Ordering::Relaxed);
-                return Ok(());
+        let byte = b[0];
+        let mut to_emit = Vec::new();
+        match advance_esc(&mut esc, byte, &mut to_emit) {
+            EscDecision::Drop => continue,
+            EscDecision::Emit => {}
+        }
+        for emitted in to_emit {
+            if ctrl_a {
+                ctrl_a = false;
+                if emitted == b'x' {
+                    let _ = io::stdout().write_all(b"\n\n");
+                    exit.store(true, Ordering::Relaxed);
+                    return Ok(());
+                }
+                stream.write_all(&[1])?;
+                stream.write_all(&[emitted])?;
+            } else if emitted == 1 {
+                ctrl_a = true;
+            } else {
+                stream.write_all(&[emitted])?;
             }
-            // Forward both the Ctrl-A and the character.
-            stream.write_all(&[1])?;
-            stream.write_all(&b)?;
-        } else if b[0] == 1 {
-            ctrl_a = true;
-        } else {
-            stream.write_all(&b)?;
         }
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+enum EscState {
+    Idle,
+    Esc,
+    /// Buffered CSI prefix (everything seen since `ESC [`, including
+    /// digits + `;`, NOT including the final byte that closes the
+    /// sequence). A short Vec — CPRs are typically <16 bytes.
+    Csi(Vec<u8>),
+}
+
+#[derive(Debug, PartialEq)]
+enum EscDecision {
+    Emit,
+    Drop,
+}
+
+/// Drive the byte-level state machine. Pushes any bytes that should
+/// reach the chip-side UART into `out`. Returns `Drop` only for the
+/// final byte of a CPR sequence we just consumed (no bytes pushed);
+/// otherwise returns `Emit` and the caller forwards everything in `out`.
+fn advance_esc(state: &mut EscState, byte: u8, out: &mut Vec<u8>) -> EscDecision {
+    match state {
+        EscState::Idle => {
+            if byte == 0x1b {
+                *state = EscState::Esc;
+                EscDecision::Drop
+            } else {
+                out.push(byte);
+                EscDecision::Emit
+            }
+        }
+        EscState::Esc => {
+            if byte == b'[' {
+                *state = EscState::Csi(Vec::with_capacity(8));
+                EscDecision::Drop
+            } else {
+                // ESC followed by something other than `[` — not a CSI.
+                // Forward both bytes verbatim and reset.
+                out.push(0x1b);
+                out.push(byte);
+                *state = EscState::Idle;
+                EscDecision::Emit
+            }
+        }
+        EscState::Csi(buf) => {
+            // Final byte = 0x40-0x7E per ECMA-48 §5.4.
+            let is_final = (0x40..=0x7e).contains(&byte);
+            if !is_final {
+                buf.push(byte);
+                return EscDecision::Drop;
+            }
+            // Strict CPR: final 'R' AND intermediate bytes are only
+            // digits and `;`. Drop. Anything else → forward the whole
+            // sequence verbatim (including the leading `ESC [`).
+            let cpr_intermediate = buf.iter().all(|&c| c.is_ascii_digit() || c == b';');
+            if byte == b'R' && cpr_intermediate {
+                *state = EscState::Idle;
+                EscDecision::Drop
+            } else {
+                out.push(0x1b);
+                out.push(b'[');
+                out.extend_from_slice(buf);
+                out.push(byte);
+                *state = EscState::Idle;
+                EscDecision::Emit
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{advance_esc, EscDecision, EscState};
+
+    fn run(input: &[u8]) -> Vec<u8> {
+        let mut state = EscState::Idle;
+        let mut out = Vec::new();
+        for &b in input {
+            let mut step = Vec::new();
+            let _ = advance_esc(&mut state, b, &mut step);
+            out.extend(step);
+        }
+        out
+    }
+
+    #[test]
+    fn passthrough_plain_bytes() {
+        assert_eq!(run(b"hello"), b"hello");
+    }
+
+    #[test]
+    fn drops_cursor_position_report() {
+        // The exact shape that landed in the bug report.
+        assert_eq!(run(b"\x1b[97;428R"), b"");
+        assert_eq!(run(b"\x1b[5;1R"), b"");
+        // Multiple back-to-back CPRs as the bug repro showed.
+        assert_eq!(run(b"\x1b[97;428R\x1b[5;1R\x1b[97;428R"), b"");
+    }
+
+    #[test]
+    fn forwards_other_csi_unchanged() {
+        // Arrow keys: ESC [ A / B / C / D — must pass through.
+        assert_eq!(run(b"\x1b[A"), b"\x1b[A");
+        assert_eq!(run(b"\x1b[D"), b"\x1b[D");
+        // Cursor home (HVP), CSI H — must pass through (it's an output
+        // sequence, but if a user types it we forward verbatim).
+        assert_eq!(run(b"\x1b[H"), b"\x1b[H");
+        // CSI with parameters and a non-R terminator (e.g. CUP) — pass through.
+        assert_eq!(run(b"\x1b[10;20H"), b"\x1b[10;20H");
+    }
+
+    #[test]
+    fn forwards_lone_escape() {
+        // Bare ESC keypress (some users send this from terminals as the
+        // alt-key-equivalent prefix). ESC followed by non-`[` forwards both.
+        assert_eq!(run(b"\x1ba"), b"\x1ba");
+    }
+
+    #[test]
+    fn cpr_sequence_split_across_bytes_still_drops() {
+        // Real reads come one byte at a time; the state machine must
+        // reassemble across calls before deciding.
+        let mut state = EscState::Idle;
+        let mut emitted = Vec::new();
+        for &b in b"\x1b[97;428R" {
+            let mut step = Vec::new();
+            let dec = advance_esc(&mut state, b, &mut step);
+            // The final byte produces Drop; preceding bytes also drop
+            // because they're buffered inside the state.
+            assert_eq!(dec, EscDecision::Drop);
+            emitted.extend(step);
+        }
+        assert!(emitted.is_empty());
+        assert_eq!(state, EscState::Idle);
+    }
 }
