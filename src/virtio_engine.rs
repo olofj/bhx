@@ -302,6 +302,39 @@ pub fn device_id_for_index(device_idx: u32) -> u32 {
     }
 }
 
+/// VIRTIO_F_VERSION_1 lives at bit 32 of the 64-bit feature space —
+/// bit 0 of the high half. Mirrors `VIRTIO_F_VERSION_1_HIGH_BIT` in
+/// `brisc-firmware/virtio.c`.
+pub const VIRTIO_F_VERSION_1_HIGH_BIT: u32 = 0x0000_0001;
+/// VIRTIO_NET_F_MAC lives at bit 5 of the low half (features[0]).
+/// Mirrors `VIRTIO_NET_F_MAC_BIT` in the firmware.
+pub const VIRTIO_NET_F_MAC_BIT: u32 = 1 << 5;
+
+/// Bits 0..31 (DEVICE_FEATURES_SEL=0) of the per-slot feature space.
+/// Mirrors `DEVICE_TEMPLATE[].dev_feat_low` in the firmware.
+#[inline]
+pub fn dev_feat_low_for_index(device_idx: u32) -> u32 {
+    match device_idx {
+        DEV_NET => VIRTIO_NET_F_MAC_BIT,
+        // Other populated slots advertise no low-half bits today.
+        DEV_BLK | DEV_BLK1 | DEV_BLK2 | DEV_CONSOLE | DEV_RNG => 0,
+        _ => 0,
+    }
+}
+
+/// Bits 32..63 (DEVICE_FEATURES_SEL=1) of the per-slot feature space.
+/// Today every populated slot advertises VIRTIO_F_VERSION_1; unused
+/// slots advertise nothing.
+#[inline]
+pub fn dev_feat_high_for_index(device_idx: u32) -> u32 {
+    match device_idx {
+        DEV_BLK | DEV_BLK1 | DEV_BLK2 | DEV_NET | DEV_CONSOLE | DEV_RNG => {
+            VIRTIO_F_VERSION_1_HIGH_BIT
+        }
+        _ => 0,
+    }
+}
+
 // ----- Compile-time sanity -----
 
 const _LAYOUT_INVARIANTS: () = {
@@ -387,6 +420,13 @@ pub mod sim {
     const SNAP_OFF_QUEUE_NOTIFY: u32 = 0x08;
     const SNAP_OFF_QUEUE_READY: u32 = 0x0c;
     const SNAP_OFF_SEL_GEN_ECHO: u32 = 0x38;
+    /// #132 SEL-watch state for DEVICE_FEATURES_SEL. Stored in the
+    /// sim's snap region (firmware-side TRISC1 keeps this in BSS, but
+    /// the sim's `step()` model has no per-step persistent state outside
+    /// L1 — snap is the natural fit). Initialized to 0 by `init_device`'s
+    /// shadow wipe, which is fine: first kernel write of SEL=0 is a
+    /// no-op (already-pre-populated low half), and SEL=1 trips the diff.
+    const SNAP_OFF_DEV_FEAT_SEL: u32 = 0x40;
 
     fn shadow_addr(slot: u32, off: u32) -> u32 {
         SHADOW_BASE + slot * SHADOW_PER_DEVICE + off
@@ -449,6 +489,19 @@ pub mod sim {
             // SW_IMPL=1: tell the patched kernel to use the
             // sel_generation handshake. See virtio.c::init_device.
             self.l1.write(base + MMIO_SW_IMPL, 1);
+            // #132: pre-populate DEVICE_FEATURES with both halves OR'd.
+            // The SEL-watch in poll_one_device strips the leak on the
+            // first observed SEL value — but it can only do that on a
+            // SEL CHANGE. Seed the snap with a sentinel so the very
+            // first iter sees a "change" (sentinel → kernel's SEL=0)
+            // and swaps, mirroring the firmware's last_dfsel[]
+            // initialization to 0xFFFFFFFF.
+            self.l1.write(
+                base + MMIO_DEVICE_FEATURES,
+                dev_feat_low_for_index(dev_idx) | dev_feat_high_for_index(dev_idx),
+            );
+            self.l1
+                .write(snap_addr(slot, SNAP_OFF_DEV_FEAT_SEL), 0xFFFF_FFFF);
         }
 
         fn poll_one_device(&mut self, slot: u32) {
@@ -488,6 +541,23 @@ pub mod sim {
                 self.handle_queue_notify(slot, notify);
                 self.l1
                     .write(snap_addr(slot, SNAP_OFF_QUEUE_NOTIFY), notify);
+            }
+
+            // #132 DEVICE_FEATURES_SEL watch — mirrors trisc1_main's
+            // SEL-watch on this register. On change, swap the visible
+            // DEVICE_FEATURES cell to the right half of the 64-bit
+            // feature space.
+            let dfsel = self.l1.read(base + MMIO_DEVICE_FEATURES_SEL);
+            let dfsel_prev = self.l1.read(snap_addr(slot, SNAP_OFF_DEV_FEAT_SEL));
+            if dfsel != dfsel_prev {
+                let dev_idx = slot % DEVS_PER_L2CPU;
+                let value = match dfsel {
+                    0 => dev_feat_low_for_index(dev_idx),
+                    1 => dev_feat_high_for_index(dev_idx),
+                    _ => 0,
+                };
+                self.l1.write(base + MMIO_DEVICE_FEATURES, value);
+                self.l1.write(snap_addr(slot, SNAP_OFF_DEV_FEAT_SEL), dfsel);
             }
 
             // sel_generation echo — last so all snapshots above are in
@@ -941,6 +1011,132 @@ mod tests {
                 slot_idx
             );
         }
+    }
+
+    #[test]
+    fn dev_feat_sel_zero_returns_low_half_no_csum_leak_post_swap() {
+        // #132: post-fix, the kernel must read SEL=0 features WITHOUT
+        // bit 0 (= CSUM on net) once TRISC1's SEL-watch has run. The
+        // initial cell value contains both halves OR'd (so a pre-swap
+        // SEL=1 read still sees VIRTIO_F_VERSION_1 — boot reliability),
+        // but TRISC1's first poll strips the leak on the first SEL
+        // observation. The sim's poll_one_device mirrors that.
+        let mut sim = VirtioFwSim::new();
+        sim.boot();
+        let net = slot(0, DEV_NET);
+        let base = slot_regs_base(net);
+        // Initial cell holds both halves (as documented above).
+        assert_eq!(
+            sim.read(base + MMIO_DEVICE_FEATURES),
+            VIRTIO_NET_F_MAC_BIT | VIRTIO_F_VERSION_1_HIGH_BIT,
+            "pre-swap DEVICE_FEATURES should hold both halves OR'd \
+             (boot-reliability seed before TRISC1 first observes SEL)"
+        );
+        // Kernel writes SEL=0 then reads — TRISC1 swap strips the
+        // VERSION_1_HIGH bit, leaving just the low half (MAC, no CSUM).
+        sim.write(base + MMIO_DEVICE_FEATURES_SEL, 0);
+        sim.step();
+        assert_eq!(
+            sim.read(base + MMIO_DEVICE_FEATURES),
+            VIRTIO_NET_F_MAC_BIT,
+            "after TRISC1's first SEL=0 swap, cell should be MAC only — \
+             no CSUM (bit 0) leak"
+        );
+    }
+
+    #[test]
+    fn dev_feat_sel_one_returns_high_half() {
+        // After kernel writes SEL=1, the visible cell holds the high
+        // half (today: just VIRTIO_F_VERSION_1).
+        let mut sim = VirtioFwSim::new();
+        sim.boot();
+        let net = slot(0, DEV_NET);
+        let base = slot_regs_base(net);
+        sim.write(base + MMIO_DEVICE_FEATURES_SEL, 1);
+        sim.step();
+        assert_eq!(
+            sim.read(base + MMIO_DEVICE_FEATURES),
+            VIRTIO_F_VERSION_1_HIGH_BIT,
+            "SEL=1 should expose the high half (VIRTIO_F_VERSION_1)"
+        );
+    }
+
+    #[test]
+    fn dev_feat_sel_change_swaps_visible_cell() {
+        // SEL=0 → SEL=1 → SEL=0 cycle: each readl after a SEL writel
+        // must reflect the right half.
+        let mut sim = VirtioFwSim::new();
+        sim.boot();
+        let net = slot(0, DEV_NET);
+        let base = slot_regs_base(net);
+        sim.write(base + MMIO_DEVICE_FEATURES_SEL, 1);
+        sim.step();
+        assert_eq!(
+            sim.read(base + MMIO_DEVICE_FEATURES),
+            VIRTIO_F_VERSION_1_HIGH_BIT
+        );
+        sim.write(base + MMIO_DEVICE_FEATURES_SEL, 0);
+        sim.step();
+        assert_eq!(sim.read(base + MMIO_DEVICE_FEATURES), VIRTIO_NET_F_MAC_BIT);
+        sim.write(base + MMIO_DEVICE_FEATURES_SEL, 1);
+        sim.step();
+        assert_eq!(
+            sim.read(base + MMIO_DEVICE_FEATURES),
+            VIRTIO_F_VERSION_1_HIGH_BIT
+        );
+    }
+
+    #[test]
+    fn dev_feat_sel_two_or_higher_returns_zero() {
+        // The 64-bit feature space defines bits 0..63; SEL>=2 is
+        // undefined and the firmware returns 0 rather than aliasing
+        // stale data from the last SEL.
+        let mut sim = VirtioFwSim::new();
+        sim.boot();
+        let net = slot(0, DEV_NET);
+        let base = slot_regs_base(net);
+        sim.write(base + MMIO_DEVICE_FEATURES_SEL, 2);
+        sim.step();
+        assert_eq!(sim.read(base + MMIO_DEVICE_FEATURES), 0);
+    }
+
+    #[test]
+    fn dev_feat_sel_per_slot_isolation() {
+        // Setting SEL=1 on the net slot must not perturb DEVICE_FEATURES
+        // on any other slot. Each slot maintains its own SEL state.
+        let mut sim = VirtioFwSim::new();
+        sim.boot();
+        let net = slot(0, DEV_NET);
+        let blk = slot(0, DEV_BLK);
+        let net_base = slot_regs_base(net);
+        let blk_base = slot_regs_base(blk);
+        // Pre-state: both slots seeded with `low | high` (MAC|VERSION_1
+        // for net, just VERSION_1 for blk).
+        assert_eq!(
+            sim.read(net_base + MMIO_DEVICE_FEATURES),
+            VIRTIO_NET_F_MAC_BIT | VIRTIO_F_VERSION_1_HIGH_BIT
+        );
+        assert_eq!(
+            sim.read(blk_base + MMIO_DEVICE_FEATURES),
+            VIRTIO_F_VERSION_1_HIGH_BIT
+        );
+        // Flip net's SEL — blk's cell shouldn't change. (blk also
+        // gets a sentinel-driven first-observation swap to dev_feat_low
+        // = 0 on this same step; that's fine — the property tested here
+        // is that the net SEL flip didn't bleed VERSION_1 high-half
+        // contents into blk's cell.)
+        sim.write(net_base + MMIO_DEVICE_FEATURES_SEL, 1);
+        sim.step();
+        assert_eq!(
+            sim.read(net_base + MMIO_DEVICE_FEATURES),
+            VIRTIO_F_VERSION_1_HIGH_BIT
+        );
+        let blk_after = sim.read(blk_base + MMIO_DEVICE_FEATURES);
+        assert!(
+            blk_after == VIRTIO_F_VERSION_1_HIGH_BIT || blk_after == 0,
+            "blk slot perturbed by net's SEL flip: {:#x}",
+            blk_after
+        );
     }
 
     #[test]

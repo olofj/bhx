@@ -138,6 +138,11 @@
 #define STATS_OFF_READY_CAPTURE_SEL_RACES 0x04c
 #define STATS_OFF_QUEUE_SETUPS            0x050
 #define STATS_OFF_QUEUE_TEARDOWNS         0x054
+// #132 TRISC1 DEVICE_FEATURES_SEL watch. Counts every observed change
+// of DEVICE_FEATURES_SEL (across all slots). Used to verify the
+// SEL-watch is firing during distro probes — non-zero on any cold
+// boot is the expected, healthy state.
+#define STATS_OFF_DEV_FEAT_SEL_CHANGES    0x058
 // Sweep-cycle histogram (#124 follow-up). MAX is misleading because
 // `init_device` on STATUS=0 burns ~1200 cycles in a 320-store wipe
 // loop, dominating the max even though it runs before the kernel's
@@ -288,17 +293,22 @@ static inline void write_u32(uintptr_t addr, uint32_t v) {
 // at boot. Same set for every L2CPU — each L2CPU's guest sees the
 // same four virtio devices.
 //
-// `extra_features_low` carries per-device feature bits we want the
-// kernel to negotiate from the LOW half (features[0]). The HIGH-half
-// `VIRTIO_F_VERSION_1` bit is OR'd in unconditionally inside
-// `init_device`; it lives in features[1] but our static-value scheme
-// (see DEVICE_FEATURES discussion in `init_device`) collapses both
-// halves to one register, so per-device extras and VERSION_1 share
-// the same word.
+// Per-device feature bits split across the 64-bit feature space:
+//   * `dev_feat_low`  → bits 0..31  (read with DEVICE_FEATURES_SEL=0)
+//   * `dev_feat_high` → bits 32..63 (read with DEVICE_FEATURES_SEL=1)
+//
+// Pre-#132 these were collapsed into one cell, which leaked
+// VIRTIO_F_VERSION_1's high-half bit into the SEL=0 read as bit 0 (=
+// VIRTIO_NET_F_CSUM on the net slot). Stock kernels then negotiated
+// CSUM and expected matching RX behavior (DATA_VALID handling) we
+// don't actually implement. The split below + TRISC1 SEL-watch on
+// DEVICE_FEATURES_SEL eliminates the leak — the visible cell holds
+// the right half within ~µs of any kernel SEL write.
 struct device_init {
     uint32_t device_id;
-    uint32_t num_queues;            // shadow only; not visible-as-MMIO
-    uint32_t extra_features_low;    // bits we OR into DEVICE_FEATURES
+    uint32_t num_queues;       // shadow only; not visible-as-MMIO
+    uint32_t dev_feat_low;
+    uint32_t dev_feat_high;
 };
 
 // Indexed by `slot % BRISC_VIRTIO_DEVS_PER_L2CPU` (see `device_for_slot`).
@@ -310,13 +320,13 @@ struct device_init {
 // guest probing those slots sees no device. Static-initialized
 // uninitialized members of an indexed designator are zero per C99.
 static const struct device_init DEVICE_TEMPLATE[BRISC_VIRTIO_DEVS_PER_L2CPU] = {
-    [BRISC_VIRTIO_DEV_BLK]     = { VIRTIO_ID_BLOCK,   BRISC_VIRTIO_QUEUES_BLK,     0 },
-    [BRISC_VIRTIO_DEV_NET]     = { VIRTIO_ID_NET,     BRISC_VIRTIO_QUEUES_NET,     VIRTIO_NET_F_MAC_BIT },
-    [BRISC_VIRTIO_DEV_CONSOLE] = { VIRTIO_ID_CONSOLE, BRISC_VIRTIO_QUEUES_CONSOLE, 0 },
-    [BRISC_VIRTIO_DEV_RNG]     = { VIRTIO_ID_ENTROPY, BRISC_VIRTIO_QUEUES_RNG,     0 },
+    [BRISC_VIRTIO_DEV_BLK]     = { VIRTIO_ID_BLOCK,   BRISC_VIRTIO_QUEUES_BLK,     0,                    VIRTIO_F_VERSION_1_HIGH_BIT },
+    [BRISC_VIRTIO_DEV_NET]     = { VIRTIO_ID_NET,     BRISC_VIRTIO_QUEUES_NET,     VIRTIO_NET_F_MAC_BIT, VIRTIO_F_VERSION_1_HIGH_BIT },
+    [BRISC_VIRTIO_DEV_CONSOLE] = { VIRTIO_ID_CONSOLE, BRISC_VIRTIO_QUEUES_CONSOLE, 0,                    VIRTIO_F_VERSION_1_HIGH_BIT },
+    [BRISC_VIRTIO_DEV_RNG]     = { VIRTIO_ID_ENTROPY, BRISC_VIRTIO_QUEUES_RNG,     0,                    VIRTIO_F_VERSION_1_HIGH_BIT },
 #if BRISC_VIRTIO_DEVS_PER_L2CPU >= 8
-    [BRISC_VIRTIO_DEV_BLK1]    = { VIRTIO_ID_BLOCK,   BRISC_VIRTIO_QUEUES_BLK,     0 },
-    [BRISC_VIRTIO_DEV_BLK2]    = { VIRTIO_ID_BLOCK,   BRISC_VIRTIO_QUEUES_BLK,     0 },
+    [BRISC_VIRTIO_DEV_BLK1]    = { VIRTIO_ID_BLOCK,   BRISC_VIRTIO_QUEUES_BLK,     0,                    VIRTIO_F_VERSION_1_HIGH_BIT },
+    [BRISC_VIRTIO_DEV_BLK2]    = { VIRTIO_ID_BLOCK,   BRISC_VIRTIO_QUEUES_BLK,     0,                    VIRTIO_F_VERSION_1_HIGH_BIT },
 #endif
 };
 
@@ -387,29 +397,27 @@ static void init_device(unsigned slot) {
     // until the guest writes QUEUE_SEL.
     *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NUM_MAX)) = BRISC_VIRTIO_QUEUE_NUM_MAX;
 
-    // DEVICE_FEATURES — pre-populate with the VIRTIO_F_VERSION_1
-    // bit (high half, bit 32 of the 64-bit feature space) plus any
-    // per-device extras from the template (today: VIRTIO_NET_F_MAC
-    // for the net slot, see #77). The poll-loop SEL multiplexer
-    // below also writes this on every iteration, but pre-setting
-    // here closes the race window between L2CPU reset release and
-    // BRISC's first poll: stock Linux virtio-mmio drivers race ~µs
-    // between `writel(SEL=1)` and `readl(DEVICE_FEATURES)`,
-    // comparable to BRISC's full sweep, so without this
-    // initialization the kernel's first read can land on a stale 0
-    // value.
-    //
-    // We accept that the SEL=0 read returns the same word as SEL=1
-    // (high-half bits aliased into low-half reads). That means:
-    //   * On the net slot the kernel sees bit 5 (MAC) at SEL=0 ✓
-    //     plus bit 37 at SEL=1 — bit 37 is undefined, kernel ignores.
-    //   * On all slots the kernel sees bit 0 (CSUM) leaked at SEL=0
-    //     (because VIRTIO_F_VERSION_1 = bit 0 of the high half lit).
-    //     We don't ACK CSUM in DRIVER_FEATURES, but virtio-net's TX
-    //     path still acts as if CSUM were negotiated; that's
-    //     compensated for in `network.rs::fix_tx_l4_checksum`.
+    // DEVICE_FEATURES — pre-populate with both halves OR'd together.
+    // TRISC1 (`trisc1_main`) watches DEVICE_FEATURES_SEL and swaps
+    // the visible cell to the right half on every SEL write, but the
+    // initial value before TRISC1's first poll iter has to satisfy
+    // BOTH a SEL=0 and a SEL=1 read — empirical testing showed
+    // pre-populating with just `dev_feat_low` lost the race against
+    // U-Boot's writel(SEL=1); readl(FEATURES); on cold-start probe,
+    // and the kernel set STATUS_FAILED because VIRTIO_F_VERSION_1
+    // wasn't in the high half it could see. With both halves OR'd:
+    //   * SEL=0 read pre-TRISC1: `dev_feat_low | VERSION_1_HIGH` —
+    //     same bit-0 leak as pre-#132 firmware (CSUM on net), but
+    //     TRISC1 strips it on its first swap so the leak window is
+    //     transient (microseconds at most). Stock kernels reading
+    //     SEL=0 after TRISC1 has swapped see only `dev_feat_low`
+    //     and don't negotiate CSUM.
+    //   * SEL=1 read pre-TRISC1: same value — bit 0 = VERSION_1, MAC
+    //     bit 5 lands at bit 37 which kernels ignore as undefined.
+    //   * Post-TRISC1 swap: cell holds the right half cleanly per
+    //     SEL — no leak in either direction.
     *l1_u32(reg_addr(slot, VIRTIO_MMIO_DEVICE_FEATURES)) =
-        VIRTIO_F_VERSION_1_HIGH_BIT | d->extra_features_low;
+        d->dev_feat_low | d->dev_feat_high;
 
     // QUEUE_NOTIFY: clear to sentinel (-1) so the first poll
     // after init_device doesn't fire a spurious "queue 0" notify
@@ -1384,7 +1392,23 @@ void main(void) {
 void trisc1_main(void) {
     volatile uint32_t *active_p =
         (volatile uint32_t *)(uintptr_t)(CTRL_BASE + CTRL_OFF_ACTIVE_SLOTS);
-    static uint32_t last_sel[BRISC_VIRTIO_NUM_SLOTS];
+    static uint32_t last_qsel[BRISC_VIRTIO_NUM_SLOTS];
+    // #132: also watch DEVICE_FEATURES_SEL so the visible
+    // DEVICE_FEATURES cell shows the right half (low vs high) of the
+    // 64-bit feature space within ~µs of any kernel SEL write. Same
+    // race pattern as QUEUE_SEL→QUEUE_READY (kernel issues writel(SEL);
+    // readl(FEATURES); back-to-back in <1 µs). Pre-#132 firmware
+    // collapsed both halves into one cell, leaking VIRTIO_F_VERSION_1's
+    // bit 0 (= VIRTIO_NET_F_CSUM on the net slot) into the SEL=0 read.
+    static uint32_t last_dfsel[BRISC_VIRTIO_NUM_SLOTS];
+    // Initialize last_dfsel[] to a sentinel that doesn't match any
+    // kernel-write value, so the first observed value (typically 0
+    // on a fresh boot) triggers the swap path and seeds the visible
+    // cell explicitly. UINT32_MAX = -1 isn't a value the kernel writes
+    // in normal operation.
+    for (unsigned i = 0; i < BRISC_VIRTIO_NUM_SLOTS; i++) {
+        last_dfsel[i] = 0xFFFFFFFFu;
+    }
     for (;;) {
         uint32_t active = *active_p;
         // Skip the UART range — those are TRISC0's lifecycle bits,
@@ -1402,11 +1426,24 @@ void trisc1_main(void) {
                     continue;
                 }
                 unsigned slot = base + i;
-                uint32_t sel = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_SEL));
-                if (sel != last_sel[slot]) {
+
+                uint32_t qsel = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_SEL));
+                if (qsel != last_qsel[slot]) {
                     *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY)) = 0;
                     FENCE_W();
-                    last_sel[slot] = sel;
+                    last_qsel[slot] = qsel;
+                }
+
+                uint32_t dfsel = read_u32(reg_addr(slot, VIRTIO_MMIO_DEVICE_FEATURES_SEL));
+                if (dfsel != last_dfsel[slot]) {
+                    const struct device_init *d = device_for_slot(slot);
+                    uint32_t value = (dfsel == 0u) ? d->dev_feat_low
+                                     : (dfsel == 1u) ? d->dev_feat_high
+                                     : 0u;
+                    *l1_u32(reg_addr(slot, VIRTIO_MMIO_DEVICE_FEATURES)) = value;
+                    FENCE_W();
+                    last_dfsel[slot] = dfsel;
+                    inc_stat(STATS_OFF_DEV_FEAT_SEL_CHANGES);
                 }
             }
         }
