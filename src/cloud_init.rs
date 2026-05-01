@@ -488,6 +488,60 @@ mod tests {
         assert!(md.contains("local-hostname: worker-3"));
     }
 
+    /// Strip the leading `#cloud-config` comment line so the rest can
+    /// be fed to a YAML parser. cloud-init treats the first line as a
+    /// MIME-style format hint, not part of the YAML document.
+    fn strip_cloud_config_header(ud: &str) -> &str {
+        ud.strip_prefix("#cloud-config\n").unwrap_or(ud)
+    }
+
+    /// Acceptance test for #118: operator-supplied password containing
+    /// shell-hostile characters (`"`, `\`, `'`, newline) must produce
+    /// user-data that round-trips through a YAML parser. The fix landed
+    /// when we switched to sha512crypt-at-seed-build-time — the hash
+    /// has only `$`, `/`, `.`, and alphanumerics, all YAML-safe inside
+    /// single quotes — so no plaintext ever reaches the YAML emitter.
+    #[test]
+    fn user_data_with_hostile_password_is_valid_yaml() {
+        for hostile in ["hunter\"two", "back\\slash", "quo'te", "with\nnewline"] {
+            let spec = SeedSpec {
+                password: Some(hostile.into()),
+                ..SeedSpec::default()
+            };
+            let ud = spec.render_user_data().unwrap();
+            assert!(!ud.contains(hostile), "plaintext leaked: {:?}", hostile);
+            // Parse the document — if anything in it is malformed the
+            // YAML parser raises an error, which fails the assert.
+            let parsed: std::result::Result<serde_yaml_ng::Value, _> =
+                serde_yaml_ng::from_str(strip_cloud_config_header(&ud));
+            parsed
+                .unwrap_or_else(|e| panic!("user-data for {:?} failed YAML parse: {}", hostile, e));
+        }
+    }
+
+    /// Same protection for the operator-supplied user name. The
+    /// rendering quotes nothing today (`name: <user>` bare scalar);
+    /// if this ever breaks for a chosen username, switch to
+    /// double-quoted scalars or a YAML emitter (per #118).
+    #[test]
+    fn user_data_with_hostile_user_is_valid_yaml() {
+        // Pick names a normal CLI user might plausibly type. Anything
+        // wilder (newlines, NUL) belongs in input validation, not the
+        // YAML emitter.
+        for hostile in ["op-1", "op_one", "op.dot"] {
+            let spec = SeedSpec {
+                user: Some(hostile.into()),
+                ..SeedSpec::default()
+            };
+            let ud = spec.render_user_data().unwrap();
+            let parsed: std::result::Result<serde_yaml_ng::Value, _> =
+                serde_yaml_ng::from_str(strip_cloud_config_header(&ud));
+            parsed.unwrap_or_else(|e| {
+                panic!("user-data for user={:?} failed YAML parse: {}", hostile, e)
+            });
+        }
+    }
+
     #[test]
     #[ignore] // requires xorrisofs / genisoimage; gated to keep CI hardware-free
     fn write_iso_round_trip_via_tool() {
