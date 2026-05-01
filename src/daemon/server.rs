@@ -1349,6 +1349,7 @@ fn run_boot_sequence(
         memory_size,
         &virtio_nodes,
         uart_addr_for_dtb,
+        has_console,
     )?;
 
     let initramfs_pb = initramfs.map(std::path::PathBuf::from);

@@ -242,6 +242,7 @@ pub fn modify_dtb(
     mem_size: u64,
     virtio_nodes: &[VirtioMmioNode],
     uart_addr: Option<u64>,
+    virtio_console_attached: bool,
 ) -> crate::Result<Vec<u8>> {
     let mem_end = mem_start + mem_size;
     crate::dlog!(
@@ -286,20 +287,38 @@ pub fn modify_dtb(
         Some(o) => o,
         None => fdt.add_subnode(0, "chosen")?,
     };
+    // Pick the console fragment based on whether the daemon will
+    // attach a virtio_console worker. Without `console=hvc0` the
+    // kernel falls back to whatever early console is registered via
+    // /chosen/stdout-path (our SBI debug console, see below); the
+    // `keep_bootcon` directive tells it to keep that early console
+    // even after init, so printk doesn't go silent past early-boot.
+    // (#114 — `--no-virtio-console` previously left `console=hvc0`
+    // in the bootargs even though no hvc0 device existed, producing
+    // a silent boot.)
+    let console_args = if virtio_console_attached {
+        "console=hvc0 earlycon=sbi"
+    } else {
+        "earlycon=sbi keep_bootcon"
+    };
     let bootargs = match boot_device {
         BootDevice::Vda(dev) => {
-            format!("rw console=hvc0 earlycon=sbi root=/dev/{}", dev)
+            format!("rw {} root=/dev/{}", console_args, dev)
         }
         BootDevice::Initramfs { addr, len } => {
-            format!("rw console=hvc0 earlycon=sbi initrd=0x{:x},{}", addr, len)
+            format!("rw {} initrd=0x{:x},{}", console_args, addr, len)
         }
         BootDevice::InitramfsAndVda { addr, len, dev } => format!(
-            "rw console=hvc0 earlycon=sbi initrd=0x{:x},{} root=/dev/{}",
-            addr, len, dev
+            "rw {} initrd=0x{:x},{} root=/dev/{}",
+            console_args, addr, len, dev
         ),
-        BootDevice::Uboot => "console=hvc0 earlycon=sbi".to_string(),
+        BootDevice::Uboot => console_args.to_string(),
     };
-    crate::dlog!("[modify_dtb]   bootargs = {:?}", bootargs);
+    crate::dlog!(
+        "[modify_dtb]   bootargs = {:?} (virtio_console_attached={})",
+        bootargs,
+        virtio_console_attached
+    );
     let mut bootargs_bytes = bootargs.into_bytes();
     bootargs_bytes.push(0);
     fdt.setprop(chosen, "bootargs", &bootargs_bytes)?;
@@ -475,7 +494,7 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x8000_0000u64; // 2 GiB
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None).unwrap();
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
         assert_eq!(read_memory_reg(&out, mem_start), (mem_start, mem_size));
     }
 
@@ -489,7 +508,7 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let override_size = 0x4000_0000u64; // 1 GiB instead of physical 4 GiB
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, override_size, &[], None).unwrap();
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, override_size, &[], None, true).unwrap();
         assert_eq!(read_memory_reg(&out, mem_start), (mem_start, override_size));
     }
 
@@ -504,7 +523,7 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x1_0000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None).unwrap();
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
 
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let path = format!("/reserved-memory/opensbi@{:x}", mem_start);
@@ -533,7 +552,7 @@ mod tests {
         let mem_start = 0x4000_b000_0000u64;
         let mem_size = 0x8000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None).unwrap();
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
         assert_eq!(read_memory_reg(&out, mem_start), (mem_start, mem_size));
 
         let fdt = Fdt::open_into(&out, 0).unwrap();
@@ -557,6 +576,7 @@ mod tests {
             0x1_0000_0000,
             &[],
             None,
+            true,
         )
         .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
@@ -585,6 +605,7 @@ mod tests {
             0x1_0000_0000,
             &[],
             None,
+            true,
         )
         .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
@@ -607,7 +628,7 @@ mod tests {
         let expected_base = mem_end - crate::regs::virtio_mmio::RESERVED_SIZE;
 
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None).unwrap();
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let res = fdt
             .path_offset("/reserved-memory/memory@4000afa00000")
@@ -643,7 +664,7 @@ mod tests {
                 irq: DISK_IRQ - i as u32,
             })
             .collect();
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &nodes, None).unwrap();
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &nodes, None, true).unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
 
         for spec in &nodes {
@@ -667,6 +688,41 @@ mod tests {
     }
 
     #[test]
+    fn modify_dtb_bootargs_omit_hvc0_when_virtio_console_not_attached() {
+        // #114: passing virtio_console_attached=false must drop
+        // `console=hvc0` and add `keep_bootcon` so the early SBI
+        // console stays load-bearing through init.
+        let mem_start = 0x4000_3000_0000u64;
+        let mem_size = 0x1_0000_0000u64;
+        let dev = BootDevice::Vda("vda".to_string());
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, false).unwrap();
+        let fdt = Fdt::open_into(&out, 0).unwrap();
+        let chosen = fdt.path_offset("/chosen").unwrap().unwrap();
+        let args = fdt.getprop(chosen, "bootargs").unwrap();
+        let s = std::str::from_utf8(&args[..args.len() - 1]).unwrap();
+        assert!(
+            !s.contains("console=hvc0"),
+            "bootargs leaked hvc0 with virtio_console_attached=false: {:?}",
+            s
+        );
+        assert!(
+            s.contains("earlycon=sbi"),
+            "bootargs missing earlycon: {:?}",
+            s
+        );
+        assert!(
+            s.contains("keep_bootcon"),
+            "bootargs missing keep_bootcon: {:?}",
+            s
+        );
+        assert!(
+            s.contains("root=/dev/vda"),
+            "bootargs missing root=/dev/vda: {:?}",
+            s
+        );
+    }
+
+    #[test]
     fn modify_dtb_with_empty_virtio_nodes_emits_none() {
         // With #64's host-buffer path, runs that don't have any
         // chip-DRAM virtio devices configured (e.g. host-RNG-only)
@@ -674,7 +730,7 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x1_0000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None).unwrap();
+        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         for i in 0..4u64 {
             let addr = mem_start + mem_size - crate::regs::virtio_mmio::MMIO_SLOT_SIZE * (i + 1);
