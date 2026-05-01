@@ -1505,7 +1505,6 @@ void trisc1_main(void) {
         last_dfsel[i] = 0xFFFFFFFFu;
     }
     for (;;) {
-        uint32_t outer_t0 = mcycle_low();
         uint32_t active = *active_p;
         // Skip the UART range — those are TRISC0's lifecycle bits,
         // not virtio slots. Iterating them here would race-clear
@@ -1525,31 +1524,15 @@ void trisc1_main(void) {
 
                 uint32_t qsel = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_SEL));
                 if (qsel != last_qsel[slot]) {
-                    // #156: read READY before zeroing so we can count
-                    // the cases where TRISC1's cleanup mattered. If
-                    // the visible cell still showed READY=1 here, that
-                    // means BRISC's main loop hasn't seen the SEL
-                    // change either yet — kernel's writel(SEL); readl(READY);
-                    // is racing both harts. Counter is a proxy for
-                    // "TRISC1 had to clean up" — useful diff against the
-                    // BRISC-side STATS_OFF_SEL_READY_RACES.
-                    //
-                    // Bracket with mcycle so MAX_TRISC1_REACTION_CYCLES
-                    // captures the actual reaction time including any
-                    // L1 bank arbitration stall.
-                    uint32_t t0 = mcycle_low();
-                    uint32_t prev_ready = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY));
+                    // SEL→READY critical section: write 0 + FENCE_W only.
+                    // Diagnostic instrumentation (mcycle bracket, prev-READY
+                    // sample, race counter) used to live here for #156 — it
+                    // measurably stretched the reaction window enough to lose
+                    // ~30% extra races on unpatched virtio_mmio kernels.
+                    // Production build keeps the path bare.
                     *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY)) = 0;
                     FENCE_W();
-                    uint32_t t1 = mcycle_low();
-                    update_max_u32(
-                        (uintptr_t)BRISC_VIRTIO_STATS_BASE
-                            + STATS_OFF_MAX_TRISC1_REACTION_CYCLES,
-                        t1 - t0);
                     last_qsel[slot] = qsel;
-                    if (prev_ready != 0u) {
-                        inc_stat(STATS_OFF_TRISC1_SEL_RACES);
-                    }
                 }
 
                 uint32_t dfsel = read_u32(reg_addr(slot, VIRTIO_MMIO_DEVICE_FEATURES_SEL));
@@ -1565,9 +1548,5 @@ void trisc1_main(void) {
                 }
             }
         }
-        uint32_t outer_t1 = mcycle_low();
-        update_max_u32(
-            (uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_MAX_TRISC1_OUTER_CYCLES,
-            outer_t1 - outer_t0);
     }
 }
