@@ -159,6 +159,22 @@
 //     from the firmware side but lives in the (TRISC1_RACES - BRISC_RACES)
 //     differential.
 #define STATS_OFF_TRISC1_SEL_RACES        0x05c
+// #156 TRISC1 timing diagnostics. All in BRISC-clock cycles (mcycle
+// low half). Updated as max-since-stats-reset.
+//   MAX_TRISC1_REACTION_CYCLES: cycles from "TRISC1 observed SEL
+//     change" (just after the read_u32) to "READY=0 published with
+//     FENCE_W" (just after the fence). This is TRISC1's per-event
+//     critical-path cost. If we're losing the race against the
+//     kernel's writel(SEL); readl(READY); back-to-back, this is
+//     where the time goes — including any L1 bank arbitration
+//     stall against concurrent BRISC writes.
+//   MAX_TRISC1_OUTER_CYCLES: cycles for a full TRISC1 outer iter
+//     (one sweep across all active virtio slots). Per-slot revisit
+//     time = this / num_active_slots. If BRISC's init_device or
+//     capture writes are stalling TRISC1's reads via the bank
+//     arbiter, this ratchets up.
+#define STATS_OFF_MAX_TRISC1_REACTION_CYCLES  0x060
+#define STATS_OFF_MAX_TRISC1_OUTER_CYCLES     0x064
 // Sweep-cycle histogram (#124 follow-up). MAX is misleading because
 // `init_device` on STATUS=0 burns ~1200 cycles in a 320-store wipe
 // loop, dominating the max even though it runs before the kernel's
@@ -1489,6 +1505,7 @@ void trisc1_main(void) {
         last_dfsel[i] = 0xFFFFFFFFu;
     }
     for (;;) {
+        uint32_t outer_t0 = mcycle_low();
         uint32_t active = *active_p;
         // Skip the UART range — those are TRISC0's lifecycle bits,
         // not virtio slots. Iterating them here would race-clear
@@ -1516,9 +1533,19 @@ void trisc1_main(void) {
                     // is racing both harts. Counter is a proxy for
                     // "TRISC1 had to clean up" — useful diff against the
                     // BRISC-side STATS_OFF_SEL_READY_RACES.
+                    //
+                    // Bracket with mcycle so MAX_TRISC1_REACTION_CYCLES
+                    // captures the actual reaction time including any
+                    // L1 bank arbitration stall.
+                    uint32_t t0 = mcycle_low();
                     uint32_t prev_ready = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY));
                     *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY)) = 0;
                     FENCE_W();
+                    uint32_t t1 = mcycle_low();
+                    update_max_u32(
+                        (uintptr_t)BRISC_VIRTIO_STATS_BASE
+                            + STATS_OFF_MAX_TRISC1_REACTION_CYCLES,
+                        t1 - t0);
                     last_qsel[slot] = qsel;
                     if (prev_ready != 0u) {
                         inc_stat(STATS_OFF_TRISC1_SEL_RACES);
@@ -1538,5 +1565,9 @@ void trisc1_main(void) {
                 }
             }
         }
+        uint32_t outer_t1 = mcycle_low();
+        update_max_u32(
+            (uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_MAX_TRISC1_OUTER_CYCLES,
+            outer_t1 - outer_t0);
     }
 }

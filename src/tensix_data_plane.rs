@@ -364,6 +364,8 @@ fn run_poll_loop(
     let mut last_kick_drops: u32 = 0;
     let mut last_sel_ready_races: u32 = 0;
     let mut last_trisc1_sel_races: u32 = 0;
+    let mut last_max_trisc1_reaction_cycles: u32 = 0;
+    let mut last_max_trisc1_outer_cycles: u32 = 0;
     let mut last_ready_capture_sel_races: u32 = 0;
     let mut last_queue_setups: u32 = 0;
     let mut last_queue_teardowns: u32 = 0;
@@ -654,6 +656,29 @@ fn run_poll_loop(
                 trisc1_sel_races
             );
             last_trisc1_sel_races = trisc1_sel_races;
+        }
+        let max_trisc1_reaction =
+            engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAX_TRISC1_REACTION_CYCLES);
+        if max_trisc1_reaction > last_max_trisc1_reaction_cycles {
+            crate::dlog!(
+                "[trisc1-timing] new max reaction cycles (SEL observed → READY=0 \
+                 published): {} cycles (~{} ns) — high values point at L1 bank \
+                 contention with concurrent BRISC writes (#156)",
+                max_trisc1_reaction,
+                max_trisc1_reaction * 1000 / 1350
+            );
+            last_max_trisc1_reaction_cycles = max_trisc1_reaction;
+        }
+        let max_trisc1_outer =
+            engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAX_TRISC1_OUTER_CYCLES);
+        if max_trisc1_outer > last_max_trisc1_outer_cycles {
+            crate::dlog!(
+                "[trisc1-timing] new max outer-iter cycles (full TRISC1 sweep): \
+                 {} cycles (~{} ns); per-slot revisit ≈ this / num_active_slots",
+                max_trisc1_outer,
+                max_trisc1_outer * 1000 / 1350
+            );
+            last_max_trisc1_outer_cycles = max_trisc1_outer;
         }
         // #124 timing probe. Log on ratchet-up only (each new max
         // since last log). 1.35 GHz BRISC ≈ 0.74 ns/cycle, so cycle

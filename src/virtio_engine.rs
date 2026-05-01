@@ -230,6 +230,20 @@ pub const STATS_OFF_DEV_FEAT_SEL_CHANGES: u32 = 0x058;
 ///     the per-iter failure rate; the next-step diagnosis lives in
 ///     #156 if and when the silent loss needs to be triangulated.
 pub const STATS_OFF_TRISC1_SEL_RACES: u32 = 0x05c;
+/// #156 TRISC1 timing diagnostics. Cycles at the BRISC clock — divide
+/// by 1.35 to get nanoseconds at MAX_AI_CLK.
+///
+/// `MAX_TRISC1_REACTION_CYCLES`: max time from "TRISC1 observed SEL
+/// change" to "READY=0 published with FENCE_W." Measures TRISC1's
+/// per-event critical path INCLUDING any L1 bank arbitration stall
+/// against concurrent BRISC writes. If this stays around ~10-15
+/// cycles in steady state but ratchets up to 50+ during cycle-test,
+/// L1 bank contention is real.
+///
+/// `MAX_TRISC1_OUTER_CYCLES`: max time for one full sweep across
+/// active virtio slots. Per-slot revisit time = this / num_active.
+pub const STATS_OFF_MAX_TRISC1_REACTION_CYCLES: u32 = 0x060;
+pub const STATS_OFF_MAX_TRISC1_OUTER_CYCLES: u32 = 0x064;
 /// Sweep-cycle histogram. Each bucket counts iterations whose sweep
 /// fell in the bucket's range (in BRISC cycles). Useful for
 /// distinguishing typical sweep cost from one-shot outliers like
