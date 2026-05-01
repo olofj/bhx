@@ -833,11 +833,18 @@ fn main() -> std::process::ExitCode {
             // the boot flow as if the operator had typed
             // `--disk <full-path>`. clap's `conflicts_with = "disk"`
             // already enforces mutual exclusion.
-            let disk_arg: Option<String> = match (cli.image.as_deref(), cli.disk) {
-                (Some(_), Some(_)) => unreachable!("clap conflicts_with"),
-                (Some(name), None) => Some(resolve_image_name(name)?),
-                (None, d) => d,
-            };
+            //
+            // Also remember which arrow we took so the eprintln below
+            // can mirror the cloud-init seed line and tell the operator
+            // exactly which file is being attached as the rootfs.
+            let (disk_arg, disk_source): (Option<String>, &'static str) =
+                match (cli.image.as_deref(), cli.disk) {
+                    (Some(_), Some(_)) => unreachable!("clap conflicts_with"),
+                    (Some(name), None) => (Some(resolve_image_name(name)?), "image"),
+                    (None, Some(p)) => (Some(p), "--disk"),
+                    (None, None) => (None, "default in cwd"),
+                };
+            let image_name_for_print = cli.image.clone();
             if let Some(profile_name) = profile {
                 run_boot_via_profile(
                     card,
@@ -897,6 +904,13 @@ fn main() -> std::process::ExitCode {
             // Print what we're attaching (or not) so the operator
             // isn't surprised by an invisible 2nd virtio-blk slot,
             // or by a missing one if they expected the auto-attach.
+            if let Some(p) = disk.as_deref() {
+                let source = match (disk_source, image_name_for_print.as_deref()) {
+                    ("image", Some(name)) => format!("image: {}", name),
+                    (s, _) => s.to_string(),
+                };
+                eprintln!("Disk: {} ({})", p, source);
+            }
             match (&cloud_init, cloud_init_source) {
                 (Some(p), src) => eprintln!("Cloud-init seed: {} ({})", p, src),
                 (None, "no seed found") if disk.is_some() => {
