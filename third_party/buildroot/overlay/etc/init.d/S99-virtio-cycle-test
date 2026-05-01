@@ -19,6 +19,7 @@
 # Tunable via VIRTIO_CYCLE_N env var (default 2000).
 
 N=${VIRTIO_CYCLE_N:-2000}
+SETTLE=${VIRTIO_CYCLE_SETTLE:-30}
 LOG=/root/bhx-cycle.log  # buildroot's /var/log → /tmp = tmpfs (wiped on poweroff); use /root which is on the persistent ext4
 
 mkdir -p "$(dirname "$LOG")"
@@ -26,6 +27,14 @@ mkdir -p "$(dirname "$LOG")"
 
 # All `say` writes go to BOTH stdout (= hvc0) and $LOG.
 say() { echo "$*" | tee -a "$LOG"; }
+
+# Settle before hammering: when running this on multiple L2CPUs in
+# parallel for #156 dual-guest stress, both guests need to be fully
+# booted (kernel + userspace + virtio-net DRIVER_OK) before either
+# starts the unbind/bind storm. Otherwise the slower guest's initial
+# boot probe races against the faster guest's hammer and misclassifies.
+say "BHX_CYCLE_SETTLE waiting ${SETTLE}s"
+sleep "$SETTLE"
 
 say "BHX_CYCLE_START n=$N"
 
