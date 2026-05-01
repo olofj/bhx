@@ -40,6 +40,7 @@ use std::io;
 use std::mem::ManuallyDrop;
 use std::os::unix::io::RawFd;
 use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::chip;
 use crate::clock::{self, PllAccess};
@@ -62,6 +63,23 @@ const ARC_RESET_WINDOW_SIZE: u64 = 0x20_0000;
 
 /// `L2CPU_RESET` lives in the reset unit at this address.
 const L2CPU_RESET_ADDR: u64 = 0x8003_0014;
+
+/// `arc_ss.reset_unit.SCRATCH_RAM[2]` — ARC firmware writes the
+/// `boot_status_0` word here as it progresses through init. Bits 1..2
+/// encode init status (0=NotStarted, 1=Started, 2=Done, 3=Error); used
+/// by `wait_arc_fw_ready_inner` to gate the post-reset path on ARC FW
+/// finishing GDDR PHY power-up + DRAM training. Mirrors luwen
+/// `crates/luwen-api/src/chip/blackhole.rs::arc_fw_init_status`.
+const ARC_BOOT_STATUS_0_ADDR: u64 = 0x8003_0408;
+
+/// How long to wait for ARC FW to reach `Done` after a PCIe reset
+/// before giving up and proceeding anyway. Empirically the chip
+/// finishes well under a second — 5 s is generous headroom.
+const ARC_FW_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll cadence while waiting for ARC FW ready. 10 ms keeps the
+/// overall wait close to actual completion without spinning.
+const ARC_FW_READY_POLL: Duration = Duration::from_millis(10);
 
 /// ARC CSM RAM is at `0x1000_0000` on tile (8,0). The ARC firmware
 /// telemetry table lives somewhere in here (its base address is read
@@ -317,17 +335,62 @@ impl SharedChip {
     /// our persistent window + fd before issuing the reset and reopen fresh
     /// after. Takes the write lock so no concurrent reader sees a torn state.
     ///
-    /// Caller is responsible for the usual post-reset sleep (~1 s) for the
-    /// chip to re-initialize. Not baked in so callers can pipeline other
-    /// setup against it.
+    /// After reopen, polls ARC FW init status (boot_status_0) until it
+    /// reports Done — that's how UMD waits for ARC FW boot, GDDR PHY
+    /// power-up, and DRAM training to all finish before anyone touches
+    /// the chip. Replaces the historical fixed 1 s post-reset sleep.
     pub fn reset_board(&self, card: u32) -> io::Result<()> {
         let mut guard = self.inner.write().unwrap();
         // Drop the existing Inner (window's FREE_TLB + close fd) BEFORE the
         // reset, so the kmd doesn't see stale references mid-reset.
         drop(guard.take());
         chip::reset_board(card)?;
-        *guard = Some(Self::open_inner(card)?);
+        let inner = Self::open_inner(card)?;
+        Self::wait_arc_fw_ready_inner(&inner);
+        *guard = Some(inner);
         Ok(())
+    }
+
+    /// Poll ARC FW init status on a freshly-opened `Inner`. Reads
+    /// `boot_status_0` directly off the reset window (we already hold
+    /// the `RwLock` write guard around the caller, so we can't go
+    /// through `arc_read32`). Bails out on `Done` or `Error`; warns and
+    /// returns on timeout so a future ARC FW that changes the protocol
+    /// can't permanently wedge the daemon.
+    fn wait_arc_fw_ready_inner(inner: &Inner) {
+        let off = ARC_BOOT_STATUS_0_ADDR - ARC_RESET_WINDOW_BASE;
+        let start = Instant::now();
+        let deadline = start + ARC_FW_READY_TIMEOUT;
+        loop {
+            let bs0 = inner.reset_window.read32(off);
+            match (bs0 >> 1) & 0x3 {
+                2 => {
+                    crate::dlog!(
+                        "[shared-chip] ARC FW init Done after {:?} (boot_status_0={:#010x})",
+                        start.elapsed(),
+                        bs0
+                    );
+                    return;
+                }
+                3 => {
+                    crate::dlog!(
+                        "[shared-chip] warning: ARC FW init Error after {:?} (boot_status_0={:#010x}); proceeding",
+                        start.elapsed(),
+                        bs0
+                    );
+                    return;
+                }
+                _ if Instant::now() >= deadline => {
+                    crate::dlog!(
+                        "[shared-chip] warning: timed out waiting for ARC FW init Done after {:?} (boot_status_0={:#010x}); proceeding",
+                        start.elapsed(),
+                        bs0
+                    );
+                    return;
+                }
+                _ => std::thread::sleep(ARC_FW_READY_POLL),
+            }
+        }
     }
 }
 

@@ -1157,14 +1157,12 @@ fn run_boot_sequence(
         let _ = state.kick_poller.lock_or_internal_error()?.take();
         let _ = state.tensix_engine.lock_or_internal_error()?.take();
         // SharedChip::reset_board internally drops its fd+window, issues the
-        // PCIe LDS reset, and reopens fresh — callers never see stale fd
-        // errors across the reset.
+        // PCIe LDS reset, reopens fresh, and polls ARC FW init status until
+        // Done (GDDR PHY + DRAM training complete) — callers never see stale
+        // fd errors across the reset, and the wait scales to actual chip
+        // readiness instead of a fixed 1 s sleep.
         state.shared_chip.reset_board(card)?;
-        dlog!(
-            "[run_boot l2cpu {}] board reset complete; sleeping 1s",
-            l2cpu_idx
-        );
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        dlog!("[run_boot l2cpu {}] board reset complete", l2cpu_idx);
     } else {
         dlog!(
             "[run_boot l2cpu {}] target held in reset; skipping board reset (siblings untouched)",
