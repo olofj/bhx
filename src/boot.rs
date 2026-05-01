@@ -235,6 +235,7 @@ pub struct VirtioMmioNode {
 /// region, and four virtio MMIO nodes under `/soc`. `mem_end` is computed by
 /// the caller from the target L2CPU's `starting_address + memory_size` so we
 /// don't depend on being able to parse every vendor's memory-node naming.
+#[allow(clippy::too_many_arguments)]
 pub fn modify_dtb(
     dtb_bytes: &[u8],
     boot_device: &BootDevice,
@@ -243,6 +244,7 @@ pub fn modify_dtb(
     virtio_nodes: &[VirtioMmioNode],
     uart_addr: Option<u64>,
     virtio_console_attached: bool,
+    shutdown_addr: Option<u64>,
 ) -> crate::Result<Vec<u8>> {
     let mem_end = mem_start + mem_size;
     crate::dlog!(
@@ -437,6 +439,53 @@ pub fn modify_dtb(
         fdt.setprop_u32(node, "interrupt-parent", plic_phandle)?;
     }
 
+    // /soc/syscon@<addr> + root-level /poweroff (#94). Tells OpenSBI
+    // generic's `fdt_reset_syscon` driver where to write the magic
+    // value on SBI SRST. Without this, SRST falls through to
+    // `sbi_hart_hang()` and the L2CPU spins in WFI — the daemon never
+    // finds out the guest has stopped.
+    //
+    // The syscon node is a generic memory-mapped register file; the
+    // poweroff child references it by phandle and supplies the offset
+    // + value pair. Same shape as upstream Linux DT bindings under
+    // Documentation/devicetree/bindings/power/reset/syscon-poweroff.yaml.
+    if let Some(addr) = shutdown_addr {
+        use crate::regs::shutdown::{MAGIC_POWEROFF, OFF_COMMAND, REG_FILE_SIZE};
+        let name = format!("syscon@{:x}", addr);
+        crate::dlog!(
+            "[modify_dtb]   adding /soc/{} size={:#x} (guest-OS shutdown)",
+            name,
+            REG_FILE_SIZE,
+        );
+        let syscon_node = fdt.add_subnode(soc, &name)?;
+        // "syscon" + "simple-mfd" lets Linux's syscon driver bind and
+        // the simple-mfd-syscon glue let child nodes (poweroff,
+        // reboot) reference the regmap. OpenSBI matches "syscon" alone.
+        // DT compatible-with-multiple-strings is concatenated NUL-
+        // terminated strings; libfdt has no setprop_string_list, so
+        // we hand-pack.
+        let compat = b"syscon\0simple-mfd\0";
+        fdt.setprop(syscon_node, "compatible", compat)?;
+        let mut reg = Vec::with_capacity(16);
+        reg.extend_from_slice(&addr.to_be_bytes());
+        reg.extend_from_slice(&REG_FILE_SIZE.to_be_bytes());
+        fdt.setprop(syscon_node, "reg", &reg)?;
+        let syscon_phandle = fdt.find_max_phandle()? + 1;
+        fdt.setprop_u32(syscon_node, "phandle", syscon_phandle)?;
+
+        let pof = fdt.add_subnode(0, "poweroff")?;
+        fdt.setprop_string(pof, "compatible", "syscon-poweroff")?;
+        fdt.setprop_u32(pof, "regmap", syscon_phandle)?;
+        fdt.setprop_u32(pof, "offset", OFF_COMMAND as u32)?;
+        fdt.setprop_u32(pof, "value", MAGIC_POWEROFF)?;
+        crate::dlog!(
+            "[modify_dtb]   added /poweroff -> syscon phandle={} offset={:#x} value={:#x}",
+            syscon_phandle,
+            OFF_COMMAND,
+            MAGIC_POWEROFF,
+        );
+    }
+
     let packed = fdt.pack()?;
     crate::dlog!("[modify_dtb] packed DTB {} bytes", packed.len());
     Ok(packed)
@@ -494,7 +543,17 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x8000_0000u64; // 2 GiB
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(read_memory_reg(&out, mem_start), (mem_start, mem_size));
     }
 
@@ -508,7 +567,17 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let override_size = 0x4000_0000u64; // 1 GiB instead of physical 4 GiB
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, override_size, &[], None, true).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            override_size,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(read_memory_reg(&out, mem_start), (mem_start, override_size));
     }
 
@@ -523,7 +592,17 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x1_0000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
 
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let path = format!("/reserved-memory/opensbi@{:x}", mem_start);
@@ -552,7 +631,17 @@ mod tests {
         let mem_start = 0x4000_b000_0000u64;
         let mem_size = 0x8000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(read_memory_reg(&out, mem_start), (mem_start, mem_size));
 
         let fdt = Fdt::open_into(&out, 0).unwrap();
@@ -577,6 +666,7 @@ mod tests {
             &[],
             None,
             true,
+            None,
         )
         .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
@@ -606,6 +696,7 @@ mod tests {
             &[],
             None,
             true,
+            None,
         )
         .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
@@ -628,7 +719,17 @@ mod tests {
         let expected_base = mem_end - crate::regs::virtio_mmio::RESERVED_SIZE;
 
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let res = fdt
             .path_offset("/reserved-memory/memory@4000afa00000")
@@ -664,7 +765,17 @@ mod tests {
                 irq: DISK_IRQ - i as u32,
             })
             .collect();
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &nodes, None, true).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &nodes,
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
 
         for spec in &nodes {
@@ -695,7 +806,17 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x1_0000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, false).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let chosen = fdt.path_offset("/chosen").unwrap().unwrap();
         let args = fdt.getprop(chosen, "bootargs").unwrap();
@@ -730,7 +851,17 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x1_0000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         for i in 0..4u64 {
             let addr = mem_start + mem_size - crate::regs::virtio_mmio::MMIO_SLOT_SIZE * (i + 1);

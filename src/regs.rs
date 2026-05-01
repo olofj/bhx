@@ -151,6 +151,58 @@ pub mod virtio_mmio {
     pub const VIRTIO_ID_ENTROPY: u32 = 4;
 }
 
+/// Guest-OS shutdown signalling (#94). One u32 register per L2CPU in
+/// BRISC L1, exposed to the guest via the existing engine TLB window
+/// at a fixed offset. OpenSBI's `fdt_reset_syscon` driver writes a
+/// magic value here on SBI SRST; BRISC observes the write and pushes
+/// a kick-ring entry with a reserved slot id.
+///
+/// Mirrors `brisc-firmware/include/shutdown_layout.h`.
+pub mod shutdown {
+    /// Engine-base-relative offset at which each L2CPU sees its own
+    /// shutdown command register. Matches
+    /// `BRISC_SHUTDOWN_OFFSET_FROM_ENGINE_BASE` in the firmware.
+    pub const OFFSET_FROM_ENGINE_BASE: u64 = 0x0005_0000;
+    /// Region size to expose in the DT `syscon` node. Generous so a
+    /// future `reboot` cell at offset 0x4 doesn't need a DT change.
+    pub const REG_FILE_SIZE: u64 = 0x0000_0010;
+    /// Offset within the per-L2CPU shutdown reg file for the command
+    /// cell. Today the only cell.
+    pub const OFF_COMMAND: u64 = 0x00;
+
+    /// Magic value the guest writes to request poweroff.
+    pub const MAGIC_POWEROFF: u32 = 0x5AFE_DEAD;
+    /// Magic value the guest writes to request reboot. Recognized by
+    /// BRISC firmware today (kicks with kind=1) but the daemon-side
+    /// dispatch lands in the reboot follow-up.
+    pub const MAGIC_REBOOT: u32 = 0xB007_BEEF;
+    /// Sentinel "no pending command." BRISC writes this back after
+    /// firing a kick so the next sweep doesn't re-fire on the same
+    /// guest write.
+    pub const SENTINEL: u32 = 0;
+
+    /// Reserved kick-ring slot ids: one per L2CPU at slots 20..23.
+    /// Disjoint from virtio (0..15) and UART (16..19).
+    pub const SLOT_BASE: u32 = 20;
+    pub const NUM_SLOTS: u32 = 4;
+
+    /// Convert a kick-ring slot id back to its L2CPU index. Returns
+    /// `None` for slots outside the shutdown range.
+    pub fn l2cpu_for_slot(slot: u32) -> Option<u8> {
+        if (SLOT_BASE..SLOT_BASE + NUM_SLOTS).contains(&slot) {
+            Some((slot - SLOT_BASE) as u8)
+        } else {
+            None
+        }
+    }
+
+    /// Kick `queue_idx` value the BRISC firmware sets when reporting
+    /// a poweroff vs reboot magic write. Must match the firmware's
+    /// `kind` decoding in `poll_shutdown_slots`.
+    pub const KIND_POWEROFF: u16 = 0;
+    pub const KIND_REBOOT: u16 = 1;
+}
+
 /// Slirp host-side port allocation for SSH forwarding to the guest.
 pub mod slirp {
     /// Base host port for the SSH forward of L2CPU 0 on card 0.

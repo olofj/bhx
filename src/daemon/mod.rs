@@ -193,6 +193,13 @@ pub struct DaemonState {
     /// per-(slot, queue) device handler. Lifetime tied to
     /// `DaemonState`: dropped on daemon shutdown.
     pub kick_poller: Mutex<Option<crate::tensix_data_plane::KickPoller>>,
+    /// Sender end of the guest-poweroff channel (#94). The kick poller
+    /// clones this when it's spawned and pushes l2cpu_idx values when
+    /// BRISC reports a guest SBI SRST. Receiver lives in
+    /// `guest_poweroff_rx` and is taken once by the handler thread
+    /// spawned in `server::serve`.
+    pub guest_poweroff_tx: std::sync::mpsc::Sender<u8>,
+    pub guest_poweroff_rx: Mutex<Option<std::sync::mpsc::Receiver<u8>>>,
     /// Set by the shutdown handler to make the accept loop exit.
     pub shutdown: Arc<AtomicBool>,
 }
@@ -241,6 +248,7 @@ impl DaemonState {
     /// and passes an `Arc` in here; tests pass a placeholder (see
     /// `SharedChip::placeholder`) so `DaemonState::new` stays hardware-free.
     pub fn new(card: u32, shared_chip: Arc<SharedChip>) -> Self {
+        let (guest_poweroff_tx, guest_poweroff_rx) = std::sync::mpsc::channel();
         DaemonState {
             card,
             started: Instant::now(),
@@ -259,6 +267,8 @@ impl DaemonState {
             shared_chip,
             tensix_engine: Mutex::new(None),
             kick_poller: Mutex::new(None),
+            guest_poweroff_tx,
+            guest_poweroff_rx: Mutex::new(Some(guest_poweroff_rx)),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -280,8 +290,12 @@ impl DaemonState {
         // events the BRISC firmware produces. The poller's thread
         // holds its own clone of the Arc; the engine outlives the
         // poller because the poller's drop joins its thread before
-        // releasing the reference.
-        let poller = crate::tensix_data_plane::KickPoller::spawn(Arc::clone(&arc));
+        // releasing the reference. Also clone our guest-poweroff
+        // sender so the poller can route #94 shutdown kicks back.
+        let poller = crate::tensix_data_plane::KickPoller::spawn(
+            Arc::clone(&arc),
+            self.guest_poweroff_tx.clone(),
+        );
         *self.kick_poller.lock().unwrap() = Some(poller);
         *guard = Some(Arc::clone(&arc));
         Ok(arc)
@@ -304,7 +318,10 @@ impl DaemonState {
         }
         let eng = crate::tensix_engine::TensixEngine::adopt_running(self.card, &self.shared_chip)?;
         let arc = Arc::new(eng);
-        let poller = crate::tensix_data_plane::KickPoller::spawn(Arc::clone(&arc));
+        let poller = crate::tensix_data_plane::KickPoller::spawn(
+            Arc::clone(&arc),
+            self.guest_poweroff_tx.clone(),
+        );
         *self.kick_poller.lock().unwrap() = Some(poller);
         *guard = Some(arc);
         Ok(())

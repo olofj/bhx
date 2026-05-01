@@ -158,6 +158,12 @@ pub struct KickPoller {
     pub stats: Arc<PollerStats>,
     pub registry: Registry,
     pub uart_registry: UartRegistry,
+    /// Set of L2CPU indices whose shutdown slot is active. Mirrors the
+    /// per-(card, l2cpu) boot lifecycle: registered on successful boot,
+    /// unregistered on slot teardown. Drives bits 20..23 of the active-
+    /// slots bitmap so BRISC only polls shutdown registers for booted
+    /// L2CPUs. (#94)
+    shutdown_registry: Arc<Mutex<std::collections::HashSet<u8>>>,
     /// Cloned for register/unregister to push the active-slots
     /// bitmap into BRISC L1 — BRISC uses it to skip non-active
     /// slots in its sweep. Without this, BRISC polls all 16 slots
@@ -172,10 +178,22 @@ impl KickPoller {
     /// Spawn the poll thread. Returns immediately; the thread runs
     /// until [`KickPoller::shutdown`] is called or the
     /// `KickPoller` is dropped.
-    pub fn spawn(engine: Arc<TensixEngine>) -> Self {
+    ///
+    /// `guest_poweroff_tx` carries #94 shutdown events from the kick
+    /// loop: when the firmware reports a kick on slots 20..23 (the
+    /// reserved shutdown range, see `regs::shutdown::SLOT_BASE`), the
+    /// poll loop sends the L2CPU index over this channel. The
+    /// receiver side lives on `DaemonState::guest_poweroff_rx`,
+    /// drained by a handler thread the server spawns at startup.
+    pub fn spawn(
+        engine: Arc<TensixEngine>,
+        guest_poweroff_tx: std::sync::mpsc::Sender<u8>,
+    ) -> Self {
         let stats = Arc::new(PollerStats::default());
         let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
         let uart_registry: UartRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let shutdown_registry: Arc<Mutex<std::collections::HashSet<u8>>> =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
         let exit = Arc::new(AtomicBool::new(false));
         let stats_thread = Arc::clone(&stats);
         let registry_thread = Arc::clone(&registry);
@@ -191,6 +209,7 @@ impl KickPoller {
                     registry_thread,
                     uart_registry_thread,
                     exit_thread,
+                    guest_poweroff_tx,
                 )
             })
             .expect("spawn tensix-kick-poller");
@@ -198,17 +217,20 @@ impl KickPoller {
             stats,
             registry,
             uart_registry,
+            shutdown_registry,
             engine,
             exit,
             join: Some(join),
         }
     }
 
-    /// Recompute the active-slots bitmap from the virtio + UART
-    /// registries and write it into BRISC L1 at CTRL_OFF_ACTIVE_SLOTS.
-    /// BRISC reads this on every sweep iteration; bit `i` set means
-    /// "poll slot `i`." Virtio slots live in 0..16; UART slots live
-    /// at `uart::UART_SLOT_BASE` + l2cpu_idx (16..20).
+    /// Recompute the active-slots bitmap from the virtio + UART +
+    /// shutdown registries and write it into BRISC L1 at
+    /// CTRL_OFF_ACTIVE_SLOTS. BRISC reads this on every sweep
+    /// iteration; bit `i` set means "poll slot `i`." Virtio slots
+    /// live in 0..16; UART slots at `uart::UART_SLOT_BASE` +
+    /// l2cpu_idx (16..20); #94 shutdown slots at
+    /// `regs::shutdown::SLOT_BASE` + l2cpu_idx (20..24).
     fn publish_active_mask(&self) {
         let mut mask: u32 = 0;
         for &slot in self.registry.lock().unwrap().keys() {
@@ -218,6 +240,12 @@ impl KickPoller {
         }
         for &l2cpu_idx in self.uart_registry.lock().unwrap().keys() {
             let slot = uart::slot_for_l2cpu(l2cpu_idx) as u32;
+            if slot < 32 {
+                mask |= 1u32 << slot;
+            }
+        }
+        for &l2cpu_idx in self.shutdown_registry.lock().unwrap().iter() {
+            let slot = crate::regs::shutdown::SLOT_BASE + l2cpu_idx as u32;
             if slot < 32 {
                 mask |= 1u32 << slot;
             }
@@ -264,6 +292,22 @@ impl KickPoller {
         self.publish_active_mask();
     }
 
+    /// Mark an L2CPU's #94 shutdown slot active so BRISC starts polling
+    /// the per-L2CPU shutdown command register. Called from the boot
+    /// path after the L2CPU's TLB window is programmed.
+    pub fn register_shutdown(&self, l2cpu_idx: u8) {
+        self.shutdown_registry.lock().unwrap().insert(l2cpu_idx);
+        self.publish_active_mask();
+    }
+
+    /// Clear bit `20+idx` so BRISC stops polling the shutdown register
+    /// for a torn-down L2CPU. Called from `slot.shutdown()` paths
+    /// alongside `unregister_slot` for the virtio devices.
+    pub fn unregister_shutdown(&self, l2cpu_idx: u8) {
+        self.shutdown_registry.lock().unwrap().remove(&l2cpu_idx);
+        self.publish_active_mask();
+    }
+
     /// Signal the thread to exit and join it. Idempotent.
     pub fn shutdown(&mut self) {
         self.exit.store(true, Ordering::Relaxed);
@@ -287,6 +331,7 @@ fn run_poll_loop(
     registry: Registry,
     uart_registry: UartRegistry,
     exit: Arc<AtomicBool>,
+    guest_poweroff_tx: std::sync::mpsc::Sender<u8>,
 ) {
     // Three-tier adaptive sleep mirroring `virtio::run_device`'s
     // pattern: tight FAST while traffic is flowing, SLOW when idle
@@ -378,6 +423,52 @@ fn run_poll_loop(
             let seq = raw[1];
             let epoch = raw[2];
             let _ = seq;
+
+            // #94 guest-OS shutdown: BRISC routes SBI-SRST observations
+            // to slots 20..23 (one per L2CPU). queue_idx encodes the
+            // command kind (0 = poweroff, 1 = reboot — reboot is
+            // recognized by the firmware but daemon-side dispatch is
+            // currently poweroff-only; #141 adds reboot semantics).
+            if let Some(l2cpu_idx) = crate::regs::shutdown::l2cpu_for_slot(slot as u32) {
+                match queue_idx {
+                    crate::regs::shutdown::KIND_POWEROFF => {
+                        crate::dlog!(
+                            "[kick-poller] guest poweroff for l2cpu {} (slot {})",
+                            l2cpu_idx,
+                            slot
+                        );
+                        let _ = guest_poweroff_tx.send(l2cpu_idx);
+                    }
+                    crate::regs::shutdown::KIND_REBOOT => {
+                        // Reboot semantics land in #141. Today we log
+                        // and treat as a no-op so a misbehaving guest
+                        // can't accidentally tear down its slot.
+                        crate::dlog!(
+                            "[kick-poller] guest reboot for l2cpu {} (slot {}) — \
+                             ignoring; reboot semantics tracked in #141",
+                            l2cpu_idx,
+                            slot
+                        );
+                    }
+                    other => {
+                        crate::dlog!(
+                            "[kick-poller] unknown shutdown kind {} for l2cpu {} \
+                             (slot {}); dropping",
+                            other,
+                            l2cpu_idx,
+                            slot
+                        );
+                    }
+                }
+                stats.last_kick_slot_queue.store(
+                    ((slot as u64) << 16) | (queue_idx as u64),
+                    Ordering::Relaxed,
+                );
+                stats.kicks_consumed.fetch_add(1, Ordering::Relaxed);
+                consumer = consumer.wrapping_add(1);
+                consumed_this_pass += 1;
+                continue;
+            }
 
             let mut map = registry.lock().unwrap();
             if let Some(reg) = map.get_mut(&(slot as u32)) {

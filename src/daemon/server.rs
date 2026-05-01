@@ -63,6 +63,7 @@ pub fn serve(
     let shared_chip = Arc::new(crate::shared_chip::SharedChip::new(card)?);
     let state = Arc::new(DaemonState::new(card, shared_chip));
     install_signal_handlers(state.shutdown.clone());
+    spawn_guest_poweroff_handler(Arc::clone(&state));
 
     listener.set_nonblocking(true)?;
 
@@ -984,6 +985,15 @@ fn dispatch_boot(
                 l2cpu_idx,
                 crate::uart_engine::slot_for_l2cpu(l2cpu_idx),
             );
+            // #94: arm the per-L2CPU shutdown slot so BRISC starts
+            // polling the syscon-poweroff register. Cleared on slot
+            // teardown by `unregister_engine_slots`.
+            poller.register_shutdown(l2cpu_idx);
+            dlog!(
+                "[run_boot l2cpu {}] shutdown slot: registered (slot {})",
+                l2cpu_idx,
+                crate::regs::shutdown::SLOT_BASE + l2cpu_idx as u32,
+            );
         } else {
             dlog!(
                 "[run_boot l2cpu {}] virtio-engine: engine + kick poller not up — \
@@ -1223,6 +1233,12 @@ fn run_boot_sequence(
     // probes after net so we keep DISK last.
     let mut virtio_nodes: Vec<crate::boot::VirtioMmioNode> = Vec::with_capacity(8);
     let uart_addr_for_dtb: Option<u64> = None;
+    // #94 guest-OS shutdown: hoisted out of the engine-bring-up branch
+    // because it's needed at modify_dtb call time. Set inside the
+    // bring-up block when x280_base is computed; stays None when the
+    // boot doesn't bring up the engine at all (rare — initramfs-only,
+    // no virtio devices).
+    let mut x280_base_for_shutdown: Option<u64> = None;
 
     let any_host_device = has_rng || has_network || has_disk || has_console || has_cidata;
 
@@ -1245,6 +1261,7 @@ fn run_boot_sequence(
             e
         })?;
         let x280_base = engine.program_l2cpu_tlb(&l2cpu, l2cpu_idx as u32)?;
+        x280_base_for_shutdown = Some(x280_base);
         dlog!(
             "[run_boot l2cpu {}] L2CPU TLB → tensix tile NOC0 ({}, {}) translated \
              ({}, {}); per-L2CPU window x280_base={:#x}",
@@ -1342,6 +1359,12 @@ fn run_boot_sequence(
         virtio_nodes.len(),
         uart_addr_for_dtb,
     );
+    // #94 guest-OS shutdown: per-L2CPU shutdown command register sits
+    // at a fixed offset within the engine TLB window. Compute the PA
+    // and pass to modify_dtb so the DT carries `/soc/syscon@<addr>`
+    // + `/poweroff` nodes pointing at it.
+    let shutdown_addr =
+        x280_base_for_shutdown.map(|b| b + crate::regs::shutdown::OFFSET_FROM_ENGINE_BASE);
     let dtb_patched = boot::modify_dtb(
         &dtb_raw,
         &boot_device,
@@ -1350,6 +1373,7 @@ fn run_boot_sequence(
         &virtio_nodes,
         uart_addr_for_dtb,
         has_console,
+        shutdown_addr,
     )?;
 
     let initramfs_pb = initramfs.map(std::path::PathBuf::from);
@@ -2076,39 +2100,105 @@ fn unregister_engine_slots(state: &Arc<DaemonState>, l2cpu_idx: u8) {
             poller.unregister_slot(base + dev_idx);
         }
         poller.unregister_uart(l2cpu_idx);
+        poller.unregister_shutdown(l2cpu_idx);
     }
 }
 
 fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) -> crate::Result<()> {
     dlog!("[stop l2cpu {}] dispatch_stop entry", l2cpu_idx);
+    match internal_stop(state, l2cpu_idx, "client-requested")? {
+        true => {
+            reply_ok(sock);
+            Ok(())
+        }
+        false => Err(crate::Error::slot_state(format!(
+            "l2cpu {} is not booted",
+            l2cpu_idx
+        ))),
+    }
+}
+
+/// Spawn the guest-poweroff handler thread (#94). Takes the receiver
+/// off `state.guest_poweroff_rx`, then loops forever consuming
+/// l2cpu_idx values pushed by the kick poller and tearing down the
+/// matching slot via `internal_stop`. Exits when the channel closes
+/// (i.e. all senders are dropped — happens when the daemon is on its
+/// way out and the kick poller has been shut down).
+fn spawn_guest_poweroff_handler(state: Arc<DaemonState>) {
+    let rx = match state.guest_poweroff_rx.lock_or_internal_error() {
+        Ok(mut g) => g.take(),
+        Err(e) => {
+            dlog!("[guest-poweroff] failed to acquire rx mutex: {}", e);
+            return;
+        }
+    };
+    let Some(rx) = rx else {
+        dlog!("[guest-poweroff] handler already running; not spawning a second");
+        return;
+    };
+    std::thread::Builder::new()
+        .name("guest-poweroff-handler".to_string())
+        .spawn(move || {
+            for l2cpu_idx in rx {
+                dlog!(
+                    "[guest-poweroff] received SRST_SHUTDOWN for l2cpu {}",
+                    l2cpu_idx
+                );
+                match internal_stop(&state, l2cpu_idx, "guest SRST_SHUTDOWN") {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        dlog!(
+                            "[guest-poweroff] l2cpu {} not booted on event arrival; ignoring",
+                            l2cpu_idx
+                        );
+                    }
+                    Err(e) => {
+                        dlog!(
+                            "[guest-poweroff] internal_stop l2cpu {} failed: {}",
+                            l2cpu_idx,
+                            e
+                        );
+                    }
+                }
+            }
+            dlog!("[guest-poweroff] receiver closed; handler exiting");
+        })
+        .expect("spawn guest-poweroff-handler");
+}
+
+/// Tear down an L2CPU slot. Called from both the client-driven
+/// `dispatch_stop` and the daemon-internal #94 guest-poweroff handler.
+/// Returns `Ok(true)` if a slot was present and torn down, `Ok(false)`
+/// if no slot was booted at the time of call. The `reason` string
+/// goes into the dlog for triage — distinguishes "user typed
+/// `bhx daemon stop`" from "guest issued SBI SRST_SHUTDOWN".
+pub(crate) fn internal_stop(
+    state: &Arc<DaemonState>,
+    l2cpu_idx: u8,
+    reason: &str,
+) -> crate::Result<bool> {
     validate_l2cpu(l2cpu_idx)?;
     let taken = state.l2cpus[l2cpu_idx as usize]
         .lock_or_internal_error()?
         .take();
     match taken {
         Some(slot) => {
-            dlog!("[stop l2cpu {}] slot taken; joining workers", l2cpu_idx);
-            // Surface the stop to any attached `bhx connect` first —
-            // without this they see no chip output, no EOF, no signal
-            // at all (#97).
+            dlog!(
+                "[stop l2cpu {}] {} — slot taken; joining workers",
+                l2cpu_idx,
+                reason
+            );
             slot.console_hub
-                .disconnect_all_with_reason(&format!("l2cpu {} stopped", l2cpu_idx));
+                .disconnect_all_with_reason(&format!("l2cpu {} stopped ({})", l2cpu_idx, reason));
             unregister_engine_slots(state, l2cpu_idx);
             slot.shutdown();
-            // If this was the last booted slot on the card, step the
-            // L2CPU PLL down to its idle setpoint — the next boot's
-            // reset_x280 brings it back up automatically (#95).
             state.maybe_idle_pll();
-            dlog!("[stop l2cpu {}] workers joined — replying ok", l2cpu_idx);
-            reply_ok(sock);
-            Ok(())
+            dlog!("[stop l2cpu {}] {} — workers joined", l2cpu_idx, reason);
+            Ok(true)
         }
         None => {
-            dlog!("[stop l2cpu {}] no slot present — replying err", l2cpu_idx);
-            Err(crate::Error::slot_state(format!(
-                "l2cpu {} is not booted",
-                l2cpu_idx
-            )))
+            dlog!("[stop l2cpu {}] {} — no slot present", l2cpu_idx, reason);
+            Ok(false)
         }
     }
 }
