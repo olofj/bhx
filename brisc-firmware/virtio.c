@@ -194,6 +194,15 @@
 // overlap the SEL→READY race window). This is the race-relevant
 // number; the original max stays for context.
 #define STATS_OFF_MAX_STEADY_SWEEP_CYCLES 0x068
+// #155 BRISC OLD-sel rescue at SEL change. When BRISC observes a
+// SEL change but `handle_queue_ready_change` never fired for the
+// old sel (kernel raced past in vm_setup_vq's
+// `setup; READY=1; SEL=N+1` sequence), BRISC snapshots the visible
+// regs (still holding kernel's last writes for old sel) into
+// shadow_q[old_sel] BEFORE the shadow swap overwrites visible NUM.
+// Lives on BRISC's main loop, not TRISC1's hot path, so it doesn't
+// slow the SEL→READY race response.
+#define STATS_OFF_BRISC_OLD_SEL_RESCUE    0x06c
 
 #define STATS_MAGIC_LOADED        0x0000B155u
 
@@ -503,7 +512,7 @@ static inline void inc_stat(unsigned off) {
 // follow-up reads. Here BRISC's writes land in L1 directly, the
 // guest's next NoC read picks them up, and there's no cache or store
 // buffer in between.
-static void handle_queue_sel_change(unsigned slot, uint32_t sel) {
+static void handle_queue_sel_change(unsigned slot, uint32_t old_sel, uint32_t sel) {
     // Out-of-range queue index: leave the visible regs as-is. The
     // guest is choosing a queue we don't expose; whatever it reads
     // back is fine — just don't touch shadow with an OOB index.
@@ -516,20 +525,10 @@ static void handle_queue_sel_change(unsigned slot, uint32_t sel) {
     // duration BRISC holds the kernel waiting after its writel(SEL).
     uint32_t t0 = mcycle_low();
 
-    // Clear visible QUEUE_READY=0 FIRST, before anything else, to
-    // minimize the time from "BRISC observed new SEL" to "QUEUE_READY=0
-    // is visible to the kernel." Stock Linux's vm_setup_vq for queue
-    // N+1 starts with `writel(SEL=N+1); readl(QUEUE_READY)` expecting
-    // 0; if we don't beat the kernel's readl with this clear, it sees
-    // stale 1 and bails with -ENOENT. NUM_MAX/NUM updates and the
-    // race-counter bookkeeping happen after the fence — they're not
-    // on the critical path for the kernel's readl response.
-    //
-    // Sample the prior READY value first so we can count the race
-    // window: if it was 1, BRISC is processing the SEL change AFTER
-    // the previous queue was set up. Daemon surfaces this counter;
-    // non-zero means our sweep is borderline even if no race lost in
-    // this run.
+    // Clear visible QUEUE_READY=0 FIRST. BRISC's main-loop sweep is
+    // slow (~1 µs); TRISC1's tight SEL-watch (#125) usually beats us
+    // here. Either way, an idempotent clear is safe — at worst the
+    // value was already 0.
     uint32_t prev_ready = *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY));
     *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_READY)) = 0;
     FENCE_W();
@@ -537,6 +536,57 @@ static void handle_queue_sel_change(unsigned slot, uint32_t sel) {
     uint32_t t1 = mcycle_low();
     update_max_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_MAX_SEL_PATH_CYCLES,
                    t1 - t0);
+
+    // RESCUE for #155 — if `handle_queue_ready_change` never observed
+    // OLD sel's READY=1 transition (kernel raced past in
+    // `vm_setup_vq`'s `setup; READY=1; SEL=N+1` sequence), the
+    // shadow for OLD sel is stale. The visible registers right now
+    // still hold the kernel's last writes for OLD sel — the shadow
+    // swap (NUM_MAX/NUM update below) is the first thing that would
+    // overwrite them, and the kernel's NEW-sel setup writes (NUM=...)
+    // typically take microseconds because the kernel allocates
+    // virtqueue buffers between the SEL=N+1 write and the NUM
+    // write. So this is a wide window where the visible regs are
+    // both readable and authoritative for OLD sel.
+    //
+    // Gate on shadow_q[old_sel].READY==0 (no successful capture
+    // yet) so we don't clobber a good capture. `sel_post == sel`
+    // catches the rare race where the kernel slipped a NEW-sel
+    // setup write in between our reads.
+    //
+    // Lives on BRISC's main loop (not TRISC1's hot path) so the
+    // ~150 ns of work doesn't slow TRISC1's READY=0 race response.
+    if (old_sel < BRISC_VIRTIO_MAX_QUEUES) {
+        uint32_t shadow_ready =
+            *l1_u32(shadow_queue_addr(slot, old_sel, SHADOW_Q_OFF_READY));
+        if (shadow_ready == 0u) {
+            uint32_t cap0 = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NUM));
+            uint32_t cap1 = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_DESC_LOW));
+            uint32_t cap2 = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_DESC_HIGH));
+            uint32_t cap3 = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_DRIVER_LOW));
+            uint32_t cap4 = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_DRIVER_HIGH));
+            uint32_t cap5 = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_DEVICE_LOW));
+            uint32_t cap6 = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_DEVICE_HIGH));
+            uint32_t sel_post = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_SEL));
+            // cap0 (NUM) being nonzero is a sanity check: a fresh
+            // queue with no kernel writes has NUM=0, and committing
+            // that to shadow would set up a 0-element ring.
+            if (sel_post == sel && cap0 != 0u) {
+                *l1_u32(shadow_queue_addr(slot, old_sel, SHADOW_Q_OFF_NUM))       = cap0;
+                *l1_u32(shadow_queue_addr(slot, old_sel, SHADOW_Q_OFF_DESC_LO))   = cap1;
+                *l1_u32(shadow_queue_addr(slot, old_sel, SHADOW_Q_OFF_DESC_HI))   = cap2;
+                *l1_u32(shadow_queue_addr(slot, old_sel, SHADOW_Q_OFF_DRIVER_LO)) = cap3;
+                *l1_u32(shadow_queue_addr(slot, old_sel, SHADOW_Q_OFF_DRIVER_HI)) = cap4;
+                *l1_u32(shadow_queue_addr(slot, old_sel, SHADOW_Q_OFF_DEVICE_LO)) = cap5;
+                *l1_u32(shadow_queue_addr(slot, old_sel, SHADOW_Q_OFF_DEVICE_HI)) = cap6;
+                FENCE_W();
+                (void)*l1_u32(shadow_queue_addr(slot, old_sel, SHADOW_Q_OFF_DEVICE_HI));
+                *l1_u32(shadow_queue_addr(slot, old_sel, SHADOW_Q_OFF_READY)) = 1u;
+                FENCE_W();
+                inc_stat(STATS_OFF_BRISC_OLD_SEL_RESCUE);
+            }
+        }
+    }
 
     // QueueNumMax is always BRISC_VIRTIO_QUEUE_NUM_MAX for queues we
     // support; it's 0 for queues past `num_queues` to tell the guest
@@ -773,7 +823,7 @@ static void poll_one_device(unsigned slot) {
     uint32_t sel = read_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_SEL));
     uint32_t sel_prev = read_u32(snap_addr(slot, SNAP_OFF_QUEUE_SEL));
     if (sel != sel_prev) {
-        handle_queue_sel_change(slot, sel);
+        handle_queue_sel_change(slot, sel_prev, sel);
         store_u32(snap_addr(slot, SNAP_OFF_QUEUE_SEL), sel);
     }
 

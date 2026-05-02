@@ -377,6 +377,7 @@ fn run_poll_loop(
     let mut last_ready_capture_sel_races: u32 = 0;
     let mut last_queue_setups: u32 = 0;
     let mut last_queue_teardowns: u32 = 0;
+    let mut last_brisc_old_sel_rescue: u32 = 0;
     let mut last_max_sweep_cycles: u32 = 0;
     let mut last_max_steady_sweep_cycles: u32 = 0;
     let mut last_max_sel_path_cycles: u32 = 0;
@@ -746,6 +747,18 @@ fn run_poll_loop(
                 teardowns
             );
             last_queue_teardowns = teardowns;
+        }
+        let brisc_old_sel_rescue =
+            engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_BRISC_OLD_SEL_RESCUE);
+        if brisc_old_sel_rescue != last_brisc_old_sel_rescue {
+            let delta = brisc_old_sel_rescue.wrapping_sub(last_brisc_old_sel_rescue);
+            crate::dlog!(
+                "[capture] BRISC rescued {} OLD-sel queue setup(s) at SEL change \
+                 (cumulative {})",
+                delta,
+                brisc_old_sel_rescue
+            );
+            last_brisc_old_sel_rescue = brisc_old_sel_rescue;
         }
         let ready_capture_sel_races =
             engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_READY_CAPTURE_SEL_RACES);

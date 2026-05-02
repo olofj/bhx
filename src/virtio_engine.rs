@@ -211,6 +211,11 @@ pub const STATS_OFF_MAX_POSTCAP_CYCLES: u32 = 0x048;
 pub const STATS_OFF_READY_CAPTURE_SEL_RACES: u32 = 0x04c;
 pub const STATS_OFF_QUEUE_SETUPS: u32 = 0x050;
 pub const STATS_OFF_QUEUE_TEARDOWNS: u32 = 0x054;
+/// #155 BRISC OLD-sel rescue captures. Mirrors the firmware
+/// `STATS_OFF_BRISC_OLD_SEL_RESCUE`. Fires when BRISC observes a SEL
+/// change with no prior successful capture for the old sel — snapshots
+/// the still-visible kernel writes for old sel into shadow.
+pub const STATS_OFF_BRISC_OLD_SEL_RESCUE: u32 = 0x06c;
 /// #132 DEVICE_FEATURES_SEL change observations from TRISC1.
 pub const STATS_OFF_DEV_FEAT_SEL_CHANGES: u32 = 0x058;
 /// #156 TRISC1-side QUEUE_SEL race counter. Bumped each time TRISC1
