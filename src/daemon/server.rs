@@ -212,7 +212,7 @@ fn warm_resume_released(state: &Arc<DaemonState>, released: &[u8]) {
     }
     for &idx in released {
         dlog!("[warm-resume l2cpu {}] probing chip state", idx);
-        let l2cpu = match L2Cpu::new(idx as usize, state.card) {
+        let l2cpu = match L2Cpu::new(idx as usize, &state.shared_chip) {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 dlog!(
@@ -1200,7 +1200,7 @@ fn run_boot_sequence(
         "[run_boot l2cpu {}] constructing L2Cpu (ioctls + 8GB VA + TLB windows)",
         l2cpu_idx
     );
-    let l2cpu = Arc::new(L2Cpu::new(l2cpu_idx as usize, card)?);
+    let l2cpu = Arc::new(L2Cpu::new(l2cpu_idx as usize, &state.shared_chip)?);
 
     dlog!("[run_boot l2cpu {}] reading DTB from {}", l2cpu_idx, dtb);
     let dtb_raw = boot::read_bin_file(Path::new(dtb))?;

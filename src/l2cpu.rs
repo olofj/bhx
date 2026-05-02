@@ -8,7 +8,7 @@ use std::os::unix::io::RawFd;
 use std::ptr;
 use std::sync::Mutex;
 
-use crate::kmd;
+use crate::shared_chip::SharedChip;
 use crate::tlb::TlbWindow;
 
 #[derive(Debug, Clone, Copy)]
@@ -72,10 +72,20 @@ unsafe impl Send for L2Cpu {}
 unsafe impl Sync for L2Cpu {}
 
 impl L2Cpu {
-    pub fn new(idx: usize, card_idx: u32) -> std::io::Result<Self> {
+    /// Build an `L2Cpu` for index `idx` on the card owned by `chip`.
+    ///
+    /// Uses `chip.dup_fd()` rather than `kmd::open_device` so the per-L2Cpu
+    /// fd shares the kernel `struct file` with the daemon's `SharedChip` fd
+    /// — `dup(2)` skips `tt_cdev_open`/`tt_cdev_release` and the
+    /// `tenstorrent_set_aggregated_power_state` round-trip to ARC, which
+    /// would otherwise reset PLL4 to ARC's cached default (800 MHz) on
+    /// every L2Cpu construction and destruction.
+    pub fn new(idx: usize, chip: &SharedChip) -> std::io::Result<Self> {
         assert!(idx < 4, "L2CPU index must be 0..3");
 
-        let fd = kmd::open_device(card_idx)?;
+        let fd = chip
+            .dup_fd()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // PLL4 (L2CPU core clock) is *not* configured here. Cold-boot path:
         // `run_boot_sequence` calls `SharedChip::reset_x280` right after the

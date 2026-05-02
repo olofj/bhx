@@ -283,6 +283,34 @@ impl SharedChip {
         self.arc_read32(L2CPU_RESET_ADDR)
     }
 
+    /// Return a `dup(2)` of the inner card fd, with `FD_CLOEXEC` set.
+    ///
+    /// `dup` shares the kernel `struct file` with the original fd, so it
+    /// does *not* re-enter `tt_cdev_open` / `tt_cdev_release` and does not
+    /// trigger `tenstorrent_set_aggregated_power_state` — which would
+    /// otherwise round-trip through ARC firmware on every L2Cpu
+    /// construction/destruction and reset PLL4 to ARC's cached default
+    /// (800 MHz, `kPLLInitialSettings`). Per-`L2Cpu` ioctls/mmaps go
+    /// through this duped fd so cold-boot/SRST events leave the chip-wide
+    /// PLL alone.
+    pub fn dup_fd(&self) -> crate::Result<RawFd> {
+        let guard = self.inner.read().unwrap();
+        let inner = guard
+            .as_ref()
+            .ok_or_else(|| crate::Error::internal("SharedChip::dup_fd while rotating fd"))?;
+        // F_DUPFD_CLOEXEC: one syscall, atomic CLOEXEC. Plain libc::dup
+        // doesn't preserve CLOEXEC, so we'd race exec() until the follow-up
+        // fcntl set it.
+        let dup = unsafe { libc::fcntl(inner.fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            return Err(crate::Error::internal(format!(
+                "SharedChip::dup_fd: fcntl(F_DUPFD_CLOEXEC) failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(dup)
+    }
+
     /// Step the chip-wide L2CPU PLL down to 200 MHz. Caller is
     /// responsible for ensuring no L2CPU is currently running — the
     /// daemon checks the slot table before invoking. Holds `seq_lock`
