@@ -64,6 +64,7 @@ pub fn serve(
     let state = Arc::new(DaemonState::new(card, shared_chip));
     install_signal_handlers(state.shutdown.clone());
     spawn_guest_poweroff_handler(Arc::clone(&state));
+    spawn_pll_watcher(Arc::clone(&state));
 
     listener.set_nonblocking(true)?;
 
@@ -2142,6 +2143,44 @@ fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) -> 
 /// matching slot via `internal_stop`. Exits when the channel closes
 /// (i.e. all senders are dropped — happens when the daemon is on its
 /// way out and the kick poller has been shut down).
+/// Polls PLL4 (L2CPU PLL) every second and logs every observed change.
+/// Used to track down "PLL silently reverted to ARC init values" reports
+/// — without this, dlog only fires on our own set_frequency calls.
+fn spawn_pll_watcher(state: Arc<DaemonState>) {
+    std::thread::Builder::new()
+        .name("pll-watcher".to_string())
+        .spawn(move || {
+            const PLL4_BASE: u64 = 0x80020500;
+            const CNTL1_OFF: u64 = 0x4;
+            const CNTL5_OFF: u64 = 0x14;
+            let mut last: Option<(u32, u32)> = None;
+            while !state.shutdown.load(Ordering::Relaxed) {
+                let cntl1 = state.shared_chip.arc_read32(PLL4_BASE + CNTL1_OFF);
+                let cntl5 = state.shared_chip.arc_read32(PLL4_BASE + CNTL5_OFF);
+                if let (Ok(c1), Ok(c5)) = (cntl1, cntl5) {
+                    let observed = (c1, c5);
+                    if last != Some(observed) {
+                        let fbdiv = (c1 >> 16) as u16;
+                        let postdiv0 = (c5 & 0xFF) as u8;
+                        let mhz = 25u32 * (fbdiv as u32) / ((postdiv0 as u32) + 1);
+                        dlog!(
+                            "[pll-watcher] PLL4 fbdiv={} postdiv0={} → {} MHz \
+                             (CNTL1={:#010x} CNTL5={:#010x})",
+                            fbdiv,
+                            postdiv0,
+                            mhz,
+                            c1,
+                            c5
+                        );
+                        last = Some(observed);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        })
+        .expect("spawn pll-watcher");
+}
+
 fn spawn_guest_poweroff_handler(state: Arc<DaemonState>) {
     let rx = match state.guest_poweroff_rx.lock_or_internal_error() {
         Ok(mut g) => g.take(),

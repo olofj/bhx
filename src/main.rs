@@ -1531,10 +1531,7 @@ fn run_dump_shutdown_regs(card: u32, x: u16, y: u16) -> std::io::Result<()> {
         })
     })?;
 
-    eprintln!(
-        "[dump-shutdown-regs] tile ({}, {}) on card {}",
-        x, y, card
-    );
+    eprintln!("[dump-shutdown-regs] tile ({}, {}) on card {}", x, y, card);
     for idx in 0..4u32 {
         let off = BRISC_SHUTDOWN_BASE + idx * BRISC_SHUTDOWN_PER_L2CPU_STRIDE;
         let val = tile.read_l1_u32(off);
