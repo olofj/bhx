@@ -459,12 +459,11 @@ static void init_device(unsigned slot) {
 
     // SW_IMPL=1 tells the patched kernel "this is a software
     // virtio backend; use the sel_generation handshake at 0x01c
-    // before reading SEL-multiplexed regs." Without it stock
-    // Linux's vm_setup_vq writes QUEUE_SEL=1 and immediately reads
-    // QUEUE_READY — if BRISC's poll hasn't yet swapped the visible
-    // reg file to queue 1's shadow (which still says READY=1 from
-    // queue 0's setup), the kernel sees "queue already up" and
-    // returns -ENOENT on virtio_net's TX queue.
+    // before reading SEL-multiplexed regs." Stock distro kernels
+    // ignore this — they don't carry the handshake — but TRISC1's
+    // QUEUE_SEL→READY watch (#125) and TRISC2's DEVICE_FEATURES_SEL
+    // watch (#158) close the race for them. Patched kernels still
+    // get the deterministic handshake path on top.
     *l1_u32(reg_addr(slot, VIRTIO_MMIO_SW_IMPL)) = 1u;
 
     // Pre-populate every queue's QueueNumMax in the shadow so a SEL
@@ -1110,9 +1109,11 @@ static void trisc0_uart_poll_one(unsigned l2cpu_idx) {
 #define TENSIX_SOFT_RESET_ADDR    0xFFB121B0u
 #define SOFT_RESET_TRISC0         (1u << 12)
 #define SOFT_RESET_TRISC1         (1u << 13)
+#define SOFT_RESET_TRISC2         (1u << 14)
 
 static int trisc0_running = 0;
 static int trisc1_running = 0;
+static int trisc2_running = 0;
 
 // Read-modify-write the soft-reset register from within the tile.
 // The register is per-tile MMIO at 0xFFB121B0, accessible as a regular
@@ -1161,12 +1162,11 @@ static void brisc_set_trisc1_reset(int asserted) {
     (void)*reg;
 }
 
-// TRISC1 lifecycle (#125): release when ANY virtio slot is active
-// (i.e. any non-UART bit in active_slots). UART bits (16..19) don't
-// concern TRISC1 — its job is the SEL→READY race-critical clear,
-// which is virtio-only.
-static void brisc_drive_trisc1_lifecycle(uint32_t active_slots) {
-    uint32_t virtio_active = active_slots & ~BRISC_UART_SLOT_MASK;
+// TRISC1 lifecycle (#125): release when ANY virtio slot is active.
+// Reads the virtio-only mask published by the daemon, so neither
+// UART (16..19) nor shutdown (20..23) bits trigger a release —
+// virtio-only by construction.
+static void brisc_drive_trisc1_lifecycle(uint32_t virtio_active) {
     int want_running = virtio_active != 0;
     if (want_running && !trisc1_running) {
         brisc_set_trisc1_reset(0);
@@ -1174,6 +1174,33 @@ static void brisc_drive_trisc1_lifecycle(uint32_t active_slots) {
     } else if (!want_running && trisc1_running) {
         brisc_set_trisc1_reset(1);
         trisc1_running = 0;
+    }
+}
+
+static void brisc_set_trisc2_reset(int asserted) {
+    volatile uint32_t *reg = (volatile uint32_t *)TENSIX_SOFT_RESET_ADDR;
+    uint32_t v = *reg;
+    if (asserted) {
+        v |= SOFT_RESET_TRISC2;
+    } else {
+        v &= ~SOFT_RESET_TRISC2;
+    }
+    *reg = v;
+    FENCE_W();
+    (void)*reg;
+}
+
+// TRISC2 lifecycle (#158): same shape as TRISC1 — release when any
+// virtio slot is active, re-assert reset when none are. TRISC2's job
+// is the DEVICE_FEATURES_SEL watch; virtio-only by construction.
+static void brisc_drive_trisc2_lifecycle(uint32_t virtio_active) {
+    int want_running = virtio_active != 0;
+    if (want_running && !trisc2_running) {
+        brisc_set_trisc2_reset(0);
+        trisc2_running = 1;
+    } else if (!want_running && trisc2_running) {
+        brisc_set_trisc2_reset(1);
+        trisc2_running = 0;
     }
 }
 
@@ -1382,6 +1409,7 @@ void main(void) {
         // grouped iteration keeps the per-sweep cost bounded by the
         // number of *active* slots, not NUM_SLOTS.
         uint32_t active = read_u32(ctrl_addr(CTRL_OFF_ACTIVE_SLOTS));
+        uint32_t virtio_active = read_u32(ctrl_addr(CTRL_OFF_ACTIVE_VIRTIO_SLOTS));
         uint32_t newly_active = active & ~prev_active;
         if (newly_active != 0u) {
             // Don't re-init bits in the UART range (16..19) — those
@@ -1438,7 +1466,8 @@ void main(void) {
         // L2CPU's feed ring directly via the chip-side TLB; BRISC is
         // not in the UART data path beyond the lifecycle bit.
         brisc_drive_trisc0_lifecycle(active);
-        brisc_drive_trisc1_lifecycle(active);
+        brisc_drive_trisc1_lifecycle(virtio_active);
+        brisc_drive_trisc2_lifecycle(virtio_active);
         poll_shutdown_slots(active);
         poll_completion_ring();
         heartbeat += 1u;
@@ -1486,31 +1515,14 @@ void main(void) {
 // hart-local state and only TRISC1 reads it.
 void trisc1_main(void) {
     volatile uint32_t *active_p =
-        (volatile uint32_t *)(uintptr_t)(CTRL_BASE + CTRL_OFF_ACTIVE_SLOTS);
+        (volatile uint32_t *)(uintptr_t)(CTRL_BASE + CTRL_OFF_ACTIVE_VIRTIO_SLOTS);
     static uint32_t last_qsel[BRISC_VIRTIO_NUM_SLOTS];
-    // #132: also watch DEVICE_FEATURES_SEL so the visible
-    // DEVICE_FEATURES cell shows the right half (low vs high) of the
-    // 64-bit feature space within ~µs of any kernel SEL write. Same
-    // race pattern as QUEUE_SEL→QUEUE_READY (kernel issues writel(SEL);
-    // readl(FEATURES); back-to-back in <1 µs). Pre-#132 firmware
-    // collapsed both halves into one cell, leaking VIRTIO_F_VERSION_1's
-    // bit 0 (= VIRTIO_NET_F_CSUM on the net slot) into the SEL=0 read.
-    static uint32_t last_dfsel[BRISC_VIRTIO_NUM_SLOTS];
-    // Initialize last_dfsel[] to a sentinel that doesn't match any
-    // kernel-write value, so the first observed value (typically 0
-    // on a fresh boot) triggers the swap path and seeds the visible
-    // cell explicitly. UINT32_MAX = -1 isn't a value the kernel writes
-    // in normal operation.
-    for (unsigned i = 0; i < BRISC_VIRTIO_NUM_SLOTS; i++) {
-        last_dfsel[i] = 0xFFFFFFFFu;
-    }
     for (;;) {
-        uint32_t active = *active_p;
-        // Skip the UART range — those are TRISC0's lifecycle bits,
-        // not virtio slots. Iterating them here would race-clear
-        // QUEUE_READY on slot indices that aren't real virtio
-        // devices when only a low-numbered L2CPU is booted.
-        uint32_t virtio_active = active & ~BRISC_UART_SLOT_MASK;
+        // Read from the virtio-only active mask — daemon publishes
+        // it alongside the unified mask via tensix_data_plane.rs's
+        // `publish_active_mask`. Bits here are virtio devices only,
+        // never UART or shutdown — so we iterate the full range.
+        uint32_t virtio_active = *active_p;
         for (unsigned base = 0; base < BRISC_VIRTIO_NUM_SLOTS; base += 8u) {
             uint32_t group = (virtio_active >> base) & 0xFFu;
             if (group == 0u) {
@@ -1534,7 +1546,63 @@ void trisc1_main(void) {
                     FENCE_W();
                     last_qsel[slot] = qsel;
                 }
+                // DEVICE_FEATURES_SEL watch lives on TRISC2 (#158) so this
+                // hot path stays focused on the queue-setup race.
+            }
+        }
+    }
+}
 
+// TRISC2: dedicated DEVICE_FEATURES_SEL watch (#158).
+//
+// Background: stock virtio_mmio's `vm_get_features` does:
+//
+//     writel(SEL, base + DEVICE_FEATURES_SEL);
+//     features = readl(base + DEVICE_FEATURES);
+//
+// back-to-back with no synchronization. If the device side hasn't
+// swapped the visible DEVICE_FEATURES cell to match the new SEL
+// value before the kernel's `readl`, the kernel reads stale bits.
+// Pre-#132 firmware collapsed both halves of the 64-bit feature
+// space into one cell (low | high), leaking bit 0 of the high half
+// (VIRTIO_F_VERSION_1) into the kernel's SEL=0 read as
+// VIRTIO_NET_F_CSUM. The fix is to swap the cell on every observed
+// SEL change.
+//
+// This watch used to live in `trisc1_main` alongside the QUEUE_SEL
+// watch. Putting both on one hart halved per-slot revisit cadence
+// in the race-critical path; #156 measurements showed 4-guest
+// stock-virtio losing ~20% of cycles to QUEUE_SEL races even after
+// the L2CPU 2/3 mask fix. Moving the dfsel watch to TRISC2 takes it
+// off TRISC1's critical path: TRISC1 stays focused on the
+// `vm_setup_vq` race, TRISC2 closes the `vm_get_features` leak,
+// neither blocks the other.
+//
+// Lifecycle: BRISC's `brisc_drive_trisc2_lifecycle` releases TRISC2
+// from soft reset when any virtio slot is active and re-asserts
+// reset when none are.
+void trisc2_main(void) {
+    volatile uint32_t *active_p =
+        (volatile uint32_t *)(uintptr_t)(CTRL_BASE + CTRL_OFF_ACTIVE_VIRTIO_SLOTS);
+    static uint32_t last_dfsel[BRISC_VIRTIO_NUM_SLOTS];
+    // Sentinel so the first observed dfsel value (typically 0 on
+    // fresh boot) triggers the swap path and seeds the visible cell.
+    // UINT32_MAX = -1 isn't a value the kernel writes in normal use.
+    for (unsigned i = 0; i < BRISC_VIRTIO_NUM_SLOTS; i++) {
+        last_dfsel[i] = 0xFFFFFFFFu;
+    }
+    for (;;) {
+        uint32_t virtio_active = *active_p;
+        for (unsigned base = 0; base < BRISC_VIRTIO_NUM_SLOTS; base += 8u) {
+            uint32_t group = (virtio_active >> base) & 0xFFu;
+            if (group == 0u) {
+                continue;
+            }
+            for (unsigned i = 0; i < 8u; i++) {
+                if (((group >> i) & 1u) == 0u) {
+                    continue;
+                }
+                unsigned slot = base + i;
                 uint32_t dfsel = read_u32(reg_addr(slot, VIRTIO_MMIO_DEVICE_FEATURES_SEL));
                 if (dfsel != last_dfsel[slot]) {
                     const struct device_init *d = device_for_slot(slot);

@@ -69,3 +69,9 @@ void trisc1_main(void) {
         __asm__ volatile("wfi");
     }
 }
+
+void trisc2_main(void) {
+    for (;;) {
+        __asm__ volatile("wfi");
+    }
+}

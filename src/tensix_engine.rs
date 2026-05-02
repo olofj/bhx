@@ -161,12 +161,23 @@ impl TensixEngine {
             );
         }
 
-        // Same ritual for TRISC1 (#125 dedicated SEL-watch core).
+        // Same ritual for TRISC1 (#125 dedicated QUEUE_SEL→READY watch).
         // Skipped silently for pre-#125 firmware (entry word is 0).
         let trisc1_pc = tile.read_trisc1_reset_entry();
         if trisc1_pc != 0 {
             tile.set_trisc1_reset_pc(trisc1_pc);
             tile.enable_trisc1_reset_pc_override();
+        }
+
+        // TRISC2 (#158 dedicated DEVICE_FEATURES_SEL watch). Same
+        // ritual; pre-#158 firmware leaves the entry word at 0 and
+        // the host skips the override. Lifecycle: BRISC drives TRISC2
+        // out of soft reset off the virtio-only mask, so no explicit
+        // release here.
+        let trisc2_pc = tile.read_trisc2_reset_entry();
+        if trisc2_pc != 0 {
+            tile.set_trisc2_reset_pc(trisc2_pc);
+            tile.enable_trisc2_reset_pc_override();
         }
 
         tile.release_brisc_only();

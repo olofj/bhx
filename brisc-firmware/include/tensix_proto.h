@@ -112,15 +112,22 @@
 #define CTRL_OFF_HELLO            0x0000u
 #define CTRL_OFF_HELLO_ACK        0x0040u
 #define CTRL_OFF_KICK_RING_HDR    0x0080u
-// u32 bitmap of "active" slots. Bits 0..15 are virtio slots —
-// daemon sets the bit when register_slot is called and clears on
-// unregister; BRISC's main poll loop skips slots whose bit is 0
-// (sweep period drops from ~4µs to ~1µs on a single-L2CPU boot,
-// closing the SEL→READY race against stock kernels). Bits 16..19
-// are per-L2CPU UART enables (#78) — daemon flips them on
-// register_uart, BRISC uses them to drive TRISC0's reset lifecycle
-// (#79) AND TRISC0 uses them to know which UART reg files to poll.
-#define CTRL_OFF_ACTIVE_SLOTS     0x00C0u
+// u32 bitmap of "active" slots. Daemon sets the bit on
+// register_slot (virtio), register_uart (UART), and shutdown
+// registry add; clears on unregister. BRISC's main poll loop reads
+// this for kick / shutdown / UART lifecycle dispatch.
+//
+// With NUM_L2CPUS=4 and DEVS_PER_L2CPU=8 the virtio slot space is
+// 0..32, which OVERLAPS UART slots (16..20) and shutdown slots
+// (20..24). For dispatch this is fine — a kick on slot N decodes
+// against the unified registry — but TRISC1's race-watch loop must
+// distinguish virtio slots from UART/shutdown bits, otherwise it
+// either skips L2CPU 2/3's actual virtio devices (when masked out
+// as "UART range") or clobbers UART/shutdown reg files (when
+// unmasked). `CTRL_OFF_ACTIVE_VIRTIO_SLOTS` carries virtio bits
+// only — TRISC1 reads it.
+#define CTRL_OFF_ACTIVE_SLOTS         0x00C0u
+#define CTRL_OFF_ACTIVE_VIRTIO_SLOTS  0x00C4u
 #define CTRL_OFF_KICK_RING        0x0100u  // ends at 0x2100 (512 × 16)
 #define CTRL_OFF_COMPL_RING_HDR   0x2100u
 #define CTRL_OFF_COMPL_RING       0x2200u  // ends at 0x2600 (64 × 16)

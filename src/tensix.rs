@@ -75,12 +75,16 @@ pub const RISCV_DEBUG_REG_TRISC0_RESET_PC: u64 = 0xFFB1_2228;
 /// TRISC1 reset PC override value (#125). Per the SoftReset.md doc
 /// the per-TRISC override registers are 4-byte spaced after T0.
 pub const RISCV_DEBUG_REG_TRISC1_RESET_PC: u64 = 0xFFB1_222C;
+/// TRISC2 reset PC override value (#158).
+pub const RISCV_DEBUG_REG_TRISC2_RESET_PC: u64 = 0xFFB1_2230;
 /// Enable bits for the TRISC reset PC override. Bit 0 = TRISC0,
-/// bit 1 = TRISC1, bit 2 = TRISC2. M6.1 set bit 0; #125 also sets
-/// bit 1 for TRISC1's dedicated SEL-watch loop.
+/// bit 1 = TRISC1, bit 2 = TRISC2. M6.1 set bit 0; #125 set bit 1
+/// for TRISC1's QUEUE_SEL→READY watch; #158 set bit 2 for TRISC2's
+/// DEVICE_FEATURES_SEL watch.
 pub const RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE: u64 = 0xFFB1_2234;
 pub const TRISC_RESET_PC_OVERRIDE_T0: u32 = 1 << 0;
 pub const TRISC_RESET_PC_OVERRIDE_T1: u32 = 1 << 1;
+pub const TRISC_RESET_PC_OVERRIDE_T2: u32 = 1 << 2;
 
 /// L1 offset of the u32 word `start.S` plants holding the linker-
 /// resolved address of `trisc0_reset_entry`. Mirrored by the firmware
@@ -89,6 +93,8 @@ pub const TRISC0_RESET_ENTRY_PTR_L1_OFFSET: u32 = 0x4;
 /// L1 offset of `trisc1_reset_entry` (#125). Adjacent to TRISC0's
 /// slot in the start.S header.
 pub const TRISC1_RESET_ENTRY_PTR_L1_OFFSET: u32 = 0x8;
+/// L1 offset of `trisc2_reset_entry` (#158).
+pub const TRISC2_RESET_ENTRY_PTR_L1_OFFSET: u32 = 0xC;
 
 /// Tensix L1 size in bytes (per `dev_mem_map.h::MEM_L1_SIZE`).
 pub const TENSIX_L1_SIZE: usize = 1536 * 1024;
@@ -275,6 +281,23 @@ impl TensixTile {
         self.read_l1_u32(TRISC1_RESET_ENTRY_PTR_L1_OFFSET)
     }
 
+    /// TRISC2 (#158) variants of the same setup ritual.
+    pub fn set_trisc2_reset_pc(&self, pc: u32) {
+        let off = RISCV_DEBUG_REG_TRISC2_RESET_PC - TLB_BASE_DEBUG_REGS;
+        self.debug_regs_window.write32(off, pc);
+    }
+
+    pub fn enable_trisc2_reset_pc_override(&self) {
+        let off = RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE - TLB_BASE_DEBUG_REGS;
+        let prev = self.debug_regs_window.read32(off);
+        self.debug_regs_window
+            .write32(off, prev | TRISC_RESET_PC_OVERRIDE_T2);
+    }
+
+    pub fn read_trisc2_reset_entry(&self) -> u32 {
+        self.read_l1_u32(TRISC2_RESET_ENTRY_PTR_L1_OFFSET)
+    }
+
     /// Copy `firmware` bytes into L1 starting at offset 0 using
     /// 32-bit MMIO writes. Pads with zeros if `firmware.len()` is
     /// not a multiple of 4.
@@ -330,6 +353,8 @@ mod tests {
         assert!(TENSIX_SOFT_RESET_ADDR + 4 <= TLB_BASE_DEBUG_REGS + TWO_MEG);
         assert!(RISCV_DEBUG_REG_TRISC0_RESET_PC >= TLB_BASE_DEBUG_REGS);
         assert!(RISCV_DEBUG_REG_TRISC0_RESET_PC + 4 <= TLB_BASE_DEBUG_REGS + TWO_MEG);
+        assert!(RISCV_DEBUG_REG_TRISC1_RESET_PC + 4 <= TLB_BASE_DEBUG_REGS + TWO_MEG);
+        assert!(RISCV_DEBUG_REG_TRISC2_RESET_PC + 4 <= TLB_BASE_DEBUG_REGS + TWO_MEG);
         assert!(RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE >= TLB_BASE_DEBUG_REGS);
         assert!(RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE + 4 <= TLB_BASE_DEBUG_REGS + TWO_MEG);
         assert!(SOFT_RESET_ALL & SOFT_RESET_BRISC == SOFT_RESET_BRISC);

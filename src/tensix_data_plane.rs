@@ -232,12 +232,13 @@ impl KickPoller {
     /// l2cpu_idx (16..20); #94 shutdown slots at
     /// `regs::shutdown::SLOT_BASE` + l2cpu_idx (20..24).
     fn publish_active_mask(&self) {
-        let mut mask: u32 = 0;
+        let mut virtio_mask: u32 = 0;
         for &slot in self.registry.lock().unwrap().keys() {
             if slot < 32 {
-                mask |= 1u32 << slot;
+                virtio_mask |= 1u32 << slot;
             }
         }
+        let mut mask: u32 = virtio_mask;
         for &l2cpu_idx in self.uart_registry.lock().unwrap().keys() {
             let slot = uart::slot_for_l2cpu(l2cpu_idx) as u32;
             if slot < 32 {
@@ -253,6 +254,13 @@ impl KickPoller {
         self.engine.write_l1_u32(
             crate::tensix_proto::CTRL_BASE + crate::tensix_proto::CTRL_OFF_ACTIVE_SLOTS,
             mask,
+        );
+        // Virtio-only mask: TRISC1's race-watch loop reads this so it
+        // doesn't skip L2CPU 2/3's actual virtio devices (which live
+        // at slot indices that overlap the UART/shutdown range).
+        self.engine.write_l1_u32(
+            crate::tensix_proto::CTRL_BASE + crate::tensix_proto::CTRL_OFF_ACTIVE_VIRTIO_SLOTS,
+            virtio_mask,
         );
     }
 

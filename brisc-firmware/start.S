@@ -40,8 +40,11 @@ _start:
     .word    trisc0_reset_entry    // PC=4:   TRISC0 reset entry address
                                    //         (host reads, writes to PC override)
     .word    trisc1_reset_entry    // PC=8:   TRISC1 reset entry address (#125)
-                                   //         dedicated SEL-watch core for the
-                                   //         SEL→READY race-critical path.
+                                   //         dedicated QUEUE_SEL→READY watch.
+    .word    trisc2_reset_entry    // PC=C:   TRISC2 reset entry address (#158)
+                                   //         dedicated DEVICE_FEATURES_SEL watch
+                                   //         (split from TRISC1 to halve per-slot
+                                   //         work in the race-critical path).
 
     // Aligned entry. Anything past here is the actual program.
     .org 0x80
@@ -98,5 +101,19 @@ trisc1_reset_entry:
     // BRISC's full sweep period.
     li       sp, 0xFFB01000
     call     trisc1_main
+1:  wfi
+    j        1b
+
+    .global  trisc2_reset_entry
+trisc2_reset_entry:
+    // TRISC2 private data RAM mirrors TRISC0/1: each core sees its own
+    // 4 KiB at 0xFFB0_0000. Stack grows downward from the top.
+    //
+    // TRISC2 runs the dedicated DEVICE_FEATURES_SEL watch (#158): swap
+    // the visible DEVICE_FEATURES cell to match the kernel's most
+    // recent SEL write, closing the bit-0 leak (#132) without competing
+    // with TRISC1's QUEUE_SEL watch for L1 bandwidth in the same hart.
+    li       sp, 0xFFB01000
+    call     trisc2_main
 1:  wfi
     j        1b

@@ -74,6 +74,7 @@ pub const CTRL_OFF_HELLO: u32 = 0x0000;
 pub const CTRL_OFF_HELLO_ACK: u32 = 0x0040;
 pub const CTRL_OFF_KICK_RING_HDR: u32 = 0x0080;
 pub const CTRL_OFF_ACTIVE_SLOTS: u32 = 0x00C0;
+pub const CTRL_OFF_ACTIVE_VIRTIO_SLOTS: u32 = 0x00C4;
 pub const CTRL_OFF_KICK_RING: u32 = 0x0100; // ends at 0x2100 (512 × 16)
 pub const CTRL_OFF_COMPL_RING_HDR: u32 = 0x2100;
 pub const CTRL_OFF_COMPL_RING: u32 = 0x2200; // ends at 0x2600 (64 × 16)
