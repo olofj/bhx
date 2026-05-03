@@ -238,6 +238,14 @@ fn build_slirp_size_probe() {
         // enough for the actual struct from libslirp. Fail at build time if
         // the library has grown. Cargo cleans up `OUT_DIR` on `cargo clean`,
         // so leftover artifacts from a crashed build don't accumulate.
+        //
+        // Every layer panics with a specific message on failure. The old
+        // `if let Ok(out) = ... if out.status.success() if let Ok(real)`
+        // chain swallowed every failure mode (no compiler, no header, no
+        // /tmp write permission, parse failure) — so the slirp feature
+        // would build successfully against an unverified buffer size on
+        // any system where the probe couldn't run, defeating the guard's
+        // entire purpose (#147).
         let out_dir = std::env::var_os("OUT_DIR")
             .expect("OUT_DIR not set — cargo always sets this for build scripts");
         let probe_dir = std::path::Path::new(&out_dir).join("slirp_probe");
@@ -250,24 +258,43 @@ fn build_slirp_size_probe() {
                     "echo '#include <slirp/libslirp.h>\n",
                     "#include <stdio.h>\n",
                     "int main(){{printf(\"%zu\",sizeof(SlirpConfig));return 0;}}' ",
-                    "| cc -x c - -o {0} 2>/dev/null && {0}"
+                    "| cc -x c - -o {0} && {0}"
                 ),
                 bin_path.display()
             ))
-            .output();
+            .output()
+            .expect(
+                "failed to run cc + SlirpConfig sizeof probe — install cc and \
+                 libslirp-dev, or disable the slirp feature (--no-default-features)",
+            );
 
-        if let Ok(out) = output {
-            if out.status.success() {
-                let size_str = String::from_utf8_lossy(&out.stdout);
-                if let Ok(real_size) = size_str.trim().parse::<usize>() {
-                    if real_size > 512 {
-                        panic!(
-                            "SlirpConfig is {} bytes but our buffer is only 512 — increase _data size in slirp_ffi.rs",
-                            real_size
-                        );
-                    }
-                }
-            }
+        if !output.status.success() {
+            panic!(
+                "SlirpConfig sizeof probe failed (exit {}); stderr:\n{}\n\
+                 stdout:\n{}\n\
+                 This usually means libslirp headers are missing — install \
+                 libslirp-dev — or the build doesn't have write access to \
+                 OUT_DIR. Disable the slirp feature with \
+                 --no-default-features if you intentionally don't want it.",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout),
+            );
+        }
+        let size_str = String::from_utf8_lossy(&output.stdout);
+        let real_size: usize = size_str.trim().parse().unwrap_or_else(|_| {
+            panic!(
+                "SlirpConfig sizeof probe printed {:?}, which doesn't parse as \
+                 a usize. Probably a compiler bug or a corrupted probe binary.",
+                size_str
+            );
+        });
+        if real_size > 512 {
+            panic!(
+                "SlirpConfig is {} bytes but our buffer is only 512 — \
+                 increase _data size in slirp_ffi.rs",
+                real_size
+            );
         }
     }
 }
