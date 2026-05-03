@@ -201,6 +201,16 @@ pub struct DaemonState {
     /// spawned in `server::serve`.
     pub guest_poweroff_tx: std::sync::mpsc::Sender<u8>,
     pub guest_poweroff_rx: Mutex<Option<std::sync::mpsc::Receiver<u8>>>,
+    /// Card-wide gate around the `dispatch_boot` decide-and-do-reset
+    /// step (#162). Without it, two concurrent boots in the same iter
+    /// both observe `running=true` from the previous iter, both call
+    /// `reset_board()`, and the second blip lands while the first
+    /// boot is mid-`L2Cpu::new`, killing it. With the lock the first
+    /// boot's `reset_board` clears `running`; the second boot then
+    /// sees `running=false` and skips. After release, both boots
+    /// proceed in parallel through the per-L2CPU image-load path,
+    /// which has been concurrent-safe under load.
+    pub boot_lock: Mutex<()>,
     /// Set by the shutdown handler to make the accept loop exit.
     pub shutdown: Arc<AtomicBool>,
 }
@@ -270,6 +280,7 @@ impl DaemonState {
             kick_poller: Mutex::new(None),
             guest_poweroff_tx,
             guest_poweroff_rx: Mutex::new(Some(guest_poweroff_rx)),
+            boot_lock: Mutex::new(()),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }

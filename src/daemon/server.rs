@@ -1146,49 +1146,61 @@ fn run_boot_sequence(
     let dtb_addr = starting_address + boot_image::DTB_OFFSET;
     let rootfs_addr = starting_address + boot_image::INITRAMFS_OFFSET;
 
-    // Pre-reset state check goes through the daemon's SharedChip — one
-    // persistent TLB to tile (8,0) for all L2CPUs, so this read can't race
-    // with other boots' reads/writes of the same register.
-    let running = state.shared_chip.l2cpu_is_running(l2cpu_idx as usize)?;
-    let need_reset = force_reset_pcie || running;
-    dlog!(
-        "[run_boot l2cpu {}] running={} force_reset_pcie={} need_reset={}",
-        l2cpu_idx,
-        running,
-        force_reset_pcie,
-        need_reset
-    );
+    // Reset coordination (#162). Two concurrent dispatch_boots in the
+    // same multi-L2CPU iter would otherwise both observe `running=true`
+    // from the previous iter, both call `reset_board()`, and the second
+    // PCIe blip would land while the first boot is mid-`L2Cpu::new` and
+    // kill it. The card-wide `boot_lock` lets the first thread reset
+    // the board; the second thread acquires the lock afterwards, finds
+    // `running=false` (the first thread's reset cleared everything),
+    // and skips its own reset. After release, both threads proceed
+    // through the per-L2CPU image-load path concurrently.
+    {
+        let _boot_guard = state
+            .boot_lock
+            .lock()
+            .map_err(|_| io::Error::other("daemon boot_lock poisoned"))?;
+        let running = state.shared_chip.l2cpu_is_running(l2cpu_idx as usize)?;
+        let need_reset = force_reset_pcie || running;
+        dlog!(
+            "[run_boot l2cpu {}] running={} force_reset_pcie={} need_reset={}",
+            l2cpu_idx,
+            running,
+            force_reset_pcie,
+            need_reset
+        );
 
-    if need_reset {
-        dlog!(
-            "[run_boot l2cpu {}] issuing full board reset (other L2CPUs on this card will see a PCIe blip)",
-            l2cpu_idx
-        );
-        // Drop the engine + its kick poller before the PCIe LDS reset.
-        // The engine's `TensixTile` holds an open `/dev/tenstorrent/N`
-        // fd; an LDS reset re-enumerates the device, leaving any
-        // pre-reset fds pointing at unmapped BARs. Hanging on the
-        // CONFIG_WRITE ioctl (observed empirically on the bench's
-        // back-to-back daemon-restart path) is the failure mode. Per
-        // the lifetime model "tensix has the same lifetime as the
-        // L2CPUs", a board reset is the natural moment to recycle
-        // the engine — the next cold-boot RPC will bring it up fresh.
-        // Drop the kick poller first (its thread holds another
-        // Arc<TensixEngine>); KickPoller::drop joins the thread.
-        let _ = state.kick_poller.lock_or_internal_error()?.take();
-        let _ = state.tensix_engine.lock_or_internal_error()?.take();
-        // SharedChip::reset_board internally drops its fd+window, issues the
-        // PCIe LDS reset, reopens fresh, and polls ARC FW init status until
-        // Done (GDDR PHY + DRAM training complete) — callers never see stale
-        // fd errors across the reset, and the wait scales to actual chip
-        // readiness instead of a fixed 1 s sleep.
-        state.shared_chip.reset_board(card)?;
-        dlog!("[run_boot l2cpu {}] board reset complete", l2cpu_idx);
-    } else {
-        dlog!(
-            "[run_boot l2cpu {}] target held in reset; skipping board reset (siblings untouched)",
-            l2cpu_idx
-        );
+        if need_reset {
+            dlog!(
+                "[run_boot l2cpu {}] issuing full board reset (other L2CPUs on this card will see a PCIe blip)",
+                l2cpu_idx
+            );
+            // Drop the engine + its kick poller before the PCIe LDS reset.
+            // The engine's `TensixTile` holds an open `/dev/tenstorrent/N`
+            // fd; an LDS reset re-enumerates the device, leaving any
+            // pre-reset fds pointing at unmapped BARs. Hanging on the
+            // CONFIG_WRITE ioctl (observed empirically on the bench's
+            // back-to-back daemon-restart path) is the failure mode. Per
+            // the lifetime model "tensix has the same lifetime as the
+            // L2CPUs", a board reset is the natural moment to recycle
+            // the engine — the next cold-boot RPC will bring it up fresh.
+            // Drop the kick poller first (its thread holds another
+            // Arc<TensixEngine>); KickPoller::drop joins the thread.
+            let _ = state.kick_poller.lock_or_internal_error()?.take();
+            let _ = state.tensix_engine.lock_or_internal_error()?.take();
+            // SharedChip::reset_board internally drops its fd+window, issues the
+            // PCIe LDS reset, reopens fresh, and polls ARC FW init status until
+            // Done (GDDR PHY + DRAM training complete) — callers never see stale
+            // fd errors across the reset, and the wait scales to actual chip
+            // readiness instead of a fixed 1 s sleep.
+            state.shared_chip.reset_board(card)?;
+            dlog!("[run_boot l2cpu {}] board reset complete", l2cpu_idx);
+        } else {
+            dlog!(
+                "[run_boot l2cpu {}] target held in reset; skipping board reset (siblings untouched)",
+                l2cpu_idx
+            );
+        }
     }
 
     // Construct the runtime L2Cpu handle BEFORE the image load so the load
