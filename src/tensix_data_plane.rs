@@ -674,7 +674,7 @@ fn run_poll_loop(
                  published): {} cycles (~{} ns) — high values point at L1 bank \
                  contention with concurrent BRISC writes (#156)",
                 max_trisc1_reaction,
-                max_trisc1_reaction * 1000 / 1350
+                u64::from(max_trisc1_reaction) * 1000 / 1350
             );
             last_max_trisc1_reaction_cycles = max_trisc1_reaction;
         }
@@ -685,7 +685,7 @@ fn run_poll_loop(
                 "[trisc1-timing] new max outer-iter cycles (full TRISC1 sweep): \
                  {} cycles (~{} ns); per-slot revisit ≈ this / num_active_slots",
                 max_trisc1_outer,
-                max_trisc1_outer * 1000 / 1350
+                u64::from(max_trisc1_outer) * 1000 / 1350
             );
             last_max_trisc1_outer_cycles = max_trisc1_outer;
         }
@@ -698,7 +698,7 @@ fn run_poll_loop(
             crate::dlog!(
                 "[brisc-timing] new max main-loop sweep (incl init_device outliers): {} cycles (~{} ns)",
                 max_sweep,
-                max_sweep * 1000 / 1350
+                u64::from(max_sweep) * 1000 / 1350
             );
             last_max_sweep_cycles = max_sweep;
         }
@@ -708,7 +708,7 @@ fn run_poll_loop(
             crate::dlog!(
                 "[brisc-timing] new max STEADY sweep (race-relevant): {} cycles (~{} ns)",
                 max_steady_sweep,
-                max_steady_sweep * 1000 / 1350
+                u64::from(max_steady_sweep) * 1000 / 1350
             );
             last_max_steady_sweep_cycles = max_steady_sweep;
         }
@@ -718,7 +718,7 @@ fn run_poll_loop(
                 "[brisc-timing] new max SEL→READY critical-path: {} cycles \
                  (~{} ns @ 1.35 GHz)",
                 max_sel_path,
-                max_sel_path * 1000 / 1350
+                u64::from(max_sel_path) * 1000 / 1350
             );
             last_max_sel_path_cycles = max_sel_path;
         }
