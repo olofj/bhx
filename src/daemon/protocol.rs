@@ -228,7 +228,18 @@ pub enum Response {
     /// Success with a typed payload.
     Status(StatusPayload),
     /// Console attach succeeded; a fd follows via SCM_RIGHTS.
-    Attached { scrollback_bytes: u32 },
+    /// `live` is `true` for a normal interactive attach to a running
+    /// slot, `false` for a post-mortem replay of a stopped slot's
+    /// scrollback tail (#160). Pre-#160 every `Attached` was a live
+    /// attach; the `live` field defaults to `true` on the wire so an
+    /// older client speaking to a newer daemon doesn't break, but a
+    /// new client speaking to an old daemon (`live` absent) treats
+    /// the response as live by default.
+    Attached {
+        scrollback_bytes: u32,
+        #[serde(default = "default_true")]
+        live: bool,
+    },
     /// Request was understood but failed. `error` is a human string.
     Error { error: String },
 }

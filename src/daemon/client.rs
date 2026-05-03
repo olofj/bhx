@@ -153,19 +153,26 @@ pub fn shutdown(sock: &mut UnixStream) -> io::Result<()> {
     expect_ok(read_frame(&mut *sock)?)
 }
 
-/// Attach a console: returns `(scrollback_bytes, fd)`. The fd is the client
-/// end of a socketpair to the daemon; read chip output from it and write
-/// keystrokes into it (only honored if `mode` was `Rw` or `Takeover`).
+/// Attach a console: returns `(scrollback_bytes, live, fd)`. The fd is
+/// the client end of a socketpair to the daemon; read chip output from
+/// it and write keystrokes into it (only honored if `mode` was `Rw` or
+/// `Takeover`). `live=false` indicates a post-mortem replay of a stopped
+/// slot's scrollback tail (#160) — the daemon will EOF the fd after
+/// the tail is delivered, so the caller should drain to EOF and exit
+/// rather than entering interactive raw-mode pumping.
 pub fn attach_console(
     sock: &mut UnixStream,
     l2cpu: u8,
     mode: ConsoleMode,
-) -> io::Result<(u32, OwnedFd)> {
+) -> io::Result<(u32, bool, OwnedFd)> {
     write_frame(&mut *sock, &Request::AttachConsole { l2cpu, mode })?;
     match read_frame::<_, Response>(&mut *sock)? {
-        Response::Attached { scrollback_bytes } => {
+        Response::Attached {
+            scrollback_bytes,
+            live,
+        } => {
             let fd = recv_fd(sock)?;
-            Ok((scrollback_bytes, fd))
+            Ok((scrollback_bytes, live, fd))
         }
         Response::Error { error } => Err(crate::Error::bad_request(error).into()),
         other => Err(crate::Error::internal(format!("unexpected response: {:?}", other)).into()),

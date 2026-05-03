@@ -1390,13 +1390,40 @@ fn run_connect_client(
     mode: daemon::protocol::ConsoleMode,
 ) -> std::io::Result<()> {
     let mut sock = daemon::client::connect(card)?;
-    let (scrollback_bytes, fd) = daemon::client::attach_console(&mut sock, l2cpu, mode)?;
-    eprintln!(
-        "[connect] attached l2cpu {} ({} bytes scrollback)",
-        l2cpu, scrollback_bytes
-    );
-    let exit = Arc::new(AtomicBool::new(false));
-    daemon::terminal::pump(fd, exit)?;
+    let (scrollback_bytes, live, fd) = daemon::client::attach_console(&mut sock, l2cpu, mode)?;
+    if live {
+        eprintln!(
+            "[connect] attached l2cpu {} ({} bytes scrollback)",
+            l2cpu, scrollback_bytes
+        );
+        let exit = Arc::new(AtomicBool::new(false));
+        daemon::terminal::pump(fd, exit)?;
+    } else {
+        // Post-mortem replay (#160): the slot is gone but the daemon
+        // had a tail captured at stop time. Drain to EOF without
+        // entering raw mode (no live core to forward keystrokes to).
+        eprintln!(
+            "[connect] l2cpu {} is stopped; replaying {} bytes of last scrollback",
+            l2cpu, scrollback_bytes
+        );
+        use std::io::{Read, Write};
+        let file: std::fs::File = fd.into();
+        let mut reader = file;
+        let mut stdout = std::io::stdout().lock();
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    stdout.write_all(&buf[..n])?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        stdout.flush()?;
+        eprintln!("[connect] l2cpu {} scrollback tail done", l2cpu);
+    }
     Ok(())
 }
 

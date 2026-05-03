@@ -28,6 +28,16 @@ use std::sync::Mutex;
 
 use crate::daemon::protocol::ConsoleMode;
 
+/// Bytes of console scrollback the daemon snapshots into
+/// `DaemonState::shutdown_tails` at slot teardown so an operator who
+/// runs `bhx connect` *after* the slot is gone can still see the
+/// last screenful or two of console output (#160). 16 KiB covers a
+/// full 80×24 terminal plus a few prior scroll lines and ANSI/escape
+/// overhead — enough to capture a kernel panic banner or `poweroff`
+/// sequence. 4 L2CPUs × 16 KiB = 64 KiB resident across the daemon's
+/// lifetime; trivial.
+pub const SHUTDOWN_TAIL_BYTES: usize = 16 * 1024;
+
 /// Fixed-size per-L2CPU scrollback buffer. Sized to comfortably hold a full
 /// stock-distro boot log — Fedora 42's OpenSBI + U-Boot + grub + kernel +
 /// systemd output runs ~200 KiB of ANSI-decorated bytes, so 1 MiB leaves
@@ -208,9 +218,24 @@ impl ConsoleHub {
     /// their daemon-side fds so client-side reader threads see EOF and
     /// exit cleanly. Used by stop / force-reboot / shutdown so a
     /// `bhx connect` doesn't hang silently after its slot disappears.
+    ///
+    /// Also appends the goodbye line into the scrollback ring so a
+    /// subsequent [`Self::tail`] capture (taken by `internal_stop` for
+    /// the post-mortem readout in #160) ends with `[bhx: <reason>]\r\n`
+    /// — the cue an operator needs to know the slot torn down cleanly.
     pub fn disconnect_all_with_reason(&self, reason: &str) {
         let mut s = self.state.lock().unwrap();
         let goodbye = format!("\r\n[bhx: {}]\r\n", reason);
+
+        // Append to scrollback first (#160). Bound by the same overflow
+        // logic as `push_chip_output`; the goodbye is short so this is
+        // effectively a no-overflow append in practice.
+        let overflow = (s.scrollback.len() + goodbye.len()).saturating_sub(SCROLLBACK_BYTES);
+        for _ in 0..overflow {
+            s.scrollback.pop_front();
+        }
+        s.scrollback.extend(goodbye.bytes());
+
         for c in &s.clients {
             // Best-effort write of the goodbye line. Errors here are
             // fine — we're about to shut the socket down anyway.
@@ -221,6 +246,18 @@ impl ConsoleHub {
         crate::daemon::metrics::L2CPU_CONSOLE_CLIENTS
             .at(self.idx)
             .set(0);
+    }
+
+    /// Snapshot the last `n` bytes of the scrollback (or the whole
+    /// scrollback if it's shorter). Pure read — no state change.
+    /// Used by `internal_stop` to capture a post-mortem tail before
+    /// the slot is dropped (#160).
+    pub fn tail(&self, n: usize) -> Vec<u8> {
+        let s = self.state.lock().unwrap();
+        let len = s.scrollback.len();
+        let take = n.min(len);
+        let start = len - take;
+        s.scrollback.iter().skip(start).copied().collect()
     }
 }
 
@@ -458,5 +495,43 @@ mod tests {
         }
         assert_eq!(dropped, vec![r1.id]);
         assert_eq!(hub.client_count(), 0);
+    }
+
+    // ---- shutdown tail (#160) ----
+
+    #[test]
+    fn tail_returns_last_n_bytes_or_full_scrollback_if_shorter() {
+        let hub = ConsoleHub::new(0);
+        let big: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        hub.push_chip_output(&big);
+        let t = hub.tail(16 * 1024);
+        assert_eq!(t.len(), 16 * 1024);
+        // The tail is the last 16 KiB of the source.
+        assert_eq!(t.as_slice(), &big[big.len() - 16 * 1024..]);
+
+        // Shorter scrollback than requested → return everything.
+        let hub2 = ConsoleHub::new(0);
+        hub2.push_chip_output(b"only-100-bytes-here");
+        let t2 = hub2.tail(16 * 1024);
+        assert_eq!(t2, b"only-100-bytes-here");
+    }
+
+    #[test]
+    fn disconnect_all_with_reason_appends_goodbye_into_scrollback() {
+        let hub = ConsoleHub::new(0);
+        hub.push_chip_output(b"some kernel output\n");
+        hub.disconnect_all_with_reason("l2cpu 0 stopped (test)");
+        let t = hub.tail(SHUTDOWN_TAIL_BYTES);
+        let s = String::from_utf8_lossy(&t);
+        assert!(
+            s.ends_with("[bhx: l2cpu 0 stopped (test)]\r\n"),
+            "scrollback tail should end with the goodbye line, got {:?}",
+            s
+        );
+        assert!(
+            s.contains("some kernel output"),
+            "scrollback tail should retain prior bytes, got {:?}",
+            s
+        );
     }
 }

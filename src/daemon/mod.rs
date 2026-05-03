@@ -211,6 +211,16 @@ pub struct DaemonState {
     /// proceed in parallel through the per-L2CPU image-load path,
     /// which has been concurrent-safe under load.
     pub boot_lock: Mutex<()>,
+    /// Per-L2CPU shutdown scrollback tails (#160). Captured at
+    /// `internal_stop` time as the last
+    /// [`crate::daemon::console_hub::SHUTDOWN_TAIL_BYTES`] of the live
+    /// hub's ring (which by then has the goodbye line appended). Read
+    /// by `dispatch_attach_console` when the slot is `None`, so an
+    /// operator who runs `bhx connect` after a slot has torn down can
+    /// still see the last screenful or two.
+    /// Cleared on cold-boot of the same L2CPU so the next slot's
+    /// scrollback isn't conflated with the previous one's tail.
+    pub shutdown_tails: [Mutex<Vec<u8>>; 4],
     /// Set by the shutdown handler to make the accept loop exit.
     pub shutdown: Arc<AtomicBool>,
 }
@@ -281,6 +291,12 @@ impl DaemonState {
             guest_poweroff_tx,
             guest_poweroff_rx: Mutex::new(Some(guest_poweroff_rx)),
             boot_lock: Mutex::new(()),
+            shutdown_tails: [
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+            ],
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }

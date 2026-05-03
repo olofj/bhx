@@ -711,6 +711,16 @@ fn dispatch_boot(
     validate_l2cpu(l2cpu_idx)?;
     handle_existing_slot(state, l2cpu_idx, force).map_err(crate::Error::slot_state)?;
 
+    // Cold-boot: clear any captured shutdown scrollback (#160) so the
+    // next slot's tail isn't conflated with the previous one's. Done
+    // here rather than at run_boot_sequence's tail because the
+    // existing-slot teardown above (when `force` is set) populates the
+    // tail via internal_stop, and we want to throw it away — the
+    // operator opted into `force` because they want a fresh slot.
+    if let Ok(mut g) = state.shutdown_tails[l2cpu_idx as usize].lock() {
+        g.clear();
+    }
+
     // No daemon-wide serialization of the chip-touching phase here —
     // tile-(8,0) access is mediated by `SharedChip::seq_lock` inside each
     // of its typed methods, and per-L2CPU NOC traffic goes through each
@@ -1556,14 +1566,29 @@ fn dispatch_attach_console(
     // using as its console picks them up.
     let (hub, input_tx, vc_input) = {
         let slot_guard = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
-        let slot = slot_guard.as_ref().ok_or_else(|| {
-            crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx))
-        })?;
-        (
-            slot.console_hub.clone(),
-            slot.console_input_tx.clone(),
-            slot.virtio_console.as_ref().map(|vc| vc.input_buf.clone()),
-        )
+        match slot_guard.as_ref() {
+            Some(slot) => (
+                slot.console_hub.clone(),
+                slot.console_input_tx.clone(),
+                slot.virtio_console.as_ref().map(|vc| vc.input_buf.clone()),
+            ),
+            None => {
+                // Slot is gone. Try a post-mortem replay (#160) of the
+                // tail captured at internal_stop time. Rw/Takeover are
+                // refused — there's no live core to forward keystrokes
+                // to and silently degrading would mislead the operator.
+                drop(slot_guard);
+                return dispatch_attach_console_post_mortem(
+                    sock,
+                    state,
+                    l2cpu_idx,
+                    mode,
+                    daemon_end,
+                    daemon_read,
+                    client_end,
+                );
+            }
+        }
     };
 
     let (res, scrollback) = hub.attach(daemon_end, mode);
@@ -1588,6 +1613,7 @@ fn dispatch_attach_console(
         sock,
         &Response::Attached {
             scrollback_bytes: res.scrollback_bytes,
+            live: true,
         },
     ) {
         dlog!("[daemon] attach write response: {}", e);
@@ -1670,6 +1696,82 @@ fn client_reader_main(
         }
     }
     hub.detach(id);
+}
+
+/// Post-mortem attach: the slot is gone, but we may have a captured
+/// scrollback tail from `internal_stop` (#160). If so, replay it
+/// read-only and EOF the daemon side so the client exits cleanly.
+/// Rw / Takeover are refused because there's no live core to forward
+/// keystrokes to and silently degrading would mislead the operator.
+fn dispatch_attach_console_post_mortem(
+    sock: &UnixStream,
+    state: &Arc<DaemonState>,
+    l2cpu_idx: u8,
+    mode: ConsoleMode,
+    daemon_end: UnixStream,
+    daemon_read: UnixStream,
+    client_end: UnixStream,
+) -> crate::Result<()> {
+    if !matches!(mode, ConsoleMode::Ro) {
+        // The daemon-side socketpair gets dropped here; the kernel
+        // tears them down without the operator's client_end having
+        // ever seen them.
+        drop(daemon_end);
+        drop(daemon_read);
+        drop(client_end);
+        return Err(crate::Error::slot_state(format!(
+            "l2cpu {} is not booted; attach in Ro mode to view the last scrollback",
+            l2cpu_idx
+        )));
+    }
+    let tail: Vec<u8> = {
+        let g = state.shutdown_tails[l2cpu_idx as usize].lock_or_internal_error()?;
+        g.clone()
+    };
+    if tail.is_empty() {
+        drop(daemon_end);
+        drop(daemon_read);
+        drop(client_end);
+        return Err(crate::Error::slot_state(format!(
+            "l2cpu {} is not booted",
+            l2cpu_idx
+        )));
+    }
+    if let Err(e) = write_frame(
+        sock,
+        &Response::Attached {
+            scrollback_bytes: tail.len() as u32,
+            live: false,
+        },
+    ) {
+        dlog!(
+            "[daemon] post-mortem attach l2cpu {} write response: {}",
+            l2cpu_idx,
+            e
+        );
+        return Ok(());
+    }
+    if let Err(e) = send_fd(sock, client_end.as_raw_fd()) {
+        dlog!(
+            "[daemon] post-mortem attach l2cpu {} send_fd: {}",
+            l2cpu_idx,
+            e
+        );
+        return Ok(());
+    }
+    drop(client_end);
+    if let Err(e) = write_scrollback(&daemon_read, &tail) {
+        dlog!(
+            "[daemon] post-mortem attach l2cpu {} write_scrollback: {}",
+            l2cpu_idx,
+            e
+        );
+    }
+    // EOF the daemon side so the client's reader loop sees end-of-stream
+    // and exits cleanly. No worker thread, no further bytes.
+    let _ = daemon_read.shutdown(std::net::Shutdown::Both);
+    let _ = daemon_end.shutdown(std::net::Shutdown::Both);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2258,6 +2360,17 @@ pub(crate) fn internal_stop(
             );
             slot.console_hub
                 .disconnect_all_with_reason(&format!("l2cpu {} stopped ({})", l2cpu_idx, reason));
+            // Snapshot a tail of the scrollback for post-mortem
+            // attaches (#160). disconnect_all_with_reason has just
+            // appended the goodbye line into the ring, so the
+            // captured tail ends with `[bhx: l2cpu N stopped (...)]`.
+            // Must run BEFORE `slot.shutdown()` consumes the slot.
+            let tail = slot
+                .console_hub
+                .tail(crate::daemon::console_hub::SHUTDOWN_TAIL_BYTES);
+            if let Ok(mut g) = state.shutdown_tails[l2cpu_idx as usize].lock() {
+                *g = tail;
+            }
             unregister_engine_slots(state, l2cpu_idx);
             slot.shutdown();
             state.maybe_idle_pll();
@@ -2360,6 +2473,122 @@ mod tests {
         match resp {
             Response::Status { .. } => {}
             other => panic!("expected Status response, got {:?}", other),
+        }
+    }
+
+    /// A poisoned `state.tensix_engine` mutex must not panic the
+    /// Post-mortem attach (#160): when the slot is gone but a tail
+    /// has been captured at internal_stop time, an Ro attach replays
+    /// the tail with `live: false` and EOFs the daemon side. Rw is
+    /// rejected with a clear "attach in Ro mode" message.
+    #[test]
+    fn dispatch_attach_console_replays_tail_for_stopped_slot() {
+        use crate::daemon::protocol::{recv_fd, ConsoleMode, Request};
+        use crate::shared_chip::SharedChip;
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let state = Arc::new(DaemonState::new(0, Arc::new(SharedChip::placeholder())));
+        let captured = b"early dmesg...\n[bhx: l2cpu 0 stopped (test)]\r\n";
+        *state.shutdown_tails[0].lock().unwrap() = captured.to_vec();
+
+        // Ro path: replay tail, live=false, fd EOFs after writing.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write_frame(
+            &mut client,
+            &Request::AttachConsole {
+                l2cpu: 0,
+                mode: ConsoleMode::Ro,
+            },
+        )
+        .unwrap();
+        handle_client(server, Arc::clone(&state));
+
+        let resp: Response = read_frame(&mut client).expect("read response");
+        let bytes = match resp {
+            Response::Attached {
+                scrollback_bytes,
+                live,
+            } => {
+                assert!(!live, "post-mortem attach should report live=false");
+                scrollback_bytes
+            }
+            other => panic!("expected Attached, got {:?}", other),
+        };
+        assert_eq!(bytes as usize, captured.len());
+
+        let fd = recv_fd(&client).expect("recv_fd");
+        let mut chan: std::fs::File = fd.into();
+        let mut got = Vec::new();
+        chan.read_to_end(&mut got).expect("drain post-mortem fd");
+        assert_eq!(got.as_slice(), captured.as_slice());
+
+        // Rw path: rejected with slot-state error mentioning Ro.
+        let (mut client2, server2) = UnixStream::pair().unwrap();
+        client2
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write_frame(
+            &mut client2,
+            &Request::AttachConsole {
+                l2cpu: 0,
+                mode: ConsoleMode::Rw,
+            },
+        )
+        .unwrap();
+        handle_client(server2, state);
+
+        let resp_rw: Response = read_frame(&mut client2).expect("read response");
+        match resp_rw {
+            Response::Error { error } => {
+                assert!(
+                    error.contains("Ro"),
+                    "Rw rejection should mention Ro mode, got {:?}",
+                    error
+                );
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    /// Empty tail + absent slot keeps today's "not booted" error.
+    #[test]
+    fn dispatch_attach_console_empty_tail_returns_not_booted() {
+        use crate::daemon::protocol::{ConsoleMode, Request};
+        use crate::shared_chip::SharedChip;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let state = Arc::new(DaemonState::new(0, Arc::new(SharedChip::placeholder())));
+        // shutdown_tails[0] is empty by default.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write_frame(
+            &mut client,
+            &Request::AttachConsole {
+                l2cpu: 0,
+                mode: ConsoleMode::Ro,
+            },
+        )
+        .unwrap();
+        handle_client(server, state);
+
+        let resp_err: Response = read_frame(&mut client).expect("read response");
+        match resp_err {
+            Response::Error { error } => {
+                assert!(
+                    error.contains("not booted"),
+                    "empty-tail rejection should preserve historical wording, got {:?}",
+                    error
+                );
+            }
+            other => panic!("expected Error, got {:?}", other),
         }
     }
 
