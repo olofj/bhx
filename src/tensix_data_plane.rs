@@ -503,12 +503,10 @@ fn run_poll_loop(
                     }
                     reg.last_epoch = epoch;
                 }
-                let posted = dispatch_chain(&engine, reg, queue_idx);
-                if posted {
+                if let Some(used_idx) = dispatch_chain(&engine, reg, queue_idx) {
                     // Push a completion to BRISC for diagnostics +
                     // future BRISC-side IRQ dispatch. The PLIC IRQ
                     // itself is fired daemon-side today.
-                    let used_idx = read_used_idx(reg, queue_idx);
                     engine.push_completion(slot, queue_idx, used_idx);
                 }
             } else {
@@ -549,9 +547,7 @@ fn run_poll_loop(
                 ) {
                     continue;
                 }
-                let posted = dispatch_chain(&engine, reg, 0);
-                if posted {
-                    let used_idx = read_used_idx(reg, 0);
+                if let Some(used_idx) = dispatch_chain(&engine, reg, 0) {
                     engine.push_completion(*slot as u16, 0, used_idx);
                     rx_drained = true;
                 }
@@ -869,7 +865,11 @@ fn run_poll_loop(
 /// the L2CPU's memory namespace, calls the device's
 /// `process_queue_*` hooks, writes the used-ring entry, fires the
 /// PLIC IRQ on success. Returns `true` if a chain was posted.
-fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16) -> bool {
+/// Drain pending chains for one (slot, queue). Returns `Some(used_idx)`
+/// if at least one chain was processed, where `used_idx` is the
+/// kernel-visible `VringUsed::idx` after our final commit (read back
+/// from guest DRAM via volatile load). `None` if nothing was drained.
+fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16) -> Option<u32> {
     // Lazily extend `processed` if a kick references a queue index
     // beyond what the device announced at registration. Out of
     // bounds shouldn't happen for a well-behaved guest, but a
@@ -881,7 +881,7 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
             queue_idx,
             reg.processed.len()
         );
-        return false;
+        return None;
     }
 
     // Read the four per-queue pointers from BRISC L1 shadow. The
@@ -937,7 +937,7 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
         // shadow pointers yet. Drop the kick silently; otherwise the
         // RX-side polling loop spams this for every idle iteration
         // while net's queue 0 is unconfigured.
-        return false;
+        return None;
     }
     if queue_num == 0 || queue_num > u16::MAX as u32 {
         // Kernel hasn't published QUEUE_NUM yet, or it published
@@ -949,7 +949,7 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
             queue_idx,
             queue_num
         );
-        return false;
+        return None;
     }
     let queue_num = queue_num as u16;
 
@@ -973,7 +973,7 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
             starting,
             mem_end,
         );
-        return false;
+        return None;
     }
     let desc_q = unsafe { memory.add((desc_addr - starting) as usize) as *mut VringDesc };
     let avail_q = unsafe { memory.add((avail_addr - starting) as usize) as *mut VringAvail };
@@ -1007,38 +1007,30 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
         posted = true;
     }
 
-    if posted {
-        // Fire the PLIC IRQ via the existing per-L2CPU
-        // InterruptController. This is functionally identical to
-        // what `virtio::run_device` does; we just trigger it
-        // here instead of from a per-device MMIO-poll worker.
-        // (Reading `interrupt_status` from the visible reg file
-        // matches what run_device does for the legacy path; for
-        // the engine path the address is on the Tensix L1 reg
-        // file at the slot's MMIO_INTERRUPT_STATUS offset.)
-        let interrupt_status_addr_l1 = ve::slot_regs_base(reg.slot) + ve::MMIO_INTERRUPT_STATUS;
-        let interrupt_status_ptr = engine.l1_ptr(interrupt_status_addr_l1) as *mut u32;
-        reg.interrupt_ctl
-            .set_interrupt(interrupt_status_ptr, reg.interrupt_number);
-        crate::virtio::bump_interrupt_metric(reg.interrupt_kind, reg.l2cpu.idx() as u8);
+    if !posted {
+        return None;
     }
-    posted
-}
+    // Fire the PLIC IRQ via the existing per-L2CPU
+    // InterruptController. This is functionally identical to
+    // what `virtio::run_device` does; we just trigger it
+    // here instead of from a per-device MMIO-poll worker.
+    // (Reading `interrupt_status` from the visible reg file
+    // matches what run_device does for the legacy path; for
+    // the engine path the address is on the Tensix L1 reg
+    // file at the slot's MMIO_INTERRUPT_STATUS offset.)
+    let interrupt_status_addr_l1 = ve::slot_regs_base(reg.slot) + ve::MMIO_INTERRUPT_STATUS;
+    let interrupt_status_ptr = engine.l1_ptr(interrupt_status_addr_l1) as *mut u32;
+    reg.interrupt_ctl
+        .set_interrupt(interrupt_status_ptr, reg.interrupt_number);
+    crate::virtio::bump_interrupt_metric(reg.interrupt_kind, reg.l2cpu.idx() as u8);
 
-/// Read the current `used.idx` for a queue — used so we can record
-/// the latest used-ring head in the completion entry pushed back to
-/// BRISC.
-fn read_used_idx(reg: &RegEntry, queue_idx: u16) -> u32 {
-    let qi = queue_idx as u32;
-    let used_lo = 0u32; // no-op read; the actual used.idx lives in
-                        // guest DRAM and we already advanced it inside
-                        // `process_one_chain_for_queue`. The
-                        // CompletionEntry's used_idx field is
-                        // diagnostic for now, so we just echo the
-                        // queue's ring slot count modulo `processed`.
-    let _ = qi;
-    let _ = used_lo;
-    reg.processed[queue_idx as usize] as u32
+    // Read the kernel-visible used.idx after our final commit. The
+    // dispatcher already advanced `*used_q.idx` for each chain it
+    // posted; this is the value the kernel will observe. Volatile
+    // because it lives in guest DRAM and the kernel may race a read.
+    // u16 → u32 widen for the wire field; ring head fits trivially.
+    let used_idx = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*used_q).idx)) };
+    Some(used_idx as u32)
 }
 
 #[cfg(test)]
