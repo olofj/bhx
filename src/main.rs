@@ -1248,7 +1248,15 @@ fn parse_memory(s: &str) -> std::io::Result<u64> {
             crate::Error::bad_request(format!("--memory must be positive: {:?}", s)).into(),
         );
     }
-    Ok((num * mult as f64) as u64)
+    let bytes_f = num * mult as f64;
+    // `as u64` saturates rather than erroring on overflow / Inf, so
+    // strings like "1e30GB" or "999999999999EiB" silently become
+    // u64::MAX. Catch both before the cast: non-finite (covers Inf
+    // produced by the multiply) and beyond-u64.
+    if !bytes_f.is_finite() || bytes_f < 0.0 || bytes_f > u64::MAX as f64 {
+        return Err(crate::Error::bad_request(format!("--memory {:?}: too large", s)).into());
+    }
+    Ok(bytes_f as u64)
 }
 
 /// RFC-952 hostname check: 1..=63 chars from `a-z0-9-`, lowercase,
@@ -3050,6 +3058,24 @@ mod tests {
         assert!(parse_memory("-1GB").is_err());
         assert!(parse_memory("2 GB ").is_ok()); // trim
         assert!(parse_memory("GB").is_err());
+    }
+
+    #[test]
+    fn parse_memory_overflow_returns_error() {
+        // Each of these saturated to u64::MAX before #152.
+        assert!(parse_memory("1e30GB").is_err());
+        assert!(parse_memory("99999999999GB").is_err());
+        assert!(parse_memory("inf").is_err());
+        assert!(parse_memory("NaN").is_err());
+    }
+
+    #[test]
+    fn parse_memory_at_or_below_u64_max_succeeds() {
+        // u64::MAX in plain bytes, with explicit `B` suffix, and a
+        // 1 EiB value that fits in u64 are all accepted.
+        assert_eq!(parse_memory(&format!("{}", u64::MAX)).unwrap(), u64::MAX);
+        assert_eq!(parse_memory(&format!("{}B", u64::MAX)).unwrap(), u64::MAX);
+        assert!(parse_memory("1EiB").is_err()); // EiB suffix not supported; pinned
     }
 
     #[test]

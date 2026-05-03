@@ -490,7 +490,14 @@ pub fn parse_memory_str(s: &str) -> Result<u64> {
             s
         )));
     }
-    Ok((num * mult as f64) as u64)
+    let bytes_f = num * mult as f64;
+    // `as u64` saturates rather than erroring on overflow, so a
+    // malformed profile like `memory: 1e30GB` would otherwise yield
+    // u64::MAX silently.
+    if !bytes_f.is_finite() || bytes_f < 0.0 || bytes_f > u64::MAX as f64 {
+        return Err(Error::bad_request(format!("memory {:?}: too large", s)));
+    }
+    Ok(bytes_f as u64)
 }
 
 // ============================================================================
@@ -1156,6 +1163,15 @@ mod tests {
         assert_eq!(parse_memory_str("2GB").unwrap(), 2_000_000_000);
         assert_eq!(parse_memory_str("2GiB").unwrap(), 2_147_483_648);
         assert_eq!(parse_memory_str("1.5GiB").unwrap(), 1_610_612_736);
+    }
+
+    #[test]
+    fn parse_memory_str_overflow_returns_error() {
+        // Each of these saturated to u64::MAX before #152.
+        assert!(parse_memory_str("1e30GB").is_err());
+        assert!(parse_memory_str("99999999999GB").is_err());
+        assert!(parse_memory_str("inf").is_err());
+        assert!(parse_memory_str("NaN").is_err());
     }
 
     // ---- pick_editor ----
