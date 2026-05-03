@@ -2301,6 +2301,19 @@ mod tests {
 
     // ---- decide_boot_slot ----
 
+    /// Tests in this module observe the cumulative
+    /// `DAEMON_RPC_TOTAL` / `DAEMON_RPC_ERRORS_TOTAL` counters from
+    /// `daemon::metrics`. Cargo runs tests in parallel within a binary
+    /// — a "did this dispatch bump the counter?" snapshot+assert in
+    /// one test races with a parallel test that bumps the same global.
+    /// Serialize all metrics-observing tests on this lock so each can
+    /// take its before/after snapshots without interference. Recovers
+    /// from poison so a panicking test doesn't wedge the rest of the run.
+    fn metrics_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        M.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Wiring test for #31's RPC counter: drive a real `Request::Status`
     /// through `handle_client` over a unix socketpair and assert
     /// `DAEMON_RPC_TOTAL{method=status}` ticked. Catches a regression
@@ -2319,6 +2332,7 @@ mod tests {
         use std::os::unix::net::UnixStream;
         use std::time::Duration;
 
+        let _guard = metrics_test_lock();
         let (mut client, server) = UnixStream::pair().unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -2363,6 +2377,7 @@ mod tests {
         use std::os::unix::net::UnixStream;
         use std::time::Duration;
 
+        let _guard = metrics_test_lock();
         let state = Arc::new(DaemonState::new(0, Arc::new(SharedChip::placeholder())));
 
         // Poison `state.tensix_engine` by panicking inside a held lock.
@@ -2412,6 +2427,8 @@ mod tests {
         use crate::shared_chip::SharedChip;
         use std::os::unix::net::UnixStream;
         use std::time::Duration;
+
+        let _guard = metrics_test_lock();
 
         // --- Failure path: AddDisk against empty slot ---
         let (mut client, server) = UnixStream::pair().unwrap();
@@ -2481,6 +2498,7 @@ mod tests {
         use std::os::unix::net::UnixStream;
         use std::time::Duration;
 
+        let _guard = metrics_test_lock();
         let (mut client, server) = UnixStream::pair().unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(2)))

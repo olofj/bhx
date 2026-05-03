@@ -104,9 +104,55 @@ impl SeedSpec {
     /// `meta-data` at the root, and is ~10 KiB on disk. Overwrites
     /// `output` if it exists.
     pub fn write_iso(&self, output: &Path) -> Result<()> {
+        self.validate()?;
         let user_data = self.render_user_data()?;
         let meta_data = self.render_meta_data();
         write_iso(&user_data, &meta_data, output)
+    }
+
+    /// Validate every operator-supplied field at the boundary so the
+    /// hand-rolled YAML emission downstream can keep using bare
+    /// scalars without escaping (#148). Pre-validation we'd happily
+    /// emit `users[].name: foo"bar` straight from a clap arg, leaving
+    /// cloud-init to fail noisily on first boot — or worse, succeed
+    /// in unexpected ways.
+    ///
+    /// Validation policy:
+    /// - `user`: `[a-zA-Z][a-zA-Z0-9._-]{0,31}` (POSIX-ish login name).
+    /// - `hostname`: routes through [`crate::parse::parse_hostname`]
+    ///   (lowercase a-z0-9-, ≤63 chars).
+    /// - `instance_id`: `[a-zA-Z0-9-]{1,64}`.
+    /// - `ssh_keys`: ASCII-printable, no embedded newlines, ≤4 KiB
+    ///   (covers any reasonable ed25519/RSA key with comment).
+    /// - `nameservers`: must each parse as `IpAddr`.
+    /// - `extra_user_data`: must parse as YAML via serde_yaml_ng so
+    ///   we reject syntactic garbage at seed-build time rather than
+    ///   waiting for cloud-init to choke on first boot.
+    fn validate(&self) -> Result<()> {
+        if let Some(u) = self.user.as_deref() {
+            validate_user(u)?;
+        }
+        if let Some(h) = self.hostname.as_deref() {
+            crate::parse::parse_hostname(h)
+                .map_err(|e| crate::Error::bad_request(format!("hostname: {}", e)))?;
+        }
+        if let Some(id) = self.instance_id.as_deref() {
+            validate_instance_id(id)?;
+        }
+        for (i, key) in self.ssh_keys.iter().enumerate() {
+            validate_ssh_key(i, key)?;
+        }
+        for ns in &self.nameservers {
+            ns.parse::<std::net::IpAddr>().map_err(|_| {
+                crate::Error::bad_request(format!("nameserver {:?}: not an IP", ns))
+            })?;
+        }
+        if let Some(extra) = self.extra_user_data.as_deref() {
+            serde_yaml_ng::from_str::<serde_yaml_ng::Value>(extra).map_err(|e| {
+                crate::Error::bad_request(format!("extra_user_data is not valid YAML: {}", e))
+            })?;
+        }
+        Ok(())
     }
 
     fn render_user_data(&self) -> Result<String> {
@@ -281,6 +327,93 @@ fn hash_password_sha512(plaintext: &str) -> Result<String> {
         "could not hash password: install one of `openssl` (>= 1.1) or \
          `mkpasswd` (Debian/Ubuntu: apt install whois)",
     ))
+}
+
+/// POSIX-ish login-name validator (#148): first char alphanumeric,
+/// rest from `[a-zA-Z0-9._-]`, length 1..=32. Strict so a hand-rolled
+/// YAML emission downstream stays safe without escaping.
+fn validate_user(s: &str) -> Result<()> {
+    if s.is_empty() {
+        return Err(crate::Error::bad_request("user: empty"));
+    }
+    if s.len() > 32 {
+        return Err(crate::Error::bad_request(
+            "user longer than 32 chars (POSIX limit)",
+        ));
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_alphabetic() || first.is_ascii_digit()) {
+        return Err(crate::Error::bad_request(format!(
+            "user: must start with a letter or digit (got {:?})",
+            first
+        )));
+    }
+    for c in chars {
+        if !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+            return Err(crate::Error::bad_request(format!(
+                "user: only [a-zA-Z0-9._-] allowed (got {:?})",
+                c
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// cloud-init `instance-id` validator (#148): alphanumeric or `-`,
+/// length 1..=64. Tighter than cloud-init's own grammar (which is
+/// loose) to avoid YAML-meaningful chars in our hand-rolled emission.
+fn validate_instance_id(s: &str) -> Result<()> {
+    if s.is_empty() {
+        return Err(crate::Error::bad_request("instance_id: empty"));
+    }
+    if s.len() > 64 {
+        return Err(crate::Error::bad_request(
+            "instance_id longer than 64 chars",
+        ));
+    }
+    for c in s.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '-') {
+            return Err(crate::Error::bad_request(format!(
+                "instance_id: only [a-zA-Z0-9-] allowed (got {:?})",
+                c
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// SSH key validator (#148): ASCII-printable plus space/tab, no
+/// embedded newlines, ≤4 KiB. Doesn't try to parse OpenSSH key
+/// algorithms — that's cloud-init's job. We only ensure the line
+/// can't break out of its YAML scalar.
+fn validate_ssh_key(idx: usize, s: &str) -> Result<()> {
+    if s.is_empty() {
+        return Err(crate::Error::bad_request(format!(
+            "ssh_keys[{}]: empty",
+            idx
+        )));
+    }
+    if s.len() > 4096 {
+        return Err(crate::Error::bad_request(format!(
+            "ssh_keys[{}]: longer than 4 KiB",
+            idx
+        )));
+    }
+    for (i, c) in s.chars().enumerate() {
+        // Printable ASCII range plus space/tab. Newline, embedded
+        // null, and control chars all rejected — they'd either
+        // break the YAML emission or land in authorized_keys as
+        // multiple lines.
+        let ok = (' '..='~').contains(&c) || c == '\t';
+        if !ok {
+            return Err(crate::Error::bad_request(format!(
+                "ssh_keys[{}]: non-printable char at byte {} ({:?})",
+                idx, i, c
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Best-effort random-ish instance id. Doesn't need to be UUID-grade
@@ -540,6 +673,145 @@ mod tests {
                 panic!("user-data for user={:?} failed YAML parse: {}", hostile, e)
             });
         }
+    }
+
+    // ---- input validation (#148) ----
+
+    #[test]
+    fn validate_rejects_hostile_user_name() {
+        let too_long = "a".repeat(33);
+        let bads: &[&str] = &[
+            "",
+            "foo\"bar",
+            "foo bar",
+            "foo\nbar",
+            "-leading-dash",
+            "_leading-underscore",
+            ".leading-dot",
+            &too_long,
+        ];
+        for bad in bads {
+            let spec = SeedSpec {
+                user: Some((*bad).to_string()),
+                ..SeedSpec::default()
+            };
+            assert!(
+                spec.validate().is_err(),
+                "user={:?} should fail validation",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_clean_user_names() {
+        for ok in ["bhx", "alice", "user01", "operator-1", "op.dot", "op_one"] {
+            let spec = SeedSpec {
+                user: Some(ok.into()),
+                ..SeedSpec::default()
+            };
+            spec.validate()
+                .unwrap_or_else(|e| panic!("user={:?} should pass: {:?}", ok, e));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_hostile_hostname() {
+        for bad in [
+            "",
+            "weird\nhost",
+            "UPPER",
+            "foo_bar",
+            "-leading",
+            "trailing-",
+        ] {
+            let spec = SeedSpec {
+                hostname: Some(bad.into()),
+                ..SeedSpec::default()
+            };
+            assert!(
+                spec.validate().is_err(),
+                "hostname={:?} should fail validation",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_ssh_key_with_embedded_newline() {
+        let spec = SeedSpec {
+            ssh_keys: vec!["ssh-ed25519 AAAA\nsecond-line".into()],
+            ..SeedSpec::default()
+        };
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_clean_ssh_key() {
+        let spec = SeedSpec {
+            ssh_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 alice@example.com".into()],
+            ..SeedSpec::default()
+        };
+        spec.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_non_ip_nameserver() {
+        for bad in ["", "not-an-ip", "999.999.999.999", "8.8.8"] {
+            let spec = SeedSpec {
+                nameservers: vec![bad.into()],
+                ..SeedSpec::default()
+            };
+            assert!(spec.validate().is_err(), "nameserver={:?} should fail", bad);
+        }
+    }
+
+    #[test]
+    fn validate_accepts_ipv4_and_ipv6_nameservers() {
+        let spec = SeedSpec {
+            nameservers: vec!["8.8.8.8".into(), "2001:4860:4860::8888".into()],
+            ..SeedSpec::default()
+        };
+        spec.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_invalid_instance_id() {
+        for bad in [
+            "",
+            &"a".repeat(65),
+            "with space",
+            "with/slash",
+            "with\nnewline",
+        ] {
+            let spec = SeedSpec {
+                instance_id: Some(bad.into()),
+                ..SeedSpec::default()
+            };
+            assert!(
+                spec.validate().is_err(),
+                "instance_id={:?} should fail",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_garbage_extra_user_data() {
+        let spec = SeedSpec {
+            extra_user_data: Some("not: valid: yaml: : :".into()),
+            ..SeedSpec::default()
+        };
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_valid_extra_user_data() {
+        let spec = SeedSpec {
+            extra_user_data: Some("packages:\n  - git\n  - vim\n".into()),
+            ..SeedSpec::default()
+        };
+        spec.validate().unwrap();
     }
 
     #[test]
