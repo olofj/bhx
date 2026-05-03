@@ -30,16 +30,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Resolve the per-card runtime directory. Does not create it.
+/// Falls back to `/tmp/bhx-<uid>` via [`crate::xdg::runtime_dir_fallback`]
+/// when `$XDG_RUNTIME_DIR` is unset; `ensure_runtime_dir` then sets
+/// mode 0700 so the per-user fallback is never world-writable.
 pub fn runtime_dir(card: u32) -> PathBuf {
     let base = match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(x) if !x.is_empty() => PathBuf::from(x),
-        _ => {
-            // Fall back to /tmp/bhx-$UID (per-user to avoid collisions
-            // on shared hosts). Creating a world-writable dir would be a
-            // security hole; we set mode 0700 in `ensure_runtime_dir`.
-            let uid = unsafe { libc::getuid() };
-            PathBuf::from(format!("/tmp/bhx-{}", uid))
-        }
+        _ => crate::xdg::runtime_dir_fallback(),
     };
     let mut path = base;
     if !path.ends_with("bhx") {

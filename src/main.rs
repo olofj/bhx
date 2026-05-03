@@ -43,6 +43,7 @@ mod uart_engine;
 mod virtio;
 mod virtio_engine;
 mod x280_tlb;
+mod xdg;
 
 // Re-export the structured error type at the crate root so call sites
 // can write `crate::Result<T>` rather than `crate::error::Result<T>`.
@@ -819,12 +820,10 @@ fn resolve_firmware_path(filename: &str, in_tree_subdir: &str) -> String {
 
 /// `$XDG_DATA_HOME/bhx/firmware/`, falling back to
 /// `~/.local/share/bhx/firmware/` per the XDG Base Directory spec.
+/// Returns `None` if neither env var is set — the caller falls back
+/// to in-tree paths in that case.
 fn xdg_firmware_dir() -> Option<std::path::PathBuf> {
-    let base: std::path::PathBuf = match std::env::var_os("XDG_DATA_HOME") {
-        Some(v) if !v.is_empty() => std::path::PathBuf::from(v),
-        _ => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".local/share"),
-    };
-    Some(base.join("bhx/firmware"))
+    crate::xdg::data_subdir("firmware").ok()
 }
 
 fn main() -> std::process::ExitCode {

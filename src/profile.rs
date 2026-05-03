@@ -239,20 +239,10 @@ profiles: {}
 #     bootloader: uboot
 ";
 
-/// Resolve `~/.config/bhx/profiles.yaml`. Honors `$XDG_CONFIG_HOME`,
-/// falls back to `$HOME/.config`. Pure path construction; doesn't
-/// touch the filesystem.
+/// Resolve `~/.config/bhx/profiles.yaml` via [`crate::xdg::config_home`].
+/// Pure path construction; doesn't touch the filesystem.
 pub fn profiles_path() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ => {
-            let home = std::env::var_os("HOME").ok_or_else(|| {
-                Error::internal("neither XDG_CONFIG_HOME nor HOME set; can't locate profiles.yaml")
-            })?;
-            PathBuf::from(home).join(".config")
-        }
-    };
-    Ok(base.join("bhx").join("profiles.yaml"))
+    Ok(crate::xdg::config_home()?.join("bhx").join("profiles.yaml"))
 }
 
 /// Load the profile catalog. Returns an empty [`ProfilesFile`] if the
@@ -504,21 +494,9 @@ pub fn parse_memory_str(s: &str) -> Result<u64> {
 // Per-instance disks (#93)
 // ============================================================================
 
-/// Resolve `~/.local/share/bhx/instances`. Honors `$XDG_DATA_HOME`,
-/// falls back to `$HOME/.local/share`. Pure path construction.
+/// Resolve `~/.local/share/bhx/instances` via [`crate::xdg::data_subdir`].
 pub fn instances_dir() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_DATA_HOME") {
-        Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ => {
-            let home = std::env::var_os("HOME").ok_or_else(|| {
-                Error::internal(
-                    "neither XDG_DATA_HOME nor HOME set; can't locate instance disk dir",
-                )
-            })?;
-            PathBuf::from(home).join(".local").join("share")
-        }
-    };
-    Ok(base.join("bhx").join("instances"))
+    crate::xdg::data_subdir("instances")
 }
 
 /// Per-(profile, l2cpu) instance directory. Each pair gets its own

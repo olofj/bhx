@@ -304,16 +304,17 @@ pub fn is_single_fs_artifact(image: &KnownImage) -> bool {
 /// at any path they like, including a custom location they curate
 /// outside the canonical tree.
 pub fn image_dir() -> PathBuf {
-    let base: PathBuf = match std::env::var_os("XDG_DATA_HOME") {
-        Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ => match std::env::var_os("HOME") {
-            Some(h) => PathBuf::from(h).join(".local/share"),
-            None => PathBuf::from(".local/share"),
-        },
-    };
-    let dir = base.join("bhx/images");
-    let _ = fs::create_dir_all(&dir);
-    dir
+    // Best-effort fallback to a CWD-relative path (`./.local/share`)
+    // preserves the historical pre-#154 behavior of the CLI-side
+    // `bhx image pull` flow on hosts where neither `$XDG_DATA_HOME`
+    // nor `$HOME` is set. New callers in the daemon path should
+    // prefer `xdg::data_subdir("images")?` directly so they error
+    // out instead of writing to wherever the daemon's chdir landed.
+    crate::xdg::data_subdir("images").unwrap_or_else(|_| {
+        let dir = PathBuf::from(".local/share/bhx/images");
+        let _ = fs::create_dir_all(&dir);
+        dir
+    })
 }
 
 /// Pull (download and convert) an image by name.
