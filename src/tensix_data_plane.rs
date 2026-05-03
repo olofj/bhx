@@ -770,6 +770,21 @@ fn run_poll_loop(
         }
         // Per-slot STATUS transitions. Snapshot registry under lock,
         // then do chip-side L1 reads outside the lock.
+        //
+        // We read the visible-as-MMIO `MMIO_STATUS` register, NOT
+        // BRISC's private `SNAP_OFF_STATUS` snap. The snap is BRISC's
+        // own diffing buffer (`brisc-firmware/virtio.c::poll_one_device`
+        // line ~818, comment: "Snap is BRISC-private; no fence needed.
+        // The next sweep's diff against snap is local to this hart so
+        // ordering is automatic; the daemon never reads snap_addr.").
+        // Pre-#159 the logger here read snap, so under sustained
+        // multi-L2CPU load BRISC's store-coalescing queue could leave
+        // snap stale from the daemon's L1 view — the symptom was zero
+        // logged transitions for L2CPU 1+ slots while the kernel-side
+        // probe successfully cycled STATUS thousands of times. Reading
+        // the same MMIO register the kernel writes lands the diff on
+        // a write path that has guest-side fencing, not BRISC's
+        // delayed coalescer.
         let snapshot: Vec<(u32, &'static str)> = {
             let map = registry.lock().unwrap();
             map.iter()
@@ -777,7 +792,7 @@ fn run_poll_loop(
                 .collect()
         };
         for (slot, kind) in snapshot {
-            let status = engine.read_l1_u32(ve::snap_addr(slot, ve::SNAP_OFF_STATUS));
+            let status = engine.read_l1_u32(ve::slot_regs_base(slot) + ve::MMIO_STATUS);
             let prev = last_status.get(&slot).copied().unwrap_or(0);
             if status == prev {
                 continue;
