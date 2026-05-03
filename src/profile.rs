@@ -402,92 +402,24 @@ pub fn validate_profile_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Strict RFC-952 / RFC-1123 hostname check (lowercase a-z0-9-, ≤63
-/// chars, no leading/trailing dash).
+/// Strict RFC-952 / RFC-1123 hostname check. Thin wrapper around
+/// [`crate::parse::parse_hostname`] that discards the canonicalized
+/// String the canonical version returns — profile-side callers only
+/// want the validation, not a copy.
 fn validate_hostname(s: &str) -> Result<()> {
-    if s.is_empty() {
-        return Err(Error::bad_request("empty"));
-    }
-    if s.len() > 63 {
-        return Err(Error::bad_request("longer than 63 chars (RFC 952)"));
-    }
-    if s.starts_with('-') || s.ends_with('-') {
-        return Err(Error::bad_request("must not start or end with '-'"));
-    }
-    for c in s.chars() {
-        if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
-            return Err(Error::bad_request(format!(
-                "only lowercase a-z, 0-9, '-' allowed (got {:?})",
-                c
-            )));
-        }
-    }
-    Ok(())
+    crate::parse::parse_hostname(s).map(|_| ())
 }
 
-/// `HOST:GUEST` → `(u16, u16)`. Both must be 1..=65535.
+/// `HOST:GUEST` → `(u16, u16)`. Re-export of
+/// [`crate::parse::parse_fwd_pair`] under the historical name.
 fn parse_forward(s: &str) -> Result<(u16, u16)> {
-    let (h, g) = s
-        .split_once(':')
-        .ok_or_else(|| Error::bad_request(format!("expected HOST:GUEST in {:?}", s)))?;
-    let host: u16 = h
-        .parse()
-        .map_err(|_| Error::bad_request(format!("invalid HOST {:?}", h)))?;
-    let guest: u16 = g
-        .parse()
-        .map_err(|_| Error::bad_request(format!("invalid GUEST {:?}", g)))?;
-    if host == 0 || guest == 0 {
-        return Err(Error::bad_request(format!(
-            "ports must be 1..=65535 in {:?}",
-            s
-        )));
-    }
-    Ok((host, guest))
+    crate::parse::parse_fwd_pair(s)
 }
 
-/// Parse a memory size string. Same accepted format as the `--memory`
-/// CLI flag — kept in sync with `main::parse_memory` (the
-/// CLI-side parser uses io::Result, this one uses crate::Result).
+/// Parse a memory size string. Re-export of
+/// [`crate::parse::parse_memory`] under the historical name.
 pub fn parse_memory_str(s: &str) -> Result<u64> {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return Err(Error::bad_request("empty memory value"));
-    }
-    let (num_part, mult) = if let Some(rest) = trimmed.strip_suffix("GiB") {
-        (rest, 1u64 << 30)
-    } else if let Some(rest) = trimmed.strip_suffix("MiB") {
-        (rest, 1u64 << 20)
-    } else if let Some(rest) = trimmed.strip_suffix("KiB") {
-        (rest, 1u64 << 10)
-    } else if let Some(rest) = trimmed.strip_suffix("GB") {
-        (rest, 1_000_000_000u64)
-    } else if let Some(rest) = trimmed.strip_suffix("MB") {
-        (rest, 1_000_000u64)
-    } else if let Some(rest) = trimmed.strip_suffix("KB") {
-        (rest, 1_000u64)
-    } else if let Some(rest) = trimmed.strip_suffix('B') {
-        (rest, 1u64)
-    } else {
-        (trimmed, 1u64)
-    };
-    let num: f64 = num_part
-        .trim()
-        .parse()
-        .map_err(|_| Error::bad_request(format!("expected e.g. 2GB or 2GiB, got {:?}", s)))?;
-    if !num.is_finite() || num <= 0.0 {
-        return Err(Error::bad_request(format!(
-            "memory must be positive: {:?}",
-            s
-        )));
-    }
-    let bytes_f = num * mult as f64;
-    // `as u64` saturates rather than erroring on overflow, so a
-    // malformed profile like `memory: 1e30GB` would otherwise yield
-    // u64::MAX silently.
-    if !bytes_f.is_finite() || bytes_f < 0.0 || bytes_f > u64::MAX as f64 {
-        return Err(Error::bad_request(format!("memory {:?}: too large", s)));
-    }
-    Ok(bytes_f as u64)
+    crate::parse::parse_memory(s)
 }
 
 // ============================================================================

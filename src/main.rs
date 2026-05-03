@@ -24,6 +24,7 @@ mod fetch;
 mod image;
 mod kmd;
 mod l2cpu;
+mod parse;
 mod profile;
 mod ramdisk;
 mod regs;
@@ -1202,119 +1203,36 @@ fn parse_console_mode(s: &str) -> std::io::Result<daemon::protocol::ConsoleMode>
     }
 }
 
-/// Parse `HOST:GUEST` for `add-net --fwd`. Both sides must be in the
-/// 1..=65535 range; bare numbers, leading whitespace, and missing
-/// halves all error out cleanly.
-/// Parse an operator-friendly memory size string into a byte count.
-/// Accepts plain integers (interpreted as bytes) and suffixed forms
-/// in either SI (`KB`/`MB`/`GB`) or IEC binary (`KiB`/`MiB`/`GiB`)
-/// notation. The number portion can carry a decimal point; the
-/// daemon clamps to the L2CPU's physical size and 2 MiB-aligns.
-///
-/// Examples:
-///   - "2GB"   -> 2_000_000_000
-///   - "2GiB"  -> 2_147_483_648
-///   - "2048MB" -> 2_048_000_000
-///   - "1.5GiB" -> 1_610_612_736
+/// Clap value-parser wrapper around [`crate::parse::parse_memory`].
+/// Annotates the bad-request error with the `--memory` flag name so
+/// the CLI message names what the operator typed wrong.
 fn parse_memory(s: &str) -> std::io::Result<u64> {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return Err(crate::Error::bad_request("empty --memory value").into());
-    }
-    let (num_part, mult) = if let Some(rest) = trimmed.strip_suffix("GiB") {
-        (rest, 1u64 << 30)
-    } else if let Some(rest) = trimmed.strip_suffix("MiB") {
-        (rest, 1u64 << 20)
-    } else if let Some(rest) = trimmed.strip_suffix("KiB") {
-        (rest, 1u64 << 10)
-    } else if let Some(rest) = trimmed.strip_suffix("GB") {
-        (rest, 1_000_000_000u64)
-    } else if let Some(rest) = trimmed.strip_suffix("MB") {
-        (rest, 1_000_000u64)
-    } else if let Some(rest) = trimmed.strip_suffix("KB") {
-        (rest, 1_000u64)
-    } else if let Some(rest) = trimmed.strip_suffix('B') {
-        (rest, 1u64)
-    } else {
-        (trimmed, 1u64)
-    };
-    let num: f64 = num_part.trim().parse().map_err(|_| {
+    crate::parse::parse_memory(s).map_err(|e| {
         std::io::Error::from(crate::Error::bad_request(format!(
-            "invalid --memory {:?}; expected e.g. 2GB or 2GiB",
-            s
+            "invalid --memory: {}",
+            e
         )))
-    })?;
-    if !num.is_finite() || num <= 0.0 {
-        return Err(
-            crate::Error::bad_request(format!("--memory must be positive: {:?}", s)).into(),
-        );
-    }
-    let bytes_f = num * mult as f64;
-    // `as u64` saturates rather than erroring on overflow / Inf, so
-    // strings like "1e30GB" or "999999999999EiB" silently become
-    // u64::MAX. Catch both before the cast: non-finite (covers Inf
-    // produced by the multiply) and beyond-u64.
-    if !bytes_f.is_finite() || bytes_f < 0.0 || bytes_f > u64::MAX as f64 {
-        return Err(crate::Error::bad_request(format!("--memory {:?}: too large", s)).into());
-    }
-    Ok(bytes_f as u64)
+    })
 }
 
-/// RFC-952 hostname check: 1..=63 chars from `a-z0-9-`, lowercase,
-/// no leading/trailing `-`. Strict so a malformed override doesn't
-/// trip the slirp DHCP server's parser silently. Per RFC-1123 we
-/// also allow leading digits.
+/// Clap value-parser wrapper around [`crate::parse::parse_hostname`].
 fn parse_hostname(s: &str) -> std::io::Result<String> {
-    let bad = |reason: &str| -> std::io::Error {
+    crate::parse::parse_hostname(s).map_err(|e| {
         std::io::Error::from(crate::Error::bad_request(format!(
             "invalid --hostname {:?}: {}",
-            s, reason
+            s, e
         )))
-    };
-    if s.is_empty() {
-        return Err(bad("empty"));
-    }
-    if s.len() > 63 {
-        return Err(bad("longer than 63 chars (RFC 952)"));
-    }
-    if s.starts_with('-') || s.ends_with('-') {
-        return Err(bad("must not start or end with '-'"));
-    }
-    for c in s.chars() {
-        if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
-            return Err(bad("only lowercase a-z, 0-9, '-' allowed"));
-        }
-    }
-    Ok(s.to_string())
+    })
 }
 
+/// Clap value-parser wrapper around [`crate::parse::parse_fwd_pair`].
 fn parse_fwd_pair(s: &str) -> std::io::Result<(u16, u16)> {
-    let (h, g) = s.split_once(':').ok_or_else(|| {
+    crate::parse::parse_fwd_pair(s).map_err(|e| {
         std::io::Error::from(crate::Error::bad_request(format!(
-            "invalid --fwd {:?}; expected HOST:GUEST",
-            s
+            "invalid --fwd {:?}: {}",
+            s, e
         )))
-    })?;
-    let host: u16 = h.parse().map_err(|_| {
-        std::io::Error::from(crate::Error::bad_request(format!(
-            "invalid --fwd HOST {:?}",
-            h
-        )))
-    })?;
-    let guest: u16 = g.parse().map_err(|_| {
-        std::io::Error::from(crate::Error::bad_request(format!(
-            "invalid --fwd GUEST {:?}",
-            g
-        )))
-    })?;
-    if host == 0 || guest == 0 {
-        return Err(crate::Error::bad_request(format!(
-            "invalid --fwd {:?}; ports must be 1..=65535",
-            s
-        ))
-        .into());
-    }
-    Ok((host, guest))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

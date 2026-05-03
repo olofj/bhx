@@ -874,27 +874,13 @@ fn resize_image(path: &Path, size: &str, is_single_fs: bool) -> Result<()> {
     Ok(())
 }
 
-/// Parse a size string like "10G" or "2T" to bytes.
+/// Parse a disk-image size string. Thin re-export of
+/// [`crate::parse::parse_size_disk`] (the original implementation
+/// here used `&s[..s.len() - 1]`, which would panic on a multi-byte
+/// last char — the canonical version uses `strip_suffix` and is
+/// byte-safe).
 fn parse_size(s: &str) -> Result<u64> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(Error::bad_request("empty size string"));
-    }
-
-    let (num_str, suffix) = if s.ends_with('G') || s.ends_with('g') {
-        (&s[..s.len() - 1], 1024u64 * 1024 * 1024)
-    } else if s.ends_with('T') || s.ends_with('t') {
-        (&s[..s.len() - 1], 1024u64 * 1024 * 1024 * 1024)
-    } else if s.ends_with('M') || s.ends_with('m') {
-        (&s[..s.len() - 1], 1024u64 * 1024)
-    } else {
-        (s, 1u64)
-    };
-
-    let num: u64 = num_str
-        .parse()
-        .map_err(|e| Error::bad_request(format!("Invalid size '{}': {}", s, e)))?;
-    Ok(num * suffix)
+    crate::parse::parse_size_disk(s)
 }
 
 // ============================================================================
