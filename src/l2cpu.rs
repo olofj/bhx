@@ -160,6 +160,12 @@ impl L2Cpu {
             }
         };
 
+        // Register the full 8 GB VA span with the chip-fault handler so
+        // a SIGBUS landing here gets attributed to "chip access" rather
+        // than "daemon bug" (#149). Best-effort — registration failure
+        // is silently dropped.
+        crate::daemon::sigbus::register_chip_range(memory, 2usize << 32);
+
         Ok(L2Cpu {
             fd,
             idx,
@@ -249,6 +255,7 @@ impl Drop for L2Cpu {
         // the fd, because ioctl_free_tlb uses the fd. We use ManuallyDrop to control
         // this explicitly: drop windows first (second before first, matching C++),
         // then munmap the 8GB reservation, then close the fd.
+        crate::daemon::sigbus::unregister_chip_range(self.memory);
         unsafe {
             ManuallyDrop::drop(&mut self._second);
             ManuallyDrop::drop(&mut self._first);

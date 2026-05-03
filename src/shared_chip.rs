@@ -107,6 +107,13 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        // Unregister the chip-fault ranges before the underlying mmaps
+        // disappear (#149). Belt-and-suspenders: even if a stale fault
+        // arrives later it can't match a stale range now.
+        let reset_data = self.reset_window.data();
+        let csm_data = self.csm_window.data();
+        crate::daemon::sigbus::unregister_chip_range(reset_data);
+        crate::daemon::sigbus::unregister_chip_range(csm_data);
         unsafe {
             ManuallyDrop::drop(&mut self.csm_window);
             ManuallyDrop::drop(&mut self.reset_window);
@@ -198,6 +205,17 @@ impl SharedChip {
                 return Err(e);
             }
         };
+        // Register both persistent windows with the chip-fault handler
+        // so a SIGBUS from a tt-smi -r mid-access on the ARC tile lands
+        // in the "during chip access" message branch (#149). Re-register
+        // on every `open_inner` call (called at SharedChip::new and
+        // again after each `reset_board` fd rotation) — the previous
+        // mmap was freed and replaced with a new one at a different VA.
+        let reset_data = reset_window.data();
+        let csm_data = csm_window.data();
+        crate::daemon::sigbus::register_chip_range(reset_data, ARC_RESET_WINDOW_SIZE as usize);
+        crate::daemon::sigbus::register_chip_range(csm_data, CSM_WINDOW_SIZE as usize);
+
         Ok(Inner {
             reset_window: ManuallyDrop::new(reset_window),
             csm_window: ManuallyDrop::new(csm_window),
