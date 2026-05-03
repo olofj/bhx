@@ -1105,48 +1105,166 @@ fn run_exporter(listener: TcpListener, state: Arc<DaemonState>) {
     dlog!("[metrics] exporter thread exiting");
 }
 
+/// Hard cap on request-header bytes the exporter accepts before
+/// returning `413 Payload Too Large` (#151). 8 KiB is generous for
+/// a Prometheus-style scrape — the request line is ~30 bytes, all
+/// known scrapers' headers fit in 1–2 KiB. Bumping past 8 KiB suggests
+/// a misconfigured client or a probe; we'd rather fail loudly than
+/// allocate unbounded buffer.
+const MAX_REQUEST_HEADER_BYTES: usize = 8 * 1024;
+
+/// Categorized result of parsing a single HTTP request line. Returned
+/// by [`parse_request_line`] so the dispatch is pure-function testable
+/// without a TCP socket.
+#[derive(Debug, PartialEq, Eq)]
+enum RequestKind {
+    /// `GET /metrics` (with or without a query string). Serve metrics.
+    Metrics,
+    /// Path was `/metrics` but method was not `GET`. Serve 405.
+    MethodNotAllowed,
+    /// Anything else — wrong path, malformed line, unknown verb. 404.
+    NotFound,
+}
+
+/// Parse a single HTTP request line ("`GET /path HTTP/1.1`"-shaped)
+/// into a [`RequestKind`]. Whitespace tolerant: only the method and
+/// path are inspected; the version is ignored. Trailing `?<query>`
+/// on `/metrics` is accepted and ignored.
+///
+/// Pre-#151 the dispatch used `request_line.starts_with("GET /metrics")`,
+/// which mismatches `/metricsfoo` (matched the prefix) and rejected
+/// `POST /metrics` as 404 instead of the proper 405. Both matter for
+/// reverse-proxy setups where the operator expects RFC-compliant
+/// behavior.
+fn parse_request_line(line: &str) -> RequestKind {
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let raw_path = parts.next().unwrap_or("");
+    let path = raw_path.split('?').next().unwrap_or("");
+    if path != "/metrics" {
+        return RequestKind::NotFound;
+    }
+    if method != "GET" {
+        return RequestKind::MethodNotAllowed;
+    }
+    RequestKind::Metrics
+}
+
+/// Read from `stream` until the request headers end (CRLF CRLF) or
+/// the buffer hits [`MAX_REQUEST_HEADER_BYTES`]. Returns the bytes
+/// read (which include the trailing CRLF CRLF on success) or an error.
+///
+/// Pre-#151 the exporter read into a fixed 1 KiB buffer with a single
+/// `read()` call. A scraper that chunked the request line across two
+/// TCP reads, or one whose headers exceeded 1 KiB, fell through to
+/// "unknown" and got 404 even when the path was `/metrics`. Looping
+/// until CRLF CRLF (or the cap) makes both cases work.
+///
+/// Three terminal states are normal: `\r\n\r\n` found in the buffer
+/// (well-formed request — return), peer closed the write side
+/// (return what we have, caller parses best-effort), or a read
+/// returns `WouldBlock`/`TimedOut` (the per-read socket timeout
+/// fired — return what we have so a malformed client that doesn't
+/// terminate its headers can't hang the accept loop). Header
+/// overflow is the only error path; it maps to a 413 response.
+fn read_request_headers<R: Read>(stream: &mut R) -> io::Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 512];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return Ok(buf),
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    return Ok(buf);
+                }
+                if buf.len() >= MAX_REQUEST_HEADER_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "headers exceed MAX_REQUEST_HEADER_BYTES",
+                    ));
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(buf);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Format a complete HTTP/1.1 response with `Connection: close`.
+/// Pulled out as a pure helper so error responses keep a consistent
+/// shape and the test harness can build expected outputs.
+fn http_response(status_line: &str, content_type: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {}\r\n\
+         Content-Type: {}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        status_line,
+        content_type,
+        body.len(),
+        body
+    )
+}
+
 fn handle_request(mut stream: TcpStream, state: &Arc<DaemonState>) {
     // Bound the per-request work: short timeouts so a slow / hung
-    // client can't block the accept loop.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    // client can't block the accept loop. 1 s on read is enough for
+    // any well-behaved scraper (a Prometheus scrape sends headers in
+    // a single packet); a malformed client whose headers never reach
+    // CRLF CRLF gets the timeout, falls into the read_request_headers
+    // best-effort branch, and the dispatch turns its truncated input
+    // into a 404. 5 s on write covers an unusually large body
+    // through a slow consumer.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
-    // Read the request line + headers in one go. 1 KiB is plenty —
-    // we only care about the first line, but headers may follow.
-    let mut buf = [0u8; 1024];
-    let n = match stream.read(&mut buf) {
-        Ok(0) => return,
-        Ok(n) => n,
-        Err(_) => return,
+    let response = match read_request_headers(&mut stream) {
+        Ok(buf) => {
+            let request_line = std::str::from_utf8(&buf)
+                .ok()
+                .and_then(|s| s.lines().next())
+                .unwrap_or("");
+            match parse_request_line(request_line) {
+                RequestKind::Metrics => {
+                    let body = render_prometheus(state);
+                    http_response("200 OK", "text/plain; version=0.0.4; charset=utf-8", &body)
+                }
+                RequestKind::MethodNotAllowed => http_response(
+                    "405 Method Not Allowed",
+                    "text/plain; charset=utf-8",
+                    "405 Method Not Allowed\n",
+                ),
+                RequestKind::NotFound => http_response(
+                    "404 Not Found",
+                    "text/plain; charset=utf-8",
+                    "404 Not Found\n",
+                ),
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => http_response(
+            "413 Payload Too Large",
+            "text/plain; charset=utf-8",
+            "413 Payload Too Large\n",
+        ),
+        Err(_) => {
+            // Read failed (timeout, peer reset, etc.); nothing to
+            // respond with. Just close.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
     };
-    let request_line = std::str::from_utf8(&buf[..n])
-        .ok()
-        .and_then(|s| s.lines().next())
-        .unwrap_or("");
 
-    let response = if request_line.starts_with("GET /metrics") {
-        let body = render_prometheus(state);
-        format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\r\n{}",
-            body.len(),
-            body
-        )
-    } else {
-        let body = "404 Not Found\n";
-        format!(
-            "HTTP/1.1 404 Not Found\r\n\
-             Content-Type: text/plain; charset=utf-8\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\r\n{}",
-            body.len(),
-            body
-        )
-    };
-
-    let _ = stream.write_all(response.as_bytes());
+    if let Err(e) = stream.write_all(response.as_bytes()) {
+        dlog!("[metrics] response write failed: {}", e);
+    }
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
@@ -1589,10 +1707,15 @@ mod tests {
         let (code, _) = request("/healthz");
         assert_eq!(code, 404);
 
-        // /metrics with extra query string still hits the route —
-        // we use prefix-match `starts_with("GET /metrics")`.
+        // /metrics with extra query string still hits the route — the
+        // path matcher strips the `?...` suffix before comparing.
         let (code, _) = request("/metrics?foo=bar");
         assert_eq!(code, 200);
+
+        // /metricsfoo must NOT match — pre-#151 a `starts_with` check
+        // served metrics for any path beginning with `/metrics`.
+        let (code, _) = request("/metricsfoo");
+        assert_eq!(code, 404, "/metricsfoo must not match /metrics");
 
         // Tell the exporter thread to stop. There's no join handle
         // (the spawn is fire-and-forget so callers don't have to
@@ -1601,12 +1724,10 @@ mod tests {
         state.shutdown.store(true, Ordering::Relaxed);
     }
 
-    /// Adversarial input handling for the HTTP exporter (#33). The
-    /// listener uses a fixed 1024-byte read buffer and only inspects
-    /// the first line of the request — which is fine, but easy to
-    /// break with a refactor. Test the three plausible regressions:
-    /// oversize requests, malformed first lines, and pipelined
-    /// follow-on requests on the same connection.
+    /// Adversarial input handling for the HTTP exporter (#33, #151).
+    /// Test plausible regressions: oversize requests, malformed
+    /// first lines, pipelined follow-on requests, and the post-#151
+    /// 413 on header overflow.
     #[test]
     fn http_exporter_handles_adversarial_inputs() {
         use std::io::{Read, Write};
@@ -1673,6 +1794,122 @@ mod tests {
         assert!(
             text.starts_with("HTTP/1.1 404"),
             "expected 404 on empty request line, got:\n{}",
+            text
+        );
+
+        // Headers exceed MAX_REQUEST_HEADER_BYTES with no `\r\n\r\n`
+        // anywhere — the read loop should hit the cap and respond 413.
+        // (Pre-#151 the fixed 1 KiB single-read returned 404 for this
+        // case, masking the abuse.)
+        let mut huge = b"GET /metrics HTTP/1.1\r\nHost: ".to_vec();
+        huge.extend(std::iter::repeat_n(b'X', 9000));
+        // No CRLF CRLF — the server must time out the size cap, not wait.
+        let resp = do_request(&huge);
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 413"),
+            "expected 413 Payload Too Large on >8 KiB headers, got:\n{}",
+            text
+        );
+
+        // POST /metrics → 405, not 404. Pre-#151 it returned 404
+        // because `starts_with("GET /metrics")` failed.
+        let resp = do_request(b"POST /metrics HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 405"),
+            "expected 405 Method Not Allowed on POST /metrics, got:\n{}",
+            text
+        );
+
+        state.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Pure-function tests for `parse_request_line`. These cover the
+    /// dispatch policy without spinning up a TCP socket — easier to
+    /// pin the matcher's behavior than going through the exporter
+    /// integration test.
+    #[test]
+    fn parse_request_line_serves_metrics_for_exact_path() {
+        assert_eq!(
+            parse_request_line("GET /metrics HTTP/1.1"),
+            RequestKind::Metrics
+        );
+    }
+
+    #[test]
+    fn parse_request_line_serves_metrics_with_query_string() {
+        assert_eq!(
+            parse_request_line("GET /metrics?probe=node HTTP/1.1"),
+            RequestKind::Metrics
+        );
+        assert_eq!(
+            parse_request_line("GET /metrics? HTTP/1.1"),
+            RequestKind::Metrics
+        );
+    }
+
+    #[test]
+    fn parse_request_line_rejects_path_with_metrics_prefix() {
+        assert_eq!(
+            parse_request_line("GET /metricsfoo HTTP/1.1"),
+            RequestKind::NotFound
+        );
+        assert_eq!(
+            parse_request_line("GET /metrics/extra HTTP/1.1"),
+            RequestKind::NotFound
+        );
+    }
+
+    #[test]
+    fn parse_request_line_405_on_non_get_to_metrics() {
+        assert_eq!(
+            parse_request_line("POST /metrics HTTP/1.1"),
+            RequestKind::MethodNotAllowed
+        );
+        assert_eq!(
+            parse_request_line("PUT /metrics HTTP/1.1"),
+            RequestKind::MethodNotAllowed
+        );
+    }
+
+    #[test]
+    fn parse_request_line_404_on_unknown_path() {
+        assert_eq!(
+            parse_request_line("GET /healthz HTTP/1.1"),
+            RequestKind::NotFound
+        );
+        assert_eq!(parse_request_line(""), RequestKind::NotFound);
+        assert_eq!(parse_request_line("garbage"), RequestKind::NotFound);
+    }
+
+    /// Split-read regression: pre-#151 a fixed 1 KiB read might miss
+    /// part of the request line if the client wrote it in two TCP
+    /// chunks with a pause between them. The new loop reads until
+    /// CRLF CRLF, so this works.
+    #[test]
+    fn http_exporter_handles_split_read() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        let state = Arc::new(DaemonState::new(0, Arc::new(SharedChip::placeholder())));
+        let port = spawn_exporter(0, state.clone()).expect("bind on port 0");
+
+        let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        // Write the request in two halves with a pause; the exporter
+        // must loop on read until it sees `\r\n\r\n`, not bail after
+        // the first short read.
+        s.write_all(b"GET /metr").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        s.write_all(b"ics HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "split-read request should still 200, got:\n{}",
             text
         );
 
