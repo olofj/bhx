@@ -1302,25 +1302,74 @@ fn run_boot_client(
     )
 }
 
+/// Decision the auto-start path makes from the current environment.
+/// Pulled out as a struct + pure function so the env-var policy is
+/// hardware-free testable without touching `is_running` / `start`.
+#[derive(Debug, PartialEq, Eq)]
+enum AutoStartDecision {
+    /// `BHX_AUTO_START=0` was set; the boot should error out instead
+    /// of silently spawning a daemon.
+    Disabled,
+    /// Auto-start permitted; spawn with these options. `metrics_port`
+    /// honors `BHX_AUTO_START_METRICS_PORT`.
+    Spawn { metrics_port: Option<u16> },
+}
+
+/// Pure-function policy decoder. Looks at env vars only; no side
+/// effects; safe to unit-test against a snapshot.
+fn auto_start_decision_from_env<F>(getter: F) -> AutoStartDecision
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if matches!(
+        getter("BHX_AUTO_START").as_deref(),
+        Some("0") | Some("false")
+    ) {
+        return AutoStartDecision::Disabled;
+    }
+    let metrics_port = getter("BHX_AUTO_START_METRICS_PORT").and_then(|v| v.trim().parse().ok());
+    AutoStartDecision::Spawn { metrics_port }
+}
+
 /// Auto-start the per-card daemon if it isn't already running. Limited
 /// to `bhx boot` (and the profile-driven boot path it shares); other
 /// subcommands are intentionally NOT covered — `connect`/`status`/
 /// `add-disk`/`stop` against a stopped daemon usually means
 /// "the daemon I expected just died" or "wrong shell," and silently
 /// starting one would mask that. `boot` is the natural session-start
-/// verb where auto-start is unsurprising. (#134)
+/// verb where auto-start is unsurprising. (#134, #153)
+///
+/// Env-var knobs (#153):
+/// - `BHX_AUTO_START=0` opts out — instead of spawning, the function
+///   returns an error so a CI/scripted run that doesn't want a stray
+///   daemon can fail loudly rather than leaving one behind.
+/// - `BHX_AUTO_START_METRICS_PORT=N` forwards into the spawned
+///   daemon's `StartOpts.metrics_port`. Without this an operator
+///   running a Prometheus scrape against the box would silently miss
+///   data from auto-started sessions.
 fn ensure_daemon_running(card: u32) -> std::io::Result<()> {
     if daemon::lifetime::is_running(card) {
         return Ok(());
     }
-    eprintln!("[daemon] not running for card {} — auto-starting", card);
-    daemon::runner::start(daemon::runner::StartOpts {
-        card,
-        foreground: false,
-        log_file: None,
-        sandbox: true,
-        metrics_port: None,
-    })
+    match auto_start_decision_from_env(|k| std::env::var(k).ok()) {
+        AutoStartDecision::Disabled => {
+            Err(std::io::Error::from(crate::Error::bad_request(format!(
+                "daemon not running for card {} and BHX_AUTO_START=0 set; \
+                 run `bhx daemon start -t {}` first",
+                card, card
+            ))))
+        }
+        AutoStartDecision::Spawn { metrics_port } => {
+            eprintln!("[daemon] not running for card {} — auto-starting", card);
+            daemon::runner::start(daemon::runner::StartOpts {
+                card,
+                foreground: false,
+                log_file: None,
+                sandbox: true,
+                metrics_port,
+            })
+        }
+    }
 }
 
 fn absolutize(path: &str) -> std::io::Result<String> {
@@ -3019,6 +3068,96 @@ mod tests {
         assert!(parse_hostname("foo_bar").is_err());
         // dots rejected (this is the per-label part, not FQDN)
         assert!(parse_hostname("foo.bar").is_err());
+    }
+
+    // --- ensure_daemon_running env-var policy (#153) -----------------------
+
+    fn empty_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn auto_start_default_is_spawn_with_no_metrics_port() {
+        assert_eq!(
+            auto_start_decision_from_env(empty_env),
+            AutoStartDecision::Spawn { metrics_port: None }
+        );
+    }
+
+    #[test]
+    fn auto_start_disabled_by_zero_or_false() {
+        for v in ["0", "false"] {
+            let g = move |k: &str| {
+                if k == "BHX_AUTO_START" {
+                    Some(v.to_string())
+                } else {
+                    None
+                }
+            };
+            assert_eq!(auto_start_decision_from_env(g), AutoStartDecision::Disabled);
+        }
+    }
+
+    #[test]
+    fn auto_start_other_truthy_values_still_spawn() {
+        // We only treat "0"/"false" as disable. Any other value enables.
+        // Avoids a yes/no/maybe surface where "BHX_AUTO_START=yes" silently
+        // turns auto-start off.
+        for v in ["1", "true", "yes", "yeah-i-guess", ""] {
+            let g = move |k: &str| {
+                if k == "BHX_AUTO_START" {
+                    Some(v.to_string())
+                } else {
+                    None
+                }
+            };
+            assert!(matches!(
+                auto_start_decision_from_env(g),
+                AutoStartDecision::Spawn { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn auto_start_forwards_metrics_port() {
+        let g = |k: &str| {
+            if k == "BHX_AUTO_START_METRICS_PORT" {
+                Some("9090".into())
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            auto_start_decision_from_env(g),
+            AutoStartDecision::Spawn {
+                metrics_port: Some(9090)
+            }
+        );
+    }
+
+    #[test]
+    fn auto_start_ignores_garbage_metrics_port() {
+        let g = |k: &str| {
+            if k == "BHX_AUTO_START_METRICS_PORT" {
+                Some("not-a-port".into())
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            auto_start_decision_from_env(g),
+            AutoStartDecision::Spawn { metrics_port: None }
+        );
+    }
+
+    #[test]
+    fn auto_start_disabled_overrides_metrics_port() {
+        let g = |k: &str| match k {
+            "BHX_AUTO_START" => Some("0".into()),
+            "BHX_AUTO_START_METRICS_PORT" => Some("9090".into()),
+            _ => None,
+        };
+        assert_eq!(auto_start_decision_from_env(g), AutoStartDecision::Disabled);
     }
 
     // --- parse_l2cpu_locator + resolve_target (#98) ------------------------
