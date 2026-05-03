@@ -635,8 +635,7 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Re
 
     let engine_tile = state
         .tensix_engine
-        .lock()
-        .unwrap()
+        .lock_or_internal_error()?
         .as_ref()
         .map(|e| (e.noc0_x, e.noc0_y));
     // Read L2CPU PLL state via SharedChip ARC window. PLL4 lives at
@@ -2348,6 +2347,57 @@ mod tests {
             Response::Status { .. } => {}
             other => panic!("expected Status response, got {:?}", other),
         }
+    }
+
+    /// A poisoned `state.tensix_engine` mutex must not panic the
+    /// daemon: dispatch_status used to call `.lock().unwrap()` on it
+    /// (sweep #104 missed that one site, fix in #145), which would
+    /// kill the daemon on the next status RPC after any unrelated
+    /// panic that held the lock. Now wrapped in `lock_or_internal_error`,
+    /// so the RPC just gets a framed `Response::Error` and
+    /// `rpc_errors_total{Status}` bumps.
+    #[test]
+    fn dispatch_status_handles_poisoned_tensix_engine_lock() {
+        use crate::daemon::metrics::{RpcMethod, DAEMON_RPC_ERRORS_TOTAL};
+        use crate::shared_chip::SharedChip;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let state = Arc::new(DaemonState::new(0, Arc::new(SharedChip::placeholder())));
+
+        // Poison `state.tensix_engine` by panicking inside a held lock.
+        let state_for_poison = Arc::clone(&state);
+        let _ = std::thread::spawn(move || {
+            let _guard = state_for_poison.tensix_engine.lock().unwrap();
+            panic!("intentional: poisoning tensix_engine for test");
+        })
+        .join();
+        assert!(state.tensix_engine.is_poisoned());
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write_frame(&mut client, &Request::Status).unwrap();
+
+        let err_before = DAEMON_RPC_ERRORS_TOTAL.at(RpcMethod::Status).get();
+        handle_client(server, state);
+
+        let resp: Response = read_frame(&mut client).expect("read response");
+        match resp {
+            Response::Error { error } => {
+                assert!(
+                    error.to_lowercase().contains("internal"),
+                    "expected internal-error message, got {:?}",
+                    error
+                );
+            }
+            other => panic!("expected Error response, got {:?}", other),
+        }
+        assert!(
+            DAEMON_RPC_ERRORS_TOTAL.at(RpcMethod::Status).get() > err_before,
+            "rpc_errors_total{{Status}} should bump on poisoned-lock failure"
+        );
     }
 
     /// Wiring test for the rpc_errors_total bump (sub of #29). An
