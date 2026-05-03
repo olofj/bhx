@@ -92,25 +92,10 @@ pub fn install_chip_fault_handler() -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// Calling `install_chip_fault_handler` registers SOMETHING for
-    /// SIGBUS + SIGSEGV. We don't assert the handler pointer is exactly
-    /// ours — that's brittle across build modes — only that we replaced
-    /// the default disposition.
-    #[test]
-    fn install_replaces_default_disposition_for_bus_and_segv() {
-        // Save the current handler so we can restore it at the end.
-        // Tests inside the same binary share the process's signal
-        // table; we don't want to leave SA_RESETHAND'd handlers behind
-        // for subsequent tests in the same run.
-        let mut prev_bus: libc::sigaction = unsafe { std::mem::zeroed() };
-        let mut prev_segv: libc::sigaction = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::sigaction(libc::SIGBUS, std::ptr::null(), &mut prev_bus);
-            libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut prev_segv);
-        }
-
+    /// Body of the install assertion — same checks the in-process
+    /// version had, factored so the child process can run them.
+    fn assert_handler_installed_for_bus_and_segv() {
         install_chip_fault_handler().expect("install should succeed");
-
         for sig in [libc::SIGBUS, libc::SIGSEGV] {
             let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
             let rc = unsafe { libc::sigaction(sig, std::ptr::null(), &mut current) };
@@ -127,13 +112,45 @@ mod tests {
                 sig
             );
         }
+    }
 
-        // Restore so other tests in the same process don't inherit
-        // the chip-fault handler.
-        unsafe {
-            libc::sigaction(libc::SIGBUS, &prev_bus, std::ptr::null_mut());
-            libc::sigaction(libc::SIGSEGV, &prev_segv, std::ptr::null_mut());
+    /// Calling `install_chip_fault_handler` registers SOMETHING for
+    /// SIGBUS + SIGSEGV. We don't assert the handler pointer is exactly
+    /// ours — that's brittle across build modes — only that we replaced
+    /// the default disposition.
+    ///
+    /// Runs in a subprocess so the installed handler doesn't bleed into
+    /// other parallel tests in the same binary (#150). The handler
+    /// `_exit(128+sig)`s on first fault — without isolation, any other
+    /// test that happens to SIGSEGV during the install window would
+    /// silently kill the runner.
+    #[test]
+    fn install_replaces_default_disposition_for_bus_and_segv() {
+        const CHILD_MARKER: &str = "BHX_SIGBUS_TEST_CHILD";
+
+        if std::env::var(CHILD_MARKER).is_ok() {
+            // Child branch: do the install + assertions and exit. A
+            // panic here aborts the child with non-zero status, which
+            // the parent reads as a test failure.
+            assert_handler_installed_for_bus_and_segv();
+            std::process::exit(0);
         }
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let status = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "daemon::sigbus::tests::install_replaces_default_disposition_for_bus_and_segv",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .status()
+            .expect("spawn child test runner");
+        assert!(
+            status.success(),
+            "child failed (exit code {:?})",
+            status.code()
+        );
     }
 
     /// The pre-formatted message buffers must end with a newline so the
