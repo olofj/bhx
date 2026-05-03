@@ -784,17 +784,14 @@ mod tests {
 
     // ---- ProfilesFile round-trip ----
 
-    /// Process-wide mutex serialising every test that mutates env
-    /// vars. `cargo test` runs tests in parallel by default and
-    /// `std::env::set_var` is globally visible — without this lock,
-    /// two tests setting `XDG_DATA_HOME` race and clobber each
-    /// other's tmpdir.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::test_util::env_lock;
 
     /// Override `$XDG_DATA_HOME` for the duration of a test so
     /// `instances_dir()` lands inside our tempdir instead of the
-    /// operator's real `~/.local/share`. Holds `ENV_LOCK` for the
-    /// guard's lifetime.
+    /// operator's real `~/.local/share`. Holds the process-wide
+    /// env-var lock from `crate::test_util` for the guard's
+    /// lifetime, so cross-module tests that mutate other env vars
+    /// (lifetime.rs's `XDG_RUNTIME_DIR`) serialize against this one.
     struct DataHomeGuard {
         prev: Option<std::ffi::OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -802,7 +799,7 @@ mod tests {
 
     impl DataHomeGuard {
         fn set(value: &Path) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = env_lock();
             let prev = std::env::var_os("XDG_DATA_HOME");
             unsafe {
                 std::env::set_var("XDG_DATA_HOME", value);
@@ -1178,7 +1175,7 @@ mod tests {
 
     #[test]
     fn pick_editor_prefers_visual_then_editor_then_vi() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = env_lock();
         // Save + restore env so test order doesn't leak state.
         let prev_visual = std::env::var_os("VISUAL");
         let prev_editor = std::env::var_os("EDITOR");

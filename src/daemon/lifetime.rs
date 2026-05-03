@@ -233,17 +233,8 @@ pub fn stop(card: u32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    // Tests here mutate XDG_RUNTIME_DIR, which is process-global. Serialize
-    // them with a test-only mutex so parallel cargo-test threads don't race.
-    // (std::env::set_var is unsafe-by-convention in multi-threaded code.)
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-    }
+    use crate::test_util::env_lock;
+    use std::sync::MutexGuard;
 
     struct EnvGuard {
         prev: Option<std::ffi::OsString>,

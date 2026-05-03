@@ -36,6 +36,8 @@ mod tensix_data_plane;
 mod tensix_engine;
 mod tensix_proto;
 mod tensix_tile;
+#[cfg(test)]
+mod test_util;
 mod tlb;
 mod uart_engine;
 mod virtio;
