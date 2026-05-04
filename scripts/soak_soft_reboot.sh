@@ -21,7 +21,7 @@
 #
 # Env:
 #   ITERATIONS    cycles per L2CPU before the harness exits (default 100)
-#   CORES         space-separated L2CPU indices (default "0 1 2")
+#   GUESTS        space-separated L2CPU indices (default "0 1 2")
 #   BINARY        bhx binary (default ./target/debug/bhx)
 #   LOG_FILE      daemon log path (default ./daemon-card0.log)
 #   CARD          tt device index (default 0)
@@ -31,8 +31,8 @@
 set -euo pipefail
 
 ITERATIONS=${ITERATIONS:-100}
-CORES_STR=${CORES:-"0 1 2"}
-read -ra CORES <<<"$CORES_STR"
+GUESTS_STR=${GUESTS:-"0 1 2"}
+read -ra GUESTS <<<"$GUESTS_STR"
 BINARY=${BINARY:-./target/debug/bhx}
 LOG_FILE=${LOG_FILE:-./daemon-card0.log}
 CARD=${CARD:-0}
@@ -45,10 +45,10 @@ note() { echo "[soak] $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 cleanup() {
-    # Kill per-core watchers cleanly so they stop spamming releases
+    # Kill per-guest watchers cleanly so they stop spamming releases
     # while the daemon is on its way out.
-    for i in "${CORES[@]}"; do
-        local pidfile="$STATE_DIR/core-$i.pid"
+    for i in "${GUESTS[@]}"; do
+        local pidfile="$STATE_DIR/guest-$i.pid"
         if [ -f "$pidfile" ]; then
             local p
             p=$(cat "$pidfile")
@@ -69,9 +69,9 @@ trap cleanup EXIT
 [ -e Image ] || fail "Image missing"
 [ -e blackhole-card.dtb ] || fail "blackhole-card.dtb missing"
 
-# Per-core rootfs copies so concurrent disk workers don't share an
+# Per-guest rootfs copies so concurrent disk workers don't share an
 # mmap'd backing file.
-for i in "${CORES[@]}"; do
+for i in "${GUESTS[@]}"; do
     cp --reflink=auto "$ROOTFS" "$STATE_DIR/rootfs-$i.ext2"
 done
 
@@ -79,13 +79,13 @@ note "tt-smi -r (cold chip)"
 (. ~/.tenstorrent-venv/bin/activate && tt-smi -r) >/dev/null 2>&1
 
 rm -f "$LOG_FILE"
-note "daemon start (BHX_SOFT_REBOOT=1, ITERATIONS=$ITERATIONS, CORES=${CORES[*]})"
+note "daemon start (BHX_SOFT_REBOOT=1, ITERATIONS=$ITERATIONS, GUESTS=${GUESTS[*]})"
 BHX_SOFT_REBOOT=1 "$BINARY" daemon start -t "$CARD" --log-file "$LOG_FILE" >/dev/null
 sleep 0.3
 
 # Cold boot all selected L2CPUs once.
-note "cold boot: ${CORES[*]}"
-for i in "${CORES[@]}"; do
+note "cold boot: ${GUESTS[*]}"
+for i in "${GUESTS[@]}"; do
     BHX_SOFT_REBOOT=1 "$BINARY" boot -t "$CARD" -l "$i" \
         -d "$STATE_DIR/rootfs-$i.ext2" >/dev/null \
         || fail "cold boot l2cpu $i failed"
@@ -109,10 +109,10 @@ read_purgatory() {
           }'
 }
 
-# Per-core watcher: each runs in the background, manages its own L2CPU
-# without touching the others. Output prefixed `[core N]` so a `tail
-# -f` of the soak log shows interleaved per-core progress in real time.
-core_loop() {
+# Per-guest watcher: each runs in the background, manages its own L2CPU
+# without touching the others. Output prefixed `[guest N]` so a `tail
+# -f` of the soak log shows interleaved per-guest progress in real time.
+guest_loop() {
     local idx=$1
     local n=0
     local stuck=0
@@ -126,13 +126,13 @@ core_loop() {
 
         if [ "$v" = "$PARKED_MAGIC" ]; then
             n=$((n + 1))
-            echo "[core $idx] iter $n/$ITERATIONS: PARKED — releasing"
+            echo "[guest $idx] iter $n/$ITERATIONS: PARKED — releasing"
             if BHX_SOFT_REBOOT=1 "$BINARY" boot -t "$CARD" -l "$idx" \
                   -d "$STATE_DIR/rootfs-$idx.ext2" >/dev/null 2>&1; then
-                echo "[core $idx] iter $n: released"
+                echo "[guest $idx] iter $n: released"
             else
                 stuck=$((stuck + 1))
-                echo "[core $idx] iter $n: release RPC failed (stuck=$stuck)" >&2
+                echo "[guest $idx] iter $n: release RPC failed (stuck=$stuck)" >&2
                 # Don't bail; let the next iter retry.
                 sleep 5
             fi
@@ -149,7 +149,7 @@ core_loop() {
                 elapsed=$((now - prev_purg_since))
                 if [ "$elapsed" -ge "$PARK_TIMEOUT" ]; then
                     stuck=$((stuck + 1))
-                    echo "[core $idx] iter $((n+1)): stuck for ${elapsed}s on purgatory=$v (stuck=$stuck) — keep watching" >&2
+                    echo "[guest $idx] iter $((n+1)): stuck for ${elapsed}s on purgatory=$v (stuck=$stuck) — keep watching" >&2
                     prev_purg_since=$now  # reset window so we log every PARK_TIMEOUT
                 fi
             fi
@@ -157,18 +157,18 @@ core_loop() {
         fi
     done
 
-    echo "[core $idx] DONE: completed $ITERATIONS iters, stuck count=$stuck"
+    echo "[guest $idx] DONE: completed $ITERATIONS iters, stuck count=$stuck"
 }
 
-# Spawn one watcher per core and write its PID to STATE_DIR so cleanup
+# Spawn one watcher per guest and write its PID to STATE_DIR so cleanup
 # can reap it.
-note "spawning per-core watchers"
-for i in "${CORES[@]}"; do
-    core_loop "$i" &
-    echo "$!" > "$STATE_DIR/core-$i.pid"
+note "spawning per-guest watchers"
+for i in "${GUESTS[@]}"; do
+    guest_loop "$i" &
+    echo "$!" > "$STATE_DIR/guest-$i.pid"
 done
 
-# Wait for all per-core watchers to finish their ITERATIONS targets.
+# Wait for all per-guest watchers to finish their ITERATIONS targets.
 # `wait` without args reaps all child processes started by this shell.
 wait
 
