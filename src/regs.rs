@@ -203,6 +203,29 @@ pub mod shutdown {
     pub const KIND_REBOOT: u16 = 1;
 }
 
+/// (#166 Phase 1) OpenSBI purgatory status block. Mirrors the
+/// `TT_PURGATORY_STATUS_OFFSET` / `TT_PURGATORY_STATUS_PARKED`
+/// constants in `third_party/opensbi/patches/0002-tt-purgatory-magic.patch`.
+/// When the SBI SRST fall-through reaches `sbi_platform_final_exit`,
+/// our patched OpenSBI writes the magic at this offset within the
+/// L2CPU's DRAM range; the daemon polls it via `dispatch_status` to
+/// confirm the soft-reboot path is functioning.
+pub mod purgatory {
+    /// Offset from the L2CPU's memory base (= OpenSBI's `fw_start`)
+    /// where the purgatory hook writes its status word. Lives in the
+    /// firmware-reserved range `[mem_base, mem_base + 0x100000)` (DTB
+    /// is at +0x100000, so 0xE0000 leaves a 64 KiB margin) and well
+    /// past OpenSBI's own .text/.data/.bss + scratch (typically
+    /// <300 KiB). Future phases will expand this region into a full
+    /// handshake area (release magic, next-entry-address slot, per-hart
+    /// liveness mask, etc.).
+    pub const STATUS_OFFSET: u64 = 0x000E_0000;
+    /// "PARKED__" interpreted as little-endian u64. Final_exit hook
+    /// writes this exact value to indicate the harts are about to
+    /// enter `sbi_hsm_hart_wait`.
+    pub const STATUS_PARKED: u64 = 0x5f5f_4445_4b52_4150;
+}
+
 /// Slirp host-side port allocation for SSH forwarding to the guest.
 pub mod slirp {
     /// Base host port for the SSH forward of L2CPU 0 on card 0.

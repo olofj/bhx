@@ -300,6 +300,20 @@ pub fn status(card: u32) -> io::Result<()> {
                         "  l2cpu {}: {:?} disk={} net={} vconsole={} clients={}",
                         l.idx, l.state, disk, net, vc, l.clients
                     );
+                    // (#166 Phase 1) Surface OpenSBI's purgatory status
+                    // word when the slot is alive. PARKED magic
+                    // ("PARKED__") = SBI SRST fall-through reached
+                    // sbi_platform_final_exit; 0 = still running guest.
+                    if let Some(p) = l.purgatory_status {
+                        let label = if p == crate::regs::purgatory::STATUS_PARKED {
+                            "PARKED"
+                        } else if p == 0 {
+                            "running (no SRST yet)"
+                        } else {
+                            "unknown"
+                        };
+                        println!("    purgatory: {} ({:#018x})", label, p);
+                    }
                     // Per-disk lines for everything beyond the
                     // primary rootfs (already printed above as
                     // `disk=`). Most commonly the cloud-init seed

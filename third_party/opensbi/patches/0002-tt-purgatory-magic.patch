@@ -1,0 +1,149 @@
+Add a sbi_platform_final_exit hook that writes a "PARKED__" magic at
+a known DRAM offset before the warmboot loop spins, plus a stub
+sbi_system_reset_device so SBI SRST is reported supported and falls
+through to sbi_exit instead of the kernel halting locally.
+
+Phase 1 of bhx#166: smallest possible verification that the SBI SRST
+fall-through path (sbi_system_reset → stub.system_reset returns →
+sbi_exit → sbi_platform_final_exit → sbi_hsm_exit → jump_warmboot →
+sbi_hsm_hart_wait) lands in our hook before the harts park. The host
+(bhx daemon) reads the magic from L2CPU DRAM at scratch->fw_start +
+TT_PURGATORY_STATUS_OFFSET.
+
+Why a stub reset device is needed:
+
+  - Without ANY system_reset_device registered, sbi_system_reset_supported()
+    returns false, so the guest kernel's reboot/halt path sees the SBI SRST
+    extension as unsupported and just halts in place — never invoking
+    SBI SRST, so our final_exit hook never fires.
+  - With our stub returning priority 1 from system_reset_check, the kernel
+    sees the extension as supported and issues sbi_ecall(SRST). Our stub's
+    system_reset() returns immediately (no-op), letting sbi_system_reset
+    fall through to sbi_exit().
+  - Coexistence with the existing #94 syscon-poweroff path: bhx's daemon
+    DTB injects a /poweroff -> syscon node by default. OpenSBI's
+    fdt_reset_syscon driver registers a reset device for it (priority 1)
+    in the cold-init phase. Our stub registers in final_init (after the
+    fdt scan). On a tie at priority 1, the first-registered device wins
+    in sbi_system_reset_get_device, so syscon takes precedence by default
+    — preserving the existing BRISC-kick path.
+  - When the daemon is run with BHX_SOFT_REBOOT=1, modify_dtb skips the
+    syscon-poweroff node entirely. With no syscon device registered, our
+    stub is the sole reset device → SBI SRST falls through to sbi_exit
+    → final_exit → magic written → harts park.
+
+Magic layout (64-bit little-endian):
+  0x00 .. 0x07 : status word
+  - 0x0000_0000_0000_0000 : not yet parked (cold-boot zero-init)
+  - 0x5f5f_4445_4b52_4150 : "PARKED__" — final_exit reached, harts
+                            about to enter sbi_hsm_hart_wait
+
+Future phases will expand this region into a full handshake area
+(release magic, next-entry-address slot, per-hart liveness mask, etc.).
+
+The status offset 0xE0000 lives in the firmware's reserved range past
+OpenSBI's .text/.data/.bss + scratch (typically <300 KiB) and before
+the kernel-DTB at +0x100000.
+
+sbi_scratch.h and sbi_system.h are pulled in transitively via
+sbi_platform.h, so no new include needed.
+
+--- a/platform/generic/platform.c
++++ b/platform/generic/platform.c
+@@ -238,6 +238,9 @@
+ 	return 0;
+ }
+ 
++/* bhx#166 Phase 1: forward decl, definition is later in this file. */
++static void tt_purgatory_register_reset_device(void);
++
+ int generic_final_init(bool cold_boot)
+ {
+ 	void *fdt = fdt_get_address_rw();
+@@ -249,6 +252,9 @@
+ 	fdt_fixups(fdt);
+ 	fdt_domain_fixup(fdt);
+ 
++	/* bhx#166 Phase 1: register stub reset device so SBI SRST → sbi_exit. */
++	tt_purgatory_register_reset_device();
++
+ 	return 0;
+ }
+ 
+@@ -331,6 +337,68 @@
+ 	return fdt_mpxy_init(fdt);
+ }
+ 
++/* bhx#166 Phase 1: announce parked-in-warmboot to the PCIe host.
++ *
++ * Called from sbi_exit() right before sbi_hsm_exit() jumps into the
++ * HSM warmboot wait loop. We write a fixed magic to a known offset
++ * within the firmware's reserved DRAM range; the bhx daemon polls
++ * that cell over NoC to learn the L2CPU has parked itself instead
++ * of needing a chip-side reset.
++ *
++ * Only the SRST-issuing hart reaches this hook (peers were halted
++ * by sbi_ipi_send_halt and walked sbi_hsm_hart_stop -> sbi_hsm_exit
++ * directly, bypassing sbi_exit). One write is enough: per-hart
++ * liveness will live elsewhere in the status block in later phases.
++ */
++#define TT_PURGATORY_STATUS_OFFSET	0x000E0000UL
++#define TT_PURGATORY_STATUS_PARKED	0x5f5f44454b524150UL  /* "PARKED__" LE */
++
++static void tt_purgatory_final_exit(void)
++{
++	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
++	volatile unsigned long *status =
++		(volatile unsigned long *)(scratch->fw_start +
++					   TT_PURGATORY_STATUS_OFFSET);
++
++	*status = TT_PURGATORY_STATUS_PARKED;
++	__asm__ volatile("fence ow,ow" : : : "memory");
++}
++
++/* Stub reset device so the kernel sees SBI SRST as supported. Returns
++ * priority 1 (same as syscon-poweroff). Registered in final_init AFTER
++ * fdt_reset_init has scanned for syscon, so on a tie syscon wins; we
++ * only become the active reset device when no other one was registered.
++ * system_reset() returns immediately, letting sbi_system_reset() fall
++ * through to sbi_exit() and ultimately our final_exit hook.
++ */
++static int tt_purgatory_reset_check(u32 reset_type, u32 reset_reason)
++{
++	(void)reset_reason;
++	if (reset_type == SBI_SRST_RESET_TYPE_SHUTDOWN ||
++	    reset_type == SBI_SRST_RESET_TYPE_COLD_REBOOT ||
++	    reset_type == SBI_SRST_RESET_TYPE_WARM_REBOOT)
++		return 1;
++	return 0;
++}
++
++static void tt_purgatory_reset_do(u32 reset_type, u32 reset_reason)
++{
++	(void)reset_type; (void)reset_reason;
++	/* No-op: caller's sbi_system_reset() falls through to sbi_exit(). */
++}
++
++static struct sbi_system_reset_device tt_purgatory_reset_device = {
++	.name = "tt-purgatory",
++	.system_reset_check = tt_purgatory_reset_check,
++	.system_reset = tt_purgatory_reset_do,
++};
++
++static void tt_purgatory_register_reset_device(void)
++{
++	sbi_system_reset_add_device(&tt_purgatory_reset_device);
++}
++
++
+ struct sbi_platform_operations generic_platform_ops = {
+ 	.cold_boot_allowed	= generic_cold_boot_allowed,
+ 	.nascent_init		= generic_nascent_init,
+@@ -346,6 +414,7 @@
+ 	.get_tlb_num_entries	= generic_tlb_num_entries,
+ 	.timer_init		= fdt_timer_init,
+ 	.mpxy_init		= generic_mpxy_init,
++	.final_exit		= tt_purgatory_final_exit,
+ };
+ 
+ struct sbi_platform platform = {

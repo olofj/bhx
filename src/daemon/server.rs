@@ -598,29 +598,45 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Re
     let mut l2cpus = Vec::new();
     for (idx, slot_mutex) in state.l2cpus.iter().enumerate() {
         let slot = slot_mutex.lock_or_internal_error()?;
-        let (st, disk, disks, net, virtio_console, clients) = match slot.as_ref() {
+        let (st, disk, disks, net, virtio_console, clients, purgatory_status) = match slot.as_ref()
+        {
             None => {
                 let st = if state.wedged[idx].load(Ordering::Relaxed) {
                     L2CpuState::Wedged
                 } else {
                     L2CpuState::Stopped
                 };
-                (st, None, Vec::new(), false, false, 0)
+                (st, None, Vec::new(), false, false, 0, None)
             }
-            Some(s) => (
-                L2CpuState::Running,
-                s.disks.first().map(|d| d.path.clone()),
-                s.disks
-                    .iter()
-                    .map(|d| crate::daemon::protocol::DiskAttach {
-                        path: d.path.clone(),
-                        name: d.name.clone(),
-                    })
-                    .collect(),
-                s.net.is_some(),
-                s.virtio_console.is_some(),
-                s.console_hub.client_count() as u32,
-            ),
+            Some(s) => {
+                // (#166 Phase 1) Read the OpenSBI purgatory status word
+                // at L2CPU memory base + 0xE0000. With the syscon-poweroff
+                // DTB injection disabled (BHX_SOFT_REBOOT=1), an in-guest
+                // SBI SRST should fall through to sbi_platform_final_exit,
+                // which writes "PARKED__" (0x5f5f44454b524150) here. Two
+                // u32 reads + assemble little-endian u64.
+                let purg_pa = crate::l2cpu::L2CPU_STARTING_ADDRESS[idx]
+                    + crate::regs::purgatory::STATUS_OFFSET;
+                let purg = match (s.l2cpu.read32(purg_pa), s.l2cpu.read32(purg_pa + 4)) {
+                    (Ok(lo), Ok(hi)) => Some(((hi as u64) << 32) | (lo as u64)),
+                    _ => None,
+                };
+                (
+                    L2CpuState::Running,
+                    s.disks.first().map(|d| d.path.clone()),
+                    s.disks
+                        .iter()
+                        .map(|d| crate::daemon::protocol::DiskAttach {
+                            path: d.path.clone(),
+                            name: d.name.clone(),
+                        })
+                        .collect(),
+                    s.net.is_some(),
+                    s.virtio_console.is_some(),
+                    s.console_hub.client_count() as u32,
+                    purg,
+                )
+            }
         };
         l2cpus.push(L2CpuStatus {
             idx: idx as u8,
@@ -630,6 +646,7 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Re
             net,
             virtio_console,
             clients,
+            purgatory_status,
         });
     }
 
@@ -1403,8 +1420,24 @@ fn run_boot_sequence(
     // at a fixed offset within the engine TLB window. Compute the PA
     // and pass to modify_dtb so the DT carries `/soc/syscon@<addr>`
     // + `/poweroff` nodes pointing at it.
-    let shutdown_addr =
-        x280_base_for_shutdown.map(|b| b + crate::regs::shutdown::OFFSET_FROM_ENGINE_BASE);
+    //
+    // #166 Phase 1 escape hatch: BHX_SOFT_REBOOT=1 skips the syscon
+    // injection entirely. With the syscon node absent, OpenSBI's
+    // fdt_reset_syscon driver doesn't register itself; SBI SRST falls
+    // through to sbi_exit → sbi_platform_final_exit → sbi_hsm_exit,
+    // landing in our patched purgatory hook (third_party/opensbi/
+    // patches/0002-tt-purgatory-magic.patch) which writes the
+    // "PARKED__" magic at scratch->fw_start + 0xE0000.
+    let soft_reboot = std::env::var("BHX_SOFT_REBOOT").ok().as_deref() == Some("1");
+    let shutdown_addr = if soft_reboot {
+        dlog!(
+            "[run_boot l2cpu {}] BHX_SOFT_REBOOT=1: skipping syscon-poweroff DTB injection",
+            l2cpu_idx
+        );
+        None
+    } else {
+        x280_base_for_shutdown.map(|b| b + crate::regs::shutdown::OFFSET_FROM_ENGINE_BASE)
+    };
     let dtb_patched = boot::modify_dtb(
         &dtb_raw,
         &boot_device,

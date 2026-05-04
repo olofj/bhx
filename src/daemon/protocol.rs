@@ -290,6 +290,16 @@ pub struct L2CpuStatus {
     #[serde(default = "default_true")]
     pub virtio_console: bool,
     pub clients: u32,
+    /// (#166 Phase 1) Snapshot of the OpenSBI purgatory status word at
+    /// `L2CPU_STARTING_ADDRESS[idx] + 0xE0000`. `None` = slot is
+    /// stopped or the read failed. `Some(0)` = OpenSBI is running but
+    /// the SRST hook hasn't fired (guest hasn't issued shutdown).
+    /// `Some(0x5f5f44454b524150)` = "PARKED__" magic, the SRST
+    /// fall-through reached `sbi_platform_final_exit` and harts are
+    /// in the warmboot wait loop. `#[serde(default)]` keeps older
+    /// clients compatible.
+    #[serde(default)]
+    pub purgatory_status: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,6 +494,7 @@ mod tests {
                 net: true,
                 virtio_console: true,
                 clients: 1,
+                purgatory_status: None,
             }],
             engine_tile: Some((16, 11)),
             pll_fbdiv: Some(140),
