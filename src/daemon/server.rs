@@ -598,46 +598,52 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Re
     let mut l2cpus = Vec::new();
     for (idx, slot_mutex) in state.l2cpus.iter().enumerate() {
         let slot = slot_mutex.lock_or_internal_error()?;
-        let (st, disk, disks, net, virtio_console, clients, purgatory_status) = match slot.as_ref()
-        {
-            None => {
-                let st = if state.wedged[idx].load(Ordering::Relaxed) {
-                    L2CpuState::Wedged
-                } else {
-                    L2CpuState::Stopped
-                };
-                (st, None, Vec::new(), false, false, 0, None)
-            }
-            Some(s) => {
-                // (#166 Phase 1) Read the OpenSBI purgatory status word
-                // at L2CPU memory base + 0xE0000. With the syscon-poweroff
-                // DTB injection disabled (BHX_SOFT_REBOOT=1), an in-guest
-                // SBI SRST should fall through to sbi_platform_final_exit,
-                // which writes "PARKED__" (0x5f5f44454b524150) here. Two
-                // u32 reads + assemble little-endian u64.
-                let purg_pa = crate::l2cpu::L2CPU_STARTING_ADDRESS[idx]
-                    + crate::regs::purgatory::STATUS_OFFSET;
-                let purg = match (s.l2cpu.read32(purg_pa), s.l2cpu.read32(purg_pa + 4)) {
-                    (Ok(lo), Ok(hi)) => Some(((hi as u64) << 32) | (lo as u64)),
-                    _ => None,
-                };
-                (
-                    L2CpuState::Running,
-                    s.disks.first().map(|d| d.path.clone()),
-                    s.disks
-                        .iter()
-                        .map(|d| crate::daemon::protocol::DiskAttach {
-                            path: d.path.clone(),
-                            name: d.name.clone(),
-                        })
-                        .collect(),
-                    s.net.is_some(),
-                    s.virtio_console.is_some(),
-                    s.console_hub.client_count() as u32,
-                    purg,
-                )
-            }
-        };
+        let (st, disk, disks, net, virtio_console, clients, purgatory_status, purgatory_peers) =
+            match slot.as_ref() {
+                None => {
+                    let st = if state.wedged[idx].load(Ordering::Relaxed) {
+                        L2CpuState::Wedged
+                    } else {
+                        L2CpuState::Stopped
+                    };
+                    (st, None, Vec::new(), false, false, 0, None, None)
+                }
+                Some(s) => {
+                    // (#166 Phase 1+2) Read the OpenSBI purgatory status
+                    // block at L2CPU memory base + 0xE0000:
+                    //   +0x00 .. 0x07 : status word (PARKED magic / 0)
+                    //   +0x08 .. 0x0F : peers convergence bitmask
+                    // With the syscon-poweroff DTB injection disabled
+                    // (BHX_SOFT_REBOOT=1), an in-guest SBI SRST falls
+                    // through to sbi_platform_final_exit, which polls
+                    // peer HSM states until all are STOPPED, writes the
+                    // peers bitmask, then writes "PARKED__" magic.
+                    let mem_base = crate::l2cpu::L2CPU_STARTING_ADDRESS[idx];
+                    let read_u64 = |pa: u64| -> Option<u64> {
+                        let lo = s.l2cpu.read32(pa).ok()?;
+                        let hi = s.l2cpu.read32(pa + 4).ok()?;
+                        Some(((hi as u64) << 32) | (lo as u64))
+                    };
+                    let purg = read_u64(mem_base + crate::regs::purgatory::STATUS_OFFSET);
+                    let peers = read_u64(mem_base + crate::regs::purgatory::PEERS_OFFSET);
+                    (
+                        L2CpuState::Running,
+                        s.disks.first().map(|d| d.path.clone()),
+                        s.disks
+                            .iter()
+                            .map(|d| crate::daemon::protocol::DiskAttach {
+                                path: d.path.clone(),
+                                name: d.name.clone(),
+                            })
+                            .collect(),
+                        s.net.is_some(),
+                        s.virtio_console.is_some(),
+                        s.console_hub.client_count() as u32,
+                        purg,
+                        peers,
+                    )
+                }
+            };
         l2cpus.push(L2CpuStatus {
             idx: idx as u8,
             state: st,
@@ -647,6 +653,7 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Re
             virtio_console,
             clients,
             purgatory_status,
+            purgatory_peers,
         });
     }
 

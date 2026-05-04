@@ -312,7 +312,21 @@ pub fn status(card: u32) -> io::Result<()> {
                         } else {
                             "unknown"
                         };
-                        println!("    purgatory: {} ({:#018x})", label, p);
+                        let peers_str = match l.purgatory_peers {
+                            Some(mask) if p == crate::regs::purgatory::STATUS_PARKED => {
+                                // Number of peer harts that converged to STOPPED.
+                                // The SRST-issuing hart's bit is intentionally
+                                // not set; full convergence on a 4-hart tile is
+                                // count == 3.
+                                format!(
+                                    " peers_stopped=0b{:04b}({})",
+                                    mask & 0xF,
+                                    mask.count_ones()
+                                )
+                            }
+                            _ => String::new(),
+                        };
+                        println!("    purgatory: {} ({:#018x}){}", label, p, peers_str);
                     }
                     // Per-disk lines for everything beyond the
                     // primary rootfs (already printed above as

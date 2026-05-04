@@ -138,6 +138,24 @@ read_purgatory() {
           }'
 }
 
+# (#166 Phase 2) Read the peers_stopped bitmask. Returns the trailing
+# decimal popcount in parentheses ("3" for full convergence on a 4-hart
+# tile). Returns empty string if the field isn't present.
+read_peers_stopped_count() {
+    local idx=$1
+    "$BINARY" daemon status -t "$CARD" 2>/dev/null \
+      | awk -v idx="$idx" '
+          $0 ~ "^  l2cpu " idx ":"           { in_block=1; next }
+          in_block && /^  l2cpu /             { in_block=0 }
+          in_block && /peers_stopped=/        {
+              for (i = 1; i <= NF; i++) {
+                  if ($i ~ /peers_stopped=/) {
+                      sub(/.*\(/, "", $i); sub(/\)/, "", $i); print $i; exit
+                  }
+              }
+          }'
+}
+
 # Send `poweroff -f` to L2CPU N's guest. Spawns pexpect, returns when
 # the connect socket EOFs or 30s timeout.
 trigger_poweroff() {
@@ -208,11 +226,21 @@ for iter in $(seq 1 "$ITERATIONS"); do
         wait "$p" || note "  warning: poweroff subprocess $p exited non-zero"
     done
 
-    # 2. Wait for all 3 to reach PARKED.
+    # 2. Wait for all 3 to reach PARKED, with full peer convergence.
     note "iter $iter: waiting for PARKED on all cores"
     for i in "${CORES[@]}"; do
         if wait_for_parked "$i"; then
-            note "  l2cpu $i: PARKED"
+            local count
+            count=$(read_peers_stopped_count "$i" || true)
+            if [ -n "$count" ]; then
+                if [ "$count" = "3" ]; then
+                    note "  l2cpu $i: PARKED, full convergence (3/3 peers)"
+                else
+                    note "  l2cpu $i: PARKED, PARTIAL convergence ($count/3 peers)"
+                fi
+            else
+                note "  l2cpu $i: PARKED (peers field unavailable)"
+            fi
         else
             fail "iter $iter: l2cpu $i did not reach PARKED within ${PARK_TIMEOUT}s"
         fi

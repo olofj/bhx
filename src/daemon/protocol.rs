@@ -300,6 +300,15 @@ pub struct L2CpuStatus {
     /// clients compatible.
     #[serde(default)]
     pub purgatory_status: Option<u64>,
+    /// (#166 Phase 2) Peer-convergence bitmask read at
+    /// `STATUS_OFFSET + 8`. Low 4 bits = harts 0..3 of this tile
+    /// that reached `SBI_HSM_STATE_STOPPED` before the SRST-issuing
+    /// hart announced PARKED. `0xE` = harts 1..3 stopped (self
+    /// transitions itself, doesn't set its own bit); `0xD` = hart 2
+    /// failed to converge; etc. `None` if the read failed or status
+    /// isn't PARKED yet.
+    #[serde(default)]
+    pub purgatory_peers: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,6 +504,7 @@ mod tests {
                 virtio_console: true,
                 clients: 1,
                 purgatory_status: None,
+                purgatory_peers: None,
             }],
             engine_tile: Some((16, 11)),
             pll_fbdiv: Some(140),

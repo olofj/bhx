@@ -220,6 +220,17 @@ pub mod purgatory {
     /// handshake area (release magic, next-entry-address slot, per-hart
     /// liveness mask, etc.).
     pub const STATUS_OFFSET: u64 = 0x000E_0000;
+    /// Phase 2 (#166) — peer convergence bitmask, 8 bytes after
+    /// the status word. Low 4 bits = harts 0..3 of this tile that
+    /// reached `SBI_HSM_STATE_STOPPED` before the final_exit hook
+    /// announced PARKED. The SRST-issuing hart's bit is NOT set
+    /// here (it transitions itself in `sbi_hsm_exit` after final_exit
+    /// returns). Operator interpretation:
+    ///   0xE = full convergence on a 4-hart tile (peers 1..3 stopped,
+    ///         self about to)
+    ///   0x0 = SRST hart proceeded without seeing any peer reach STOPPED
+    ///         (timeout or single-hart tile)
+    pub const PEERS_OFFSET: u64 = STATUS_OFFSET + 8;
     /// "PARKED__" interpreted as little-endian u64. Final_exit hook
     /// writes this exact value to indicate the harts are about to
     /// enter `sbi_hsm_hart_wait`.
