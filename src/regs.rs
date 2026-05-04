@@ -204,8 +204,8 @@ pub mod shutdown {
 }
 
 /// (#166 Phase 1) OpenSBI purgatory status block. Mirrors the
-/// `TT_PURGATORY_STATUS_OFFSET` / `TT_PURGATORY_STATUS_PARKED`
-/// constants in `third_party/opensbi/patches/0002-tt-purgatory-magic.patch`.
+/// `BHX_PURGATORY_STATUS_OFFSET` / `BHX_PURGATORY_STATUS_PARKED`
+/// constants in `third_party/opensbi/patches/0002-bhx-purgatory-magic.patch`.
 /// When the SBI SRST fall-through reaches `sbi_platform_final_exit`,
 /// our patched OpenSBI writes the magic at this offset within the
 /// L2CPU's DRAM range; the daemon polls it via `dispatch_status` to
@@ -234,7 +234,7 @@ pub mod purgatory {
     /// Phase 4a (#166) — hart 0 release-metadata block. Each field
     /// is a u64 PA the host writes to via the L2CPU's persistent
     /// TLB window. Layout matches the C #defines in
-    /// `third_party/opensbi/patches/0002-tt-purgatory-magic.patch`.
+    /// `third_party/opensbi/patches/0002-bhx-purgatory-magic.patch`.
     pub const NEXT_ADDR_PA_OFFSET: u64 = STATUS_OFFSET + 0x10;
     pub const NEXT_MODE_PA_OFFSET: u64 = STATUS_OFFSET + 0x18;
     pub const NEXT_ARG1_PA_OFFSET: u64 = STATUS_OFFSET + 0x20;

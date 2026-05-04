@@ -117,7 +117,7 @@ of a hart's HSM state atomic_t, since the file-static
  }
  
 +/* bhx#166 Phase 1: forward decl, definition is later in this file. */
-+static void tt_purgatory_register_reset_device(void);
++static void bhx_purgatory_register_reset_device(void);
 +
  int generic_final_init(bool cold_boot)
  {
@@ -127,7 +127,7 @@ of a hart's HSM state atomic_t, since the file-static
  	fdt_domain_fixup(fdt);
  
 +	/* bhx#166 Phase 1: register stub reset device so SBI SRST → sbi_exit. */
-+	tt_purgatory_register_reset_device();
++	bhx_purgatory_register_reset_device();
 +
  	return 0;
  }
@@ -193,14 +193,14 @@ of a hart's HSM state atomic_t, since the file-static
 + * already-published values (they don't change across re-entries
 + * because OpenSBI's bss is preserved through the HSM warmboot loop).
 + */
-+#define TT_PURGATORY_STATUS_OFFSET	0x000E0000UL
-+#define TT_PURGATORY_STATUS_PARKED	0x5f5f44454b524150UL  /* "PARKED__" LE */
-+#define TT_PURGATORY_PEERS_OFFSET	(TT_PURGATORY_STATUS_OFFSET + 8)
-+#define TT_PURGATORY_NEXT_ADDR_OFFSET	(TT_PURGATORY_STATUS_OFFSET + 0x10)
-+#define TT_PURGATORY_NEXT_MODE_OFFSET	(TT_PURGATORY_STATUS_OFFSET + 0x18)
-+#define TT_PURGATORY_NEXT_ARG1_OFFSET	(TT_PURGATORY_STATUS_OFFSET + 0x20)
-+#define TT_PURGATORY_HSM_STATE_OFFSET	(TT_PURGATORY_STATUS_OFFSET + 0x28)
-+#define TT_PURGATORY_MSIP_OFFSET	(TT_PURGATORY_STATUS_OFFSET + 0x30)
++#define BHX_PURGATORY_STATUS_OFFSET	0x000E0000UL
++#define BHX_PURGATORY_STATUS_PARKED	0x5f5f44454b524150UL  /* "PARKED__" LE */
++#define BHX_PURGATORY_PEERS_OFFSET	(BHX_PURGATORY_STATUS_OFFSET + 8)
++#define BHX_PURGATORY_NEXT_ADDR_OFFSET	(BHX_PURGATORY_STATUS_OFFSET + 0x10)
++#define BHX_PURGATORY_NEXT_MODE_OFFSET	(BHX_PURGATORY_STATUS_OFFSET + 0x18)
++#define BHX_PURGATORY_NEXT_ARG1_OFFSET	(BHX_PURGATORY_STATUS_OFFSET + 0x20)
++#define BHX_PURGATORY_HSM_STATE_OFFSET	(BHX_PURGATORY_STATUS_OFFSET + 0x28)
++#define BHX_PURGATORY_MSIP_OFFSET	(BHX_PURGATORY_STATUS_OFFSET + 0x30)
 +
 +/* L2CPU local CLINT base — see third_party/dtb/blackhole.dtsi
 + * (`tenstorrent,blackhole-clint` / `sifive,clint0` at 0x2000000).
@@ -214,9 +214,9 @@ of a hart's HSM state atomic_t, since the file-static
 + * per iter), well above the ~µs latency of an in-tile IPI dispatch
 + * but short enough that a wedged hart fails fast rather than hanging
 + * the SRST path. */
-+#define TT_PURGATORY_PEER_WAIT_ITERS	(64u * 1024u)
++#define BHX_PURGATORY_PEER_WAIT_ITERS	(64u * 1024u)
 +
-+static unsigned long tt_purgatory_collect_peers_stopped(u32 self_hartindex)
++static unsigned long bhx_purgatory_collect_peers_stopped(u32 self_hartindex)
 +{
 +	unsigned long mask = 0;
 +	u32 i, count = sbi_hart_count();
@@ -230,7 +230,7 @@ of a hart's HSM state atomic_t, since the file-static
 +	return mask;
 +}
 +
-+static void tt_purgatory_final_exit(void)
++static void bhx_purgatory_final_exit(void)
 +{
 +	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
 +	struct sbi_scratch *hart0_scratch = sbi_hartindex_to_scratch(0);
@@ -242,25 +242,25 @@ of a hart's HSM state atomic_t, since the file-static
 +	u32 i;
 +	volatile unsigned long *status =
 +		(volatile unsigned long *)(scratch->fw_start +
-+					   TT_PURGATORY_STATUS_OFFSET);
++					   BHX_PURGATORY_STATUS_OFFSET);
 +	volatile unsigned long *peers =
 +		(volatile unsigned long *)(scratch->fw_start +
-+					   TT_PURGATORY_PEERS_OFFSET);
++					   BHX_PURGATORY_PEERS_OFFSET);
 +	volatile unsigned long *next_addr_pa =
 +		(volatile unsigned long *)(scratch->fw_start +
-+					   TT_PURGATORY_NEXT_ADDR_OFFSET);
++					   BHX_PURGATORY_NEXT_ADDR_OFFSET);
 +	volatile unsigned long *next_mode_pa =
 +		(volatile unsigned long *)(scratch->fw_start +
-+					   TT_PURGATORY_NEXT_MODE_OFFSET);
++					   BHX_PURGATORY_NEXT_MODE_OFFSET);
 +	volatile unsigned long *next_arg1_pa =
 +		(volatile unsigned long *)(scratch->fw_start +
-+					   TT_PURGATORY_NEXT_ARG1_OFFSET);
++					   BHX_PURGATORY_NEXT_ARG1_OFFSET);
 +	volatile unsigned long *hsm_state_pa =
 +		(volatile unsigned long *)(scratch->fw_start +
-+					   TT_PURGATORY_HSM_STATE_OFFSET);
++					   BHX_PURGATORY_HSM_STATE_OFFSET);
 +	volatile unsigned long *msip_pa =
 +		(volatile unsigned long *)(scratch->fw_start +
-+					   TT_PURGATORY_MSIP_OFFSET);
++					   BHX_PURGATORY_MSIP_OFFSET);
 +
 +	/* Build the expected peer mask: every hart except ourselves. */
 +	for (i = 0; i < hart_count && i < 64; i++)
@@ -268,8 +268,8 @@ of a hart's HSM state atomic_t, since the file-static
 +			expected_mask |= 1UL << i;
 +
 +	/* Wait for peers to reach STOPPED. */
-+	while (spin++ < TT_PURGATORY_PEER_WAIT_ITERS) {
-+		peers_mask = tt_purgatory_collect_peers_stopped(hartindex);
++	while (spin++ < BHX_PURGATORY_PEER_WAIT_ITERS) {
++		peers_mask = bhx_purgatory_collect_peers_stopped(hartindex);
 +		if (peers_mask == expected_mask)
 +			break;
 +	}
@@ -286,7 +286,7 @@ of a hart's HSM state atomic_t, since the file-static
 +
 +	*peers = peers_mask;
 +	__asm__ volatile("fence ow,ow" : : : "memory");
-+	*status = TT_PURGATORY_STATUS_PARKED;
++	*status = BHX_PURGATORY_STATUS_PARKED;
 +	__asm__ volatile("fence ow,ow" : : : "memory");
 +}
 +
@@ -297,7 +297,7 @@ of a hart's HSM state atomic_t, since the file-static
 + * system_reset() returns immediately, letting sbi_system_reset() fall
 + * through to sbi_exit() and ultimately our final_exit hook.
 + */
-+static int tt_purgatory_reset_check(u32 reset_type, u32 reset_reason)
++static int bhx_purgatory_reset_check(u32 reset_type, u32 reset_reason)
 +{
 +	(void)reset_reason;
 +	if (reset_type == SBI_SRST_RESET_TYPE_SHUTDOWN ||
@@ -307,21 +307,21 @@ of a hart's HSM state atomic_t, since the file-static
 +	return 0;
 +}
 +
-+static void tt_purgatory_reset_do(u32 reset_type, u32 reset_reason)
++static void bhx_purgatory_reset_do(u32 reset_type, u32 reset_reason)
 +{
 +	(void)reset_type; (void)reset_reason;
 +	/* No-op: caller's sbi_system_reset() falls through to sbi_exit(). */
 +}
 +
-+static struct sbi_system_reset_device tt_purgatory_reset_device = {
-+	.name = "tt-purgatory",
-+	.system_reset_check = tt_purgatory_reset_check,
-+	.system_reset = tt_purgatory_reset_do,
++static struct sbi_system_reset_device bhx_purgatory_reset_device = {
++	.name = "bhx-purgatory",
++	.system_reset_check = bhx_purgatory_reset_check,
++	.system_reset = bhx_purgatory_reset_do,
 +};
 +
-+static void tt_purgatory_register_reset_device(void)
++static void bhx_purgatory_register_reset_device(void)
 +{
-+	sbi_system_reset_add_device(&tt_purgatory_reset_device);
++	sbi_system_reset_add_device(&bhx_purgatory_reset_device);
 +}
 +
 +
@@ -332,7 +332,7 @@ of a hart's HSM state atomic_t, since the file-static
  	.get_tlb_num_entries	= generic_tlb_num_entries,
  	.timer_init		= fdt_timer_init,
  	.mpxy_init		= generic_mpxy_init,
-+	.final_exit		= tt_purgatory_final_exit,
++	.final_exit		= bhx_purgatory_final_exit,
  };
  
  struct sbi_platform platform = {

@@ -54,7 +54,7 @@ BINARY=${BINARY:-./target/debug/bhx}
 LOG_FILE=${LOG_FILE:-./daemon-card0.log}
 CARD=${CARD:-0}
 PARK_TIMEOUT=${PARK_TIMEOUT:-30}
-BOOT_TIMEOUT=${BOOT_TIMEOUT:-60}
+BOOT_TIMEOUT=${BOOT_TIMEOUT:-180}
 PARKED_MAGIC="0x5f5f44454b524150"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -138,13 +138,25 @@ done
 PROMPT_WAITER="$(mktemp)"
 cat > "$PROMPT_WAITER" <<'PY'
 #!/usr/bin/env python3
-"""Block until L2CPU N's guest reaches a shell prompt."""
+"""Block until L2CPU N's guest reaches a shell prompt. Logs the last
+~2 KB of raw connect output to stderr on timeout for debugging."""
 import sys, pexpect
 idx = sys.argv[1]
 child = pexpect.spawn(f"./target/debug/bhx connect -l {idx} --mode ro",
-                     encoding="utf-8", timeout=120)
-child.expect([r"# $", r"buildroot login:", pexpect.EOF, pexpect.TIMEOUT],
-             timeout=120)
+                     encoding="utf-8", timeout=180)
+try:
+    i = child.expect([r"# $", r"buildroot login:", pexpect.EOF, pexpect.TIMEOUT],
+                     timeout=180)
+    if i in (2, 3):
+        # EOF or TIMEOUT — dump tail of buffer for diagnostics.
+        buf = (child.before or "") + (child.after if isinstance(child.after, str) else "")
+        sys.stderr.write(f"[prompt_waiter l2cpu {idx}] no prompt within 180s; buffer tail:\n")
+        sys.stderr.write(buf[-2048:])
+        sys.stderr.write("\n[prompt_waiter end]\n")
+        sys.exit(2)
+except pexpect.exceptions.ExceptionPexpect as e:
+    sys.stderr.write(f"[prompt_waiter l2cpu {idx}] pexpect error: {e}\n")
+    sys.exit(3)
 PY
 trap 'rm -f "$SHUTDOWN_DRIVER" "$PROMPT_WAITER"; cleanup' EXIT
 
@@ -275,9 +287,32 @@ for iter in $(seq 1 "$ITERATIONS"); do
     note "iter $iter: releasing all cores from purgatory"
     for i in "${CORES[@]}"; do
         if ! release_purgatory "$i"; then
-            note "iter $iter: release_purgatory($i) failed (expected until Phase 4 lands)"
+            note "iter $iter: release_purgatory($i) failed"
             note "stopping soak; PASSED iters: $((iter - 1))"
             exit 1
+        fi
+    done
+
+    # 4. Wait for each released kernel to reach a shell prompt before
+    # the next iter's poweroff. Without this the next trigger_poweroff
+    # spawns a connect against a still-booting kernel; pexpect can't
+    # find the prompt and exits non-zero, leaving that L2CPU's SBI
+    # SRST never fired.
+    note "iter $iter: waiting for re-boot to reach shell prompt"
+    for i in "${CORES[@]}"; do
+        # PROMPT_WAITER dumps the last 2 KB of pexpect's buffer on
+        # timeout. We use a 30s outer-timeout cushion past pexpect's
+        # internal 180s so its diagnostic write has time to flush.
+        if ! timeout "$((BOOT_TIMEOUT + 30))" python3 "$PROMPT_WAITER" "$i" \
+                 > "/tmp/soak-$i-prompt.log" 2>&1; then
+            note "iter $iter: l2cpu $i prompt-wait diagnostics:"
+            note "  daemon status snapshot:"
+            "$BINARY" daemon status -t "$CARD" 2>&1 | sed 's/^/    /' >&2
+            note "  prompt-wait stderr/stdout tail:"
+            tail -50 "/tmp/soak-$i-prompt.log" | sed 's/^/    /' >&2
+            note "  daemon log tail:"
+            tail -30 "$LOG_FILE" | sed 's/^/    /' >&2
+            fail "iter $iter: l2cpu $i didn't reach prompt within ${BOOT_TIMEOUT}s after release"
         fi
     done
 done

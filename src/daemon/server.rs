@@ -1707,7 +1707,7 @@ fn run_boot_sequence(
     // fdt_reset_syscon driver doesn't register itself; SBI SRST falls
     // through to sbi_exit → sbi_platform_final_exit → sbi_hsm_exit,
     // landing in our patched purgatory hook (third_party/opensbi/
-    // patches/0002-tt-purgatory-magic.patch) which writes the
+    // patches/0002-bhx-purgatory-magic.patch) which writes the
     // "PARKED__" magic at scratch->fw_start + 0xE0000.
     let soft_reboot = std::env::var("BHX_SOFT_REBOOT").ok().as_deref() == Some("1");
     let shutdown_addr = if soft_reboot {
@@ -1792,6 +1792,17 @@ fn release_l2cpu_from_reset(
     l2cpu: &L2Cpu,
 ) -> crate::Result<()> {
     dlog!("[run_boot l2cpu {}] releasing from reset", l2cpu_idx);
+    // (#166) Zero the bhx-purgatory status block before reset release.
+    // After tt-smi -r the L2CPU's DRAM holds whatever pattern the
+    // training pass left — typically random-looking bytes that read
+    // as garbage like `0x0000555574209000` and confuse the
+    // `daemon status` purgatory line ("unknown (0x...)"). Pre-zeroing
+    // gives the operator a clean "running (no SRST yet)" baseline
+    // until the first SBI SRST writes the PARKED magic.
+    let mem_base = crate::l2cpu::L2CPU_STARTING_ADDRESS[l2cpu_idx as usize];
+    let purg_pa = mem_base + crate::regs::purgatory::STATUS_OFFSET;
+    let _ = l2cpu.write32(purg_pa, 0);
+    let _ = l2cpu.write32(purg_pa + 4, 0);
     // reset_x280 goes through SharedChip so the PLL step and the
     // L2CPU_RESET R-M-W serialize against any other boot RPC issuing the
     // same sequence.

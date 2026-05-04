@@ -363,6 +363,31 @@ pub fn modify_dtb(
     fdt.setprop(virtio_reserved, "reg", &reserved_reg)?;
     fdt.setprop(virtio_reserved, "no-map", &[])?;
 
+    // (#166) When soft-reboot mode is active (no syscon-poweroff
+    // injection above), reserve the page where the OpenSBI purgatory
+    // status block lives so the kernel doesn't allocate over it.
+    // Without this, the kernel happily uses [mem_start + ~60 KiB,
+    // end_of_DRAM) for its page allocator — including 0xE0000 — and
+    // overwrites the status word with whatever happens to land there
+    // (printk buffer / kmalloc / etc.). Empirically this corrupts
+    // the cell after ~20 reboot cycles, manifesting as a kernel boot
+    // that never reaches userspace because the parked-hart wake
+    // sequence reads stale next_addr/next_mode/etc. The page is
+    // 4 KiB and exactly covers the status block.
+    if shutdown_addr.is_none() {
+        let purg_pa = mem_start + crate::regs::purgatory::STATUS_OFFSET;
+        let purg_node = fdt.add_subnode(reserved, &format!("bhx-purgatory@{:x}", purg_pa))?;
+        let mut purg_reg = Vec::with_capacity(16);
+        purg_reg.extend_from_slice(&purg_pa.to_be_bytes());
+        purg_reg.extend_from_slice(&0x1000u64.to_be_bytes());
+        fdt.setprop(purg_node, "reg", &purg_reg)?;
+        fdt.setprop(purg_node, "no-map", &[])?;
+        crate::dlog!(
+            "[modify_dtb]   adding /reserved-memory/bhx-purgatory@{:x} size=0x1000 (#166)",
+            purg_pa
+        );
+    }
+
     // We used to add an `opensbi@<mem_start>` reservation here covering
     // the bottom 2 MiB to protect fw_jump.bin and the OSBIdbug
     // descriptor (#110). Turns out OpenSBI's generic platform fixup
