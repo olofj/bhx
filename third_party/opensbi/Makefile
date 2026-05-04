@@ -89,13 +89,17 @@ $(SB_SRCDIR)/Makefile: $(DL_DIR)/$(OPENSBI_TARBALL) $(PATCH_FILES)
 	@echo "==> Verifying $(OPENSBI_TARBALL)"
 	@cd $(DL_DIR) && sha256sum -c $(TOPDIR)/sha256sums --ignore-missing
 	@echo "==> Extracting"
+	@# Reset the source dir before extracting so patches always apply
+	@# against a known-clean upstream tree. Idempotency via -N is
+	@# unreliable for create-new-file hunks: tar -xf doesn't overwrite
+	@# files that aren't in the tarball, so a patch-created file like
+	@# lib/utils/serial/virtual-uart.c survives a re-extract; patch -N
+	@# then double-applies and the build fails with "redefinition" errors.
+	rm -rf $(SB_SRCDIR)
 	tar -xf $(DL_DIR)/$(OPENSBI_TARBALL) -C $(TOPDIR)
-	@# Apply any *.patch files (alphabetical order). The patch tool's
-	@# -N flag skips already-applied hunks so a re-extract that left
-	@# stale build state behind doesn't double-patch.
 	@for p in $(PATCH_FILES); do \
 		echo "==> Applying $$(basename $$p)"; \
-		(cd $(SB_SRCDIR) && patch -p1 -N --quiet < $$p) || true; \
+		(cd $(SB_SRCDIR) && patch -p1 --quiet < $$p) || exit 1; \
 	done
 	@touch $@
 

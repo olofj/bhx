@@ -81,22 +81,26 @@ $(UB_SRCDIR)/Makefile: $(DL_DIR)/$(UBOOT_TARBALL) $(TOPDIR)/patches/serial_sbi_d
 	@echo "==> Verifying $(UBOOT_TARBALL)"
 	@cd $(DL_DIR) && sha256sum -c $(TOPDIR)/sha256sums --ignore-missing
 	@echo "==> Extracting"
+	@# Reset before re-extract so patches and the cp-installed driver
+	@# always land on a known-clean upstream tree. Without the rm,
+	@# patch-created or cp-installed files survive a re-extract; a
+	@# subsequent `patch -N` for create-file hunks doubles content
+	@# instead of skipping. See third_party/opensbi/Makefile for the
+	@# in-the-wild manifestation.
+	rm -rf $(UB_SRCDIR)
 	tar -xf $(DL_DIR)/$(UBOOT_TARBALL) -C $(TOPDIR)
 	@echo "==> Installing bhx DM SBI serial driver"
 	cp $(TOPDIR)/patches/serial_sbi_dm.c $(UB_SRCDIR)/drivers/serial/
-	@# Append Kconfig entry + Makefile rule. Idempotent: only add if
-	@# not already present (so re-running this step on an existing
-	@# tree doesn't duplicate.)
+	@# Append Kconfig entry + Makefile rule. The grep guard would also
+	@# protect against double-append, but with the rm-rf above the tree
+	@# is always pristine here so the guard is now belt-and-suspenders.
 	@grep -q SERIAL_SBI_DM $(UB_SRCDIR)/drivers/serial/Kconfig || \
 		printf '\nconfig SERIAL_SBI_DM\n\tbool "DM serial driver wrapping SBI DBCN"\n\tdepends on DM_SERIAL && RISCV_SMODE\n\thelp\n\t  bhx downstream patch — see uboot/patches/serial_sbi_dm.c.\n' >> $(UB_SRCDIR)/drivers/serial/Kconfig
 	@grep -q SERIAL_SBI_DM $(UB_SRCDIR)/drivers/serial/Makefile || \
 		echo 'obj-$$(CONFIG_SERIAL_SBI_DM) += serial_sbi_dm.o' >> $(UB_SRCDIR)/drivers/serial/Makefile
-	@# Apply any *.patch files (alphabetical order). The patch tool's
-	@# -N flag skips already-applied hunks so a re-extract that left
-	@# stale .config behind doesn't double-patch.
 	@for p in $(PATCH_FILES); do \
 		echo "==> Applying $$(basename $$p)"; \
-		(cd $(UB_SRCDIR) && patch -p1 -N --quiet < $$p) || true; \
+		(cd $(UB_SRCDIR) && patch -p1 --quiet < $$p) || exit 1; \
 	done
 	@touch $@
 
