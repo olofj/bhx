@@ -82,6 +82,33 @@ fi
 [ -e Image ] || fail "Image missing"
 [ -e blackhole-card.dtb ] || fail "blackhole-card.dtb missing"
 
+# Self-contained shutdown driver. Written to a tmpfile so bash's
+# heredoc-piped-into-python edge cases (stdin races on concurrent
+# backgrounded invocations) can't bite us.
+SHUTDOWN_DRIVER="$(mktemp)"
+cat > "$SHUTDOWN_DRIVER" <<'PY'
+#!/usr/bin/env python3
+"""Drive an in-guest poweroff -f on the given L2CPU."""
+import sys, pexpect
+idx = sys.argv[1]
+child = pexpect.spawn(f"./target/debug/bhx connect -l {idx} --mode rw",
+                     encoding="utf-8", timeout=120)
+child.logfile_read = sys.stdout
+child.sendline("")
+i = child.expect([r"# $", r"buildroot login:", pexpect.TIMEOUT], timeout=120)
+if i == 1:
+    child.sendline("root")
+    i = child.expect([r"# $", pexpect.TIMEOUT], timeout=30)
+    if i != 0:
+        sys.exit(f"l2cpu {idx}: no shell prompt within 30s")
+elif i != 0:
+    sys.exit(f"l2cpu {idx}: no prompt within 120s")
+child.sendline("poweroff -f")
+child.expect([r"Power down", pexpect.EOF, pexpect.TIMEOUT], timeout=30)
+print(f"\n[shutdown_l {idx} done]")
+PY
+trap 'rm -f "$SHUTDOWN_DRIVER"; cleanup' EXIT
+
 # Per-core rootfs copies: concurrent disk workers can't share an mmap'd
 # backing file.
 for i in "${CORES[@]}"; do
@@ -108,17 +135,23 @@ for i in "${CORES[@]}"; do
         || fail "cold boot l2cpu $i failed"
 done
 
-# Wait for all three guests to be at a shell prompt before the soak.
-note "waiting for guests to reach shell prompt"
-for i in "${CORES[@]}"; do
-    if ! timeout "$BOOT_TIMEOUT" python3 - "$i" <<'EOF'
+PROMPT_WAITER="$(mktemp)"
+cat > "$PROMPT_WAITER" <<'PY'
+#!/usr/bin/env python3
+"""Block until L2CPU N's guest reaches a shell prompt."""
 import sys, pexpect
 idx = sys.argv[1]
 child = pexpect.spawn(f"./target/debug/bhx connect -l {idx} --mode ro",
-                     encoding="utf-8", timeout=30)
-child.expect([r"# $", r"buildroot login:", pexpect.EOF, pexpect.TIMEOUT], timeout=60)
-EOF
-    then
+                     encoding="utf-8", timeout=120)
+child.expect([r"# $", r"buildroot login:", pexpect.EOF, pexpect.TIMEOUT],
+             timeout=120)
+PY
+trap 'rm -f "$SHUTDOWN_DRIVER" "$PROMPT_WAITER"; cleanup' EXIT
+
+# Wait for all three guests to be at a shell prompt before the soak.
+note "waiting for guests to reach shell prompt"
+for i in "${CORES[@]}"; do
+    if ! timeout "$BOOT_TIMEOUT" python3 "$PROMPT_WAITER" "$i" >/dev/null 2>&1; then
         fail "guest $i didn't reach prompt within ${BOOT_TIMEOUT}s"
     fi
 done
@@ -126,55 +159,53 @@ done
 # ---- Helpers ----
 
 # Read a single L2CPU's purgatory cell as an integer (decoded from
-# `bhx daemon status` output's `purgatory: <label> (0x...)` line).
+# `bhx daemon status` output's `purgatory: <label> (0x...) ...` line).
+# Uses regex match so column shifts (e.g., extra peers_stopped field
+# in Phase 2) don't break parsing.
 read_purgatory() {
     local idx=$1
     "$BINARY" daemon status -t "$CARD" 2>/dev/null \
       | awk -v idx="$idx" '
           $0 ~ "^  l2cpu " idx ":"           { in_block=1; next }
           in_block && /^  l2cpu /             { in_block=0 }
-          in_block && /^    purgatory: /      {
-              gsub(/[()]/, "", $4); print $4; exit
+          in_block && /^    purgatory: / {
+              if (match($0, /\(0x[0-9a-fA-F]+\)/)) {
+                  hex = substr($0, RSTART, RLENGTH)
+                  gsub(/[()]/, "", hex)
+                  print hex
+                  exit
+              }
           }'
 }
 
-# (#166 Phase 2) Read the peers_stopped bitmask. Returns the trailing
-# decimal popcount in parentheses ("3" for full convergence on a 4-hart
-# tile). Returns empty string if the field isn't present.
+# (#166 Phase 2) Read the peers_stopped bitmask popcount ("3" for full
+# convergence on a 4-hart tile). Returns empty if absent.
 read_peers_stopped_count() {
     local idx=$1
     "$BINARY" daemon status -t "$CARD" 2>/dev/null \
       | awk -v idx="$idx" '
           $0 ~ "^  l2cpu " idx ":"           { in_block=1; next }
           in_block && /^  l2cpu /             { in_block=0 }
-          in_block && /peers_stopped=/        {
-              for (i = 1; i <= NF; i++) {
-                  if ($i ~ /peers_stopped=/) {
-                      sub(/.*\(/, "", $i); sub(/\)/, "", $i); print $i; exit
-                  }
+          in_block && /peers_stopped=/ {
+              if (match($0, /peers_stopped=0b[01]+\(([0-9]+)\)/, arr)) {
+                  print arr[1]
+                  exit
+              }
+              # gawk-array-extension fallback for posix awk
+              if (match($0, /peers_stopped=0b[01]+\([0-9]+\)/)) {
+                  s = substr($0, RSTART, RLENGTH)
+                  sub(/.*\(/, "", s); sub(/\)/, "", s)
+                  print s
+                  exit
               }
           }'
 }
 
-# Send `poweroff -f` to L2CPU N's guest. Spawns pexpect, returns when
-# the connect socket EOFs or 30s timeout.
+# Send `poweroff -f` to L2CPU N's guest. Calls the tmpfile-resident
+# pexpect driver from a backgrounded subshell.
 trigger_poweroff() {
     local idx=$1
-    timeout 60 python3 - "$idx" <<'EOF'
-import sys, pexpect
-idx = sys.argv[1]
-child = pexpect.spawn(f"./target/debug/bhx connect -l {idx} --mode rw",
-                     encoding="utf-8", timeout=60)
-child.sendline("")
-i = child.expect([r"# $", r"buildroot login:", pexpect.TIMEOUT], timeout=30)
-if i == 1:
-    child.sendline("root")
-    child.expect([r"# $", pexpect.TIMEOUT], timeout=30)
-elif i != 0:
-    sys.exit(f"l2cpu {idx}: no prompt")
-child.sendline("poweroff -f")
-child.expect([r"Power down", pexpect.EOF, pexpect.TIMEOUT], timeout=30)
-EOF
+    timeout 90 python3 "$SHUTDOWN_DRIVER" "$idx"
 }
 
 # Wait for L2CPU N's purgatory cell to read PARKED, polling once per
@@ -193,21 +224,16 @@ wait_for_parked() {
     return 1
 }
 
-# Phase 4 placeholder. When the host-side release path lands, this
-# function should:
-#   1. Re-write OpenSBI / kernel / DTB into L2CPU DRAM via the daemon
-#      (existing `boot_l2cpu` path).
-#   2. Write `next_addr` (= OpenSBI _start), `next_mode` (=M-mode), and
-#      `next_arg1` (=DTB PA) into hart 0's `sbi_scratch`.
-#   3. Atomically flip hart 0's HSM state to START_PENDING.
-#   4. IPI hart 0 (write 1 to CLINT MSIP[0]).
-#   5. Poll for the slot to report Running with a fresh kernel up.
-#
-# Until that lands, fail loud.
+# (#166 Phase 4b) Release a parked L2CPU back into a fresh boot. The
+# daemon detects the Parked state at dispatch_boot entry and routes
+# to dispatch_release, which re-writes the kernel image, writes
+# scratch->next_addr/mode/arg1, flips HSM state to START_PENDING, and
+# fires CLINT MSIP[0] to wake hart 0. The new kernel SBI-HSM-starts
+# the remaining harts itself.
 release_purgatory() {
     local idx=$1
-    echo "[soak-soft-reboot] release_purgatory($idx): NOT IMPLEMENTED (Phase 4 of #166)" >&2
-    return 99
+    BHX_SOFT_REBOOT=1 "$BINARY" boot -t "$CARD" -l "$idx" \
+        -d "rootfs-soft-${idx}.ext2" >/dev/null 2>&1
 }
 
 # ---- Main loop ----
@@ -230,7 +256,6 @@ for iter in $(seq 1 "$ITERATIONS"); do
     note "iter $iter: waiting for PARKED on all cores"
     for i in "${CORES[@]}"; do
         if wait_for_parked "$i"; then
-            local count
             count=$(read_peers_stopped_count "$i" || true)
             if [ -n "$count" ]; then
                 if [ "$count" = "3" ]; then

@@ -231,10 +231,35 @@ pub mod purgatory {
     ///   0x0 = SRST hart proceeded without seeing any peer reach STOPPED
     ///         (timeout or single-hart tile)
     pub const PEERS_OFFSET: u64 = STATUS_OFFSET + 8;
+    /// Phase 4a (#166) — hart 0 release-metadata block. Each field
+    /// is a u64 PA the host writes to via the L2CPU's persistent
+    /// TLB window. Layout matches the C #defines in
+    /// `third_party/opensbi/patches/0002-tt-purgatory-magic.patch`.
+    pub const NEXT_ADDR_PA_OFFSET: u64 = STATUS_OFFSET + 0x10;
+    pub const NEXT_MODE_PA_OFFSET: u64 = STATUS_OFFSET + 0x18;
+    pub const NEXT_ARG1_PA_OFFSET: u64 = STATUS_OFFSET + 0x20;
+    /// PA of hart 0's HSM `state` field. Host writes
+    /// `SBI_HSM_STATE_START_PENDING = 2` here to wake the parked hart.
+    pub const HSM_STATE_PA_OFFSET: u64 = STATUS_OFFSET + 0x28;
+    /// PA of CLINT MSIP[0]. Host writes `1` here to fire the M-mode
+    /// software interrupt that wakes hart 0 from `wfi`.
+    pub const MSIP_PA_OFFSET: u64 = STATUS_OFFSET + 0x30;
+
     /// "PARKED__" interpreted as little-endian u64. Final_exit hook
     /// writes this exact value to indicate the harts are about to
     /// enter `sbi_hsm_hart_wait`.
     pub const STATUS_PARKED: u64 = 0x5f5f_4445_4b52_4150;
+    /// HSM state values (from `SBI_HSM_STATE_*` in OpenSBI's
+    /// `sbi_ecall_interface.h`). Used by the release path to validate
+    /// that the parked hart reads as STOPPED before the host writes
+    /// START_PENDING.
+    pub const HSM_STATE_STARTED: u32 = 0;
+    pub const HSM_STATE_STOPPED: u32 = 1;
+    pub const HSM_STATE_START_PENDING: u32 = 2;
+    pub const HSM_STATE_STOP_PENDING: u32 = 3;
+    /// `next_mode` value the host writes for an S-mode kernel handoff.
+    /// Mirrors `PRV_S` from RISC-V privileged spec.
+    pub const NEXT_MODE_S: u64 = 1;
 }
 
 /// Slirp host-side port allocation for SSH forwarding to the guest.

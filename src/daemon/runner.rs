@@ -327,6 +327,19 @@ pub fn status(card: u32) -> io::Result<()> {
                             _ => String::new(),
                         };
                         println!("    purgatory: {} ({:#018x}){}", label, p, peers_str);
+                        // Phase 4a: when PARKED, the OpenSBI hook publishes
+                        // the PAs the host needs to release hart 0. Surface
+                        // them so the operator can sanity-check.
+                        if let Some(m) = &l.purgatory_release_meta {
+                            println!(
+                                "      release: next_addr@{:#x} next_mode@{:#x} next_arg1@{:#x}",
+                                m.next_addr_pa, m.next_mode_pa, m.next_arg1_pa
+                            );
+                            println!(
+                                "               hsm_state@{:#x} msip@{:#x}",
+                                m.hsm_state_pa, m.msip_pa
+                            );
+                        }
                     }
                     // Per-disk lines for everything beyond the
                     // primary rootfs (already printed above as

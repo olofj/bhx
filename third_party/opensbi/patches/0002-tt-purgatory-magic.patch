@@ -3,58 +3,105 @@ a known DRAM offset before the warmboot loop spins, plus a stub
 sbi_system_reset_device so SBI SRST is reported supported and falls
 through to sbi_exit instead of the kernel halting locally.
 
-Phase 1+2 of bhx#166. Phase 1 was: smallest possible verification that
-the SBI SRST fall-through path (sbi_system_reset → stub.system_reset
-returns → sbi_exit → sbi_platform_final_exit → sbi_hsm_exit →
-jump_warmboot → sbi_hsm_hart_wait) lands in our hook before the harts
-park. Phase 2 adds multi-hart convergence: the SRST-issuing hart polls
-peer HSM state until every peer has reached SBI_HSM_STATE_STOPPED, then
-writes the convergence bitmask + PARKED magic. The host therefore sees
-PARKED only when every hart in the tile is fully quiesced, not just
-the SRST-issuing one.
+Phase 1+2+4a of bhx#166. Phase 1 was the smallest possible verification
+that the SBI SRST fall-through path lands in our hook. Phase 2 added
+multi-hart convergence: the SRST-issuing hart polls peer HSM state
+until every peer reaches SBI_HSM_STATE_STOPPED before announcing
+PARKED. Phase 4a publishes hart 0's release metadata in the status
+block — `&scratch->next_addr/mode/arg1` PAs, the HSM state PA, and
+the CLINT MSIP[0] PA — so the host can drive a release-from-purgatory
+without re-deriving any of these by hand.
 
-Why a stub reset device is needed:
+Why a stub reset device is needed: without ANY system_reset_device
+registered, sbi_system_reset_supported() returns false, so the guest
+kernel's reboot/halt path sees the SBI SRST extension as unsupported
+and just halts in place — never invoking SBI SRST, so our final_exit
+hook never fires. The stub returns priority 1 from system_reset_check
+(matching syscon-poweroff's priority); registered in final_init AFTER
+fdt_reset_init has scanned for syscon, so on a tie syscon takes
+precedence — preserving the existing #94 BRISC-kick path. With
+BHX_SOFT_REBOOT=1 the daemon skips syscon-poweroff DTB injection,
+making our stub the sole reset device → SBI SRST falls through to
+sbi_exit → final_exit → magic written → harts park.
 
-  - Without ANY system_reset_device registered, sbi_system_reset_supported()
-    returns false, so the guest kernel's reboot/halt path sees the SBI SRST
-    extension as unsupported and just halts in place — never invoking
-    SBI SRST, so our final_exit hook never fires.
-  - With our stub returning priority 1 from system_reset_check, the kernel
-    sees the extension as supported and issues sbi_ecall(SRST). Our stub's
-    system_reset() returns immediately (no-op), letting sbi_system_reset
-    fall through to sbi_exit().
-  - Coexistence with the existing #94 syscon-poweroff path: bhx's daemon
-    DTB injects a /poweroff -> syscon node by default. OpenSBI's
-    fdt_reset_syscon driver registers a reset device for it (priority 1)
-    in the cold-init phase. Our stub registers in final_init (after the
-    fdt scan). On a tie at priority 1, the first-registered device wins
-    in sbi_system_reset_get_device, so syscon takes precedence by default
-    — preserving the existing BRISC-kick path.
-  - When the daemon is run with BHX_SOFT_REBOOT=1, modify_dtb skips the
-    syscon-poweroff node entirely. With no syscon device registered, our
-    stub is the sole reset device → SBI SRST falls through to sbi_exit
-    → final_exit → magic written → harts park.
-
-State quiesce: sbi_exit's earlier calls to sbi_timer_exit / sbi_ipi_exit
-/ sbi_irqchip_exit handle pending CLINT MSIP / mtimecmp / external IRQs
-on the current hart, so we don't duplicate that here. Cache flush + PMP
-re-validation are deferred to the Phase 4 release path (see #166).
-
-Status block layout (extends in later phases):
-  +0x00 : status word
-          0x0000_0000_0000_0000 = not yet parked (cold-boot zero-init)
-          0x5f5f_4445_4b52_4150 = "PARKED__" — final_exit reached
+Status block layout (all u64 little-endian; status_word written LAST
+as a publish barrier so the host trusts the rest of the block once
+it sees the PARKED magic):
+  +0x00 : status word (PARKED magic / 0)
   +0x08 : peers convergence bitmask
-          Low N bits: hart indices that reached STOPPED before
-          the SRST-issuing hart announced PARKED. The SRST-issuing
-          hart's bit is NOT set (it transitions itself in sbi_hsm_exit).
-          Full convergence on a 4-hart tile: bitmask = 0xE / 0xD /
-          0xB / 0x7 depending on which hart issued the SRST.
+  +0x10 : hart 0's `&scratch->next_addr` PA
+  +0x18 : hart 0's `&scratch->next_mode` PA
+  +0x20 : hart 0's `&scratch->next_arg1` PA
+  +0x28 : hart 0's HSM state PA
+  +0x30 : CLINT MSIP[0] PA
 
-The status offset 0xE0000 lives in the firmware's reserved range past
+Status offset 0xE0000 lives in the firmware's reserved range past
 OpenSBI's .text/.data/.bss + scratch (typically <300 KiB) and before
 the kernel-DTB at +0x100000.
 
+The host's release sequence (Phase 4b, in bhx daemon) becomes:
+  1. Re-image kernel + DTB into DRAM via the existing boot_l2cpu path.
+  2. Read the metadata fields from the status block.
+  3. Write *next_addr_pa = kernel entry PA.
+  4. Write *next_mode_pa = PRV_S = 1.
+  5. Write *next_arg1_pa = DTB PA.
+  6. Write *hsm_state_pa = SBI_HSM_STATE_START_PENDING = 2.
+  7. Write *msip_pa = 1 to fire the M-mode software interrupt.
+  Hart 0 wakes from sbi_hsm_hart_wait, mainline runs init_warmboot →
+  sbi_hart_switch_mode → S-mode entry. New kernel SBI-HSM-starts the
+  remaining harts itself.
+
+State quiesce on the SRST-issuing hart (clearing pending CLINT MSIP /
+mtimecmp / external IRQs) is already done by sbi_exit's earlier calls
+to sbi_timer_exit / sbi_ipi_exit / sbi_irqchip_exit; we don't
+duplicate that here.
+
+A new helper sbi_hsm_hart_state_addr() in sbi_hsm.c exposes the PA
+of a hart's HSM state atomic_t, since the file-static
+`hart_data_offset` isn't otherwise reachable from platform.c.
+
+--- a/include/sbi/sbi_hsm.h
++++ b/include/sbi/sbi_hsm.h
+@@ -79,6 +79,11 @@
+ 			       long newstate);
+ int __sbi_hsm_hart_get_state(u32 hartindex);
+ int sbi_hsm_hart_get_state(const struct sbi_domain *dom, u32 hartid);
++/* (bhx#166 Phase 4) Expose the address of a hart's HSM `state` atomic
++ * field. The PCIe host uses this to flip a parked hart's HSM state
++ * from STOPPED to START_PENDING from outside the chip. Returns NULL if
++ * the hartindex is invalid or sbi_hsm_init() hasn't been called yet. */
++void *sbi_hsm_hart_state_addr(u32 hartindex);
+ int sbi_hsm_hart_interruptible_mask(const struct sbi_domain *dom,
+ 				    struct sbi_hartmask *mask);
+ void __sbi_hsm_suspend_non_ret_save(struct sbi_scratch *scratch);
+--- a/lib/sbi/sbi_hsm.c
++++ b/lib/sbi/sbi_hsm.c
+@@ -85,6 +85,25 @@
+ 	return __sbi_hsm_hart_get_state(hartindex);
+ }
+ 
++/* (bhx#166 Phase 4) Address of a hart's HSM state atomic_t. Lives in
++ * the per-hart sbi_scratch at file-static `hart_data_offset` plus the
++ * `state` member offset (zero — it's the first field of struct
++ * sbi_hsm_data). Used by the patched generic platform's final_exit
++ * hook to publish the address to the PCIe host so the host can drive
++ * the STOPPED -> START_PENDING transition that wakes a parked hart. */
++void *sbi_hsm_hart_state_addr(u32 hartindex)
++{
++	struct sbi_scratch *scratch;
++	struct sbi_hsm_data *hdata;
++
++	scratch = sbi_hartindex_to_scratch(hartindex);
++	if (!scratch || !hart_data_offset)
++		return NULL;
++
++	hdata = sbi_scratch_offset_ptr(scratch, hart_data_offset);
++	return &hdata->state;
++}
++
+ /*
+  * Try to acquire the ticket for the given target hart to make sure only
+  * one hart prepares the start of the target hart.
 --- a/platform/generic/platform.c
 +++ b/platform/generic/platform.c
 @@ -14,6 +14,7 @@
@@ -85,36 +132,82 @@ the kernel-DTB at +0x100000.
  	return 0;
  }
  
-@@ -331,6 +338,126 @@
+@@ -331,6 +338,195 @@
  	return fdt_mpxy_init(fdt);
  }
  
-+/* bhx#166 Phase 1+2: announce parked-in-warmboot to the PCIe host
-+ * after multi-hart convergence.
++/* bhx#166 Phase 1+2+4a: announce parked-in-warmboot to the PCIe host
++ * after multi-hart convergence, and publish the metadata the host
++ * needs to release hart 0 from the HSM warmboot wait loop.
 + *
 + * Called from sbi_exit() right before sbi_hsm_exit() jumps into the
 + * HSM warmboot wait loop. The SRST-issuing hart broadcasts halt-IPIs
 + * before reaching here; peers walk sbi_hsm_hart_stop -> sbi_hsm_exit
 + * (which atomically transitions STOP_PENDING -> STOPPED) and join the
 + * warmboot wait loop on their own. We poll their HSM state until
-+ * every peer reaches STOPPED, then write the magic. The host therefore
-+ * sees PARKED only when every hart in the tile is quiesced.
++ * every peer reaches STOPPED, write the metadata + peers bitmask,
++ * then write the PARKED magic last (single-writer fence so the host
++ * never observes PARKED with stale metadata). The host therefore
++ * sees PARKED only when every hart in the tile is quiesced AND the
++ * release metadata is current.
 + *
 + * State quiesce on the SRST-issuing hart (clearing pending IPIs,
 + * timer, external IRQs) is already done by sbi_exit's earlier calls
 + * to sbi_timer_exit / sbi_ipi_exit / sbi_irqchip_exit; we don't
-+ * duplicate that here.
++ * duplicate that here. Cache flush + PMP re-validation are deferred
++ * to the host (see #166).
 + *
-+ * Status block layout (extends in later phases):
-+ *   +0x00 : status word (PARKED magic / 0)
-+ *   +0x08 : peer convergence: bitmask of hart indices that reached
-+ *           STOPPED (low 4 bits = harts 0..3 of this tile). The
-+ *           SRST-issuing hart's bit is NOT set here (it's about to
-+ *           transition itself in sbi_hsm_exit).
++ * Status block layout (all u64 little-endian; the SRST-issuing hart
++ * writes status_word LAST so the host can poll the magic and trust
++ * the rest of the block once the magic shows up):
++ *
++ *   +0x00 : status word
++ *           0x0000_0000_0000_0000 = not yet parked (cold-boot zero)
++ *           0x5f5f_4445_4b52_4150 = "PARKED__" magic
++ *
++ *   +0x08 : peer convergence bitmask. Low N bits = harts 0..N-1 that
++ *           reached SBI_HSM_STATE_STOPPED before the SRST-issuing
++ *           hart announced PARKED. The SRST-issuing hart's bit is
++ *           NOT set (it transitions itself in sbi_hsm_exit AFTER
++ *           final_exit returns). Full convergence on a 4-hart tile
++ *           when hart 0 issued SRST: 0xE.
++ *
++ *   +0x10 : hart 0's `&scratch->next_addr` PA. Host writes the new
++ *           kernel entry-point here.
++ *
++ *   +0x18 : hart 0's `&scratch->next_mode` PA. Host writes
++ *           PRV_S = 1 (next mode after sbi_hart_switch_mode).
++ *
++ *   +0x20 : hart 0's `&scratch->next_arg1` PA. Host writes the new
++ *           DTB PA (becomes a1 on entry to the kernel).
++ *
++ *   +0x28 : hart 0's HSM state PA. Host writes
++ *           SBI_HSM_STATE_START_PENDING = 2 to wake hart 0 from
++ *           sbi_hsm_hart_wait. Read STOPPED = 1 first to confirm
++ *           the hart hasn't been started by some other path.
++ *
++ *   +0x30 : CLINT MSIP[0] PA. Host writes 1 to fire the M-mode
++ *           software interrupt that wakes hart 0 from `wfi`.
++ *
++ * Metadata is computed at first call. Subsequent SRSTs reuse the
++ * already-published values (they don't change across re-entries
++ * because OpenSBI's bss is preserved through the HSM warmboot loop).
 + */
 +#define TT_PURGATORY_STATUS_OFFSET	0x000E0000UL
 +#define TT_PURGATORY_STATUS_PARKED	0x5f5f44454b524150UL  /* "PARKED__" LE */
 +#define TT_PURGATORY_PEERS_OFFSET	(TT_PURGATORY_STATUS_OFFSET + 8)
++#define TT_PURGATORY_NEXT_ADDR_OFFSET	(TT_PURGATORY_STATUS_OFFSET + 0x10)
++#define TT_PURGATORY_NEXT_MODE_OFFSET	(TT_PURGATORY_STATUS_OFFSET + 0x18)
++#define TT_PURGATORY_NEXT_ARG1_OFFSET	(TT_PURGATORY_STATUS_OFFSET + 0x20)
++#define TT_PURGATORY_HSM_STATE_OFFSET	(TT_PURGATORY_STATUS_OFFSET + 0x28)
++#define TT_PURGATORY_MSIP_OFFSET	(TT_PURGATORY_STATUS_OFFSET + 0x30)
++
++/* L2CPU local CLINT base — see third_party/dtb/blackhole.dtsi
++ * (`tenstorrent,blackhole-clint` / `sifive,clint0` at 0x2000000).
++ * Host accesses it via the per-L2CPU TLB window that already covers
++ * [0, 4 GiB) of the L2CPU's local bus. */
++#define TT_L2CPU_CLINT_BASE		0x02000000UL
++#define TT_L2CPU_CLINT_MSIP(hart)	(TT_L2CPU_CLINT_BASE + 4UL * (hart))
 +
 +/* Maximum spin iterations waiting for peers to reach STOPPED. At
 + * 1750 MHz this caps the wait around ~10ms (single inline pause
@@ -140,6 +233,8 @@ the kernel-DTB at +0x100000.
 +static void tt_purgatory_final_exit(void)
 +{
 +	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
++	struct sbi_scratch *hart0_scratch = sbi_hartindex_to_scratch(0);
++	void *hart0_state = sbi_hsm_hart_state_addr(0);
 +	u32 hartindex = current_hartindex();
 +	u32 hart_count = sbi_hart_count();
 +	unsigned long expected_mask = 0, peers_mask = 0;
@@ -151,22 +246,43 @@ the kernel-DTB at +0x100000.
 +	volatile unsigned long *peers =
 +		(volatile unsigned long *)(scratch->fw_start +
 +					   TT_PURGATORY_PEERS_OFFSET);
++	volatile unsigned long *next_addr_pa =
++		(volatile unsigned long *)(scratch->fw_start +
++					   TT_PURGATORY_NEXT_ADDR_OFFSET);
++	volatile unsigned long *next_mode_pa =
++		(volatile unsigned long *)(scratch->fw_start +
++					   TT_PURGATORY_NEXT_MODE_OFFSET);
++	volatile unsigned long *next_arg1_pa =
++		(volatile unsigned long *)(scratch->fw_start +
++					   TT_PURGATORY_NEXT_ARG1_OFFSET);
++	volatile unsigned long *hsm_state_pa =
++		(volatile unsigned long *)(scratch->fw_start +
++					   TT_PURGATORY_HSM_STATE_OFFSET);
++	volatile unsigned long *msip_pa =
++		(volatile unsigned long *)(scratch->fw_start +
++					   TT_PURGATORY_MSIP_OFFSET);
 +
 +	/* Build the expected peer mask: every hart except ourselves. */
 +	for (i = 0; i < hart_count && i < 64; i++)
 +		if (i != hartindex)
 +			expected_mask |= 1UL << i;
 +
-+	/* Wait for peers to reach STOPPED (they were halted via
-+	 * sbi_ipi_send_halt earlier in sbi_system_reset and walk the
-+	 * sbi_hsm_hart_stop -> sbi_hsm_exit path on their own).
-+	 * Bounded spin; partial convergence still announces PARKED so
-+	 * the host can see (and act on) a wedge via the peers field. */
++	/* Wait for peers to reach STOPPED. */
 +	while (spin++ < TT_PURGATORY_PEER_WAIT_ITERS) {
 +		peers_mask = tt_purgatory_collect_peers_stopped(hartindex);
 +		if (peers_mask == expected_mask)
 +			break;
 +	}
++
++	/* Phase 4a: publish hart 0's release metadata. */
++	*next_addr_pa = hart0_scratch ?
++		(unsigned long)&hart0_scratch->next_addr : 0UL;
++	*next_mode_pa = hart0_scratch ?
++		(unsigned long)&hart0_scratch->next_mode : 0UL;
++	*next_arg1_pa = hart0_scratch ?
++		(unsigned long)&hart0_scratch->next_arg1 : 0UL;
++	*hsm_state_pa = (unsigned long)hart0_state;
++	*msip_pa = TT_L2CPU_CLINT_MSIP(0);
 +
 +	*peers = peers_mask;
 +	__asm__ volatile("fence ow,ow" : : : "memory");
@@ -212,7 +328,7 @@ the kernel-DTB at +0x100000.
  struct sbi_platform_operations generic_platform_ops = {
  	.cold_boot_allowed	= generic_cold_boot_allowed,
  	.nascent_init		= generic_nascent_init,
-@@ -346,6 +473,7 @@
+@@ -346,6 +542,7 @@
  	.get_tlb_num_entries	= generic_tlb_num_entries,
  	.timer_init		= fdt_timer_init,
  	.mpxy_init		= generic_mpxy_init,

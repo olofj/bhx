@@ -33,6 +33,14 @@ pub fn read_bin_file(path: &Path) -> std::io::Result<Vec<u8>> {
 /// and its `alloc_lock` — so concurrent bulk writes on different L2CPUs
 /// don't stomp each other's kmd state and no longer touch the shared
 /// ARC tile (8,0).
+/// Bulk NoC write of `data` into L2CPU memory at `addr`. Used by
+/// [`boot_l2cpu`] for image load and by
+/// [`crate::daemon::server::dispatch_release`] for the kernel
+/// re-image during release-from-purgatory (#166).
+pub fn l2cpu_noc_write_bulk_pub(l2cpu: &L2Cpu, addr: u64, data: &[u8]) -> std::io::Result<()> {
+    l2cpu_noc_write_bulk(l2cpu, addr, data)
+}
+
 fn l2cpu_noc_write_bulk(l2cpu: &L2Cpu, addr: u64, data: &[u8]) -> std::io::Result<()> {
     const TWO_MEG: u64 = crate::tlb::TWO_MEG as u64;
     let mut written: u64 = 0;

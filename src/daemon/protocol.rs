@@ -309,6 +309,33 @@ pub struct L2CpuStatus {
     /// isn't PARKED yet.
     #[serde(default)]
     pub purgatory_peers: Option<u64>,
+    /// (#166 Phase 4a) Hart 0 release-metadata block, populated by
+    /// the OpenSBI final_exit hook before the PARKED magic write.
+    /// `Some` only when the slot is `Parked`. Used by the host's
+    /// release-from-purgatory path to wake hart 0 with a fresh
+    /// kernel entry.
+    #[serde(default)]
+    pub purgatory_release_meta: Option<PurgatoryReleaseMeta>,
+}
+
+/// (#166 Phase 4a) Hart 0 release metadata published by the OpenSBI
+/// `sbi_platform_final_exit` hook. All values are L2CPU PAs the host
+/// writes through the L2CPU's persistent TLB windows.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PurgatoryReleaseMeta {
+    /// PA of `&hart0_scratch->next_addr`. Host writes the new kernel
+    /// entry-point here.
+    pub next_addr_pa: u64,
+    /// PA of `&hart0_scratch->next_mode`. Host writes `PRV_S = 1`.
+    pub next_mode_pa: u64,
+    /// PA of `&hart0_scratch->next_arg1`. Host writes the new DTB PA.
+    pub next_arg1_pa: u64,
+    /// PA of hart 0's HSM `state` atomic field. Host writes
+    /// `SBI_HSM_STATE_START_PENDING = 2` here.
+    pub hsm_state_pa: u64,
+    /// PA of CLINT MSIP[0]. Host writes `1` here to fire the
+    /// M-mode software interrupt that wakes hart 0 from `wfi`.
+    pub msip_pa: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,6 +356,12 @@ pub enum L2CpuState {
     Running,
     /// Released but OpenSBI magic is missing — needs explicit recovery.
     Wedged,
+    /// (#166) Guest issued SBI SRST; OpenSBI has parked all harts in
+    /// `sbi_hsm_hart_wait` and announced the PARKED magic in the
+    /// purgatory status block. Slot's `L2Cpu` is still alive on the
+    /// daemon side. `dispatch_boot` re-images and releases via the
+    /// host-handshake path (Phase 4) without any chip-side reset.
+    Parked,
 }
 
 /// Maximum frame size the decoder will accept before giving up. JSON control
@@ -505,6 +538,7 @@ mod tests {
                 clients: 1,
                 purgatory_status: None,
                 purgatory_peers: None,
+                purgatory_release_meta: None,
             }],
             engine_tile: Some((16, 11)),
             pll_fbdiv: Some(140),

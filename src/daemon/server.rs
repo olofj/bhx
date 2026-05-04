@@ -598,52 +598,100 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Re
     let mut l2cpus = Vec::new();
     for (idx, slot_mutex) in state.l2cpus.iter().enumerate() {
         let slot = slot_mutex.lock_or_internal_error()?;
-        let (st, disk, disks, net, virtio_console, clients, purgatory_status, purgatory_peers) =
-            match slot.as_ref() {
-                None => {
-                    let st = if state.wedged[idx].load(Ordering::Relaxed) {
-                        L2CpuState::Wedged
-                    } else {
-                        L2CpuState::Stopped
-                    };
-                    (st, None, Vec::new(), false, false, 0, None, None)
-                }
-                Some(s) => {
-                    // (#166 Phase 1+2) Read the OpenSBI purgatory status
-                    // block at L2CPU memory base + 0xE0000:
-                    //   +0x00 .. 0x07 : status word (PARKED magic / 0)
-                    //   +0x08 .. 0x0F : peers convergence bitmask
-                    // With the syscon-poweroff DTB injection disabled
-                    // (BHX_SOFT_REBOOT=1), an in-guest SBI SRST falls
-                    // through to sbi_platform_final_exit, which polls
-                    // peer HSM states until all are STOPPED, writes the
-                    // peers bitmask, then writes "PARKED__" magic.
-                    let mem_base = crate::l2cpu::L2CPU_STARTING_ADDRESS[idx];
-                    let read_u64 = |pa: u64| -> Option<u64> {
-                        let lo = s.l2cpu.read32(pa).ok()?;
-                        let hi = s.l2cpu.read32(pa + 4).ok()?;
-                        Some(((hi as u64) << 32) | (lo as u64))
-                    };
-                    let purg = read_u64(mem_base + crate::regs::purgatory::STATUS_OFFSET);
-                    let peers = read_u64(mem_base + crate::regs::purgatory::PEERS_OFFSET);
-                    (
-                        L2CpuState::Running,
-                        s.disks.first().map(|d| d.path.clone()),
-                        s.disks
-                            .iter()
-                            .map(|d| crate::daemon::protocol::DiskAttach {
-                                path: d.path.clone(),
-                                name: d.name.clone(),
+        #[allow(clippy::type_complexity)]
+        let (
+            st,
+            disk,
+            disks,
+            net,
+            virtio_console,
+            clients,
+            purgatory_status,
+            purgatory_peers,
+            release_meta,
+        ) = match slot.as_ref() {
+            None => {
+                let st = if state.wedged[idx].load(Ordering::Relaxed) {
+                    L2CpuState::Wedged
+                } else {
+                    L2CpuState::Stopped
+                };
+                (st, None, Vec::new(), false, false, 0, None, None, None)
+            }
+            Some(s) => {
+                // (#166 Phase 1/2/4a) Read the OpenSBI purgatory status
+                // block at L2CPU memory base + 0xE0000. Layout in
+                // src/regs.rs::purgatory.
+                let mem_base = crate::l2cpu::L2CPU_STARTING_ADDRESS[idx];
+                let read_u64 = |pa: u64| -> Option<u64> {
+                    let lo = s.l2cpu.read32(pa).ok()?;
+                    let hi = s.l2cpu.read32(pa + 4).ok()?;
+                    Some(((hi as u64) << 32) | (lo as u64))
+                };
+                let purg = read_u64(mem_base + crate::regs::purgatory::STATUS_OFFSET);
+                let peers = read_u64(mem_base + crate::regs::purgatory::PEERS_OFFSET);
+                // (#166 Phase 3) When the magic reads PARKED, surface
+                // it as a distinct slot state. The L2Cpu is still
+                // alive on the daemon side; release-from-purgatory
+                // (Phase 4) re-images and IPIs hart 0 to wake parked
+                // harts. Also pull the release metadata when PARKED so
+                // the operator can sanity-check the published PAs.
+                let parked = purg == Some(crate::regs::purgatory::STATUS_PARKED);
+                let st = if parked {
+                    L2CpuState::Parked
+                } else {
+                    L2CpuState::Running
+                };
+                let release = if parked {
+                    let next_addr_pa =
+                        read_u64(mem_base + crate::regs::purgatory::NEXT_ADDR_PA_OFFSET);
+                    let next_mode_pa =
+                        read_u64(mem_base + crate::regs::purgatory::NEXT_MODE_PA_OFFSET);
+                    let next_arg1_pa =
+                        read_u64(mem_base + crate::regs::purgatory::NEXT_ARG1_PA_OFFSET);
+                    let hsm_state_pa =
+                        read_u64(mem_base + crate::regs::purgatory::HSM_STATE_PA_OFFSET);
+                    let msip_pa = read_u64(mem_base + crate::regs::purgatory::MSIP_PA_OFFSET);
+                    match (
+                        next_addr_pa,
+                        next_mode_pa,
+                        next_arg1_pa,
+                        hsm_state_pa,
+                        msip_pa,
+                    ) {
+                        (Some(a), Some(b), Some(c), Some(d), Some(e)) => {
+                            Some(crate::daemon::protocol::PurgatoryReleaseMeta {
+                                next_addr_pa: a,
+                                next_mode_pa: b,
+                                next_arg1_pa: c,
+                                hsm_state_pa: d,
+                                msip_pa: e,
                             })
-                            .collect(),
-                        s.net.is_some(),
-                        s.virtio_console.is_some(),
-                        s.console_hub.client_count() as u32,
-                        purg,
-                        peers,
-                    )
-                }
-            };
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                (
+                    st,
+                    s.disks.first().map(|d| d.path.clone()),
+                    s.disks
+                        .iter()
+                        .map(|d| crate::daemon::protocol::DiskAttach {
+                            path: d.path.clone(),
+                            name: d.name.clone(),
+                        })
+                        .collect(),
+                    s.net.is_some(),
+                    s.virtio_console.is_some(),
+                    s.console_hub.client_count() as u32,
+                    purg,
+                    peers,
+                    release,
+                )
+            }
+        };
         l2cpus.push(L2CpuStatus {
             idx: idx as u8,
             state: st,
@@ -654,6 +702,7 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Re
             clients,
             purgatory_status,
             purgatory_peers,
+            purgatory_release_meta: release_meta,
         });
     }
 
@@ -733,6 +782,20 @@ fn dispatch_boot(
         l2cpu_idx, opensbi, payload, dtb, initramfs, root_device, force_reset_pcie, disk, network, console, rng, force, memory_override, hostname_override, cloud_init
     );
     validate_l2cpu(l2cpu_idx)?;
+
+    // (#166 Phase 4b) Detect a Parked slot and route to the
+    // release-from-purgatory path instead of cold boot. Skips
+    // chip-side reset entirely; the parked OpenSBI in M-mode is
+    // already running and just needs hart 0 woken from
+    // sbi_hsm_hart_wait.
+    if let Some(meta) = read_parked_release_meta(state, l2cpu_idx)? {
+        dlog!(
+            "[boot l2cpu {}] Parked slot detected — routing to release-from-purgatory",
+            l2cpu_idx
+        );
+        return dispatch_release(state, sock, l2cpu_idx, payload, meta);
+    }
+
     handle_existing_slot(state, l2cpu_idx, force).map_err(crate::Error::slot_state)?;
 
     // Cold-boot: clear any captured shutdown scrollback (#160) so the
@@ -1120,6 +1183,217 @@ fn install_slot_and_reply_ok(
         "[boot l2cpu {}] dispatch_boot complete — replying ok",
         l2cpu_idx
     );
+    reply_ok(sock);
+    Ok(())
+}
+
+/// (#166 Phase 4b) Release-from-purgatory metadata, captured under
+/// the slot mutex along with the L2Cpu Arc. Returned by
+/// `read_parked_release_meta` only when the slot's purgatory cell
+/// reads as PARKED with all five published PAs valid (>0).
+pub struct ParkedReleaseMeta {
+    /// Arc to the slot's L2Cpu so the caller can issue NoC writes
+    /// without holding the slot mutex across the long re-image.
+    pub l2cpu: Arc<L2Cpu>,
+    /// PA of `&hart0_scratch->next_addr`. Host writes the new kernel
+    /// entry here.
+    pub next_addr_pa: u64,
+    /// PA of `&hart0_scratch->next_mode`. Host writes PRV_S = 1.
+    pub next_mode_pa: u64,
+    /// PA of `&hart0_scratch->next_arg1`. Host writes the DTB PA.
+    pub next_arg1_pa: u64,
+    /// PA of hart 0's HSM `state` atomic. Host writes
+    /// SBI_HSM_STATE_START_PENDING (= 2).
+    pub hsm_state_pa: u64,
+    /// PA of CLINT MSIP[0]. Host writes 1 to fire the M-mode
+    /// software interrupt that wakes hart 0 from `wfi`.
+    pub msip_pa: u64,
+}
+
+/// (#166 Phase 4b) If the slot is alive AND its OpenSBI purgatory
+/// cell reads as PARKED with valid release metadata, return the
+/// metadata so the caller can drive a release-from-purgatory.
+/// Returns Ok(None) if the slot is None or not parked.
+fn read_parked_release_meta(
+    state: &Arc<DaemonState>,
+    l2cpu_idx: u8,
+) -> crate::Result<Option<ParkedReleaseMeta>> {
+    let guard = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
+    let Some(slot) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let mem_base = crate::l2cpu::L2CPU_STARTING_ADDRESS[l2cpu_idx as usize];
+    let read_u64 = |pa: u64| -> Option<u64> {
+        let lo = slot.l2cpu.read32(pa).ok()?;
+        let hi = slot.l2cpu.read32(pa + 4).ok()?;
+        Some(((hi as u64) << 32) | (lo as u64))
+    };
+    let status = read_u64(mem_base + crate::regs::purgatory::STATUS_OFFSET);
+    if status != Some(crate::regs::purgatory::STATUS_PARKED) {
+        return Ok(None);
+    }
+    let next_addr_pa = read_u64(mem_base + crate::regs::purgatory::NEXT_ADDR_PA_OFFSET);
+    let next_mode_pa = read_u64(mem_base + crate::regs::purgatory::NEXT_MODE_PA_OFFSET);
+    let next_arg1_pa = read_u64(mem_base + crate::regs::purgatory::NEXT_ARG1_PA_OFFSET);
+    let hsm_state_pa = read_u64(mem_base + crate::regs::purgatory::HSM_STATE_PA_OFFSET);
+    let msip_pa = read_u64(mem_base + crate::regs::purgatory::MSIP_PA_OFFSET);
+    let (next_addr_pa, next_mode_pa, next_arg1_pa, hsm_state_pa, msip_pa) = match (
+        next_addr_pa,
+        next_mode_pa,
+        next_arg1_pa,
+        hsm_state_pa,
+        msip_pa,
+    ) {
+        (Some(a), Some(b), Some(c), Some(d), Some(e))
+            if a > 0 && b > 0 && c > 0 && d > 0 && e > 0 =>
+        {
+            (a, b, c, d, e)
+        }
+        _ => {
+            dlog!(
+                    "[release l2cpu {}] PARKED magic seen but metadata fields are zero/missing — skipping release",
+                    l2cpu_idx
+                );
+            return Ok(None);
+        }
+    };
+    Ok(Some(ParkedReleaseMeta {
+        l2cpu: Arc::clone(&slot.l2cpu),
+        next_addr_pa,
+        next_mode_pa,
+        next_arg1_pa,
+        hsm_state_pa,
+        msip_pa,
+    }))
+}
+
+/// (#166 Phase 4b) Drive the host-handshake release of a parked
+/// L2CPU. Re-writes the kernel image (DTB and OpenSBI keep their
+/// cold-boot bytes), then writes hart 0's scratch+state and fires
+/// the wake IPI. Hart 0 exits sbi_hsm_hart_wait, mainline runs
+/// init_warmboot_run → sbi_hart_switch_mode → mret to S-mode at
+/// next_addr. The new kernel SBI-HSM-starts harts 1..3 itself.
+fn dispatch_release(
+    state: &Arc<DaemonState>,
+    sock: &UnixStream,
+    l2cpu_idx: u8,
+    payload: &crate::daemon::protocol::BootPayload,
+    meta: ParkedReleaseMeta,
+) -> crate::Result<()> {
+    use crate::regs::boot_image;
+    let mem_base = crate::l2cpu::L2CPU_STARTING_ADDRESS[l2cpu_idx as usize];
+    let kernel_addr = mem_base + boot_image::KERNEL_OFFSET;
+    let dtb_addr = mem_base + boot_image::DTB_OFFSET;
+    let rootfs_addr = mem_base + boot_image::INITRAMFS_OFFSET;
+
+    dlog!(
+        "[release l2cpu {}] re-writing kernel from {} at {:#x}",
+        l2cpu_idx,
+        payload.path(),
+        kernel_addr
+    );
+    let kernel_path = std::path::Path::new(payload.path());
+    let kernel_bytes = crate::boot::read_bin_file(kernel_path).map_err(|e| crate::Error::Io {
+        ctx: format!("read kernel {}", payload.path()),
+        source: e,
+    })?;
+    crate::boot::l2cpu_noc_write_bulk_pub(&meta.l2cpu, kernel_addr, &kernel_bytes).map_err(
+        |e| crate::Error::Io {
+            ctx: "kernel re-image".into(),
+            source: e,
+        },
+    )?;
+
+    // Clear the PARKED magic before kicking hart 0 so a status read
+    // racing the wake doesn't see stale Parked state. The new boot
+    // doesn't write to this cell unless the guest issues another SRST.
+    let purg_pa = mem_base + crate::regs::purgatory::STATUS_OFFSET;
+    meta.l2cpu
+        .write32(purg_pa, 0)
+        .and_then(|_| meta.l2cpu.write32(purg_pa + 4, 0))
+        .map_err(|e| crate::Error::Io {
+            ctx: "clear purgatory magic".into(),
+            source: e,
+        })?;
+
+    // Phase 4b core: write hart 0's release metadata, flip HSM state,
+    // fire the IPI. Order matters — next_addr/mode/arg1 must be
+    // visible before the parked hart wakes and reads them, so
+    // ordering is: meta writes → fence → state write → fence → MSIP.
+    let write_u64 = |pa: u64, val: u64| -> crate::Result<()> {
+        meta.l2cpu
+            .write32(pa, val as u32)
+            .and_then(|_| meta.l2cpu.write32(pa + 4, (val >> 32) as u32))
+            .map_err(|e| crate::Error::Io {
+                ctx: format!("write u64 @ {:#x}", pa),
+                source: e,
+            })
+    };
+    write_u64(meta.next_addr_pa, kernel_addr)?;
+    write_u64(meta.next_mode_pa, crate::regs::purgatory::NEXT_MODE_S)?;
+    write_u64(meta.next_arg1_pa, dtb_addr)?;
+
+    // HSM state is a 32-bit atomic_t (long on RV32 / int on the
+    // OpenSBI generic platform after we expanded sbi_atomic.h to use
+    // `int counter`). Read it first as a sanity check (must be
+    // STOPPED = 1) so we fail loudly on a races-with-cold-boot
+    // misconfiguration before firing the IPI.
+    let hsm_now = meta
+        .l2cpu
+        .read32(meta.hsm_state_pa)
+        .map_err(|e| crate::Error::Io {
+            ctx: "read hsm state".into(),
+            source: e,
+        })?;
+    if hsm_now != crate::regs::purgatory::HSM_STATE_STOPPED {
+        return Err(crate::Error::internal(format!(
+            "release l2cpu {}: hart 0 HSM state {} (expected STOPPED=1) — refusing to release",
+            l2cpu_idx, hsm_now
+        )));
+    }
+    meta.l2cpu
+        .write32(
+            meta.hsm_state_pa,
+            crate::regs::purgatory::HSM_STATE_START_PENDING,
+        )
+        .map_err(|e| crate::Error::Io {
+            ctx: "write hsm state START_PENDING".into(),
+            source: e,
+        })?;
+
+    // Fire the IPI. CLINT MSIP is a 32-bit register; writing 1 sets
+    // the M-mode software interrupt pending bit, waking hart 0 from
+    // wfi inside sbi_hsm_hart_wait.
+    meta.l2cpu
+        .write32(meta.msip_pa, 1)
+        .map_err(|e| crate::Error::Io {
+            ctx: "write CLINT MSIP".into(),
+            source: e,
+        })?;
+
+    dlog!(
+        "[release l2cpu {}] hart 0 released — next_addr={:#x} dtb={:#x}; awaiting kernel",
+        l2cpu_idx,
+        kernel_addr,
+        dtb_addr
+    );
+
+    // Mark the slot fresh: the new kernel won't write to the
+    // shutdown_tail buffer, but stale tail content from the
+    // previous incarnation would leak into a post-mortem attach if
+    // we left it. Clear here so the next stop captures only this
+    // boot's output.
+    if let Ok(mut g) = state.shutdown_tails[l2cpu_idx as usize].lock() {
+        g.clear();
+    }
+
+    // No need to re-spawn workers or update slot bookkeeping: the
+    // existing console worker keeps draining the virt UART, the
+    // virtio handlers stay registered with the kick poller, the
+    // slot's L2Cpu Arc lives on. Status will flip from Parked back
+    // to Running on the next status query (we cleared the magic).
+    let _ = (rootfs_addr,); // unused on this path until DTB rebuild lands
+    let _ = state; // state used for shutdown_tails above
     reply_ok(sock);
     Ok(())
 }
