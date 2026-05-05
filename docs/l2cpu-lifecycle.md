@@ -139,6 +139,29 @@ Parked → Running
 
 No chip-side reset, no PCIe blip, sibling slots untouched.
 
+**Constraints on what re-boots cleanly.** Release-from-purgatory
+re-uses the cold-boot OpenSBI + DTB + initramfs bytes. The current
+`dispatch_release` only re-writes the kernel image; the DTB, OpenSBI
+firmware, and initramfs in DRAM are preserved as-is. So a re-boot is
+clean only when the new kernel can run against the cold-boot
+configuration. In practice, a release that changes any of the
+following relative to the cold boot is unsupported today and may
+behave subtly wrong:
+
+- DTB content (memory layout, virtio nodes, `/chosen/bootargs`,
+  console fragment, root device)
+- Initramfs (or its absence) — if the cold boot used one, the new
+  kernel still finds it at `rootfs_addr`, but bytes match the cold
+  boot, not whatever the operator might have passed on the
+  release-time `bhx boot` command line
+- Memory size / `--memory` override
+
+For workloads that need to rev these, do a cold boot (`bhx boot`
+on a `Stopped` slot, or `bhx daemon stop` first) instead of a
+release. A future change ([#170](https://github.com/olofj/bhx/issues/170))
+either rewrites all four regions on release or rejects
+configuration-changing releases up front.
+
 ### Daemon stop / shutdown
 
 ```
