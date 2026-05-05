@@ -452,57 +452,47 @@ fn run_poll_loop(
 
     while !exit.load(Ordering::Relaxed) {
         let consumed_this_pass = consume_kick_ring_pass(&*engine, &mut consumer, |kick| {
-            // The legacy syscon-poweroff path used to push kicks on
-            // slots 20..23 (one per L2CPU); soft-reboot (#166)
-            // replaced it. If a chip-side surprise ever lands such
-            // a kick, log defensively and drop it.
-            const LEGACY_SHUTDOWN_SLOT_BASE: u16 = 20;
-            const LEGACY_SHUTDOWN_NUM_SLOTS: u16 = 4;
-            let legacy_shutdown_idx = kick
-                .slot
-                .checked_sub(LEGACY_SHUTDOWN_SLOT_BASE)
-                .filter(|&i| i < LEGACY_SHUTDOWN_NUM_SLOTS);
-            if let Some(l2cpu_idx) = legacy_shutdown_idx {
+            // Dispatch every kick through the virtio registry. There
+            // used to be a slots-20..23 carve-out here for the legacy
+            // syscon-poweroff path, but that path is gone (#166), and
+            // those slot numbers ARE virtio slots for l2cpu 2's
+            // BLK1/BLK2/padding under the post-bump DEVS_PER_L2CPU=8
+            // layout. Routing them anywhere other than the registry
+            // would intercept l2cpu 2's cidata kicks and silently kill
+            // dispatch — exactly the bug that tore down a sibling
+            // L2CPU when the previous "defensive log" eats slot 20.
+            let mut map = registry.lock().unwrap();
+            if let Some(reg) = map.get_mut(&(kick.slot as u32)) {
+                // STATUS=0 epoch tracking: BRISC bumps per-slot epoch
+                // on every guest STATUS=0 (see brisc-firmware
+                // virtio.c::handle_status_change). When a kick lands
+                // with an epoch we haven't seen before, the guest has
+                // reinit'd the queue — reset `processed[]` so the
+                // first dispatch reads avail.ring[0] for the fresh
+                // session instead of avail.ring[stale_idx]. Without
+                // this, AlmaLinux's U-Boot→kernel handoff (U-Boot
+                // probes virtio_blk, writes STATUS=0 on cleanup,
+                // kernel re-probes) had us pulling stale indices from
+                // the kernel's freshly-zeroed avail ring and writing
+                // id=0 into the used ring, tripping the kernel's
+                // "id 0 is not a head" guard.
+                if kick.epoch != reg.last_epoch {
+                    for p in reg.processed.iter_mut() {
+                        *p = 0;
+                    }
+                    reg.last_epoch = kick.epoch;
+                }
+                if let Some(used_idx) = dispatch_chain(&engine, reg, kick.queue_idx) {
+                    // Push a completion to BRISC for diagnostics +
+                    // future BRISC-side IRQ dispatch. The PLIC IRQ
+                    // itself is fired daemon-side today.
+                    engine.push_completion(kick.slot, kick.queue_idx, used_idx);
+                }
+            } else {
                 crate::dlog!(
-                    "[kick-poller] unexpected legacy shutdown kick: l2cpu {} kind {} (slot {})",
-                    l2cpu_idx,
-                    kick.queue_idx,
+                    "[kick-poller]   no registration for slot {}, dropping kick",
                     kick.slot
                 );
-            } else {
-                let mut map = registry.lock().unwrap();
-                if let Some(reg) = map.get_mut(&(kick.slot as u32)) {
-                    // STATUS=0 epoch tracking: BRISC bumps per-slot epoch
-                    // on every guest STATUS=0 (see brisc-firmware
-                    // virtio.c::handle_status_change). When a kick lands
-                    // with an epoch we haven't seen before, the guest has
-                    // reinit'd the queue — reset `processed[]` so the
-                    // first dispatch reads avail.ring[0] for the fresh
-                    // session instead of avail.ring[stale_idx]. Without
-                    // this, AlmaLinux's U-Boot→kernel handoff (U-Boot
-                    // probes virtio_blk, writes STATUS=0 on cleanup,
-                    // kernel re-probes) had us pulling stale indices from
-                    // the kernel's freshly-zeroed avail ring and writing
-                    // id=0 into the used ring, tripping the kernel's
-                    // "id 0 is not a head" guard.
-                    if kick.epoch != reg.last_epoch {
-                        for p in reg.processed.iter_mut() {
-                            *p = 0;
-                        }
-                        reg.last_epoch = kick.epoch;
-                    }
-                    if let Some(used_idx) = dispatch_chain(&engine, reg, kick.queue_idx) {
-                        // Push a completion to BRISC for diagnostics +
-                        // future BRISC-side IRQ dispatch. The PLIC IRQ
-                        // itself is fired daemon-side today.
-                        engine.push_completion(kick.slot, kick.queue_idx, used_idx);
-                    }
-                } else {
-                    crate::dlog!(
-                        "[kick-poller]   no registration for slot {}, dropping kick",
-                        kick.slot
-                    );
-                }
             }
             stats.last_kick_slot_queue.store(
                 ((kick.slot as u64) << 16) | (kick.queue_idx as u64),
