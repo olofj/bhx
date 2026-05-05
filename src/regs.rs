@@ -244,6 +244,19 @@ pub mod purgatory {
     /// PA of CLINT MSIP[0]. Host writes `1` here to fire the M-mode
     /// software interrupt that wakes hart 0 from `wfi`.
     pub const MSIP_PA_OFFSET: u64 = STATUS_OFFSET + 0x30;
+    /// (#166 Phase 5) Force-park IPI metadata. The host writes
+    /// `[FORCE_PARK_REQ_VALUE_OFFSET]` (a u64) to the address held at
+    /// `[FORCE_PARK_REQ_PA_OFFSET]`, then writes `1` to MSIP_PA, to
+    /// deliver an M-mode software interrupt that OpenSBI's IPI
+    /// dispatcher routes to the `bhx_force_park` event's `process`
+    /// callback (which calls `sbi_system_reset` → same path as a
+    /// guest-issued SBI SRST). Both fields are populated at OpenSBI
+    /// cold init (so available before any SRST has happened) and are
+    /// stable across reboot cycles. `req_pa == 0` means the IPI event
+    /// failed to register and the host should fall back to
+    /// `--force-reset-pcie`.
+    pub const FORCE_PARK_REQ_PA_OFFSET: u64 = STATUS_OFFSET + 0x38;
+    pub const FORCE_PARK_REQ_VALUE_OFFSET: u64 = STATUS_OFFSET + 0x40;
 
     /// "PARKED__" interpreted as little-endian u64. Final_exit hook
     /// writes this exact value to indicate the harts are about to

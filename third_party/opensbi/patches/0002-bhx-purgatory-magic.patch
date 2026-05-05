@@ -1,64 +1,75 @@
 Add a sbi_platform_final_exit hook that writes a "PARKED__" magic at
 a known DRAM offset before the warmboot loop spins, plus a stub
 sbi_system_reset_device so SBI SRST is reported supported and falls
-through to sbi_exit instead of the kernel halting locally.
+through to sbi_exit instead of the kernel halting locally, plus a
+custom IPI event ("bhx_force_park") for host-driven force-reboot
+of running guests.
 
-Phase 1+2+4a of bhx#166. Phase 1 was the smallest possible verification
-that the SBI SRST fall-through path lands in our hook. Phase 2 added
-multi-hart convergence: the SRST-issuing hart polls peer HSM state
-until every peer reaches SBI_HSM_STATE_STOPPED before announcing
-PARKED. Phase 4a publishes hart 0's release metadata in the status
-block — `&scratch->next_addr/mode/arg1` PAs, the HSM state PA, and
-the CLINT MSIP[0] PA — so the host can drive a release-from-purgatory
-without re-deriving any of these by hand.
+Phases 1+2+4a+5 of bhx#166. Phase 1 was the smallest possible
+verification that the SBI SRST fall-through path lands in our hook.
+Phase 2 added multi-hart convergence: the SRST-issuing hart polls
+peer HSM state until every peer reaches SBI_HSM_STATE_STOPPED before
+announcing PARKED. Phase 4a publishes hart 0's release metadata so
+the host can drive a release-from-purgatory without re-deriving any
+of the addresses. Phase 5 adds the bhx_force_park IPI event +
+metadata: the host writes a magic to scratch->ipi_type and fires
+CLINT MSIP[0] to deliver an M-mode software interrupt; OpenSBI's
+existing IPI dispatcher routes to our process callback, which calls
+sbi_system_reset (same path as a guest-issued SBI SRST). Recovers
+any kernel-level wedge — Linux S-mode `sstatus.SIE=0` cannot mask
+M-mode interrupts.
 
-Why a stub reset device is needed: without ANY system_reset_device
-registered, sbi_system_reset_supported() returns false, so the guest
-kernel's reboot/halt path sees the SBI SRST extension as unsupported
-and just halts in place — never invoking SBI SRST, so our final_exit
-hook never fires. The stub returns priority 1 from system_reset_check
-(matching syscon-poweroff's priority); registered in final_init AFTER
-fdt_reset_init has scanned for syscon, so on a tie syscon takes
-precedence — preserving the existing #94 BRISC-kick path. With
-BHX_SOFT_REBOOT=1 the daemon skips syscon-poweroff DTB injection,
-making our stub the sole reset device → SBI SRST falls through to
-sbi_exit → final_exit → magic written → harts park.
+Why a stub reset device is needed (Phase 1): without ANY
+system_reset_device registered, sbi_system_reset_supported() returns
+false, so the guest kernel's reboot/halt path sees the SBI SRST
+extension as unsupported and just halts in place — never invoking
+SBI SRST, so our final_exit hook never fires.
 
 Status block layout (all u64 little-endian; status_word written LAST
 as a publish barrier so the host trusts the rest of the block once
 it sees the PARKED magic):
   +0x00 : status word (PARKED magic / 0)
   +0x08 : peers convergence bitmask
-  +0x10 : hart 0's `&scratch->next_addr` PA
-  +0x18 : hart 0's `&scratch->next_mode` PA
-  +0x20 : hart 0's `&scratch->next_arg1` PA
-  +0x28 : hart 0's HSM state PA
-  +0x30 : CLINT MSIP[0] PA
+  +0x10 : hart 0's `&scratch->next_addr` PA   (Phase 4a; SRST-time)
+  +0x18 : hart 0's `&scratch->next_mode` PA   (Phase 4a; SRST-time)
+  +0x20 : hart 0's `&scratch->next_arg1` PA   (Phase 4a; SRST-time)
+  +0x28 : hart 0's HSM state PA               (Phase 4a; SRST-time)
+  +0x30 : CLINT MSIP[0] PA                    (Phase 4a + 5; published
+                                                 at cold init too)
+  +0x38 : force-park request PA               (Phase 5; cold-init)
+  +0x40 : force-park request value            (Phase 5; cold-init)
 
 Status offset 0xE0000 lives in the firmware's reserved range past
 OpenSBI's .text/.data/.bss + scratch (typically <300 KiB) and before
 the kernel-DTB at +0x100000.
 
-The host's release sequence (Phase 4b, in bhx daemon) becomes:
-  1. Re-image kernel + DTB into DRAM via the existing boot_l2cpu path.
-  2. Read the metadata fields from the status block.
-  3. Write *next_addr_pa = kernel entry PA.
-  4. Write *next_mode_pa = PRV_S = 1.
-  5. Write *next_arg1_pa = DTB PA.
-  6. Write *hsm_state_pa = SBI_HSM_STATE_START_PENDING = 2.
-  7. Write *msip_pa = 1 to fire the M-mode software interrupt.
-  Hart 0 wakes from sbi_hsm_hart_wait, mainline runs init_warmboot →
-  sbi_hart_switch_mode → S-mode entry. New kernel SBI-HSM-starts the
-  remaining harts itself.
+Phase 5 force-park sequence (host side):
+  1. Read FORCE_PARK_REQ_PA + FORCE_PARK_REQ_VALUE + MSIP_PA from the
+     status block (published at cold init, valid for any slot state).
+  2. Write the value to the request PA. Sets the bhx_force_park
+     event-pending bit in hart 0's `sbi_ipi_data->ipi_type`. No
+     concurrent IPI sender (Linux can't issue M-mode IPIs), so a
+     direct u64 write is equivalent to atomic-OR.
+  3. Write 1 to MSIP_PA — delivers the M-mode software interrupt.
+  4. Hart 0 traps; OpenSBI's IPI dispatcher walks ipi_type and calls
+     bhx_force_park_process, which calls sbi_system_reset(SHUTDOWN, 0)
+     — same path as a guest-issued SBI SRST. Peers get the halt-IPI,
+     everyone walks final_exit + warmboot, host sees PARKED magic.
+  5. Host runs the standard release-from-purgatory.
+
+Two new helpers in OpenSBI lib/sbi/ expose otherwise-file-static
+state to the patched generic platform:
+
+  - sbi_hsm_hart_state_addr(hartindex) — PA of a hart's HSM state
+    atomic_t (Phase 4a).
+  - sbi_ipi_data_addr(hartindex) — PA of a hart's ipi_type bitmap
+    (Phase 5).
 
 State quiesce on the SRST-issuing hart (clearing pending CLINT MSIP /
-mtimecmp / external IRQs) is already done by sbi_exit's earlier calls
-to sbi_timer_exit / sbi_ipi_exit / sbi_irqchip_exit; we don't
-duplicate that here.
-
-A new helper sbi_hsm_hart_state_addr() in sbi_hsm.c exposes the PA
-of a hart's HSM state atomic_t, since the file-static
-`hart_data_offset` isn't otherwise reachable from platform.c.
+mtimecmp / external IRQs) is already done by sbi_exit's earlier
+calls to sbi_timer_exit / sbi_ipi_exit / sbi_irqchip_exit; we don't
+duplicate that here. Cache flush + PMP re-validation are deferred
+to the host's release path (see #166 Phase 4b).
 
 --- a/include/sbi/sbi_hsm.h
 +++ b/include/sbi/sbi_hsm.h
@@ -102,37 +113,92 @@ of a hart's HSM state atomic_t, since the file-static
  /*
   * Try to acquire the ticket for the given target hart to make sure only
   * one hart prepares the start of the target hart.
+--- a/include/sbi/sbi_ipi.h
++++ b/include/sbi/sbi_ipi.h
+@@ -81,6 +81,15 @@
+ 
+ void sbi_ipi_clear_smode(void);
+ 
++/* (bhx#166 Phase 5) Address of a hart's ipi_type bitmap. The PCIe
++ * host writes `1ULL << event_index` to this address (no concurrent
++ * IPI sender → no atomic-OR needed) and then writes `1` to the hart's
++ * CLINT MSIP to deliver the M-mode software interrupt. OpenSBI's
++ * trap handler dispatches via the standard sbi_ipi_process() path
++ * to the registered event's `process` callback. Returns NULL if the
++ * hartindex is invalid or sbi_ipi_init() hasn't been called yet. */
++unsigned long *sbi_ipi_data_addr(u32 hartindex);
++
+ int sbi_ipi_send_halt(ulong hmask, ulong hbase);
+ 
+ void sbi_ipi_process(void);
+--- a/lib/sbi/sbi_ipi.c
++++ b/lib/sbi/sbi_ipi.c
+@@ -201,6 +201,23 @@
+ 
+ static u32 ipi_smode_event = SBI_IPI_EVENT_MAX;
+ 
++/* (bhx#166 Phase 5) Address of a hart's ipi_type bitmap. Used by the
++ * patched generic platform's bhx-purgatory hook to publish the PA so
++ * the PCIe host can drive a force-park IPI without going through
++ * sbi_ipi_send_many (which is M-mode only). */
++unsigned long *sbi_ipi_data_addr(u32 hartindex)
++{
++	struct sbi_scratch *scratch;
++	struct sbi_ipi_data *ipi_data;
++
++	scratch = sbi_hartindex_to_scratch(hartindex);
++	if (!scratch || !ipi_data_off)
++		return NULL;
++
++	ipi_data = sbi_scratch_offset_ptr(scratch, ipi_data_off);
++	return &ipi_data->ipi_type;
++}
++
+ int sbi_ipi_send_smode(ulong hmask, ulong hbase)
+ {
+ 	return sbi_ipi_send_many(hmask, hbase, ipi_smode_event, NULL);
 --- a/platform/generic/platform.c
 +++ b/platform/generic/platform.c
-@@ -14,6 +14,7 @@
+@@ -14,6 +14,8 @@
  #include <sbi/sbi_console.h>
  #include <sbi/sbi_hartmask.h>
  #include <sbi/sbi_heap.h>
 +#include <sbi/sbi_hsm.h>
++#include <sbi/sbi_ipi.h>
  #include <sbi/sbi_platform.h>
  #include <sbi/sbi_string.h>
  #include <sbi/sbi_system.h>
-@@ -238,6 +239,9 @@
+@@ -238,6 +240,12 @@
  	return 0;
  }
  
 +/* bhx#166 Phase 1: forward decl, definition is later in this file. */
 +static void bhx_purgatory_register_reset_device(void);
++/* bhx#166 Phase 5: forward decl, definition is later in this file. */
++static void bhx_purgatory_register_force_park_event(void);
++static void bhx_purgatory_publish_force_park_metadata(void);
 +
  int generic_final_init(bool cold_boot)
  {
  	void *fdt = fdt_get_address_rw();
-@@ -249,6 +253,9 @@
+@@ -249,6 +257,16 @@
  	fdt_fixups(fdt);
  	fdt_domain_fixup(fdt);
  
 +	/* bhx#166 Phase 1: register stub reset device so SBI SRST → sbi_exit. */
 +	bhx_purgatory_register_reset_device();
 +
++	/* bhx#166 Phase 5: register the force-park IPI event and publish
++	 * its metadata in the purgatory status block. Done at cold init so
++	 * the host can fire force-park on a Running guest before any SRST
++	 * has happened — final_exit only runs ON SRST. */
++	bhx_purgatory_register_force_park_event();
++	bhx_purgatory_publish_force_park_metadata();
++
  	return 0;
  }
  
-@@ -331,6 +338,195 @@
+@@ -331,6 +349,281 @@
  	return fdt_mpxy_init(fdt);
  }
  
@@ -201,6 +267,15 @@ of a hart's HSM state atomic_t, since the file-static
 +#define BHX_PURGATORY_NEXT_ARG1_OFFSET	(BHX_PURGATORY_STATUS_OFFSET + 0x20)
 +#define BHX_PURGATORY_HSM_STATE_OFFSET	(BHX_PURGATORY_STATUS_OFFSET + 0x28)
 +#define BHX_PURGATORY_MSIP_OFFSET	(BHX_PURGATORY_STATUS_OFFSET + 0x30)
++/* (#166 Phase 5) Force-park IPI metadata. The host writes
++ * `force_park_request_value` to the address at
++ * `force_park_request_pa` (an `unsigned long *` pointing at hart 0's
++ * `&ipi_data->ipi_type`), then writes 1 to MSIP. OpenSBI's existing
++ * IPI dispatcher routes via the registered `bhx_force_park` event's
++ * `process` callback, which calls `sbi_system_reset` and walks the
++ * same final_exit + warmboot path the SBI SRST case uses. */
++#define BHX_PURGATORY_FORCE_PARK_REQ_PA_OFFSET		(BHX_PURGATORY_STATUS_OFFSET + 0x38)
++#define BHX_PURGATORY_FORCE_PARK_REQ_VALUE_OFFSET	(BHX_PURGATORY_STATUS_OFFSET + 0x40)
 +
 +/* L2CPU local CLINT base — see third_party/dtb/blackhole.dtsi
 + * (`tenstorrent,blackhole-clint` / `sifive,clint0` at 0x2000000).
@@ -324,11 +399,88 @@ of a hart's HSM state atomic_t, since the file-static
 +	sbi_system_reset_add_device(&bhx_purgatory_reset_device);
 +}
 +
++/* bhx#166 Phase 5: force-park IPI event. The PCIe host fires this
++ * to take any running guest into the same parked state a SBI SRST
++ * would have produced — recovery for kernels wedged in S-mode with
++ * `sstatus.SIE=0` (M-mode IPIs preempt unconditionally). The host's
++ * sequence is:
++ *
++ *   1. Read FORCE_PARK_REQ_PA + FORCE_PARK_REQ_VALUE from the
++ *      purgatory status block (published once at cold init).
++ *   2. Write the value to the address. This sets the event-pending
++ *      bit in hart 0's `sbi_ipi_data->ipi_type`. No concurrent IPI
++ *      sender exists (the kernel can't issue M-mode IPIs), so a
++ *      direct u64 write is equivalent to atomic-OR.
++ *   3. Write 1 to MSIP_PA (CLINT MSIP[0]) to deliver the M-mode
++ *      software interrupt to hart 0.
++ *
++ * Hart 0 takes the trap, OpenSBI's IPI dispatcher walks ipi_type
++ * and invokes our `process` callback, which calls sbi_system_reset
++ * — same path as a guest-issued SBI SRST. peers get the halt-IPI,
++ * everyone walks through final_exit + warmboot, host sees PARKED
++ * magic, drives release-from-purgatory.
++ */
++static void bhx_force_park_process(struct sbi_scratch *scratch)
++{
++	(void)scratch;
++	sbi_system_reset(SBI_SRST_RESET_TYPE_SHUTDOWN, 0);
++	/* sbi_system_reset is __noreturn — it broadcasts halt-IPI to
++	 * peers, stops self, walks sbi_exit → final_exit → jump_warmboot.
++	 * If we ever return here it means the IPI dispatcher's contract
++	 * changed; sbi_hart_hang is the safest thing to do. */
++	__builtin_unreachable();
++}
++
++static const struct sbi_ipi_event_ops bhx_force_park_ops = {
++	.name = "BHX_FORCE_PARK",
++	.process = bhx_force_park_process,
++};
++
++static int bhx_force_park_event = -1;
++
++static void bhx_purgatory_register_force_park_event(void)
++{
++	int ev = sbi_ipi_event_create(&bhx_force_park_ops);
++	if (ev < 0)
++		return;  /* Out of event slots — host force-park unavailable. */
++	bhx_force_park_event = ev;
++}
++
++static void bhx_purgatory_publish_force_park_metadata(void)
++{
++	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
++	volatile unsigned long *req_pa =
++		(volatile unsigned long *)(scratch->fw_start +
++				BHX_PURGATORY_FORCE_PARK_REQ_PA_OFFSET);
++	volatile unsigned long *req_value =
++		(volatile unsigned long *)(scratch->fw_start +
++				BHX_PURGATORY_FORCE_PARK_REQ_VALUE_OFFSET);
++	/* The MSIP PA is needed at cold init for Phase 5 (force-park
++	 * fires before any SRST), separate from the Phase 4a
++	 * publication in final_exit (only valid post-SRST). Same value
++	 * either way — CLINT MSIP[0] is statically defined. Publishing
++	 * here makes it available immediately after cold init. */
++	volatile unsigned long *msip_pa =
++		(volatile unsigned long *)(scratch->fw_start +
++				BHX_PURGATORY_MSIP_OFFSET);
++	unsigned long *ipi_type_pa = sbi_ipi_data_addr(0);
++
++	if (bhx_force_park_event < 0 || !ipi_type_pa) {
++		*req_pa = 0;
++		*req_value = 0;
++	} else {
++		*req_pa = (unsigned long)ipi_type_pa;
++		*req_value = 1UL << bhx_force_park_event;
++	}
++	*msip_pa = TT_L2CPU_CLINT_MSIP(0);
++	__asm__ volatile("fence ow,ow" : : : "memory");
++}
++
 +
  struct sbi_platform_operations generic_platform_ops = {
  	.cold_boot_allowed	= generic_cold_boot_allowed,
  	.nascent_init		= generic_nascent_init,
-@@ -346,6 +542,7 @@
+@@ -346,6 +639,7 @@
  	.get_tlb_num_entries	= generic_tlb_num_entries,
  	.timer_init		= fdt_timer_init,
  	.mpxy_init		= generic_mpxy_init,

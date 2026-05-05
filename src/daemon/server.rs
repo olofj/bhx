@@ -642,6 +642,17 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Re
                 } else {
                     L2CpuState::Running
                 };
+                // Phase 4a metadata is populated by final_exit (only
+                // valid when PARKED). Phase 5 metadata is populated at
+                // cold init (valid for any state). Read both; surface
+                // unconditionally so an operator can sanity-check the
+                // force-park PAs on a Running guest before issuing
+                // `bhx boot --force`.
+                let force_park_request_pa =
+                    read_u64(mem_base + crate::regs::purgatory::FORCE_PARK_REQ_PA_OFFSET);
+                let force_park_request_value =
+                    read_u64(mem_base + crate::regs::purgatory::FORCE_PARK_REQ_VALUE_OFFSET);
+                let msip_pa = read_u64(mem_base + crate::regs::purgatory::MSIP_PA_OFFSET);
                 let release = if parked {
                     let next_addr_pa =
                         read_u64(mem_base + crate::regs::purgatory::NEXT_ADDR_PA_OFFSET);
@@ -651,7 +662,6 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Re
                         read_u64(mem_base + crate::regs::purgatory::NEXT_ARG1_PA_OFFSET);
                     let hsm_state_pa =
                         read_u64(mem_base + crate::regs::purgatory::HSM_STATE_PA_OFFSET);
-                    let msip_pa = read_u64(mem_base + crate::regs::purgatory::MSIP_PA_OFFSET);
                     match (
                         next_addr_pa,
                         next_mode_pa,
@@ -666,10 +676,26 @@ fn dispatch_status(mut sock: &UnixStream, state: &Arc<DaemonState>) -> crate::Re
                                 next_arg1_pa: c,
                                 hsm_state_pa: d,
                                 msip_pa: e,
+                                force_park_request_pa: force_park_request_pa.filter(|&v| v > 0),
+                                force_park_request_value: force_park_request_value
+                                    .filter(|&v| v > 0),
                             })
                         }
                         _ => None,
                     }
+                } else if force_park_request_pa.unwrap_or(0) > 0 {
+                    // Running slot — surface just the Phase 5 fields by
+                    // setting the Phase 4a fields to 0 (operator
+                    // shouldn't act on them while not parked).
+                    Some(crate::daemon::protocol::PurgatoryReleaseMeta {
+                        next_addr_pa: 0,
+                        next_mode_pa: 0,
+                        next_arg1_pa: 0,
+                        hsm_state_pa: 0,
+                        msip_pa: msip_pa.unwrap_or(0),
+                        force_park_request_pa,
+                        force_park_request_value,
+                    })
                 } else {
                     None
                 };
@@ -794,6 +820,30 @@ fn dispatch_boot(
             l2cpu_idx
         );
         return dispatch_release(state, sock, l2cpu_idx, payload, meta);
+    }
+
+    // (#166 Phase 5) `bhx boot --force` on a Running slot, when the
+    // slot has the force-park IPI metadata available, fires a M-mode
+    // IPI to drive the running guest into purgatory — same parked
+    // state a guest-issued SBI SRST would produce. Then routes through
+    // the standard release-from-purgatory path. Recovers any
+    // kernel-level wedge (S-mode `sstatus.SIE=0` cannot mask M-mode
+    // IPIs). The fallback for "metadata not published" (i.e., OpenSBI
+    // wasn't built with the force-park hook, or the IPI event slot
+    // ran out) is the existing handle_existing_slot --force path,
+    // which tears down the slot + does a cold-boot.
+    if force {
+        if let Some(meta) = trigger_force_park_if_available(state, l2cpu_idx)? {
+            dlog!(
+                "[boot l2cpu {}] --force: fired force-park IPI, awaiting PARKED",
+                l2cpu_idx
+            );
+            return dispatch_release(state, sock, l2cpu_idx, payload, meta);
+        }
+        dlog!(
+            "[boot l2cpu {}] --force: force-park unavailable; falling back to cold-boot teardown path",
+            l2cpu_idx
+        );
     }
 
     handle_existing_slot(state, l2cpu_idx, force).map_err(crate::Error::slot_state)?;
@@ -1265,6 +1315,113 @@ fn read_parked_release_meta(
         hsm_state_pa,
         msip_pa,
     }))
+}
+
+/// (#166 Phase 5) On `bhx boot --force` of a Running slot, fire the
+/// M-mode IPI to drive the running guest into purgatory. Returns
+/// `Ok(Some(meta))` once the slot reads PARKED so the caller can
+/// drive a release-from-purgatory; `Ok(None)` if the metadata isn't
+/// published (e.g. OpenSBI built without Phase 5 support, or IPI
+/// event slot ran out) so the caller can fall back to the cold-boot
+/// teardown path.
+///
+/// Sequence:
+///   1. Read FORCE_PARK_REQ_PA + FORCE_PARK_REQ_VALUE + MSIP_PA from
+///      the published metadata block. All three must be non-zero.
+///   2. Write the value to the request PA. This sets the
+///      `bhx_force_park` event-pending bit in hart 0's
+///      `sbi_ipi_data->ipi_type`. No concurrent IPI sender exists
+///      (the kernel can't issue M-mode IPIs), so a direct u64 write
+///      is equivalent to atomic-OR.
+///   3. Write 1 to MSIP_PA (CLINT MSIP[0]).
+///   4. Poll the slot's purgatory cell for PARKED magic, up to
+///      `force_park_timeout`. The hart traps into OpenSBI's IPI
+///      dispatcher → `bhx_force_park_process` → `sbi_system_reset`
+///      → final_exit (peer-convergence, scratch metadata) → warmboot.
+///   5. Once PARKED, return the same release metadata
+///      `read_parked_release_meta` would have returned.
+const FORCE_PARK_TIMEOUT_SECS: u64 = 10;
+fn trigger_force_park_if_available(
+    state: &Arc<DaemonState>,
+    l2cpu_idx: u8,
+) -> crate::Result<Option<ParkedReleaseMeta>> {
+    let mem_base = crate::l2cpu::L2CPU_STARTING_ADDRESS[l2cpu_idx as usize];
+
+    // Step 1: read the metadata under the slot lock.
+    let l2cpu_arc = {
+        let guard = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
+        let Some(slot) = guard.as_ref() else {
+            return Ok(None);
+        };
+        let read_u64 = |pa: u64| -> Option<u64> {
+            let lo = slot.l2cpu.read32(pa).ok()?;
+            let hi = slot.l2cpu.read32(pa + 4).ok()?;
+            Some(((hi as u64) << 32) | (lo as u64))
+        };
+        let req_pa = read_u64(mem_base + crate::regs::purgatory::FORCE_PARK_REQ_PA_OFFSET);
+        let req_val = read_u64(mem_base + crate::regs::purgatory::FORCE_PARK_REQ_VALUE_OFFSET);
+        let msip_pa = read_u64(mem_base + crate::regs::purgatory::MSIP_PA_OFFSET);
+        match (req_pa, req_val, msip_pa) {
+            (Some(rpa), Some(rval), Some(mpa)) if rpa > 0 && rval > 0 && mpa > 0 => {
+                // Step 2+3: fire the IPI.
+                let l2cpu = &slot.l2cpu;
+                l2cpu
+                    .write32(rpa, rval as u32)
+                    .and_then(|_| l2cpu.write32(rpa + 4, (rval >> 32) as u32))
+                    .map_err(|e| crate::Error::Io {
+                        ctx: "write force-park request bit".into(),
+                        source: e,
+                    })?;
+                l2cpu.write32(mpa, 1).map_err(|e| crate::Error::Io {
+                    ctx: "write CLINT MSIP for force-park".into(),
+                    source: e,
+                })?;
+                dlog!(
+                    "[force-park l2cpu {}] fired: req_pa={:#x} req_val={:#x} msip={:#x}",
+                    l2cpu_idx,
+                    rpa,
+                    rval,
+                    mpa
+                );
+                Arc::clone(&slot.l2cpu)
+            }
+            _ => {
+                dlog!(
+                    "[force-park l2cpu {}] metadata not published (req_pa={:?} req_val={:?} msip={:?}); falling back",
+                    l2cpu_idx,
+                    req_pa,
+                    req_val,
+                    msip_pa
+                );
+                return Ok(None);
+            }
+        }
+    };
+
+    // Step 4: poll for PARKED magic.
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(FORCE_PARK_TIMEOUT_SECS);
+    let purg_pa = mem_base + crate::regs::purgatory::STATUS_OFFSET;
+    loop {
+        if let (Ok(lo), Ok(hi)) = (l2cpu_arc.read32(purg_pa), l2cpu_arc.read32(purg_pa + 4)) {
+            let v = ((hi as u64) << 32) | (lo as u64);
+            if v == crate::regs::purgatory::STATUS_PARKED {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(crate::Error::internal(format!(
+                "force-park l2cpu {}: PARKED magic not seen within {}s after firing IPI",
+                l2cpu_idx, FORCE_PARK_TIMEOUT_SECS
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Step 5: re-read the now-populated release metadata under the
+    // slot lock and return it. (Same code path as a slot that
+    // PARKED via a guest-issued SBI SRST.)
+    read_parked_release_meta(state, l2cpu_idx)
 }
 
 /// (#166 Phase 4b) Drive the host-handshake release of a parked

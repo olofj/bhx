@@ -336,6 +336,18 @@ pub struct PurgatoryReleaseMeta {
     /// PA of CLINT MSIP[0]. Host writes `1` here to fire the
     /// M-mode software interrupt that wakes hart 0 from `wfi`.
     pub msip_pa: u64,
+    /// (#166 Phase 5) PA of hart 0's `ipi_type` (the bitmap of
+    /// pending IPI events on that hart). Host writes
+    /// `force_park_request_value` here, then `1` to `msip_pa`, to
+    /// drive a force-park IPI. `None` if the OpenSBI side didn't
+    /// publish it (e.g. older firmware, or IPI event slot ran out).
+    #[serde(default)]
+    pub force_park_request_pa: Option<u64>,
+    /// (#166 Phase 5) Value to write to `force_park_request_pa` —
+    /// `1 << event_index` of the registered `bhx_force_park` IPI
+    /// event. `None` paired with `force_park_request_pa`.
+    #[serde(default)]
+    pub force_park_request_value: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
