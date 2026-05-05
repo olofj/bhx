@@ -1587,11 +1587,7 @@ fn run_tensix_engine(card: u32, chip: &shared_chip::SharedChip) -> std::io::Resu
     // consumes a kick we drive directly. This proves the full path:
     // host write → BRISC pickup → kick ring push → poller consume.
     eprintln!("[tensix-engine] spawning kick poller and driving a synthetic kick");
-    // Diagnostic path doesn't drive guest-poweroff dispatch — discard
-    // the receiver so any spurious shutdown event from a real boot in
-    // progress doesn't accumulate.
-    let (gp_tx, _gp_rx) = std::sync::mpsc::channel::<u8>();
-    let mut poller = tensix_data_plane::KickPoller::spawn(Arc::clone(&engine), gp_tx);
+    let mut poller = tensix_data_plane::KickPoller::spawn(Arc::clone(&engine));
     let stats = Arc::clone(&poller.stats);
 
     // BRISC's main loop only polls slots whose bit is set in the

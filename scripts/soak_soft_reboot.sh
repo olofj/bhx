@@ -79,14 +79,14 @@ note "tt-smi -r (cold chip)"
 (. ~/.tenstorrent-venv/bin/activate && tt-smi -r) >/dev/null 2>&1
 
 rm -f "$LOG_FILE"
-note "daemon start (BHX_SOFT_REBOOT=1, ITERATIONS=$ITERATIONS, GUESTS=${GUESTS[*]})"
-BHX_SOFT_REBOOT=1 "$BINARY" daemon start -t "$CARD" --log-file "$LOG_FILE" >/dev/null
+note "daemon start (ITERATIONS=$ITERATIONS, GUESTS=${GUESTS[*]})"
+"$BINARY" daemon start -t "$CARD" --log-file "$LOG_FILE" >/dev/null
 sleep 0.3
 
 # Cold boot all selected L2CPUs once.
 note "cold boot: ${GUESTS[*]}"
 for i in "${GUESTS[@]}"; do
-    BHX_SOFT_REBOOT=1 "$BINARY" boot -t "$CARD" -l "$i" \
+    "$BINARY" boot -t "$CARD" -l "$i" \
         -d "$STATE_DIR/rootfs-$i.ext2" >/dev/null \
         || fail "cold boot l2cpu $i failed"
 done
@@ -127,7 +127,7 @@ guest_loop() {
         if [ "$v" = "$PARKED_MAGIC" ]; then
             n=$((n + 1))
             echo "[guest $idx] iter $n/$ITERATIONS: PARKED — releasing"
-            if BHX_SOFT_REBOOT=1 "$BINARY" boot -t "$CARD" -l "$idx" \
+            if "$BINARY" boot -t "$CARD" -l "$idx" \
                   -d "$STATE_DIR/rootfs-$idx.ext2" >/dev/null 2>&1; then
                 echo "[guest $idx] iter $n: released"
             else

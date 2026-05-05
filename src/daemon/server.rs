@@ -63,7 +63,6 @@ pub fn serve(
     let shared_chip = Arc::new(crate::shared_chip::SharedChip::new(card)?);
     let state = Arc::new(DaemonState::new(card, shared_chip));
     install_signal_handlers(state.shutdown.clone());
-    spawn_guest_poweroff_handler(Arc::clone(&state));
     spawn_pll_watcher(Arc::clone(&state));
 
     listener.set_nonblocking(true)?;
@@ -1156,15 +1155,6 @@ fn dispatch_boot(
                 l2cpu_idx,
                 crate::uart_engine::slot_for_l2cpu(l2cpu_idx),
             );
-            // #94: arm the per-L2CPU shutdown slot so BRISC starts
-            // polling the syscon-poweroff register. Cleared on slot
-            // teardown by `unregister_engine_slots`.
-            poller.register_shutdown(l2cpu_idx);
-            dlog!(
-                "[run_boot l2cpu {}] shutdown slot: registered (slot {})",
-                l2cpu_idx,
-                crate::regs::shutdown::SLOT_BASE + l2cpu_idx as u32,
-            );
         } else {
             dlog!(
                 "[run_boot l2cpu {}] virtio-engine: engine + kick poller not up — \
@@ -1942,28 +1932,15 @@ fn run_boot_sequence(
         virtio_nodes.len(),
         uart_addr_for_dtb,
     );
-    // #94 guest-OS shutdown: per-L2CPU shutdown command register sits
-    // at a fixed offset within the engine TLB window. Compute the PA
-    // and pass to modify_dtb so the DT carries `/soc/syscon@<addr>`
-    // + `/poweroff` nodes pointing at it.
-    //
-    // #166 Phase 1 escape hatch: BHX_SOFT_REBOOT=1 skips the syscon
-    // injection entirely. With the syscon node absent, OpenSBI's
-    // fdt_reset_syscon driver doesn't register itself; SBI SRST falls
-    // through to sbi_exit → sbi_platform_final_exit → sbi_hsm_exit,
-    // landing in our patched purgatory hook (third_party/opensbi/
-    // patches/0002-bhx-purgatory-magic.patch) which writes the
-    // "PARKED__" magic at scratch->fw_start + 0xE0000.
-    let soft_reboot = std::env::var("BHX_SOFT_REBOOT").ok().as_deref() == Some("1");
-    let shutdown_addr = if soft_reboot {
-        dlog!(
-            "[run_boot l2cpu {}] BHX_SOFT_REBOOT=1: skipping syscon-poweroff DTB injection",
-            l2cpu_idx
-        );
-        None
-    } else {
-        x280_base_for_shutdown.map(|b| b + crate::regs::shutdown::OFFSET_FROM_ENGINE_BASE)
-    };
+    // #166 — soft-reboot is the default. The DTB has no syscon-poweroff
+    // node; OpenSBI's fdt_reset_syscon driver doesn't register, SBI SRST
+    // falls through to sbi_exit → sbi_platform_final_exit → sbi_hsm_exit,
+    // landing in our patched bhx-purgatory hook (third_party/opensbi/
+    // patches/0002-bhx-purgatory-magic.patch) which writes the "PARKED__"
+    // magic at mem_base + 0xE0000. The host re-releases hart 0 from the
+    // parked state on the next `bhx boot` (no chip reset). The pre-#166
+    // BRISC shutdown register + kick-poller event path is gone.
+    let _ = x280_base_for_shutdown;
     let dtb_patched = boot::modify_dtb(
         &dtb_raw,
         &boot_device,
@@ -1972,7 +1949,6 @@ fn run_boot_sequence(
         &virtio_nodes,
         uart_addr_for_dtb,
         has_console,
-        shutdown_addr,
     )?;
 
     let initramfs_pb = initramfs.map(std::path::PathBuf::from);
@@ -2802,7 +2778,6 @@ fn unregister_engine_slots(state: &Arc<DaemonState>, l2cpu_idx: u8) {
             poller.unregister_slot(base + dev_idx);
         }
         poller.unregister_uart(l2cpu_idx);
-        poller.unregister_shutdown(l2cpu_idx);
     }
 }
 
@@ -2820,12 +2795,6 @@ fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) -> 
     }
 }
 
-/// Spawn the guest-poweroff handler thread (#94). Takes the receiver
-/// off `state.guest_poweroff_rx`, then loops forever consuming
-/// l2cpu_idx values pushed by the kick poller and tearing down the
-/// matching slot via `internal_stop`. Exits when the channel closes
-/// (i.e. all senders are dropped — happens when the daemon is on its
-/// way out and the kick poller has been shut down).
 /// Polls PLL4 (L2CPU PLL) every second and logs every observed change.
 /// Used to track down "PLL silently reverted to ARC init values" reports
 /// — without this, dlog only fires on our own set_frequency calls.
@@ -2864,54 +2833,12 @@ fn spawn_pll_watcher(state: Arc<DaemonState>) {
         .expect("spawn pll-watcher");
 }
 
-fn spawn_guest_poweroff_handler(state: Arc<DaemonState>) {
-    let rx = match state.guest_poweroff_rx.lock_or_internal_error() {
-        Ok(mut g) => g.take(),
-        Err(e) => {
-            dlog!("[guest-poweroff] failed to acquire rx mutex: {}", e);
-            return;
-        }
-    };
-    let Some(rx) = rx else {
-        dlog!("[guest-poweroff] handler already running; not spawning a second");
-        return;
-    };
-    std::thread::Builder::new()
-        .name("guest-poweroff-handler".to_string())
-        .spawn(move || {
-            for l2cpu_idx in rx {
-                dlog!(
-                    "[guest-poweroff] received SRST_SHUTDOWN for l2cpu {}",
-                    l2cpu_idx
-                );
-                match internal_stop(&state, l2cpu_idx, "guest SRST_SHUTDOWN") {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        dlog!(
-                            "[guest-poweroff] l2cpu {} not booted on event arrival; ignoring",
-                            l2cpu_idx
-                        );
-                    }
-                    Err(e) => {
-                        dlog!(
-                            "[guest-poweroff] internal_stop l2cpu {} failed: {}",
-                            l2cpu_idx,
-                            e
-                        );
-                    }
-                }
-            }
-            dlog!("[guest-poweroff] receiver closed; handler exiting");
-        })
-        .expect("spawn guest-poweroff-handler");
-}
-
-/// Tear down an L2CPU slot. Called from both the client-driven
-/// `dispatch_stop` and the daemon-internal #94 guest-poweroff handler.
-/// Returns `Ok(true)` if a slot was present and torn down, `Ok(false)`
-/// if no slot was booted at the time of call. The `reason` string
-/// goes into the dlog for triage — distinguishes "user typed
-/// `bhx daemon stop`" from "guest issued SBI SRST_SHUTDOWN".
+/// Tear down an L2CPU slot. Called from `dispatch_stop` (operator
+/// `bhx daemon stop`) and from the warm-resume + opportunistic-reset
+/// flows when a sibling slot needs to be dropped before a chip-wide
+/// reset. Returns `Ok(true)` if a slot was present and torn down,
+/// `Ok(false)` if no slot was booted at the time of call. The `reason`
+/// string goes into the dlog for triage.
 pub(crate) fn internal_stop(
     state: &Arc<DaemonState>,
     l2cpu_idx: u8,
