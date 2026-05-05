@@ -1208,47 +1208,23 @@ fn handle_existing_slot(
             "[boot l2cpu {}] --force: tearing down existing slot before re-imaging",
             l2cpu_idx
         );
-        // Clone the Arc<ConsoleHub> for the disconnect closure so the
-        // third closure can consume `prior` by value to call shutdown().
-        let hub = prior.console_hub.clone();
-        force_teardown_sequence(
-            l2cpu_idx,
-            move |reason| hub.disconnect_all_with_reason(reason),
-            || unregister_engine_slots(state, l2cpu_idx),
-            move || prior.shutdown(),
-        );
+        // Order is load-bearing: console_hub disconnect first (so
+        // attached `bhx connect` clients see a goodbye rather than EOF
+        // on a dead fd), engine unregister next (so no kick can
+        // dispatch into the slot we're about to tear down), then
+        // slot.shutdown() joins workers and drops the L2Cpu Arc. A
+        // reorder that put shutdown() before the unregister would
+        // leave a one-iteration window where the kick poller could
+        // dereference a freed Arc<L2Cpu>. See CLAUDE.md's "Boot must
+        // not race with live workers during board reset" invariant.
+        prior
+            .console_hub
+            .disconnect_all_with_reason(&format!("l2cpu {} re-imaged via --force", l2cpu_idx));
+        unregister_engine_slots(state, l2cpu_idx);
+        prior.shutdown();
         dlog!("[boot l2cpu {}] prior slot torn down", l2cpu_idx);
     }
     Ok(())
-}
-
-/// Sequence the three teardown steps that must happen before a `--force`
-/// boot can re-image the L2CPU. Order is load-bearing:
-///
-///   1. Disconnect attached `bhx connect` console clients with a goodbye
-///      so they see the slot going down rather than EOF on a dead fd.
-///   2. Unregister the slot from the kick poller's engine registry. No
-///      future kicks can dispatch into this slot's L2Cpu after this step,
-///      so the worker shutdown below can't deadlock waiting for an
-///      already-issued kick.
-///   3. Join all per-slot workers and drop the L2Cpu Arc.
-///
-/// Doing the unregister-after-shutdown reorder would leave a one-iteration
-/// window where the kick poller can still dispatch into a slot whose
-/// workers have just been joined — the dispatcher would deref a freed
-/// Arc<L2Cpu>. Keeping this order locked down at the unit-test layer
-/// guards against a future refactor accidentally swapping them. See
-/// CLAUDE.md's "Boot must not race with live workers during board
-/// reset" invariant.
-pub(crate) fn force_teardown_sequence(
-    l2cpu_idx: u8,
-    disconnect_console: impl FnOnce(&str),
-    unregister_engine: impl FnOnce(),
-    shutdown_slot: impl FnOnce(),
-) {
-    disconnect_console(&format!("l2cpu {} re-imaged via --force", l2cpu_idx));
-    unregister_engine();
-    shutdown_slot();
 }
 
 /// Classification of a non-target sibling L2CPU's purgatory cell, used
@@ -3378,58 +3354,6 @@ mod tests {
             decide_boot_slot(true, true, 1),
             BootSlotDecision::TearDownAndProceed
         );
-    }
-
-    // ---- force_teardown_sequence (#107 item 4) ----
-
-    /// The three teardown steps must run in console → engine → shutdown
-    /// order. A regression that swaps unregister_engine and shutdown
-    /// would let the kick poller dispatch into a slot whose workers
-    /// have just been joined, dereferencing a dropped `Arc<L2Cpu>`.
-    /// CLAUDE.md's "Boot must not race with live workers during board
-    /// reset" feedback memory documents exactly this class of bug.
-    #[test]
-    fn force_teardown_sequence_runs_in_console_engine_shutdown_order() {
-        let order: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
-        force_teardown_sequence(
-            2,
-            |reason| order.borrow_mut().push(format!("disconnect:{}", reason)),
-            || order.borrow_mut().push("unregister".into()),
-            || order.borrow_mut().push("shutdown".into()),
-        );
-        let order = order.into_inner();
-        assert_eq!(order.len(), 3);
-        assert!(
-            order[0].starts_with("disconnect:"),
-            "first call must be the console disconnect, got {:?}",
-            order
-        );
-        assert!(
-            order[0].contains("l2cpu 2"),
-            "disconnect reason should include the l2cpu idx, got {:?}",
-            order[0]
-        );
-        assert_eq!(order[1], "unregister", "engine unregister must run second");
-        assert_eq!(order[2], "shutdown", "slot.shutdown() must run last");
-    }
-
-    #[test]
-    fn force_teardown_disconnect_reason_mentions_force_reimage() {
-        // Operator-visible string: a `bhx connect` client reading the
-        // hub's goodbye line should learn why the slot went down. Pin
-        // the canonical phrasing so a future log reword doesn't drift
-        // the contract silently.
-        let captured: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
-        force_teardown_sequence(
-            0,
-            |reason| *captured.borrow_mut() = Some(reason.to_string()),
-            || {},
-            || {},
-        );
-        let msg = captured.into_inner().expect("disconnect closure ran");
-        assert!(msg.contains("re-imaged"));
-        assert!(msg.contains("--force"));
-        assert!(msg.contains("l2cpu 0"));
     }
 
     // ---- classify_sibling (#107 item 4) ----

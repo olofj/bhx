@@ -569,89 +569,47 @@ mod tests {
         assert!(matches!(read_reset_err, crate::Error::Internal(_)));
     }
 
-    // ---- apply_release_bits + seq_lock concurrency invariants (#107 item 3) ----
+    // ---- apply_release_bits (pure bit-OR semantics) ----
+    //
+    // The seq_lock invariant in production `reset_x280` (#1) is the
+    // critical correctness property here, but it can't be exercised
+    // without driving the real `SharedChip` (which needs hardware).
+    // Asserting it via a fresh local Mutex would only test
+    // `std::sync::Mutex`, not the production gating — see #173. So we
+    // test only the pure bit-OR shape here; integration tests against
+    // hardware cover the locking.
 
-    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering as AOrdering};
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::cell::Cell;
 
-    /// In-memory stand-in for the L2CPU_RESET register that
-    /// instruments the read-modify-write critical section: any time
-    /// `read` / `write` is in progress, `in_critical` is incremented.
-    /// `max_concurrent_observed` records the peak. Under correct
-    /// seq_lock serialization, peak is 1.
+    /// Minimal in-memory stand-in for the L2CPU_RESET register: a
+    /// single-thread Cell that records the most-recently-written
+    /// value. Sufficient for the pure bit-OR tests below.
     struct MockResetReg {
-        val: AtomicU32,
-        in_critical: AtomicUsize,
-        max_concurrent_observed: AtomicUsize,
-        /// If set, sleep this long inside `read` to widen the race
-        /// window. Tests that DON'T hold the seq_lock use this to
-        /// reliably observe interleaving.
-        read_yield_for: std::time::Duration,
+        val: Cell<u32>,
     }
 
     impl MockResetReg {
-        fn new() -> Self {
+        fn new(initial: u32) -> Self {
             MockResetReg {
-                val: AtomicU32::new(0),
-                in_critical: AtomicUsize::new(0),
-                max_concurrent_observed: AtomicUsize::new(0),
-                read_yield_for: std::time::Duration::ZERO,
+                val: Cell::new(initial),
             }
-        }
-
-        fn enter_critical(&self) {
-            let n = self.in_critical.fetch_add(1, AOrdering::SeqCst) + 1;
-            // Update max-observed via a CAS loop. Approximate but
-            // monotonic — good enough for an invariant assertion.
-            let mut cur = self.max_concurrent_observed.load(AOrdering::Relaxed);
-            while n > cur {
-                match self.max_concurrent_observed.compare_exchange_weak(
-                    cur,
-                    n,
-                    AOrdering::Relaxed,
-                    AOrdering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(prev) => cur = prev,
-                }
-            }
-        }
-
-        fn exit_critical(&self) {
-            self.in_critical.fetch_sub(1, AOrdering::SeqCst);
-        }
-
-        fn max_concurrent(&self) -> usize {
-            self.max_concurrent_observed.load(AOrdering::Relaxed)
         }
     }
 
     impl ResetRegisterIo for MockResetReg {
         fn read(&self) -> crate::Result<u32> {
-            self.enter_critical();
-            // Simulate the wall-clock cost of an arc_read32. With a
-            // non-zero yield, even a few concurrent threads colliding
-            // on the same MockResetReg without seq_lock will overlap
-            // here and bump max_concurrent past 1.
-            if !self.read_yield_for.is_zero() {
-                std::thread::sleep(self.read_yield_for);
-            } else {
-                std::thread::yield_now();
-            }
-            Ok(self.val.load(AOrdering::SeqCst))
+            Ok(self.val.get())
         }
         fn write(&self, value: u32) -> crate::Result<()> {
-            self.val.store(value, AOrdering::SeqCst);
-            self.exit_critical();
+            self.val.set(value);
             Ok(())
         }
     }
 
     #[test]
     fn apply_release_bits_ors_in_each_index_bit() {
-        let mock = MockResetReg::new();
-        // Pre-seed the register with a sentinel that should survive.
-        mock.val.store(0x0000_0001, AOrdering::SeqCst);
+        // Pre-seed with a sentinel that should survive the OR.
+        let mock = MockResetReg::new(0x0000_0001);
 
         let (before, mask, after) = apply_release_bits(&mock, &[0, 2]).unwrap();
 
@@ -660,112 +618,17 @@ mod tests {
         assert_eq!(mask, 0x0000_0050);
         // After OR: low sentinel bit preserved; release bits set.
         assert_eq!(after, 0x0000_0051);
-        // Persisted to the mock's storage.
-        assert_eq!(mock.val.load(AOrdering::SeqCst), 0x0000_0051);
+        assert_eq!(mock.val.get(), 0x0000_0051);
     }
 
     #[test]
     fn apply_release_bits_with_empty_indices_is_pure_readback() {
-        let mock = MockResetReg::new();
-        mock.val.store(0xFEED_F00D, AOrdering::SeqCst);
+        let mock = MockResetReg::new(0xFEED_F00D);
 
         let (before, mask, after) = apply_release_bits(&mock, &[]).unwrap();
 
         assert_eq!(before, 0xFEED_F00D);
         assert_eq!(mask, 0);
         assert_eq!(after, 0xFEED_F00D);
-    }
-
-    /// Spawn `n` threads, each holding `lock` while calling
-    /// `apply_release_bits` for a distinct L2CPU index, repeated
-    /// `iters` times. Returns the final register value and the
-    /// peak observed concurrency.
-    fn run_concurrent_release(n: usize, iters: usize, lock_held: bool) -> (u32, usize) {
-        let mock = Arc::new(MockResetReg {
-            val: AtomicU32::new(0),
-            in_critical: AtomicUsize::new(0),
-            max_concurrent_observed: AtomicUsize::new(0),
-            // 50µs widens the read window enough that even on a fast
-            // machine the unlocked path observes overlap; the locked
-            // path serializes through it.
-            read_yield_for: std::time::Duration::from_micros(50),
-        });
-        let lock = Arc::new(Mutex::new(()));
-        let barrier = Arc::new(Barrier::new(n));
-
-        let mut handles = Vec::new();
-        for tid in 0..n {
-            let mock = Arc::clone(&mock);
-            let lock = Arc::clone(&lock);
-            let barrier = Arc::clone(&barrier);
-            handles.push(std::thread::spawn(move || {
-                barrier.wait();
-                for _ in 0..iters {
-                    if lock_held {
-                        let _g = lock.lock().unwrap();
-                        apply_release_bits(&*mock, &[tid % 4]).unwrap();
-                    } else {
-                        apply_release_bits(&*mock, &[tid % 4]).unwrap();
-                    }
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        (mock.val.load(AOrdering::SeqCst), mock.max_concurrent())
-    }
-
-    #[test]
-    fn apply_release_bits_under_seq_lock_serializes_two_threads() {
-        let (final_val, peak) = run_concurrent_release(2, 200, true);
-        // Each thread released a distinct (tid % 4) index, so bits
-        // 0+4 and 1+4 must be set.
-        assert_ne!(final_val & (1u32 << 4), 0);
-        assert_ne!(final_val & (1u32 << 5), 0);
-        assert_eq!(peak, 1, "seq_lock must serialize R-M-W");
-    }
-
-    #[test]
-    fn apply_release_bits_under_seq_lock_serializes_four_threads() {
-        let (final_val, peak) = run_concurrent_release(4, 200, true);
-        // All four release bits set.
-        for idx in 0..4 {
-            assert_ne!(
-                final_val & (1u32 << (idx + 4)),
-                0,
-                "L2CPU {} release bit missing in {:#010x}",
-                idx,
-                final_val
-            );
-        }
-        assert_eq!(peak, 1);
-    }
-
-    #[test]
-    fn apply_release_bits_under_seq_lock_serializes_eight_threads() {
-        // 8 threads on 4 release bits — multiple threads share each
-        // L2CPU index but every R-M-W must still be exclusive.
-        let (final_val, peak) = run_concurrent_release(8, 100, true);
-        for idx in 0..4 {
-            assert_ne!(final_val & (1u32 << (idx + 4)), 0);
-        }
-        assert_eq!(peak, 1);
-    }
-
-    #[test]
-    fn unlocked_apply_release_bits_can_observe_concurrent_critical_sections() {
-        // The "no lock" sanity check. Without seq_lock and with the
-        // 50µs read yield, two threads will overlap in the read-write
-        // window with overwhelming probability. If this ever passes
-        // with peak=1 the instrumentation is broken — the locked tests
-        // above would then be vacuous.
-        let (_final_val, peak) = run_concurrent_release(4, 200, false);
-        assert!(
-            peak >= 2,
-            "without seq_lock, expected concurrent R-M-W to overlap; observed peak={}",
-            peak
-        );
     }
 }
