@@ -818,7 +818,8 @@ fn dispatch_boot(
             "[boot l2cpu {}] Parked slot detected — routing to release-from-purgatory",
             l2cpu_idx
         );
-        return dispatch_release(state, sock, l2cpu_idx, payload, meta);
+        let dtb_bytes = take_slot_dtb_bytes(state, l2cpu_idx)?;
+        return dispatch_release(state, sock, l2cpu_idx, payload, meta, dtb_bytes);
     }
 
     // (#166 Phase 5) `bhx boot --force` on a Running slot, when the
@@ -837,7 +838,8 @@ fn dispatch_boot(
                 "[boot l2cpu {}] --force: fired force-park IPI, awaiting PARKED",
                 l2cpu_idx
             );
-            return dispatch_release(state, sock, l2cpu_idx, payload, meta);
+            let dtb_bytes = take_slot_dtb_bytes(state, l2cpu_idx)?;
+            return dispatch_release(state, sock, l2cpu_idx, payload, meta, dtb_bytes);
         }
         dlog!(
             "[boot l2cpu {}] --force: force-park unavailable; falling back to cold-boot teardown path",
@@ -913,6 +915,15 @@ fn dispatch_boot(
             source: e,
         }
     })?;
+    // (#170) Stash the patched DTB bytes on the slot so a future
+    // release-from-purgatory can re-image them at dtb_addr. Linux's
+    // memblock_reserve only covers the FDT location the kernel was
+    // *passed* (which U-Boot may relocate), and even when it's the
+    // original dtb_addr, freed FDT memory after `unflatten_device_tree`
+    // can be allocator-reused before a force-park returns the chip
+    // to OpenSBI's parked state. Re-imaging from this cached buffer
+    // gives U-Boot fresh bytes on every wake.
+    slot.dtb_bytes = Some(arts.dtb_bytes);
     // (#117) Record which BLK dev_idx values we emitted DTB nodes for
     // at cold boot. dispatch_add_disk uses this to refuse hot-add of
     // a slot the kernel never saw — Linux's virtio probe walks the DT
@@ -1575,12 +1586,23 @@ fn trigger_force_park_if_available(
 /// the wake IPI. Hart 0 exits sbi_hsm_hart_wait, mainline runs
 /// init_warmboot_run → sbi_hart_switch_mode → mret to S-mode at
 /// next_addr. The new kernel SBI-HSM-starts harts 1..3 itself.
+/// Snapshot the cached patched-DTB bytes from the slot. Returns
+/// `None` for warm-resumed slots (the cold-boot daemon process is
+/// gone, no DTB stash). `dispatch_release` skips the DTB re-image in
+/// that case — the bytes at `dtb_addr` are whatever the previous
+/// kernel left there, which may or may not still be valid.
+fn take_slot_dtb_bytes(state: &Arc<DaemonState>, l2cpu_idx: u8) -> crate::Result<Option<Vec<u8>>> {
+    let guard = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
+    Ok(guard.as_ref().and_then(|s| s.dtb_bytes.clone()))
+}
+
 fn dispatch_release(
     state: &Arc<DaemonState>,
     sock: &UnixStream,
     l2cpu_idx: u8,
     payload: &crate::daemon::protocol::BootPayload,
     meta: ParkedReleaseMeta,
+    dtb_bytes: Option<Vec<u8>>,
 ) -> crate::Result<()> {
     use crate::regs::boot_image;
     let mem_base = crate::l2cpu::L2CPU_STARTING_ADDRESS[l2cpu_idx as usize];
@@ -1605,6 +1627,36 @@ fn dispatch_release(
             source: e,
         },
     )?;
+
+    // (#170) Re-image the DTB at dtb_addr if we have a cold-boot
+    // cache to draw from. Linux's allocator may have clobbered the
+    // original bytes between cold boot and the wake we're about to
+    // fire — U-Boot would then read garbage and bail with "No valid
+    // device tree binary found". Warm-resumed slots fall through
+    // without this stash; if the bytes happened to survive in DRAM
+    // the wake works anyway, otherwise the operator sees the same
+    // U-Boot error and needs a cold boot.
+    if let Some(bytes) = dtb_bytes {
+        dlog!(
+            "[release l2cpu {}] re-writing patched DTB ({} bytes) at {:#x}",
+            l2cpu_idx,
+            bytes.len(),
+            dtb_addr
+        );
+        crate::boot::l2cpu_noc_write_bulk_pub(&meta.l2cpu, dtb_addr, &bytes).map_err(|e| {
+            crate::Error::Io {
+                ctx: "dtb re-image".into(),
+                source: e,
+            }
+        })?;
+    } else {
+        dlog!(
+            "[release l2cpu {}] no cached DTB bytes (warm-resumed slot); \
+             leaving dtb_addr untouched — release may fail if the prior \
+             kernel clobbered it",
+            l2cpu_idx
+        );
+    }
 
     // Clear the PARKED magic before kicking hart 0 so a status read
     // racing the wake doesn't see stale Parked state. The new boot
@@ -1718,9 +1770,13 @@ fn dispatch_release(
 }
 
 /// Output of `run_boot_sequence`. The L2Cpu is what every later step in
-/// dispatch_boot drives off of.
+/// dispatch_boot drives off of; the patched DTB bytes are kept so a
+/// later `dispatch_release` can re-image them at `dtb_addr` (#170 —
+/// the kernel's allocator may clobber the original DTB region between
+/// cold boot and a release-from-purgatory wake).
 pub struct BootArtifacts {
     pub l2cpu: Arc<L2Cpu>,
+    pub dtb_bytes: Vec<u8>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2026,7 +2082,10 @@ fn run_boot_sequence(
         "[run_boot l2cpu {}] image+pre_init done; deferring reset release until workers spawn",
         l2cpu_idx
     );
-    Ok(BootArtifacts { l2cpu })
+    Ok(BootArtifacts {
+        l2cpu,
+        dtb_bytes: dtb_patched,
+    })
 }
 
 /// Release the L2CPU from reset and configure its prefetchers. Called
@@ -2113,6 +2172,11 @@ fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlo
         // Cold-boot callers (run_boot_sequence) overwrite this with
         // the actual DTB-emitted set before installing the slot.
         blk_dtb_dev_idx: vec![crate::virtio_engine::DEV_BLK],
+        // Same warm-resume story for dtb_bytes — we don't have the
+        // original cold-boot's patched DTB after a daemon restart.
+        // Cold-boot callers populate it from BootArtifacts before
+        // install_slot_and_reply_ok.
+        dtb_bytes: None,
         net: None,
         virtio_console: None,
         virtio_rng: None,

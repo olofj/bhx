@@ -96,6 +96,15 @@ pub struct L2CpuSlot {
     pub console_input_tx: Sender<u8>,
     pub console_worker: WorkerHandle,
     pub disks: Vec<DiskWorker>,
+    /// Patched DTB bytes that were written into chip-side DRAM at
+    /// cold-boot time. Stored so release-from-purgatory (#170 fix) can
+    /// re-write the DTB region — Linux frees the bootloader-supplied
+    /// FDT memory after copying, so the original at `dtb_addr` may have
+    /// been allocator-clobbered by the time we wake hart 0 back up.
+    /// `None` for warm-resumed slots (the cold-boot daemon process is
+    /// gone; release-from-purgatory will fall back to whatever's at
+    /// `dtb_addr`).
+    pub dtb_bytes: Option<Vec<u8>>,
     /// Set of `DEV_BLK*` device indices (inside `[0, DEVS_PER_L2CPU)`)
     /// for which a `virtio,mmio` node was emitted at cold-boot time
     /// (#117). Linux's virtio probe walks the DT once at boot and
