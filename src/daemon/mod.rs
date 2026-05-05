@@ -203,6 +203,13 @@ pub struct DaemonState {
     /// per-(slot, queue) device handler. Lifetime tied to
     /// `DaemonState`: dropped on daemon shutdown.
     pub kick_poller: Mutex<Option<crate::tensix_data_plane::KickPoller>>,
+    /// Most recent ARC telemetry snapshot. Populated by the
+    /// chip-telemetry poller every few seconds; read by the metrics
+    /// exporter on each `/metrics` scrape. `None` until the first
+    /// poll succeeds (ARC FW publishes the table at ARC boot, which
+    /// is well before the daemon starts; failure to read here means
+    /// chip access broke or the firmware regressed).
+    pub chip_telemetry: Mutex<Option<crate::telemetry::Telemetry>>,
     /// Card-wide gate around the `dispatch_boot` decide-and-do-reset
     /// step (#162). Without it, two concurrent boots in the same iter
     /// both observe `running=true` from the previous iter, both call
@@ -289,6 +296,7 @@ impl DaemonState {
             shared_chip,
             tensix_engine: Mutex::new(None),
             kick_poller: Mutex::new(None),
+            chip_telemetry: Mutex::new(None),
             boot_lock: Mutex::new(()),
             shutdown_tails: [
                 Mutex::new(Vec::new()),

@@ -1074,7 +1074,360 @@ pub fn render_prometheus(state: &DaemonState) -> String {
         }
     }
 
+    // ----- Chip telemetry (ARC firmware-published, refreshed by the
+    // chip-telemetry-poller thread). The poller has its own ~5s
+    // refresh cadence; we just read the latest snapshot here.
+    render_chip_telemetry(&mut out, state);
+
     out
+}
+
+/// Emit chip-level metrics from the most-recent ARC telemetry snapshot
+/// (or skip if the poller hasn't populated one yet — ARC-not-ready or
+/// chip rotation). Every metric carries `card="N"` so a multi-card
+/// scrape target can distinguish them; `bhx_card_info` is the join
+/// gauge with the rich identifying labels (board_id, asic_id, etc.).
+fn render_chip_telemetry(out: &mut String, state: &DaemonState) {
+    let Ok(g) = state.chip_telemetry.lock() else {
+        return;
+    };
+    let Some(t) = g.as_ref() else {
+        return;
+    };
+    let card = state.card;
+
+    // ---- bhx_card_info ----
+    //
+    // Always 1; the labels are the payload. Standard Prometheus "info
+    // gauge" pattern (cf. node_exporter `node_uname_info`). PromQL
+    // joins on `card`:
+    //   foo{card="N"} * on(card) group_left(board_id) bhx_card_info{card="N"}
+    let _ = writeln!(
+        out,
+        "# HELP bhx_card_info Card / chip identification. \
+         Always 1; payload is in the labels."
+    );
+    let _ = writeln!(out, "# TYPE bhx_card_info gauge");
+    let _ = writeln!(
+        out,
+        "bhx_card_info{{card=\"{}\",board_id=\"{:#018x}\",asic_id=\"{}\",\
+         asic_location=\"{}\",harvesting=\"{:#010x}\",enabled_l2cpu=\"{:#x}\",\
+         enabled_gddr=\"{:#x}\",enabled_eth=\"{:#x}\",pcie_usage=\"{}\"}} 1",
+        card,
+        t.board_id,
+        t.asic_id,
+        t.asic_location,
+        t.harvesting_state,
+        t.enabled_l2cpu,
+        t.enabled_gddr,
+        t.enabled_eth,
+        t.pcie_usage,
+    );
+
+    // ---- Thermal ----
+    //
+    // ASIC / VREG / BOARD temps decoded from 16.16 fixed-point on the
+    // chip side. Stored in millicelsius for integer cleanliness; emit
+    // the metric with `_millicelsius` suffix so downstream is explicit.
+    write_chip_gauge(
+        out,
+        "bhx_chip_asic_temperature_millicelsius",
+        "ASIC die temperature, millicelsius (decoded from ARC's 16.16 fixed-point).",
+        card,
+        t.asic_temperature_mc as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_vreg_temperature_millicelsius",
+        "Voltage-regulator temperature, millicelsius.",
+        card,
+        t.vreg_temperature_mc as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_board_temperature_millicelsius",
+        "Board ambient temperature, millicelsius.",
+        card,
+        t.board_temperature_mc as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_max_gddr_temperature_celsius",
+        "Highest observed GDDR channel-pair temperature, °C.",
+        card,
+        t.max_gddr_temperature_c as i64,
+    );
+
+    // Per-channel-pair GDDR temps (4 pairs: 01, 23, 45, 67).
+    let _ = writeln!(
+        out,
+        "# HELP bhx_chip_gddr_temperature_celsius Per-channel-pair GDDR temperature, °C."
+    );
+    let _ = writeln!(out, "# TYPE bhx_chip_gddr_temperature_celsius gauge");
+    for (i, &t_c) in t.gddr_temperature_c.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "bhx_chip_gddr_temperature_celsius{{card=\"{}\",pair=\"{}\"}} {}",
+            card,
+            ["01", "23", "45", "67"][i],
+            t_c
+        );
+    }
+
+    // ---- GDDR ECC ----
+    //
+    // Counters: chip-side u32s incremented as ECC events occur.
+    // Reset on tt-smi -r; Prometheus counter-reset detection handles
+    // that the standard way.
+    let _ = writeln!(
+        out,
+        "# HELP bhx_chip_gddr_corr_errors_total Per-channel-pair correctable ECC errors (cumulative)."
+    );
+    let _ = writeln!(out, "# TYPE bhx_chip_gddr_corr_errors_total counter");
+    for (i, &n) in t.gddr_corr_errs.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "bhx_chip_gddr_corr_errors_total{{card=\"{}\",pair=\"{}\"}} {}",
+            card,
+            ["01", "23", "45", "67"][i],
+            n
+        );
+    }
+    write_chip_counter(
+        out,
+        "bhx_chip_gddr_uncorr_errors_total",
+        "Total uncorrectable ECC errors across all GDDR channels.",
+        card,
+        t.gddr_uncorr_errs as u64,
+    );
+
+    // ---- Clocks ----
+    write_chip_gauge(
+        out,
+        "bhx_chip_aiclk_mhz",
+        "AI compute clock, MHz.",
+        card,
+        t.aiclk_mhz as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_axiclk_mhz",
+        "AXI fabric clock, MHz.",
+        card,
+        t.axiclk_mhz as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_arcclk_mhz",
+        "ARC management clock, MHz.",
+        card,
+        t.arcclk_mhz as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_aiclk_limit_max_mhz",
+        "AI clock max-frequency limit, MHz.",
+        card,
+        t.aiclk_limit_max_mhz as i64,
+    );
+    let _ = writeln!(
+        out,
+        "# HELP bhx_chip_l2cpuclk_mhz Per-L2CPU clock as published by ARC FW, MHz."
+    );
+    let _ = writeln!(out, "# TYPE bhx_chip_l2cpuclk_mhz gauge");
+    for (i, &mhz) in t.l2cpuclk_mhz.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "bhx_chip_l2cpuclk_mhz{{card=\"{}\",idx=\"{}\"}} {}",
+            card, i, mhz
+        );
+    }
+
+    // ---- Power / current / voltage ----
+    write_chip_gauge(
+        out,
+        "bhx_chip_tdp_watts",
+        "Instantaneous power draw, W.",
+        card,
+        t.tdp_w as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_tdc_amps",
+        "Instantaneous current draw, A.",
+        card,
+        t.tdc_a as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_input_power_watts",
+        "Board input power, W.",
+        card,
+        t.input_power_w as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_vcore_millivolts",
+        "Core voltage, mV.",
+        card,
+        t.vcore_mv as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_vdd_min_millivolts",
+        "VDD operating range minimum, mV.",
+        card,
+        t.vdd_min_mv as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_vdd_max_millivolts",
+        "VDD operating range maximum, mV.",
+        card,
+        t.vdd_max_mv as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_tdp_limit_max_watts",
+        "TDP soft-cap, W.",
+        card,
+        t.tdp_limit_max_w as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_tdc_limit_max_amps",
+        "TDC soft-cap, A.",
+        card,
+        t.tdc_limit_max_a as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_board_power_limit_watts",
+        "Board-level power limit, W.",
+        card,
+        t.board_power_limit_w as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_thm_limit_throttle_celsius",
+        "Thermal throttle threshold, °C.",
+        card,
+        t.thm_limit_throttle_c as i64,
+    );
+
+    // ---- Cooling ----
+    write_chip_gauge(
+        out,
+        "bhx_chip_fan_pct",
+        "Fan duty cycle, %.",
+        card,
+        t.fan_speed_pct as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_fan_rpm",
+        "Fan rotational speed, RPM.",
+        card,
+        t.fan_rpm as i64,
+    );
+
+    // ---- DRAM training ----
+    write_chip_gauge(
+        out,
+        "bhx_chip_ddr_status",
+        "DRAM training status bitfield.",
+        card,
+        t.ddr_status as i64,
+    );
+    write_chip_gauge(
+        out,
+        "bhx_chip_ddr_speed_mts",
+        "DRAM trained speed grade, MT/s.",
+        card,
+        t.ddr_speed_mts as i64,
+    );
+
+    // ---- Health counters ----
+    write_chip_counter(
+        out,
+        "bhx_chip_arc_heartbeat_total",
+        "ARC firmware heartbeat. Should advance on every poll. \
+         If it stalls, ARC FW has hung.",
+        card,
+        t.timer_heartbeat as u64,
+    );
+    write_chip_counter(
+        out,
+        "bhx_chip_therm_trip_total",
+        "Thermal-trip events on this chip. Hardware shut clocks down to recover.",
+        card,
+        t.therm_trip_count as u64,
+    );
+
+    // ---- Ethernet liveness ----
+    write_chip_gauge(
+        out,
+        "bhx_chip_eth_live_status",
+        "Ethernet tile liveness bitfield (per-tile).",
+        card,
+        t.eth_live_status as i64,
+    );
+}
+
+fn write_chip_gauge(out: &mut String, name: &str, help: &str, card: u32, value: i64) {
+    let _ = writeln!(out, "# HELP {} {}", name, help);
+    let _ = writeln!(out, "# TYPE {} gauge", name);
+    let _ = writeln!(out, "{}{{card=\"{}\"}} {}", name, card, value);
+}
+
+fn write_chip_counter(out: &mut String, name: &str, help: &str, card: u32, value: u64) {
+    let _ = writeln!(out, "# HELP {} {}", name, help);
+    let _ = writeln!(out, "# TYPE {} counter", name);
+    let _ = writeln!(out, "{}{{card=\"{}\"}} {}", name, card, value);
+}
+
+/// Spawn a background thread that snapshots the ARC firmware's
+/// telemetry table into `state.chip_telemetry` every few seconds.
+/// /metrics scrapes read from that snapshot — never directly from the
+/// chip — so a slow or hostile scraper can't multiply the chip-side
+/// PCIe read rate. Exits when `state.shutdown` flips.
+pub fn spawn_chip_telemetry_poller(state: Arc<DaemonState>) {
+    // 5 s matches ARC FW's own internal `TELEM_SPEED` cadence — sub-
+    // second poll on the chip side, but the values change slowly
+    // enough that any scrape interval << 5 s would just amplify
+    // PCIe traffic without surfacing fresher data. Bumping is safe;
+    // shrinking below ~1 s starts being visible in MMIO load.
+    const POLL_INTERVAL: Duration = Duration::from_secs(5);
+    thread::Builder::new()
+        .name("chip-telemetry-poller".to_string())
+        .spawn(move || {
+            // Tag-table layout is published once by ARC FW at boot and
+            // doesn't change at runtime, so the first poll on a fresh
+            // daemon may need to retry briefly if it races ARC's
+            // SCRATCH_RAM[13] write. Subsequent polls are cheap.
+            let mut backoff = Duration::from_millis(500);
+            while !state.shutdown.load(Ordering::Relaxed) {
+                match crate::telemetry::read_telemetry(&state.shared_chip) {
+                    Ok(t) => {
+                        if let Ok(mut g) = state.chip_telemetry.lock() {
+                            *g = Some(t);
+                        }
+                        backoff = Duration::from_millis(500);
+                        thread::sleep(POLL_INTERVAL);
+                    }
+                    Err(e) => {
+                        // Don't log every iteration — ARC-not-ready is
+                        // expected during the first ~100 ms of daemon
+                        // startup; chip-rotation across reset_board is
+                        // a few-ms blip. Backoff up to a minute.
+                        dlog!("[chip-telemetry] poll failed: {}", e);
+                        thread::sleep(backoff);
+                        backoff = (backoff * 2).min(Duration::from_secs(60));
+                    }
+                }
+            }
+        })
+        .expect("spawn chip-telemetry-poller");
 }
 
 fn write_counter(out: &mut String, name: &str, help: &str, value: u64) {

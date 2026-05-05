@@ -63,6 +63,7 @@ pub fn serve(
     let shared_chip = Arc::new(crate::shared_chip::SharedChip::new(card)?);
     let state = Arc::new(DaemonState::new(card, shared_chip));
     install_signal_handlers(state.shutdown.clone());
+    crate::daemon::metrics::spawn_chip_telemetry_poller(Arc::clone(&state));
 
     listener.set_nonblocking(true)?;
 
