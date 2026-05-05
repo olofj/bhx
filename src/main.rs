@@ -1401,7 +1401,7 @@ fn run_connect_client(
             l2cpu, scrollback_bytes
         );
         let exit = Arc::new(AtomicBool::new(false));
-        daemon::terminal::pump(fd, exit)?;
+        daemon::terminal::pump(fd, exit, scrollback_bytes)?;
     } else {
         // Post-mortem replay (#160): the slot is gone but the daemon
         // had a tail captured at stop time. Drain to EOF without
