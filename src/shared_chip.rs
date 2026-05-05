@@ -386,6 +386,15 @@ impl SharedChip {
     /// PLL step down to 200 MHz → OR-in release bits → PLL step up to 1750
     /// MHz. Holds `seq_lock` for the entire sequence so concurrent callers
     /// serialize rather than stepping the PLL against each other.
+    ///
+    /// **PLL is shared across all four L2CPUs.** Stepping it down + up
+    /// during a cold boot of one slot glitches the clock for any
+    /// running siblings, briefly running them at 200 MHz before they
+    /// catch back up. This is unavoidable for the documented OpenSBI
+    /// reset-release procedure on this silicon — the alternative
+    /// (release at 1750 MHz directly) wedges the chip. Callers should
+    /// expect a sub-millisecond performance dip on running siblings
+    /// when a new L2CPU comes up; functional correctness is preserved.
     pub fn reset_x280(&self, l2cpu_indices: &[usize]) -> crate::Result<()> {
         let _guard = self.seq_lock.lock().unwrap();
 

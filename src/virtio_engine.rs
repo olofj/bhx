@@ -189,17 +189,6 @@ pub const STATS_OFF_SEL_READY_RACES: u32 = 0x030;
 pub const STATS_OFF_MAX_SWEEP_CYCLES: u32 = 0x034;
 pub const STATS_OFF_MAX_SEL_PATH_CYCLES: u32 = 0x038;
 pub const STATS_OFF_LAST_SWEEP_CYCLES: u32 = 0x03c;
-/// Per-slot poll_one_device sub-section maxes. Diagnostic added in
-/// the #124 follow-up after the fence-cut hypothesis turned out wrong
-/// (cutting 15 fences from 31 didn't move sweep_max). These pinpoint
-/// which part of the per-slot work actually owns the cycles.
-///
-/// All three are deprecated post-#120 — BLIND CAPTURE was removed in
-/// favour of atomic capture-on-READY=1 in `handle_queue_ready_change`,
-/// so PRECAP/POSTCAP no longer bracket meaningful work and read 0.
-pub const STATS_OFF_MAX_PRECAP_CYCLES: u32 = 0x040;
-pub const STATS_OFF_MAX_BLINDCAP_CYCLES: u32 = 0x044;
-pub const STATS_OFF_MAX_POSTCAP_CYCLES: u32 = 0x048;
 /// #120 atomic capture stats. `READY_CAPTURE_SEL_RACES` counts cases
 /// where the kernel advanced SEL between BRISC's setup-field reads
 /// and BRISC's post-read SEL re-check (mixed-queue snapshot, discarded).
@@ -218,37 +207,6 @@ pub const STATS_OFF_QUEUE_TEARDOWNS: u32 = 0x054;
 pub const STATS_OFF_BRISC_OLD_SEL_RESCUE: u32 = 0x06c;
 /// #132 DEVICE_FEATURES_SEL change observations from TRISC1.
 pub const STATS_OFF_DEV_FEAT_SEL_CHANGES: u32 = 0x058;
-/// #156 TRISC1-side QUEUE_SEL race counter. Bumped each time TRISC1
-/// observes a SEL change while the visible QUEUE_READY for the prior
-/// SEL is still 1 — i.e. neither BRISC nor TRISC1 had zeroed the cell
-/// at that moment. Compare to the BRISC-side
-/// `STATS_OFF_SEL_READY_RACES`:
-///
-///   * TRISC1 counter > 0 AND BRISC counter > 0 → both harts were
-///     slow; the kernel almost certainly read READY=1 and
-///     `vm_setup_vq` returned -ENOENT (counted race).
-///   * TRISC1 counter > 0 AND BRISC counter = 0 → TRISC1 cleaned up
-///     the visible cell before BRISC's main loop saw the SEL change.
-///     The kernel may have read READY=1 silently before TRISC1 zeroed
-///     (silent race loss) or 0 after (race won). The differential
-///     surfaces "TRISC1 had work to do" so we can correlate against
-///     the per-iter failure rate; the next-step diagnosis lives in
-///     #156 if and when the silent loss needs to be triangulated.
-pub const STATS_OFF_TRISC1_SEL_RACES: u32 = 0x05c;
-/// #156 TRISC1 timing diagnostics. Cycles at the BRISC clock — divide
-/// by 1.35 to get nanoseconds at MAX_AI_CLK.
-///
-/// `MAX_TRISC1_REACTION_CYCLES`: max time from "TRISC1 observed SEL
-/// change" to "READY=0 published with FENCE_W." Measures TRISC1's
-/// per-event critical path INCLUDING any L1 bank arbitration stall
-/// against concurrent BRISC writes. If this stays around ~10-15
-/// cycles in steady state but ratchets up to 50+ during cycle-test,
-/// L1 bank contention is real.
-///
-/// `MAX_TRISC1_OUTER_CYCLES`: max time for one full sweep across
-/// active virtio slots. Per-slot revisit time = this / num_active.
-pub const STATS_OFF_MAX_TRISC1_REACTION_CYCLES: u32 = 0x060;
-pub const STATS_OFF_MAX_TRISC1_OUTER_CYCLES: u32 = 0x064;
 /// Sweep-cycle histogram. Each bucket counts iterations whose sweep
 /// fell in the bucket's range (in BRISC cycles). Useful for
 /// distinguishing typical sweep cost from one-shot outliers like

@@ -422,9 +422,6 @@ fn run_poll_loop(
     // than waiting for a future-restart-then-zero rollover.
     let mut last_kick_drops: u32 = 0;
     let mut last_sel_ready_races: u32 = 0;
-    let mut last_trisc1_sel_races: u32 = 0;
-    let mut last_max_trisc1_reaction_cycles: u32 = 0;
-    let mut last_max_trisc1_outer_cycles: u32 = 0;
     let mut last_ready_capture_sel_races: u32 = 0;
     let mut last_queue_setups: u32 = 0;
     let mut last_queue_teardowns: u32 = 0;
@@ -624,52 +621,15 @@ fn run_poll_loop(
             crate::daemon::metrics::KICK_DROPS_TOTAL.add(delta as u64);
         }
         let sel_ready_races = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_SEL_READY_RACES);
-        if sel_ready_races != last_sel_ready_races {
-            let delta = sel_ready_races.wrapping_sub(last_sel_ready_races);
-            crate::dlog!(
-                "[kick-poller] BRISC observed {} SEL→READY race window(s) (cumulative {}) — \
-                 sweep-margin warning; stock kernels can hit -ENOENT on virtio probe",
-                delta,
-                sel_ready_races
-            );
+        if let Some(delta) = take_delta(sel_ready_races, &mut last_sel_ready_races) {
+            // SEL→READY race observation. Per-iteration dlog used to
+            // fire here on every counter advance; under multi-guest
+            // stress that buried unrelated lines, exactly the failure
+            // mode `feedback_overflow_counters_loud.md` warns about
+            // (#172). Surface only via the Prometheus counter; an
+            // operator who needs per-event detail can `daemon logs`
+            // the historical context plus the metric delta.
             crate::daemon::metrics::SEL_READY_RACES_TOTAL.add(delta as u64);
-            last_sel_ready_races = sel_ready_races;
-        }
-        let trisc1_sel_races = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_TRISC1_SEL_RACES);
-        if trisc1_sel_races != last_trisc1_sel_races {
-            let delta = trisc1_sel_races.wrapping_sub(last_trisc1_sel_races);
-            crate::dlog!(
-                "[kick-poller] TRISC1 cleaned up {} stale READY=1 on SEL change \
-                 (cumulative {}) — TRISC1's view of the same race window BRISC counts; \
-                 differential against [BRISC observed ... races] surfaces silent TRISC1 \
-                 wins/losses (#156)",
-                delta,
-                trisc1_sel_races
-            );
-            last_trisc1_sel_races = trisc1_sel_races;
-        }
-        let max_trisc1_reaction =
-            engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAX_TRISC1_REACTION_CYCLES);
-        if max_trisc1_reaction > last_max_trisc1_reaction_cycles {
-            crate::dlog!(
-                "[trisc1-timing] new max reaction cycles (SEL observed → READY=0 \
-                 published): {} cycles (~{} ns) — high values point at L1 bank \
-                 contention with concurrent BRISC writes (#156)",
-                max_trisc1_reaction,
-                u64::from(max_trisc1_reaction) * 1000 / 1350
-            );
-            last_max_trisc1_reaction_cycles = max_trisc1_reaction;
-        }
-        let max_trisc1_outer =
-            engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_MAX_TRISC1_OUTER_CYCLES);
-        if max_trisc1_outer > last_max_trisc1_outer_cycles {
-            crate::dlog!(
-                "[trisc1-timing] new max outer-iter cycles (full TRISC1 sweep): \
-                 {} cycles (~{} ns); per-slot revisit ≈ this / num_active_slots",
-                max_trisc1_outer,
-                u64::from(max_trisc1_outer) * 1000 / 1350
-            );
-            last_max_trisc1_outer_cycles = max_trisc1_outer;
         }
         // #124 timing probe. Log on ratchet-up only (each new max
         // since last log). 1.35 GHz BRISC ≈ 0.74 ns/cycle, so cycle
@@ -732,15 +692,17 @@ fn run_poll_loop(
         }
         let brisc_old_sel_rescue =
             engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_BRISC_OLD_SEL_RESCUE);
-        if brisc_old_sel_rescue != last_brisc_old_sel_rescue {
-            let delta = brisc_old_sel_rescue.wrapping_sub(last_brisc_old_sel_rescue);
+        if let Some(delta) = take_delta(brisc_old_sel_rescue, &mut last_brisc_old_sel_rescue) {
+            // Surface the rescue counter on /metrics (#172). Per-event
+            // dlog kept below — the rescue is rare and the dlog gives
+            // the human-readable cumulative.
+            crate::daemon::metrics::BRISC_OLD_SEL_RESCUE_TOTAL.add(delta as u64);
             crate::dlog!(
                 "[capture] BRISC rescued {} OLD-sel queue setup(s) at SEL change \
                  (cumulative {})",
                 delta,
                 brisc_old_sel_rescue
             );
-            last_brisc_old_sel_rescue = brisc_old_sel_rescue;
         }
         let ready_capture_sel_races =
             engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_READY_CAPTURE_SEL_RACES);
@@ -871,10 +833,10 @@ fn run_poll_loop(
 /// kernel-visible `VringUsed::idx` after our final commit (read back
 /// from guest DRAM via volatile load). `None` if nothing was drained.
 fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16) -> Option<u32> {
-    // Lazily extend `processed` if a kick references a queue index
-    // beyond what the device announced at registration. Out of
-    // bounds shouldn't happen for a well-behaved guest, but a
-    // misbehaving guest shouldn't crash the daemon.
+    // Drop the kick if it references a queue index past what the
+    // device announced at registration. Out of bounds shouldn't
+    // happen for a well-behaved guest, but a misbehaving guest
+    // shouldn't crash the daemon.
     if (queue_idx as usize) >= reg.processed.len() {
         crate::dlog!(
             "[kick-poller]   slot {} queue {} out of range (have {}), dropping",

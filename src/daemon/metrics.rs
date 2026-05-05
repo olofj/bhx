@@ -626,6 +626,17 @@ pub static KICK_DROPS_TOTAL: Counter = Counter::new();
 /// poller] BRISC observed N SEL→READY race window(s)` log line.
 pub static SEL_READY_RACES_TOTAL: Counter = Counter::new();
 
+/// Cumulative count of OLD-sel rescue captures BRISC made — the
+/// third-and-last layer of the SEL→READY race close. Fires when
+/// BRISC observes a SEL change with no prior successful capture for
+/// the old sel and snapshots the still-visible kernel writes for the
+/// old sel into shadow. Counter's load-bearing-ness is invisible
+/// outside the daemon log without this metric (#172). TRISC1 is at
+/// max load and can't pick up the rescue capture itself, so this
+/// rescue stays in BRISC; the metric makes the rescue rate visible
+/// alongside `bhx_sel_ready_races_total`.
+pub static BRISC_OLD_SEL_RESCUE_TOTAL: Counter = Counter::new();
+
 /// Per-L2CPU UART feed-ring drop counter. TRISC0 bumps the chip-side
 /// counter (`UART_PRIV_OFF_FEED_DROP_COUNT`) when its producer
 /// outpaces the daemon consumer; the daemon polls the chip-side
@@ -980,6 +991,16 @@ pub fn render_prometheus(state: &DaemonState) -> String {
          probe with -ENOENT.",
         SEL_READY_RACES_TOTAL.get(),
     );
+    write_counter(
+        &mut out,
+        "bhx_brisc_old_sel_rescue_total",
+        "Cumulative count of BRISC's OLD-sel rescue captures — the \
+         third-and-last layer of the SEL→READY race close. BRISC \
+         snapshots the still-visible kernel writes for the previous SEL \
+         into shadow when neither the SEL-watch nor handle_queue_ready_change \
+         caught the READY=1 in time.",
+        BRISC_OLD_SEL_RESCUE_TOTAL.get(),
+    );
     let _ = writeln!(
         &mut out,
         "# HELP bhx_uart_feed_drops_total UART feed-ring drops per L2CPU \
@@ -1174,8 +1195,16 @@ fn read_request_headers<R: Read>(stream: &mut R) -> io::Result<Vec<u8>> {
         match stream.read(&mut chunk) {
             Ok(0) => return Ok(buf),
             Ok(n) => {
+                let prev_len = buf.len();
                 buf.extend_from_slice(&chunk[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                // Only scan the new tail (plus 3 bytes of overlap so a
+                // CRLF-CRLF that straddles the chunk boundary still
+                // matches). `buf.windows(4).any(...)` rescanned the
+                // whole accumulated buffer after every read, which is
+                // O(n²) on a malformed long request — exactly the
+                // adversarial-input shape an exporter shouldn't have.
+                let scan_start = prev_len.saturating_sub(3);
+                if buf[scan_start..].windows(4).any(|w| w == b"\r\n\r\n") {
                     return Ok(buf);
                 }
                 if buf.len() >= MAX_REQUEST_HEADER_BYTES {

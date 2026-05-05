@@ -63,7 +63,6 @@ pub fn serve(
     let shared_chip = Arc::new(crate::shared_chip::SharedChip::new(card)?);
     let state = Arc::new(DaemonState::new(card, shared_chip));
     install_signal_handlers(state.shutdown.clone());
-    spawn_pll_watcher(Arc::clone(&state));
 
     listener.set_nonblocking(true)?;
 
@@ -1663,6 +1662,23 @@ fn dispatch_release(
             source: e,
         })?;
 
+    // Ordering of the writes above relative to the MSIP fire below:
+    // - The next_addr / next_mode / next_arg1 stores happened earlier
+    //   in this function via l2cpu.write32 (PCIe MMIO posted writes,
+    //   strictly ordered at the device per the PCIe spec).
+    // - `write32(msip_pa, 1)` on a different L2CPU's CLINT triggers
+    //   the M-mode software interrupt that wakes hart 0 out of wfi.
+    // - The trap handler in OpenSBI's `sbi_hsm_hart_wait` reads
+    //   `hartid_to_state` (which includes our START_PENDING write)
+    //   AFTER taking the trap, so the write is observed.
+    //
+    // We rely on PCIe's ordered-posted-write guarantee from the
+    // host's PCIe root complex through to the L2CPU's view of DRAM.
+    // No explicit fence is needed today; if the chip-side memory
+    // model ever changes (e.g. a future kernel/firmware bump that
+    // routes through a different ordering domain), revisit this
+    // before assuming the implicit ordering still holds.
+    //
     // Fire the IPI. CLINT MSIP is a 32-bit register; writing 1 sets
     // the M-mode software interrupt pending bit, waking hart 0 from
     // wfi inside sbi_hsm_hart_wait.
@@ -2839,44 +2855,6 @@ fn dispatch_stop(sock: &UnixStream, state: &Arc<DaemonState>, l2cpu_idx: u8) -> 
             l2cpu_idx
         ))),
     }
-}
-
-/// Polls PLL4 (L2CPU PLL) every second and logs every observed change.
-/// Used to track down "PLL silently reverted to ARC init values" reports
-/// — without this, dlog only fires on our own set_frequency calls.
-fn spawn_pll_watcher(state: Arc<DaemonState>) {
-    std::thread::Builder::new()
-        .name("pll-watcher".to_string())
-        .spawn(move || {
-            const PLL4_BASE: u64 = 0x80020500;
-            const CNTL1_OFF: u64 = 0x4;
-            const CNTL5_OFF: u64 = 0x14;
-            let mut last: Option<(u32, u32)> = None;
-            while !state.shutdown.load(Ordering::Relaxed) {
-                let cntl1 = state.shared_chip.arc_read32(PLL4_BASE + CNTL1_OFF);
-                let cntl5 = state.shared_chip.arc_read32(PLL4_BASE + CNTL5_OFF);
-                if let (Ok(c1), Ok(c5)) = (cntl1, cntl5) {
-                    let observed = (c1, c5);
-                    if last != Some(observed) {
-                        let fbdiv = (c1 >> 16) as u16;
-                        let postdiv0 = (c5 & 0xFF) as u8;
-                        let mhz = 25u32 * (fbdiv as u32) / ((postdiv0 as u32) + 1);
-                        dlog!(
-                            "[pll-watcher] PLL4 fbdiv={} postdiv0={} → {} MHz \
-                             (CNTL1={:#010x} CNTL5={:#010x})",
-                            fbdiv,
-                            postdiv0,
-                            mhz,
-                            c1,
-                            c5
-                        );
-                        last = Some(observed);
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-        })
-        .expect("spawn pll-watcher");
 }
 
 /// Tear down an L2CPU slot. Called from `dispatch_stop` (operator
