@@ -386,15 +386,39 @@ pub fn modify_dtb(
         );
     }
 
-    // We used to add an `opensbi@<mem_start>` reservation here covering
-    // the bottom 2 MiB to protect fw_jump.bin and the OSBIdbug
-    // descriptor (#110). Turns out OpenSBI's generic platform fixup
-    // already plants `mmode_resv0` (BSS/heap) and `mmode_resv1`
-    // (text/rodata) into the same DTB, covering 384 KiB starting at
-    // mem_start — the descriptor at fw_jump.bin+0x80 is inside
-    // mmode_resv1 already. Adding our coarser reservation only
-    // produced two `OF: reserved mem: OVERLAP DETECTED!` warnings on
-    // every boot. See #119.
+    // (#170 followup) Reserve OpenSBI's text + RW region up front in
+    // the daemon-patched DTB. OpenSBI's generic platform runtime
+    // fixup adds `mmode_resv0`/`mmode_resv1` itself on cold boot, so
+    // historically (#119) we relied on that and produced
+    // `OF: reserved mem: OVERLAP DETECTED!` warnings if we added our
+    // own. But release-from-purgatory re-images this DTB AS-IS via
+    // dispatch_release without OpenSBI re-running its fixups — so
+    // without an explicit entry here the kernel's allocator uses
+    // OpenSBI's text/BSS as free pages, hits PMP store-access faults
+    // on the M-mode-only region (`Oops - store access fault` at
+    // badaddr `mem_start`), and after a few reboots even U-Boot's
+    // first SBI DBCN call crashes because OpenSBI's scratch tables
+    // got clobbered. Sizing 0x60000 = 384 KiB matches the documented
+    // R/X (256 KiB) + R/W (128 KiB) regions OpenSBI's banner reports
+    // on this platform. Overlap with OpenSBI's own runtime add on
+    // cold boot is harmless — the kernel takes the union of
+    // `/reserved-memory` entries.
+    {
+        let opensbi_pa = mem_start;
+        let opensbi_size: u64 = 0x60000;
+        let opensbi_node =
+            fdt.add_subnode(reserved, &format!("bhx-opensbi-firmware@{:x}", opensbi_pa))?;
+        let mut opensbi_reg = Vec::with_capacity(16);
+        opensbi_reg.extend_from_slice(&opensbi_pa.to_be_bytes());
+        opensbi_reg.extend_from_slice(&opensbi_size.to_be_bytes());
+        fdt.setprop(opensbi_node, "reg", &opensbi_reg)?;
+        fdt.setprop(opensbi_node, "no-map", &[])?;
+        crate::dlog!(
+            "[modify_dtb]   adding /reserved-memory/bhx-opensbi-firmware@{:x} size={:#x} (#170)",
+            opensbi_pa,
+            opensbi_size
+        );
+    }
 
     // /soc and PLIC phandle
     let soc = fdt
