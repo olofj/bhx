@@ -2482,8 +2482,28 @@ fn dispatch_remove_disk(
         let mut taken: Vec<DiskWorker> = Vec::new();
         match name.as_deref() {
             None => {
-                // Legacy behavior: remove all disks. Kept for
-                // single-disk callers that don't pass a selector.
+                // (#116) With more than one disk attached, refuse bare
+                // remove-disk: the cloud-init seed and the rootfs are
+                // both at slot N and bare remove-disk used to nuke
+                // both. Force the operator to name what they want
+                // detached; preserve the bare-form convenience for the
+                // single-disk shape.
+                if slot.disks.len() > 1 {
+                    let attached: Vec<String> = slot
+                        .disks
+                        .iter()
+                        .map(|d| {
+                            format!("{} ({})", d.name.as_deref().unwrap_or("<unnamed>"), d.path)
+                        })
+                        .collect();
+                    return Err(crate::Error::slot_state(format!(
+                        "l2cpu {} has {} disks attached; pass --name <serial> to pick one. \
+                         Attached: [{}]",
+                        l2cpu_idx,
+                        slot.disks.len(),
+                        attached.join(", ")
+                    )));
+                }
                 taken.append(&mut slot.disks);
             }
             Some(want) => {
