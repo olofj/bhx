@@ -1016,8 +1016,13 @@ pub fn render_prometheus(state: &DaemonState) -> String {
         );
     }
 
-    // Slot-derived gauges: uptime, disks, net, state. Walk the
+    // Slot-derived gauges: running, uptime, disks, net. Walk the
     // mutexes once to read every slot's snapshot.
+    let _ = writeln!(
+        &mut out,
+        "# HELP bhx_l2cpu_running 1 if a slot is installed for this L2CPU, else 0."
+    );
+    let _ = writeln!(&mut out, "# TYPE bhx_l2cpu_running gauge");
     let _ = writeln!(
         &mut out,
         "# HELP bhx_l2cpu_uptime_seconds Seconds since slot installation. \
@@ -1038,6 +1043,7 @@ pub fn render_prometheus(state: &DaemonState) -> String {
         let g = state.l2cpus[idx as usize].lock().unwrap();
         if let Some(slot) = g.as_ref() {
             let uptime = slot.started.elapsed().as_secs() as i64;
+            let _ = writeln!(&mut out, "bhx_l2cpu_running{{idx=\"{}\"}} 1", idx);
             let _ = writeln!(
                 &mut out,
                 "bhx_l2cpu_uptime_seconds{{idx=\"{}\"}} {}",
@@ -1056,10 +1062,13 @@ pub fn render_prometheus(state: &DaemonState) -> String {
                 slot.net.is_some() as u8
             );
         } else {
-            // Emit explicit zero for disks/net so absence is visible
-            // without an "is the slot installed?" lookup. Skip uptime
-            // — emitting 0 would alias to "just-installed" which is
-            // misleading in a tail of recently-stopped slots.
+            // Emit running=0 unconditionally so consumers can drive a
+            // 4-lane display without label-presence detection. Skip
+            // uptime — emitting 0 would alias to "just-installed"
+            // which is misleading in a tail of recently-stopped
+            // slots. disks/net stay at 0 for the same "absence is
+            // visible without a slot lookup" reason.
+            let _ = writeln!(&mut out, "bhx_l2cpu_running{{idx=\"{}\"}} 0", idx);
             let _ = writeln!(&mut out, "bhx_l2cpu_disks{{idx=\"{}\"}} 0", idx);
             let _ = writeln!(&mut out, "bhx_l2cpu_net{{idx=\"{}\"}} 0", idx);
         }
@@ -1473,6 +1482,12 @@ mod tests {
             "bhx_l2cpu_console_bytes_total{idx=\"3\",direction=\"h2g\"} ",
             "bhx_l2cpu_disks{idx=\"0\"} ",
             "bhx_l2cpu_net{idx=\"3\"} ",
+            // Slot presence — emitted for all 4 idx, 0 when empty so a
+            // dashboard can drive 4 lanes without label-presence detection.
+            "# HELP bhx_l2cpu_running",
+            "# TYPE bhx_l2cpu_running gauge",
+            "bhx_l2cpu_running{idx=\"0\"} 0",
+            "bhx_l2cpu_running{idx=\"3\"} 0",
             // Per virtio-block (disk_id pinned at 0 in Phase A).
             "bhx_blk_requests_total{idx=\"0\",disk_id=\"0\",op=\"read\"} ",
             "bhx_blk_requests_total{idx=\"2\",disk_id=\"0\",op=\"write\"} ",
