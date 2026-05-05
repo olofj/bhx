@@ -12,7 +12,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -21,15 +21,23 @@ use crate::console::TerminalRawMode;
 /// Drive the bidirectional stdin ↔ fd pump until the user hits Ctrl-A x
 /// (which flips `exit`) or the fd closes.
 ///
-/// `scrollback_bytes` is the number of bytes the daemon will replay
-/// before transitioning to live chip output — it comes back from
-/// `attach_console`'s response. The writer suppresses CPR responses
-/// on the operator's stdin until that many bytes have been drained
-/// (the spurious-getty case from #121 — terminal answers a stale
-/// query in the replayed history, or emits one on raw-mode entry,
-/// and we don't want that response reaching the chip-side getty).
-/// After the boundary, everything passes through, including
-/// legitimate responses to live queries from `resize` / `vim` / etc.
+/// CPR-response gating uses two pieces of state. (1) `in_replay` flips
+/// to `false` once the reader thread drains `scrollback_bytes` of
+/// chip output — answers to queries that lived in the scrollback
+/// (and thus had nothing to do with the live guest) get dropped.
+/// (2) `pending_cpr_queries` counts `\x1b[6n` queries the LIVE chip
+/// stream emitted; the writer forwards a CPR response only when the
+/// counter is non-zero. Together they cover three failure modes:
+///
+///   - Scrollback replay containing stale `\x1b[6n`: counter doesn't
+///     bump (we only count live bytes), responses dropped.
+///   - Raw-mode entry causing the operator's terminal to emit a
+///     spontaneous CPR with no chip-side query: counter is 0,
+///     response dropped.
+///   - Live `resize` / `vim` query: counter bumped by reader,
+///     response forwarded by writer.
+///
+/// `scrollback_bytes` comes back from `attach_console`'s response.
 pub fn pump(fd: OwnedFd, exit: Arc<AtomicBool>, scrollback_bytes: u32) -> io::Result<()> {
     let _raw = TerminalRawMode::new()?;
 
@@ -42,24 +50,30 @@ pub fn pump(fd: OwnedFd, exit: Arc<AtomicBool>, scrollback_bytes: u32) -> io::Re
     };
 
     // True until the reader thread has drained `scrollback_bytes` from
-    // the chip stream. Writer drops CPR responses while this is true.
+    // the chip stream. Writer drops CPR responses while this is true
+    // and the counter stays at zero — see the comment on `pump`.
     let in_replay = Arc::new(AtomicBool::new(scrollback_bytes > 0));
+    let pending_cpr = Arc::new(AtomicUsize::new(0));
 
-    // Reader thread: stream → stdout.
+    // Reader thread: stream → stdout. Bumps `pending_cpr` for live
+    // `\x1b[6n` queries so the writer knows to forward the next CPR
+    // response.
     let reader_exit = exit.clone();
     let reader_stream = stream.try_clone()?;
     let reader_in_replay = in_replay.clone();
+    let reader_pending = pending_cpr.clone();
     let reader = thread::spawn(move || {
         reader_loop(
             reader_stream,
             reader_exit,
             scrollback_bytes,
             reader_in_replay,
+            reader_pending,
         )
     });
 
     // Main thread: stdin → stream, with Ctrl-A x detection.
-    let writer_result = writer_loop(&stream, &exit, &in_replay);
+    let writer_result = writer_loop(&stream, &exit, &in_replay, &pending_cpr);
 
     // Shut down the socket so both the daemon side (which then detaches us
     // from the hub and closes its end) and our reader clone see EOF. Just
@@ -76,11 +90,13 @@ fn reader_loop(
     exit: Arc<AtomicBool>,
     scrollback_bytes: u32,
     in_replay: Arc<AtomicBool>,
+    pending_cpr: Arc<AtomicUsize>,
 ) {
     let mut stream = stream;
     let mut buf = [0u8; 4096];
     let mut drained: u64 = 0;
     let target = scrollback_bytes as u64;
+    let mut det = CprQueryDetector::new();
     loop {
         match stream.read(&mut buf) {
             Ok(0) => {
@@ -90,10 +106,27 @@ fn reader_loop(
             Ok(n) => {
                 let _ = io::stdout().write_all(&buf[..n]);
                 let _ = io::stdout().flush();
-                if in_replay.load(Ordering::Relaxed) {
+                // Decide where the live boundary falls inside this
+                // chunk. Bytes at offsets `[live_start..n)` are live;
+                // bytes before that belong to scrollback. Detector
+                // only sees live bytes — counting queries in
+                // scrollback would credit responses to a dead
+                // incarnation.
+                let was_replay = in_replay.load(Ordering::Relaxed);
+                let live_start = if was_replay {
+                    let remaining = target.saturating_sub(drained);
                     drained = drained.saturating_add(n as u64);
                     if drained >= target {
                         in_replay.store(false, Ordering::Relaxed);
+                    }
+                    remaining.min(n as u64) as usize
+                } else {
+                    0
+                };
+                if live_start < n {
+                    let queries = det.consume(&buf[live_start..n]);
+                    if queries > 0 {
+                        pending_cpr.fetch_add(queries, Ordering::Relaxed);
                     }
                 }
             }
@@ -106,20 +139,82 @@ fn reader_loop(
     }
 }
 
-fn writer_loop(stream: &UnixStream, exit: &AtomicBool, in_replay: &AtomicBool) -> io::Result<()> {
+/// Byte-level state machine that counts `ESC [ 6 n` (DSR-CPR query)
+/// occurrences in the chip-output stream. Used by the reader thread
+/// to gate the writer thread's CPR-response passthrough — without a
+/// matching outbound query, a CPR-shaped sequence on the operator's
+/// stdin is the spurious / scrollback case and gets dropped.
+#[derive(Debug, PartialEq)]
+enum CprQueryState {
+    Idle,
+    Esc,
+    /// Saw `ESC [` ; collecting the parameter bytes.
+    Csi(Vec<u8>),
+}
+
+struct CprQueryDetector {
+    state: CprQueryState,
+}
+
+impl CprQueryDetector {
+    fn new() -> Self {
+        CprQueryDetector {
+            state: CprQueryState::Idle,
+        }
+    }
+
+    /// Count DSR queries (`ESC [ <digits/;>* n`) in `bytes`. Strict
+    /// shape: final byte `n`, intermediate bytes only digits and `;`.
+    /// `\x1b[?6n` (private-mode prefix) does NOT match — `?` isn't a
+    /// digit; intentional, the chip doesn't fire that variant.
+    fn consume(&mut self, bytes: &[u8]) -> usize {
+        let mut hits = 0;
+        for &b in bytes {
+            match &mut self.state {
+                CprQueryState::Idle => {
+                    if b == 0x1b {
+                        self.state = CprQueryState::Esc;
+                    }
+                }
+                CprQueryState::Esc => {
+                    self.state = if b == b'[' {
+                        CprQueryState::Csi(Vec::with_capacity(4))
+                    } else {
+                        CprQueryState::Idle
+                    };
+                }
+                CprQueryState::Csi(buf) => {
+                    let is_final = (0x40..=0x7e).contains(&b);
+                    if !is_final {
+                        buf.push(b);
+                        continue;
+                    }
+                    let intermediate_ok = buf.iter().all(|&c| c.is_ascii_digit() || c == b';');
+                    if b == b'n' && intermediate_ok {
+                        hits += 1;
+                    }
+                    self.state = CprQueryState::Idle;
+                }
+            }
+        }
+        hits
+    }
+}
+
+fn writer_loop(
+    stream: &UnixStream,
+    exit: &AtomicBool,
+    in_replay: &AtomicBool,
+    pending_cpr: &AtomicUsize,
+) -> io::Result<()> {
     let mut stream = stream;
     let mut ctrl_a = false;
-    // Filter cursor-position-report (CPR) replies on the operator's
-    // stdin while the chip-output stream is still replaying scrollback.
-    // The replay can contain stale `ESC [ 6 n` queries that the host
-    // terminal answers with `ESC [ <row> ; <col> R`; entering raw mode
-    // can also provoke an unsolicited CPR. Either way, those responses
-    // were never asked for by the live guest — forwarding them lands
-    // at the chip-side getty (#121).
-    //
-    // After the reader thread drains `scrollback_bytes`, `in_replay`
-    // flips to false and we pass everything through, including the
-    // legitimate responses `resize` / `vim` / etc. ask for.
+    // CPR-response gating: forward only when the LIVE chip stream
+    // recently emitted a `\x1b[6n` query that hasn't been answered
+    // yet (`pending_cpr > 0`). Scrollback-replay queries are
+    // ignored by the reader, raw-mode-entry CPRs from the operator's
+    // terminal arrive with the counter at zero and get dropped, and
+    // legitimate `resize` / `vim` responses pass through.
     let mut esc = EscState::Idle;
     while !exit.load(Ordering::Relaxed) {
         // Poll stdin with 20 ms timeout so we notice `exit` without spinning.
@@ -155,7 +250,16 @@ fn writer_loop(stream: &UnixStream, exit: &AtomicBool, in_replay: &AtomicBool) -
                 if in_replay.load(Ordering::Relaxed) {
                     continue;
                 }
-                // Live mode: forward as-is.
+                // Live mode: forward only if the chip recently asked
+                // for a CPR. Otherwise this is a spontaneous response
+                // from raw-mode entry (or any other host-terminal-side
+                // emission) that the chip never solicited.
+                let popped = pending_cpr
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .is_ok();
+                if !popped {
+                    continue;
+                }
             }
         }
         for emitted in to_emit {
@@ -263,87 +367,130 @@ fn advance_esc(state: &mut EscState, byte: u8, out: &mut Vec<u8>) -> EscDecision
 
 #[cfg(test)]
 mod tests {
-    use super::{advance_esc, EscDecision, EscState};
+    use super::{advance_esc, CprQueryDetector, EscDecision, EscState};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Replays the writer-side replay-mode policy: CPR responses are
-    /// suppressed (the #121 case — answer to a stale query in the
-    /// scrollback or to a raw-mode-entry probe).
-    fn run_replay_mode(input: &[u8]) -> Vec<u8> {
-        let mut state = EscState::Idle;
-        let mut out = Vec::new();
-        for &b in input {
-            let mut step = Vec::new();
-            match advance_esc(&mut state, b, &mut step) {
-                EscDecision::Drop | EscDecision::CprResponse => {}
-                EscDecision::Emit => out.extend(step),
-            }
-        }
-        out
-    }
-
-    /// Replays the writer-side live-mode policy: CPR responses pass
-    /// through (the `resize` case — guest asked, terminal answered).
-    fn run_live_mode(input: &[u8]) -> Vec<u8> {
+    /// Replays the writer-side policy as a single helper. `in_replay`
+    /// reflects the scrollback-drain flag; `pending` is the live-CPR-
+    /// query counter the reader maintains. The two together decide
+    /// whether to forward a CPR response.
+    fn run(input: &[u8], in_replay: bool, pending: &AtomicUsize) -> Vec<u8> {
         let mut state = EscState::Idle;
         let mut out = Vec::new();
         for &b in input {
             let mut step = Vec::new();
             match advance_esc(&mut state, b, &mut step) {
                 EscDecision::Drop => {}
-                EscDecision::Emit | EscDecision::CprResponse => out.extend(step),
+                EscDecision::Emit => out.extend(step),
+                EscDecision::CprResponse => {
+                    if in_replay {
+                        continue;
+                    }
+                    let popped = pending
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                        .is_ok();
+                    if popped {
+                        out.extend(step);
+                    }
+                }
             }
         }
         out
     }
 
-    #[test]
-    fn passthrough_plain_bytes() {
-        assert_eq!(run_replay_mode(b"hello"), b"hello");
-        assert_eq!(run_live_mode(b"hello"), b"hello");
+    fn run_replay(input: &[u8]) -> Vec<u8> {
+        run(input, true, &AtomicUsize::new(0))
+    }
+
+    fn run_live_no_pending(input: &[u8]) -> Vec<u8> {
+        run(input, false, &AtomicUsize::new(0))
     }
 
     #[test]
-    fn drops_cpr_response_in_replay_mode() {
-        // The #121 case: stale CPR from scrollback replay or raw-mode
-        // entry — must not reach the chip side.
-        assert_eq!(run_replay_mode(b"\x1b[97;428R"), b"");
-        assert_eq!(run_replay_mode(b"\x1b[5;1R"), b"");
-        // Multiple back-to-back CPRs as the bug repro showed.
-        assert_eq!(run_replay_mode(b"\x1b[97;428R\x1b[5;1R\x1b[97;428R"), b"");
+    fn passthrough_plain_bytes_in_every_mode() {
+        assert_eq!(run_replay(b"hello"), b"hello");
+        assert_eq!(run_live_no_pending(b"hello"), b"hello");
+        assert_eq!(run(b"hello", false, &AtomicUsize::new(2)), b"hello");
     }
 
     #[test]
-    fn forwards_cpr_response_in_live_mode() {
-        // The resize case: chip-side guest asked via \x1b[6n, host
-        // terminal answered. After scrollback drained, response goes
-        // through.
-        assert_eq!(run_live_mode(b"\x1b[24;80R"), b"\x1b[24;80R");
-        // Multiple back-to-back responses (e.g. resize + a follow-up
-        // query): all forwarded.
-        assert_eq!(
-            run_live_mode(b"\x1b[24;80R\x1b[100;200R"),
-            b"\x1b[24;80R\x1b[100;200R"
-        );
+    fn drops_cpr_response_during_scrollback_replay() {
+        // The classic #121 case: stale CPR from a query buried in the
+        // replayed scrollback. Must not reach the chip side.
+        assert_eq!(run_replay(b"\x1b[97;428R"), b"");
+        assert_eq!(run_replay(b"\x1b[5;1R\x1b[97;428R"), b"");
     }
 
     #[test]
-    fn forwards_other_csi_unchanged_in_both_modes() {
-        // Arrow keys, cursor home, etc. — must pass through regardless
-        // of the replay/live state. The CPR gating is specifically
-        // limited to CSI-with-final-`R`-and-digit-only-intermediates.
-        for runner in [run_replay_mode, run_live_mode] {
-            assert_eq!(runner(b"\x1b[A"), b"\x1b[A");
-            assert_eq!(runner(b"\x1b[D"), b"\x1b[D");
-            assert_eq!(runner(b"\x1b[H"), b"\x1b[H");
-            assert_eq!(runner(b"\x1b[10;20H"), b"\x1b[10;20H");
+    fn drops_cpr_response_in_live_mode_with_no_pending_query() {
+        // Raw-mode entry on `bhx connect` causes some terminals to
+        // emit a spontaneous CPR. Counter is zero — drop.
+        assert_eq!(run_live_no_pending(b"\x1b[97;1R"), b"");
+        // Multiple spurious CPRs in a row: still all dropped.
+        assert_eq!(run_live_no_pending(b"\x1b[1;1R\x1b[2;2R\x1b[3;3R"), b"");
+    }
+
+    #[test]
+    fn forwards_one_cpr_per_pending_query() {
+        // The resize case: chip-side `\x1b[6n` was counted by the
+        // reader; the writer forwards exactly that many responses
+        // and drops the rest.
+        let pending = AtomicUsize::new(2);
+        let out = run(b"\x1b[24;80R\x1b[100;200R\x1b[3;3R", false, &pending);
+        assert_eq!(out, b"\x1b[24;80R\x1b[100;200R");
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn forwards_other_csi_unchanged_in_every_mode() {
+        // Arrow keys, cursor home, etc. — must pass through. The
+        // gate is strictly on CSI-with-final-`R`-and-digit-only
+        // intermediates.
+        let pending = AtomicUsize::new(0);
+        for &replay in &[true, false] {
+            assert_eq!(run(b"\x1b[A", replay, &pending), b"\x1b[A");
+            assert_eq!(run(b"\x1b[D", replay, &pending), b"\x1b[D");
+            assert_eq!(run(b"\x1b[H", replay, &pending), b"\x1b[H");
+            assert_eq!(run(b"\x1b[10;20H", replay, &pending), b"\x1b[10;20H");
         }
     }
 
     #[test]
-    fn forwards_lone_escape_in_both_modes() {
-        // Bare ESC + non-`[` byte: forwards both.
-        assert_eq!(run_replay_mode(b"\x1ba"), b"\x1ba");
-        assert_eq!(run_live_mode(b"\x1ba"), b"\x1ba");
+    fn forwards_lone_escape_in_every_mode() {
+        let pending = AtomicUsize::new(0);
+        assert_eq!(run(b"\x1ba", true, &pending), b"\x1ba");
+        assert_eq!(run(b"\x1ba", false, &pending), b"\x1ba");
+    }
+
+    // ---- CprQueryDetector ----
+
+    #[test]
+    fn cpr_query_detector_counts_dsr_query() {
+        let mut det = CprQueryDetector::new();
+        assert_eq!(det.consume(b"\x1b[6n"), 1);
+    }
+
+    #[test]
+    fn cpr_query_detector_counts_across_chunk_boundary() {
+        let mut det = CprQueryDetector::new();
+        assert_eq!(det.consume(b"\x1b["), 0);
+        assert_eq!(det.consume(b"6"), 0);
+        assert_eq!(det.consume(b"n"), 1);
+    }
+
+    #[test]
+    fn cpr_query_detector_ignores_non_query_csi() {
+        let mut det = CprQueryDetector::new();
+        // CUP, arrows, SGR, CPR responses — none of these are queries.
+        assert_eq!(det.consume(b"\x1b[10;20H\x1b[A\x1b[1;31m\x1b[24;80R"), 0);
+    }
+
+    #[test]
+    fn cpr_query_detector_rejects_private_mode_prefix() {
+        // `\x1b[?6n` (DECRQM-style) is not a DSR-CPR query — the `?`
+        // isn't a digit, so our intermediate-bytes check fails.
+        let mut det = CprQueryDetector::new();
+        assert_eq!(det.consume(b"\x1b[?6n"), 0);
     }
 
     #[test]
