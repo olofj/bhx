@@ -101,7 +101,17 @@ impl TensixEngine {
             )))
         })?;
 
-        let tile = TensixTile::new(card, picked.x, picked.y).map_err(|e| {
+        // Open the engine tile via a dup(2) of the daemon's shared-chip
+        // fd, NOT a fresh `kmd::open_device`. The fresh-open path
+        // re-enters tt-kmd's `set_aggregated_power_state` and resets
+        // PLL4 to ARC init (800 MHz). Reset_x280 brings PLL4 back up
+        // on cold boot, but if the engine is brought up later (e.g.
+        // first hot-add after a slot has stabilized) the PLL drop
+        // would persist. See #171.
+        let dup = chip
+            .dup_fd()
+            .map_err(|e| io::Error::from(crate::Error::internal(format!("dup_fd: {}", e))))?;
+        let tile = TensixTile::new_with_dup_fd(dup, picked.x, picked.y).map_err(|e| {
             io::Error::from(crate::Error::Io {
                 ctx: format!(
                     "open tensix tile ({}, {}) on card {}",
@@ -282,7 +292,11 @@ impl TensixEngine {
                 picked.x, picked.y
             )))
         })?;
-        let tile = TensixTile::new(card, picked.x, picked.y).map_err(|e| {
+        // Same dup_fd story as bring_up — see #171.
+        let dup = chip
+            .dup_fd()
+            .map_err(|e| io::Error::from(crate::Error::internal(format!("dup_fd: {}", e))))?;
+        let tile = TensixTile::new_with_dup_fd(dup, picked.x, picked.y).map_err(|e| {
             io::Error::from(crate::Error::Io {
                 ctx: format!(
                     "open tensix tile ({}, {}) on card {}",

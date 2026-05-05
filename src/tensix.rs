@@ -147,9 +147,29 @@ pub struct TensixTile {
 unsafe impl Send for TensixTile {}
 
 impl TensixTile {
-    /// Open card `card`, configure two TLB windows on tile `(x, y)`.
+    /// Open card `card` (fresh fd) and configure two TLB windows on
+    /// tile `(x, y)`. Used by debug subcommands and tests that route
+    /// around the daemon. Daemon-side callers MUST go through
+    /// [`TensixTile::new_with_dup_fd`] instead — a fresh kmd
+    /// `open_device` triggers tt-kmd's
+    /// `set_aggregated_power_state` chain which resets PLL4 to ARC
+    /// init (800 MHz, see #171 / 888c8ca).
     pub fn new(card: u32, x: u16, y: u16) -> io::Result<Self> {
         let fd = kmd::open_device(card)?;
+        Self::wrap_owned_fd(fd, x, y)
+    }
+
+    /// Same as [`TensixTile::new`] but takes an `fd` the caller
+    /// already owns — typically a `dup(2)` of the daemon's persistent
+    /// `SharedChip` fd (see `SharedChip::dup_fd`). The duped fd does
+    /// NOT re-enter tt-kmd's `tt_cdev_open` path, so PLL4 stays
+    /// where the daemon left it. The TensixTile takes ownership of
+    /// `fd` and will `libc::close` it on `Drop`.
+    pub fn new_with_dup_fd(fd: RawFd, x: u16, y: u16) -> io::Result<Self> {
+        Self::wrap_owned_fd(fd, x, y)
+    }
+
+    fn wrap_owned_fd(fd: RawFd, x: u16, y: u16) -> io::Result<Self> {
         let l1_window = match TlbWindow::new_2m(fd, x, y, TLB_BASE_L1) {
             Ok(w) => w,
             Err(e) => {
