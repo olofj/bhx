@@ -12,6 +12,29 @@
 
 use crate::kmd;
 
+/// Format a sysfs PCI BDF string (`0000:01:00.0`) from kmd's
+/// `pci_domain` field plus the packed `bus_dev_fn` u16. Pulled out
+/// for unit testing — the rest of `reset_board` requires hardware.
+pub(crate) fn format_bdf(domain: u32, bus_dev_fn: u32) -> String {
+    let bus = (bus_dev_fn >> 8) & 0xff;
+    let dev = (bus_dev_fn >> 3) & 0x1f;
+    let func = bus_dev_fn & 0x7;
+    format!("{:04x}:{:02x}:{:02x}.{}", domain, bus, dev, func)
+}
+
+/// One-step state transition of the LDS-reset poll loop. We're
+/// watching PCI config-space byte 4's bit 1 (Memory Space Enable) and
+/// waiting for it to go from "asserted" to "released" — the chip has
+/// to ENTER reset (bit=1) before we can declare it has LEFT reset
+/// (bit=0). Returns `(completed, new_saw_asserted)`. The loop exits
+/// successfully only on `completed=true`.
+pub(crate) fn lds_reset_poll_step(byte: u8, saw_asserted: bool) -> (bool, bool) {
+    let reset_bit = (byte >> 1) & 1;
+    let new_saw = saw_asserted || reset_bit == 1;
+    let completed = reset_bit == 0 && new_saw;
+    (completed, new_saw)
+}
+
 /// Full board reset mirroring tt-smi's `BHChipReset.full_lds_reset`.
 ///
 /// The PCI device is re-enumerated across the reset, so any fd held across
@@ -31,11 +54,7 @@ pub fn reset_board(card: u32) -> std::io::Result<()> {
             libc::close(fd);
         }
         let info = info?;
-        let domain = info.pci_domain as u32;
-        let bus = ((info.bus_dev_fn >> 8) & 0xff) as u32;
-        let dev = ((info.bus_dev_fn >> 3) & 0x1f) as u32;
-        let func = (info.bus_dev_fn & 0x7) as u32;
-        format!("{:04x}:{:02x}:{:02x}.{}", domain, bus, dev, func)
+        format_bdf(info.pci_domain as u32, info.bus_dev_fn as u32)
     };
     let config_path = format!("/sys/bus/pci/devices/{}/config", bdf);
     crate::dlog!(
@@ -70,12 +89,10 @@ pub fn reset_board(card: u32) -> std::io::Result<()> {
         f.seek(SeekFrom::Start(4))?;
         let mut byte = [0u8; 1];
         f.read_exact(&mut byte)?;
-        let reset_bit = (byte[0] >> 1) & 1;
         iters += 1;
-        if reset_bit == 1 {
-            saw_asserted = true;
-        }
-        if reset_bit == 0 && saw_asserted {
+        let (completed, new_saw) = lds_reset_poll_step(byte[0], saw_asserted);
+        saw_asserted = new_saw;
+        if completed {
             crate::dlog!(
                 "[reset_board]   reset completed after {} polls (command byte={:#04x})",
                 iters,
@@ -106,4 +123,96 @@ pub fn reset_board(card: u32) -> std::io::Result<()> {
     }
     crate::dlog!("[reset_board] complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_bdf_canonical_layout() {
+        // tt-kmd's bus_dev_fn packing: bits 15..8 = bus, 7..3 = dev,
+        // 2..0 = func. For 01:00.0 in domain 0000:
+        // bus_dev_fn = (1 << 8) | (0 << 3) | 0 = 0x0100.
+        assert_eq!(format_bdf(0, 0x0100), "0000:01:00.0");
+    }
+
+    #[test]
+    fn format_bdf_widens_dev_and_func() {
+        // dev=0x1f (max 5-bit value), func=0x7 (max 3-bit value),
+        // bus=0xff (max byte): bus_dev_fn = 0xfffd | 0x07 = 0xffff.
+        // Domain comfortably wider than 16-bit so the {:04x} format
+        // still pads the standard sysfs case.
+        assert_eq!(format_bdf(0xabcd, 0xffff), "abcd:ff:1f.7");
+    }
+
+    #[test]
+    fn format_bdf_masks_out_extra_bits_in_bus_dev_fn() {
+        // The kmd field is u16 in practice, but `format_bdf` accepts a
+        // u32 to dodge the cast at the callsite. Make sure stray high
+        // bits don't bleed through.
+        assert_eq!(format_bdf(0, 0xdead_0100), "0000:01:00.0");
+    }
+
+    // ---- lds_reset_poll_step ----
+    //
+    // The poll loop needs to observe the reset bit go through the
+    // 0 -> 1 -> 0 transition before returning success. These tests
+    // pin the small state machine so a reordering that lets it exit
+    // without ever seeing the assertion would fail loudly.
+
+    #[test]
+    fn poll_step_initial_zero_does_not_complete() {
+        // Bit hasn't been asserted yet; we keep waiting.
+        let (done, saw) = lds_reset_poll_step(0b0000_0000, false);
+        assert!(!done);
+        assert!(!saw);
+    }
+
+    #[test]
+    fn poll_step_observes_assertion_and_keeps_waiting() {
+        // Bit went up: record that we saw it, keep waiting for release.
+        let (done, saw) = lds_reset_poll_step(0b0000_0010, false);
+        assert!(!done);
+        assert!(saw);
+    }
+
+    #[test]
+    fn poll_step_completes_on_release_after_seeing_assertion() {
+        // Standard happy path: previous iter saw bit=1, this iter
+        // sees bit=0. Reset completed.
+        let (done, saw) = lds_reset_poll_step(0b0000_0000, true);
+        assert!(done);
+        assert!(saw);
+    }
+
+    #[test]
+    fn poll_step_does_not_complete_on_zero_without_prior_assertion() {
+        // Bit is 0 but we never saw it asserted. This is the broken
+        // path: returning early here would mean the chip never
+        // entered reset. Guard against an "if reset_bit == 0 break"
+        // reorder regression.
+        let (done, saw) = lds_reset_poll_step(0b0000_0000, false);
+        assert!(!done);
+        assert!(!saw);
+    }
+
+    #[test]
+    fn poll_step_keeps_saw_asserted_sticky_under_assertion() {
+        // While bit is still 1, we haven't completed yet but
+        // saw_asserted remains true.
+        let (done, saw) = lds_reset_poll_step(0b0000_0010, true);
+        assert!(!done);
+        assert!(saw);
+    }
+
+    #[test]
+    fn poll_step_ignores_unrelated_bits_in_command_byte() {
+        // Bit 0 (IO Space Enable) and bits 2..7 must not perturb the
+        // poll's decision — only bit 1 matters.
+        let (done_a, _) = lds_reset_poll_step(0b1111_1101, true);
+        assert!(done_a, "bit 1 = 0 plus saw_asserted -> done");
+        let (done_b, _) = lds_reset_poll_step(0b1111_1111, false);
+        assert!(!done_b, "all other bits set, bit 1 also set -> waiting");
+    }
 }
