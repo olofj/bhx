@@ -171,7 +171,17 @@ fn uart_pass(
     const IDLE_SLEEP: Duration = Duration::from_millis(10);
     const FAST_WINDOW: Duration = Duration::from_millis(200);
     const IDLE_WINDOW: Duration = Duration::from_secs(2);
+    /// Cadence for re-reading the OpenSBI bhx-purgatory status cell.
+    /// 200 ms is fast enough that `bhx connect` exits within a blink
+    /// of `poweroff` returning, slow enough to be invisible in the
+    /// daemon's CPU profile.
+    const PARKED_PROBE_INTERVAL: Duration = Duration::from_millis(200);
     let mut last_active = std::time::Instant::now();
+    let purg_pa = starting_address + crate::regs::purgatory::STATUS_OFFSET;
+    let mut last_parked = false;
+    let mut last_parked_check = std::time::Instant::now()
+        .checked_sub(PARKED_PROBE_INTERVAL)
+        .unwrap_or_else(std::time::Instant::now);
 
     loop {
         if exit_flag.load(Ordering::Relaxed) {
@@ -181,6 +191,25 @@ fn uart_pass(
         let magic = unsafe { read_magic(q) };
         if u64::from_le(magic) != VIRTUAL_UART_MAGIC {
             return Ok(UartExit::Retry);
+        }
+
+        // (#166) Notice when the guest has powered off and the slot
+        // has transitioned to Parked. The slot stays alive on the
+        // daemon side (so `bhx boot` can release-from-purgatory),
+        // but any attached `bhx connect` clients are now stranded —
+        // the chip is silent. Send them a goodbye on the false→true
+        // transition so they see EOF and exit cleanly.
+        if last_parked_check.elapsed() >= PARKED_PROBE_INTERVAL {
+            last_parked_check = std::time::Instant::now();
+            let parked = read_parked_state(l2cpu, purg_pa);
+            if detect_park_transition(last_parked, parked) {
+                hub.disconnect_all_with_reason(&format!(
+                    "l2cpu {} parked (guest powered off); `bhx boot -l {}` to release",
+                    l2cpu.idx(),
+                    l2cpu.idx()
+                ));
+            }
+            last_parked = parked;
         }
 
         // Drain up to N bytes from chip TX this pass.
@@ -426,6 +455,31 @@ fn decode_magic(magic_bytes: &[u8; 8]) -> Result<(), u64> {
     }
 }
 
+/// Read the OpenSBI bhx-purgatory status cell and return whether it
+/// holds the PARKED magic. Read failures are treated as "not parked"
+/// — same defensive default as `classify_sibling` in the boot path:
+/// if we can't read the cell we don't claim a transition happened.
+fn read_parked_state(l2cpu: &L2Cpu, purg_pa: u64) -> bool {
+    let lo = match l2cpu.read32(purg_pa) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let hi = match l2cpu.read32(purg_pa + 4) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let combined = ((hi as u64) << 32) | (lo as u64);
+    combined == crate::regs::purgatory::STATUS_PARKED
+}
+
+/// Compute whether to fire the "guest powered off" disconnect on this
+/// purgatory probe. Fires only on the false→true edge so a fully-
+/// parked slot whose pump runs many iterations without intervening
+/// transitions doesn't spam goodbyes at any client that re-attaches.
+pub(crate) fn detect_park_transition(last_parked: bool, current_parked: bool) -> bool {
+    !last_parked && current_parked
+}
+
 /// Daemon's long-running per-L2CPU console loop. Reattaches on chip reset
 /// (magic mismatch) the same way `console::console_main` does.
 pub fn chip_console_main(
@@ -543,6 +597,36 @@ mod tests {
         // the decoder to reject — that's the hardware layer's call.
         let buf = valid_descriptor(0);
         assert_eq!(decode_descriptor(&buf), Ok(0));
+    }
+
+    // ---- detect_park_transition ----
+
+    #[test]
+    fn park_transition_fires_on_false_to_true_edge() {
+        assert!(detect_park_transition(false, true));
+    }
+
+    #[test]
+    fn park_transition_does_not_fire_when_still_parked() {
+        // Each pump iteration after the initial transition keeps
+        // observing PARKED. We must not re-fire — already-attached
+        // clients are gone, and a NEW attach (post-park) would get
+        // hit on every probe interval.
+        assert!(!detect_park_transition(true, true));
+    }
+
+    #[test]
+    fn park_transition_does_not_fire_when_steady_running() {
+        assert!(!detect_park_transition(false, false));
+    }
+
+    #[test]
+    fn park_transition_does_not_fire_on_parked_to_running_edge() {
+        // The Parked → Running transition (host released the slot
+        // via `bhx boot`) just resets last_parked for future
+        // detections. No goodbye, no disconnect — there's nothing
+        // attached to disconnect from anyway.
+        assert!(!detect_park_transition(true, false));
     }
 
     #[test]
