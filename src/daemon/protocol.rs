@@ -43,8 +43,6 @@ pub enum Request {
         #[serde(default = "default_root_device")]
         root_device: String,
         #[serde(default)]
-        force_reset_pcie: bool,
-        #[serde(default)]
         disk: Option<String>,
         #[serde(default)]
         network: bool,
@@ -476,7 +474,6 @@ mod tests {
             dtb: "blackhole-card.dtb".into(),
             initramfs: None,
             root_device: "vda".into(),
-            force_reset_pcie: false,
             disk: None,
             network: false,
             extra_fwd: vec![],
@@ -509,7 +506,6 @@ mod tests {
             dtb: "blackhole-card.dtb".into(),
             initramfs: None,
             root_device: "vda".into(),
-            force_reset_pcie: false,
             disk: Some("debian.raw".into()),
             network: false,
             extra_fwd: vec![],
@@ -711,7 +707,6 @@ mod tests {
                 dtb: "c".into(),
                 initramfs: None,
                 root_device: "vda".into(),
-                force_reset_pcie: false,
                 disk: None,
                 network: false,
                 extra_fwd: vec![],
@@ -820,7 +815,6 @@ mod tests {
             dtb: "c".into(),
             initramfs: None,
             root_device: "vda".into(),
-            force_reset_pcie: false,
             disk: None,
             network: false,
             extra_fwd: vec![],

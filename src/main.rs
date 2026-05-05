@@ -135,13 +135,6 @@ enum Commands {
         /// Ignored when --initramfs is set.
         #[arg(long, default_value = "vda")]
         root_device: String,
-        /// Force a full PCIe link reset before booting.
-        ///
-        /// Disrupts other L2CPUs on the same card (they see a PCIe
-        /// blip), so by default we probe `L2CPU_RESET` first and only
-        /// reset when necessary.
-        #[arg(long)]
-        force_reset_pcie: bool,
         /// Tear down any existing slot for this L2CPU before re-imaging.
         ///
         /// Without this, a duplicate `boot` returns an error and leaves
@@ -844,7 +837,6 @@ fn main() -> std::process::ExitCode {
             dtb,
             initramfs,
             root_device,
-            force_reset_pcie,
             force,
             no_virtio_console,
             no_virtio_rng,
@@ -883,7 +875,6 @@ fn main() -> std::process::ExitCode {
                     dtb,
                     initramfs,
                     root_device,
-                    force_reset_pcie,
                     force,
                     disk_arg.as_deref(),
                     cli.network,
@@ -961,7 +952,6 @@ fn main() -> std::process::ExitCode {
                 dtb,
                 initramfs,
                 root_device,
-                force_reset_pcie,
                 disk,
                 cli.network,
                 fwd,
@@ -1244,7 +1234,6 @@ fn run_boot_client(
     dtb: String,
     initramfs: Option<String>,
     root_device: String,
-    force_reset_pcie: bool,
     disk: Option<String>,
     network: bool,
     extra_fwd: Vec<(u16, u16)>,
@@ -1289,7 +1278,6 @@ fn run_boot_client(
         dtb,
         initramfs,
         root_device,
-        force_reset_pcie,
         disk,
         network,
         extra_fwd,
@@ -2833,7 +2821,6 @@ fn run_boot_via_profile(
     dtb: String,
     initramfs: Option<String>,
     root_device: String,
-    force_reset_pcie: bool,
     force: bool,
     cli_disk: Option<&str>,
     cli_network: bool,
@@ -2966,7 +2953,6 @@ fn run_boot_via_profile(
         dtb,
         initramfs.or_else(|| p.initramfs.clone()),
         root_device,
-        force_reset_pcie,
         Some(disk_path.display().to_string()),
         network,
         fwd,

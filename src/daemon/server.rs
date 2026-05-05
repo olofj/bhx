@@ -318,7 +318,6 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             dtb,
             initramfs,
             root_device,
-            force_reset_pcie,
             disk,
             network,
             extra_fwd,
@@ -337,7 +336,6 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             &dtb,
             initramfs.as_deref(),
             &root_device,
-            force_reset_pcie,
             disk,
             network,
             extra_fwd,
@@ -781,7 +779,6 @@ fn dispatch_boot(
     dtb: &str,
     initramfs: Option<&str>,
     root_device: &str,
-    force_reset_pcie: bool,
     disk: Option<String>,
     network: bool,
     extra_fwd: Vec<(u16, u16)>,
@@ -804,8 +801,8 @@ fn dispatch_boot(
         initramfs
     };
     dlog!(
-        "[boot l2cpu {}] dispatch_boot entry: opensbi={} payload={:?} dtb={} initramfs={:?} root={} force_reset_pcie={} disk={:?} network={} console={} rng={} force={} mem_override={:?} hostname_override={:?} cloud_init={:?}",
-        l2cpu_idx, opensbi, payload, dtb, initramfs, root_device, force_reset_pcie, disk, network, console, rng, force, memory_override, hostname_override, cloud_init
+        "[boot l2cpu {}] dispatch_boot entry: opensbi={} payload={:?} dtb={} initramfs={:?} root={} disk={:?} network={} console={} rng={} force={} mem_override={:?} hostname_override={:?} cloud_init={:?}",
+        l2cpu_idx, opensbi, payload, dtb, initramfs, root_device, disk, network, console, rng, force, memory_override, hostname_override, cloud_init
     );
     validate_l2cpu(l2cpu_idx)?;
 
@@ -848,6 +845,14 @@ fn dispatch_boot(
 
     handle_existing_slot(state, l2cpu_idx, force).map_err(crate::Error::slot_state)?;
 
+    // (#166 Phase 6 / #168) Opportunistic chip-wide quiesce: if no
+    // sibling slot is Running, fold a `reset_board` into the cold-boot
+    // path. Parked siblings auto-transition to Stopped. Silent — the
+    // operator just sees a fresh chip + their target booted. When any
+    // sibling IS Running, we skip the reset (it would SIGBUS that
+    // sibling's worker) and proceed straight to cold-boot.
+    maybe_opportunistic_reset_board(state, l2cpu_idx, state.card)?;
+
     // Cold-boot: clear any captured shutdown scrollback (#160) so the
     // next slot's tail isn't conflated with the previous one's. Done
     // here rather than at run_boot_sequence's tail because the
@@ -873,7 +878,6 @@ fn dispatch_boot(
         dtb,
         initramfs,
         root_device,
-        force_reset_pcie,
         disk.is_some(),
         network,
         console,
@@ -1211,6 +1215,113 @@ fn handle_existing_slot(
         prior.shutdown();
         dlog!("[boot l2cpu {}] prior slot torn down", l2cpu_idx);
     }
+    Ok(())
+}
+
+/// (#166 Phase 6 / #168) Opportunistic `reset_board` folded into the
+/// cold-boot path. Silent / automatic. Goes through when:
+///
+///   - the target slot itself is `None` after `handle_existing_slot`
+///     (a true cold boot, not a release-from-purgatory or force-park
+///     flow that already returned earlier);
+///   - no NON-target slot is `Running` — we need a clean sweep, but
+///     a running guest's worker would SIGBUS the daemon when the PCIe
+///     LDS reset invalidates its mmap.
+///
+/// Effect on parked siblings: their `L2Cpu` instances are dropped and
+/// the slots transition to `None` (Stopped). The operator sees them
+/// as cold-bootable again. The reset is logged loudly so this is
+/// visible without `--verbose` flags.
+///
+/// When skipped (because a sibling is Running), the cold boot
+/// proceeds as today — no reset, no kernel-side state guarantees
+/// beyond what the previous boot left behind. The operator is in
+/// charge of explicitly stopping the running sibling first if they
+/// want a fully-clean baseline.
+fn maybe_opportunistic_reset_board(
+    state: &Arc<DaemonState>,
+    target_idx: u8,
+    card: u32,
+) -> crate::Result<()> {
+    // Snapshot non-target slot states without holding all four mutexes
+    // simultaneously: identify Running siblings and Parked siblings in
+    // separate passes. Running detection: slot is Some AND its
+    // purgatory cell does NOT read PARKED. Parked detection: slot is
+    // Some AND purgatory cell == PARKED magic.
+    let mut running_siblings = Vec::new();
+    let mut parked_siblings = Vec::new();
+    for i in 0..4u8 {
+        if i == target_idx {
+            continue;
+        }
+        let guard = state.l2cpus[i as usize].lock_or_internal_error()?;
+        let Some(slot) = guard.as_ref() else {
+            continue;
+        };
+        let mem_base = crate::l2cpu::L2CPU_STARTING_ADDRESS[i as usize];
+        let purg_pa = mem_base + crate::regs::purgatory::STATUS_OFFSET;
+        let purg = match (slot.l2cpu.read32(purg_pa), slot.l2cpu.read32(purg_pa + 4)) {
+            (Ok(lo), Ok(hi)) => Some(((hi as u64) << 32) | (lo as u64)),
+            _ => None,
+        };
+        if purg == Some(crate::regs::purgatory::STATUS_PARKED) {
+            parked_siblings.push(i);
+        } else {
+            running_siblings.push(i);
+        }
+    }
+
+    if !running_siblings.is_empty() {
+        dlog!(
+            "[boot l2cpu {}] opportunistic reset_board skipped — sibling l2cpu {:?} still Running",
+            target_idx,
+            running_siblings
+        );
+        return Ok(());
+    }
+
+    dlog!(
+        "[boot l2cpu {}] opportunistic reset_board: no Running siblings; parked siblings to drop: {:?}",
+        target_idx,
+        parked_siblings
+    );
+
+    // Drop parked-sibling L2Cpu instances + transition slots to None.
+    // Console-hub clients (if any) get the goodbye; engine slots
+    // unregister so the kick poller stops dispatching to them.
+    for &i in &parked_siblings {
+        if let Ok(true) = internal_stop(state, i, "opportunistic reset_board") {
+            dlog!(
+                "[boot l2cpu {}] opportunistic reset: l2cpu {} transitioned Parked → Stopped",
+                target_idx,
+                i
+            );
+        }
+    }
+
+    // Drop the engine + kick poller before the PCIe LDS reset. Their
+    // fds point at the about-to-be-reset chardev; holding them across
+    // the reset would leave them pointing at unmapped BARs.
+    let _ = state.kick_poller.lock_or_internal_error()?.take();
+    let _ = state.tensix_engine.lock_or_internal_error()?.take();
+
+    // Hold the boot_lock across reset_board so a concurrent boot RPC
+    // (different thread, different L2CPU) doesn't race with the reset.
+    let _boot_guard = state
+        .boot_lock
+        .lock()
+        .map_err(|_| crate::Error::internal("daemon boot_lock poisoned"))?;
+    state
+        .shared_chip
+        .reset_board(card)
+        .map_err(|e| crate::Error::Io {
+            ctx: "opportunistic reset_board".into(),
+            source: e,
+        })?;
+    dlog!(
+        "[boot l2cpu {}] opportunistic reset_board complete",
+        target_idx
+    );
     Ok(())
 }
 
@@ -1570,7 +1681,6 @@ fn run_boot_sequence(
     dtb: &str,
     initramfs: Option<&str>,
     root_device: &str,
-    force_reset_pcie: bool,
     has_disk: bool,
     has_network: bool,
     has_console: bool,
@@ -1580,7 +1690,6 @@ fn run_boot_sequence(
 ) -> io::Result<BootArtifacts> {
     use crate::regs::boot_image;
 
-    let card = state.card;
     let starting_address = crate::l2cpu::L2CPU_STARTING_ADDRESS[l2cpu_idx as usize];
     let physical_size = crate::l2cpu::L2CPU_MEMORY_SIZE[l2cpu_idx as usize];
     // #91: clamp the operator's override to the L2CPU's physical DRAM
@@ -1610,62 +1719,13 @@ fn run_boot_sequence(
     let dtb_addr = starting_address + boot_image::DTB_OFFSET;
     let rootfs_addr = starting_address + boot_image::INITRAMFS_OFFSET;
 
-    // Reset coordination (#162). Two concurrent dispatch_boots in the
-    // same multi-L2CPU iter would otherwise both observe `running=true`
-    // from the previous iter, both call `reset_board()`, and the second
-    // PCIe blip would land while the first boot is mid-`L2Cpu::new` and
-    // kill it. The card-wide `boot_lock` lets the first thread reset
-    // the board; the second thread acquires the lock afterwards, finds
-    // `running=false` (the first thread's reset cleared everything),
-    // and skips its own reset. After release, both threads proceed
-    // through the per-L2CPU image-load path concurrently.
-    {
-        let _boot_guard = state
-            .boot_lock
-            .lock()
-            .map_err(|_| io::Error::other("daemon boot_lock poisoned"))?;
-        let running = state.shared_chip.l2cpu_is_running(l2cpu_idx as usize)?;
-        let need_reset = force_reset_pcie || running;
-        dlog!(
-            "[run_boot l2cpu {}] running={} force_reset_pcie={} need_reset={}",
-            l2cpu_idx,
-            running,
-            force_reset_pcie,
-            need_reset
-        );
-
-        if need_reset {
-            dlog!(
-                "[run_boot l2cpu {}] issuing full board reset (other L2CPUs on this card will see a PCIe blip)",
-                l2cpu_idx
-            );
-            // Drop the engine + its kick poller before the PCIe LDS reset.
-            // The engine's `TensixTile` holds an open `/dev/tenstorrent/N`
-            // fd; an LDS reset re-enumerates the device, leaving any
-            // pre-reset fds pointing at unmapped BARs. Hanging on the
-            // CONFIG_WRITE ioctl (observed empirically on the bench's
-            // back-to-back daemon-restart path) is the failure mode. Per
-            // the lifetime model "tensix has the same lifetime as the
-            // L2CPUs", a board reset is the natural moment to recycle
-            // the engine — the next cold-boot RPC will bring it up fresh.
-            // Drop the kick poller first (its thread holds another
-            // Arc<TensixEngine>); KickPoller::drop joins the thread.
-            let _ = state.kick_poller.lock_or_internal_error()?.take();
-            let _ = state.tensix_engine.lock_or_internal_error()?.take();
-            // SharedChip::reset_board internally drops its fd+window, issues the
-            // PCIe LDS reset, reopens fresh, and polls ARC FW init status until
-            // Done (GDDR PHY + DRAM training complete) — callers never see stale
-            // fd errors across the reset, and the wait scales to actual chip
-            // readiness instead of a fixed 1 s sleep.
-            state.shared_chip.reset_board(card)?;
-            dlog!("[run_boot l2cpu {}] board reset complete", l2cpu_idx);
-        } else {
-            dlog!(
-                "[run_boot l2cpu {}] target held in reset; skipping board reset (siblings untouched)",
-                l2cpu_idx
-            );
-        }
-    }
+    // Phase 6 (#168) moved the opportunistic reset_board into
+    // `maybe_opportunistic_reset_board` called from dispatch_boot
+    // BEFORE this function — the precondition needs daemon-level slot
+    // state visibility, and Phases 4b/5 may take alternative paths
+    // (release-from-purgatory, force-park) that bypass cold-boot
+    // entirely. Once we're here, this is a true cold boot: build the
+    // L2Cpu, write the image, release from reset.
 
     // Construct the runtime L2Cpu handle BEFORE the image load so the load
     // can go through its persistent fd + `get_persistent_2m_window` UC
