@@ -172,10 +172,10 @@ fn uart_pass(
     const FAST_WINDOW: Duration = Duration::from_millis(200);
     const IDLE_WINDOW: Duration = Duration::from_secs(2);
     /// Cadence for re-reading the OpenSBI bhx-purgatory status cell.
-    /// 200 ms is fast enough that `bhx connect` exits within a blink
-    /// of `poweroff` returning, slow enough to be invisible in the
-    /// daemon's CPU profile.
-    const PARKED_PROBE_INTERVAL: Duration = Duration::from_millis(200);
+    /// 1.5 s is plenty for `bhx connect` to exit a beat after the
+    /// guest's `poweroff` finishes printing — operator-visible
+    /// latency, not interrupt-handler latency.
+    const PARKED_PROBE_INTERVAL: Duration = Duration::from_millis(1500);
     let mut last_active = std::time::Instant::now();
     let purg_pa = starting_address + crate::regs::purgatory::STATUS_OFFSET;
     let mut last_parked = false;
