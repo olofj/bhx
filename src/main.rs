@@ -378,10 +378,16 @@ enum DaemonAction {
         no_sandbox: bool,
         /// Bind a Prometheus exporter on 127.0.0.1:<port>.
         ///
-        /// Serves `GET /metrics`. Loopback only. Off by default; pass
-        /// an explicit port to enable. See `daemon::metrics`.
+        /// Serves `GET /metrics`. Loopback only — never listens on
+        /// public interfaces. Default 9090. Pass `--no-metrics` to
+        /// disable, or another port if 9090 is taken (e.g.
+        /// multi-card hosts where each card's daemon needs its
+        /// own port). See `daemon::metrics`.
+        #[arg(long, default_value_t = 9090)]
+        metrics_port: u16,
+        /// Skip binding the Prometheus exporter entirely.
         #[arg(long)]
-        metrics_port: Option<u16>,
+        no_metrics: bool,
     },
     /// Stop the daemon: SIGTERM, 5s grace, SIGKILL; idempotent.
     Stop,
@@ -396,8 +402,11 @@ enum DaemonAction {
         #[arg(long)]
         no_sandbox: bool,
         /// See `daemon start --metrics-port`.
+        #[arg(long, default_value_t = 9090)]
+        metrics_port: u16,
+        /// See `daemon start --no-metrics`.
         #[arg(long)]
-        metrics_port: Option<u16>,
+        no_metrics: bool,
     },
     /// Show daemon + per-L2CPU status.
     Status {
@@ -1301,8 +1310,9 @@ enum AutoStartDecision {
     /// of silently spawning a daemon.
     Disabled,
     /// Auto-start permitted; spawn with these options. `metrics_port`
-    /// honors `BHX_AUTO_START_METRICS_PORT`.
-    Spawn { metrics_port: Option<u16> },
+    /// honors `BHX_AUTO_START_METRICS_PORT`. `no_metrics` honors
+    /// `BHX_AUTO_START_NO_METRICS=1`.
+    Spawn { metrics_port: u16, no_metrics: bool },
 }
 
 /// Pure-function policy decoder. Looks at env vars only; no side
@@ -1317,8 +1327,17 @@ where
     ) {
         return AutoStartDecision::Disabled;
     }
-    let metrics_port = getter("BHX_AUTO_START_METRICS_PORT").and_then(|v| v.trim().parse().ok());
-    AutoStartDecision::Spawn { metrics_port }
+    let metrics_port = getter("BHX_AUTO_START_METRICS_PORT")
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(9090);
+    let no_metrics = matches!(
+        getter("BHX_AUTO_START_NO_METRICS").as_deref(),
+        Some("1") | Some("true")
+    );
+    AutoStartDecision::Spawn {
+        metrics_port,
+        no_metrics,
+    }
 }
 
 /// Auto-start the per-card daemon if it isn't already running. Limited
@@ -1349,7 +1368,10 @@ fn ensure_daemon_running(card: u32) -> std::io::Result<()> {
                 card, card
             ))))
         }
-        AutoStartDecision::Spawn { metrics_port } => {
+        AutoStartDecision::Spawn {
+            metrics_port,
+            no_metrics,
+        } => {
             eprintln!("[daemon] not running for card {} — auto-starting", card);
             daemon::runner::start(daemon::runner::StartOpts {
                 card,
@@ -1357,6 +1379,7 @@ fn ensure_daemon_running(card: u32) -> std::io::Result<()> {
                 log_file: None,
                 sandbox: true,
                 metrics_port,
+                no_metrics,
             })
         }
     }
@@ -2484,12 +2507,14 @@ fn run_daemon_cmd(card: u32, action: DaemonAction) -> std::io::Result<()> {
             log_file,
             no_sandbox,
             metrics_port,
+            no_metrics,
         } => daemon::runner::start(daemon::runner::StartOpts {
             card,
             foreground,
             log_file: log_file.map(std::path::PathBuf::from),
             sandbox: !no_sandbox,
             metrics_port,
+            no_metrics,
         }),
         DaemonAction::Stop => daemon::runner::stop(card),
         DaemonAction::Restart {
@@ -2497,12 +2522,14 @@ fn run_daemon_cmd(card: u32, action: DaemonAction) -> std::io::Result<()> {
             log_file,
             no_sandbox,
             metrics_port,
+            no_metrics,
         } => daemon::runner::restart(
             card,
             foreground,
             log_file.map(std::path::PathBuf::from),
             !no_sandbox,
             metrics_port,
+            no_metrics,
         ),
         DaemonAction::Status { debug } => daemon::runner::status(card, debug),
         DaemonAction::Logs { lines, no_follow } => daemon::runner::logs(daemon::runner::LogsOpts {
@@ -3050,10 +3077,13 @@ mod tests {
     }
 
     #[test]
-    fn auto_start_default_is_spawn_with_no_metrics_port() {
+    fn auto_start_default_spawns_with_metrics_port_9090() {
         assert_eq!(
             auto_start_decision_from_env(empty_env),
-            AutoStartDecision::Spawn { metrics_port: None }
+            AutoStartDecision::Spawn {
+                metrics_port: 9090,
+                no_metrics: false,
+            }
         );
     }
 
@@ -3092,10 +3122,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_start_forwards_metrics_port() {
+    fn auto_start_forwards_metrics_port_override() {
         let g = |k: &str| {
             if k == "BHX_AUTO_START_METRICS_PORT" {
-                Some("9090".into())
+                Some("9101".into())
             } else {
                 None
             }
@@ -3103,13 +3133,14 @@ mod tests {
         assert_eq!(
             auto_start_decision_from_env(g),
             AutoStartDecision::Spawn {
-                metrics_port: Some(9090)
+                metrics_port: 9101,
+                no_metrics: false,
             }
         );
     }
 
     #[test]
-    fn auto_start_ignores_garbage_metrics_port() {
+    fn auto_start_falls_back_to_default_port_on_garbage_override() {
         let g = |k: &str| {
             if k == "BHX_AUTO_START_METRICS_PORT" {
                 Some("not-a-port".into())
@@ -3119,8 +3150,31 @@ mod tests {
         };
         assert_eq!(
             auto_start_decision_from_env(g),
-            AutoStartDecision::Spawn { metrics_port: None }
+            AutoStartDecision::Spawn {
+                metrics_port: 9090,
+                no_metrics: false,
+            }
         );
+    }
+
+    #[test]
+    fn auto_start_no_metrics_via_env_var() {
+        for v in ["1", "true"] {
+            let g = move |k: &str| {
+                if k == "BHX_AUTO_START_NO_METRICS" {
+                    Some(v.to_string())
+                } else {
+                    None
+                }
+            };
+            assert_eq!(
+                auto_start_decision_from_env(g),
+                AutoStartDecision::Spawn {
+                    metrics_port: 9090,
+                    no_metrics: true,
+                }
+            );
+        }
     }
 
     #[test]

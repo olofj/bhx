@@ -28,10 +28,12 @@ pub struct StartOpts {
     /// Install seccomp + landlock filters before the accept loop. See
     /// `daemon::sandbox`.
     pub sandbox: bool,
-    /// If set, bind a Prometheus-style HTTP exporter on
-    /// `127.0.0.1:<port>` and serve `GET /metrics`. None = no exporter.
+    /// Bind a Prometheus-style HTTP exporter on `127.0.0.1:<port>`
+    /// and serve `GET /metrics`. Loopback only. Default 9090.
     /// See `daemon::metrics`.
-    pub metrics_port: Option<u16>,
+    pub metrics_port: u16,
+    /// Skip the metrics exporter bind entirely.
+    pub no_metrics: bool,
 }
 
 /// Resolve the caller-supplied log path against the current working dir and
@@ -152,6 +154,7 @@ fn run_foreground(
         opts.sandbox,
         log_path,
         opts.metrics_port,
+        opts.no_metrics,
     )?;
     drop(pid_guard);
     let _ = std::fs::remove_file(pid_path);
@@ -223,6 +226,7 @@ fn run_daemonized(
         opts.sandbox,
         log_path,
         opts.metrics_port,
+        opts.no_metrics,
     ) {
         crate::dlog!("[daemon] fatal: {}", e);
     }
@@ -240,7 +244,8 @@ pub fn restart(
     foreground: bool,
     log_file: Option<PathBuf>,
     sandbox: bool,
-    metrics_port: Option<u16>,
+    metrics_port: u16,
+    no_metrics: bool,
 ) -> io::Result<()> {
     stop(card)?;
     start(StartOpts {
@@ -249,6 +254,7 @@ pub fn restart(
         log_file,
         sandbox,
         metrics_port,
+        no_metrics,
     })
 }
 

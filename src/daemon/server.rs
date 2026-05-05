@@ -52,7 +52,8 @@ pub fn serve(
     listener: UnixListener,
     sandbox: bool,
     log_path: &Path,
-    metrics_port: Option<u16>,
+    metrics_port: u16,
+    no_metrics: bool,
 ) -> io::Result<()> {
     // Open the one-and-only persistent TLB window to tile (8,0) before
     // anything else touches chip state, so the daemon has a single
@@ -78,17 +79,17 @@ pub fn serve(
     // sandbox-install failures abort the daemon. Once the listener is
     // up, the accept thread runs under whatever sandbox we install
     // next (the seccomp filter already allows TCP listen+accept).
-    if let Some(port) = metrics_port {
-        if let Err(e) = crate::daemon::metrics::spawn_exporter(port, state.clone()) {
+    // Default-on as of f61f9d-ish: 127.0.0.1:9090. Operators with
+    // multiple cards override `--metrics-port` per daemon to avoid
+    // bind-conflict; the rest get observability for free.
+    if !no_metrics {
+        if let Err(e) = crate::daemon::metrics::spawn_exporter(metrics_port, state.clone()) {
             return Err(crate::Error::Io {
-                ctx: format!("metrics exporter bind on 127.0.0.1:{}", port),
+                ctx: format!("metrics exporter bind on 127.0.0.1:{}", metrics_port),
                 source: e,
             }
             .into());
         }
-        // The bound port is also the requested port (we don't pass 0
-        // through the CLI), so we don't need to log it here — the
-        // metrics module already logs the bind on its own.
     }
 
     // Install seccomp + landlock AFTER chip probe + warm-resume have
