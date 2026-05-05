@@ -72,6 +72,15 @@ unsafe fn read_rx_tail(q: *const u8) -> u32 {
 unsafe fn write_rx_head(q: *mut u8, val: u32) {
     ptr::write_volatile(q.add(OFF_RX_HEAD) as *mut u32, val);
 }
+/// Cross-domain write of the consumer index. Only safe when the chip
+/// side isn't reading — i.e. when the guest is parked in OpenSBI's
+/// `sbi_hsm_hart_wait` and no kernel is running. Used by
+/// [`drain_rx_on_park`] to throw away stale bytes that the dying
+/// kernel didn't consume so they don't surface as commands at U-Boot
+/// on the next release-from-purgatory wake.
+unsafe fn write_rx_tail(q: *mut u8, val: u32) {
+    ptr::write_volatile(q.add(OFF_RX_TAIL) as *mut u32, val);
+}
 unsafe fn can_push(q: *const u8) -> bool {
     atomic::fence(Ordering::Acquire);
     let head = read_rx_head(q) % BUFFER_SIZE;
@@ -208,6 +217,26 @@ fn uart_pass(
                     l2cpu.idx(),
                     l2cpu.idx()
                 ));
+                // Drain any input the kernel didn't consume before it
+                // poweroff'd: bytes still in the daemon-side mpsc
+                // channel from the writer client, plus bytes already
+                // pushed into the chip-side virtuart RX ring. Without
+                // this, U-Boot reads them on the next release-from-
+                // purgatory wake and treats them as commands at the
+                // `=>` prompt, interrupting autoboot. Cross-domain
+                // write of `rx_tail` is safe here because the guest
+                // is in OpenSBI's hsm_hart_wait — no kernel is
+                // reading from this ring.
+                let mpsc_dropped = drain_input_channel(input_rx);
+                let ring_dropped = unsafe { drain_rx_ring(q) };
+                if mpsc_dropped > 0 || ring_dropped > 0 {
+                    crate::dlog!(
+                        "[console l2cpu {}] parked: dropped {} byte(s) from input mpsc, {} byte(s) from chip-side RX ring",
+                        l2cpu.idx(),
+                        mpsc_dropped,
+                        ring_dropped
+                    );
+                }
             }
             last_parked = parked;
         }
@@ -478,6 +507,40 @@ fn read_parked_state(l2cpu: &L2Cpu, purg_pa: u64) -> bool {
 /// transitions doesn't spam goodbyes at any client that re-attaches.
 pub(crate) fn detect_park_transition(last_parked: bool, current_parked: bool) -> bool {
     !last_parked && current_parked
+}
+
+/// Pull every queued byte out of the writer-side mpsc channel and
+/// drop them. Returns the count of bytes dropped. Called on the
+/// Parked transition so client keystrokes the kernel didn't consume
+/// don't end up shoved into the chip-side ring during the parked
+/// window — they'd surface as commands at U-Boot's `=>` prompt on
+/// the next release-from-purgatory wake.
+fn drain_input_channel(input_rx: &mpsc::Receiver<u8>) -> usize {
+    let mut n = 0usize;
+    while input_rx.try_recv().is_ok() {
+        n += 1;
+    }
+    n
+}
+
+/// Cross-domain reset of the chip-side virtuart RX ring: write the
+/// guest-owned `rx_tail` to match the daemon-owned `rx_head`,
+/// effectively "the guest has consumed everything." Safe only when
+/// no guest code is reading the ring — i.e. the guest is parked in
+/// OpenSBI's hsm_hart_wait. Returns the byte count we threw away
+/// (head - tail, modulo BUFFER_SIZE).
+///
+/// # Safety
+/// Caller must hold a valid `q` pointer to a virtuart whose magic
+/// has been validated, and must guarantee no other code path is
+/// concurrently writing `rx_head` (the daemon's own pump is the only
+/// other writer; this function is called from the same pump thread).
+unsafe fn drain_rx_ring(q: *mut u8) -> u32 {
+    let head = read_rx_head(q);
+    let tail = read_rx_tail(q);
+    let pending = head.wrapping_sub(tail) % BUFFER_SIZE;
+    write_rx_tail(q, head);
+    pending
 }
 
 /// Daemon's long-running per-L2CPU console loop. Reattaches on chip reset
