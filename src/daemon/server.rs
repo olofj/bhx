@@ -563,14 +563,17 @@ fn validate_remove_disk_request(disks_empty: bool) -> Result<(), &'static str> {
 }
 
 /// Pick the first free `DEV_BLK*` slot index for a new attach, given
-/// the slots already in use. Returns `None` if all three are taken.
-/// Tied to `MAX_DISKS_PER_L2CPU`; bumping that requires extending the
-/// list here in lockstep.
-fn pick_free_blk_slot(used: &[u32]) -> Option<u32> {
+/// the slots already in use AND the slots whose `virtio,mmio` DTB
+/// node was emitted at cold boot (#117). The DTB-emitted set
+/// constrains hot-add: Linux's virtio probe walks the DT once and
+/// doesn't rescan, so a "successful" attach to a slot the kernel
+/// never saw would be a phantom. Returns `None` if every eligible
+/// slot is taken or no eligible slot was declared at cold boot.
+fn pick_free_blk_slot(used: &[u32], eligible: &[u32]) -> Option<u32> {
     use crate::virtio_engine::{DEV_BLK, DEV_BLK1, DEV_BLK2};
     [DEV_BLK, DEV_BLK1, DEV_BLK2]
         .into_iter()
-        .find(|s| !used.contains(s))
+        .find(|s| eligible.contains(s) && !used.contains(s))
 }
 
 fn irq_for_blk_dev_idx(dev_idx: u32) -> u32 {
@@ -910,9 +913,22 @@ fn dispatch_boot(
             source: e,
         }
     })?;
+    // (#117) Record which BLK dev_idx values we emitted DTB nodes for
+    // at cold boot. dispatch_add_disk uses this to refuse hot-add of
+    // a slot the kernel never saw — Linux's virtio probe walks the DT
+    // once at boot and doesn't rescan, so a "successful" hot-add at a
+    // never-declared slot would be a phantom that the operator can't
+    // see. DEV_BLK is always declared (rootfs); DEV_BLK1 only when
+    // --cloud-init was passed.
+    let mut blk_dtb_dev_idx = vec![crate::virtio_engine::DEV_BLK];
+    if cloud_init.is_some() {
+        blk_dtb_dev_idx.push(crate::virtio_engine::DEV_BLK1);
+    }
+    slot.blk_dtb_dev_idx = blk_dtb_dev_idx;
     dlog!(
-        "[boot l2cpu {}] slot ready (console worker spawned)",
-        l2cpu_idx
+        "[boot l2cpu {}] slot ready (console worker spawned, blk_dtb_dev_idx={:?})",
+        l2cpu_idx,
+        slot.blk_dtb_dev_idx
     );
 
     // Register virtio device handlers with the engine's kick poller.
@@ -2074,6 +2090,12 @@ fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlo
             description: format!("chip_console l2cpu {}", l2cpu_idx),
         },
         disks: Vec::new(),
+        // Conservative default: warm-resumed slots come through this
+        // path with no record of which BLK dev_idx values the
+        // original cold boot declared, so we assume DEV_BLK only.
+        // Cold-boot callers (run_boot_sequence) overwrite this with
+        // the actual DTB-emitted set before installing the slot.
+        blk_dtb_dev_idx: vec![crate::virtio_engine::DEV_BLK],
         net: None,
         virtio_console: None,
         virtio_rng: None,
@@ -2342,15 +2364,19 @@ fn dispatch_add_disk(
         slot.disks.iter().map(|d| d.name.clone()),
         std::path::Path::new(&path),
     )?;
-    // Pick the first free DEV_BLK* slot. Each existing disk's slot_idx
-    // is in engine-slot space (l2cpu_idx * DEVS_PER_L2CPU + dev_idx);
-    // map back to dev_idx for the picker.
+    // Pick the first free DEV_BLK* slot among the ones whose
+    // virtio-mmio DTB node was emitted at cold boot. Each existing
+    // disk's slot_idx is in engine-slot space (l2cpu_idx *
+    // DEVS_PER_L2CPU + dev_idx); map back to dev_idx for the picker.
     let l2cpu_base = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU;
     let used: Vec<u32> = slot.disks.iter().map(|d| d.slot_idx - l2cpu_base).collect();
-    let dev_idx = pick_free_blk_slot(&used).ok_or_else(|| {
+    let dev_idx = pick_free_blk_slot(&used, &slot.blk_dtb_dev_idx).ok_or_else(|| {
         crate::Error::slot_state(format!(
-            "no free virtio-blk slots (max {})",
-            MAX_DISKS_PER_L2CPU
+            "no virtio-blk slot available for hot-add on l2cpu {} \
+             (DTB-declared blk dev_idxs: {:?}, in use: {:?}). \
+             Re-boot with `bhx boot --cloud-init <seed>` to declare a second blk slot at cold-boot, \
+             or stop and cold-boot with the disks declared up front.",
+            l2cpu_idx, slot.blk_dtb_dev_idx, used
         ))
     })?;
     let irq = irq_for_blk_dev_idx(dev_idx);
@@ -3370,14 +3396,41 @@ mod tests {
     #[test]
     fn pick_free_blk_slot_walks_dev_blk_first() {
         use crate::virtio_engine::{DEV_BLK, DEV_BLK1, DEV_BLK2};
+        let all = [DEV_BLK, DEV_BLK1, DEV_BLK2];
         // No disks attached → DEV_BLK.
-        assert_eq!(pick_free_blk_slot(&[]), Some(DEV_BLK));
+        assert_eq!(pick_free_blk_slot(&[], &all), Some(DEV_BLK));
         // Rootfs attached → next is DEV_BLK1 (cidata slot).
-        assert_eq!(pick_free_blk_slot(&[DEV_BLK]), Some(DEV_BLK1));
+        assert_eq!(pick_free_blk_slot(&[DEV_BLK], &all), Some(DEV_BLK1));
         // Rootfs + cidata → DEV_BLK2.
-        assert_eq!(pick_free_blk_slot(&[DEV_BLK, DEV_BLK1]), Some(DEV_BLK2));
+        assert_eq!(
+            pick_free_blk_slot(&[DEV_BLK, DEV_BLK1], &all),
+            Some(DEV_BLK2)
+        );
         // All three taken → None.
-        assert_eq!(pick_free_blk_slot(&[DEV_BLK, DEV_BLK1, DEV_BLK2]), None);
+        assert_eq!(
+            pick_free_blk_slot(&[DEV_BLK, DEV_BLK1, DEV_BLK2], &all),
+            None
+        );
+    }
+
+    #[test]
+    fn pick_free_blk_slot_respects_dtb_eligibility() {
+        // (#117) Only DTB-declared slots are picked, even if a
+        // higher-numbered slot is unused. Cold boot without
+        // --cloud-init declares DEV_BLK only; hot-add must refuse.
+        use crate::virtio_engine::{DEV_BLK, DEV_BLK1};
+        let only_blk = [DEV_BLK];
+        // Rootfs already attached, DEV_BLK1 unused but not declared.
+        assert_eq!(pick_free_blk_slot(&[DEV_BLK], &only_blk), None);
+        // Cidata declared too: DEV_BLK1 is now eligible.
+        let blk_and_cidata = [DEV_BLK, DEV_BLK1];
+        assert_eq!(
+            pick_free_blk_slot(&[DEV_BLK], &blk_and_cidata),
+            Some(DEV_BLK1)
+        );
+        // Empty eligibility set (theoretical: an initramfs-only boot)
+        // refuses everything.
+        assert_eq!(pick_free_blk_slot(&[], &[]), None);
     }
 
     // ---- validate_remove_disk_request ----

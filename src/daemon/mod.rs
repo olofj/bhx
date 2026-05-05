@@ -96,6 +96,15 @@ pub struct L2CpuSlot {
     pub console_input_tx: Sender<u8>,
     pub console_worker: WorkerHandle,
     pub disks: Vec<DiskWorker>,
+    /// Set of `DEV_BLK*` device indices (inside `[0, DEVS_PER_L2CPU)`)
+    /// for which a `virtio,mmio` node was emitted at cold-boot time
+    /// (#117). Linux's virtio probe walks the DT once at boot and
+    /// doesn't rescan, so only these slots can accept a post-boot
+    /// `add-disk`. Slots outside this set are silently invisible to
+    /// the kernel and `dispatch_add_disk` rejects them with a clear
+    /// error rather than letting the operator wonder why their disk
+    /// never shows up.
+    pub blk_dtb_dev_idx: Vec<u32>,
     pub net: Option<WorkerHandle>,
     /// virtio-console worker (#51). When `Some`, kernel sees a
     /// virtio-mmio device with id=3 in the third virtio slot. Operator
