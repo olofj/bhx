@@ -123,6 +123,15 @@ pub fn vdd_limits(raw: u32) -> (u16, u16) {
     ((raw & 0xFFFF) as u16, ((raw >> 16) & 0xFFFF) as u16)
 }
 
+/// Reduce a packed-4-byte u32 (e.g. `GDDR{01,23,45,67}_TEMP`, where ARC
+/// firmware stuffs four u8 sensor readings into one tag word) to a
+/// single °C value: the maximum across the four bytes. Matches the
+/// semantics of the scalar `MAX_GDDR_TEMP` aggregate, which is the
+/// global max of all 16 sensor readings across the four pair-tags.
+pub fn max_byte_u32(raw: u32) -> u32 {
+    raw.to_le_bytes().iter().copied().max().unwrap_or(0) as u32
+}
+
 /// Decoded telemetry of interest. The raw `entries` map is preserved
 /// so `debug telemetry-dump` can show every tag the firmware reported,
 /// not just the few fields M2 cares about.
@@ -157,8 +166,14 @@ pub struct Telemetry {
     pub vreg_temperature_mc: i32,
     pub board_temperature_mc: i32,
     pub max_gddr_temperature_c: u32,
-    /// Per-channel-pair GDDR temps (°C, integer). Indexes 0..4 map to
-    /// channel pairs 01, 23, 45, 67.
+    /// Per-channel-pair max GDDR temperature (°C, integer). Indexes
+    /// 0..4 map to channel pairs 01, 23, 45, 67. The chip publishes
+    /// each `GDDR{0123,2345,4567,67xx}_TEMP` tag as a u32 with **four
+    /// u8 sensor readings packed in** (one per channel within the
+    /// pair, plus die-edge sensors); the decoder reduces those to a
+    /// single max-temperature-in-the-pair value, which is what
+    /// operationally drives throttle decisions and matches the
+    /// scalar `max_gddr_temperature_c` aggregate in semantics.
     pub gddr_temperature_c: [u32; 4],
     /// Per-channel-pair correctable ECC error counts (monotonic).
     pub gddr_corr_errs: [u32; 4],
@@ -316,10 +331,10 @@ pub fn decode_entries(version: u32, entry_count: u32, entries: &[TelemetryEntry]
             tag::VREG_TEMPERATURE => t.vreg_temperature_mc = fixed16_to_millicelsius(e.data),
             tag::BOARD_TEMPERATURE => t.board_temperature_mc = fixed16_to_millicelsius(e.data),
             tag::MAX_GDDR_TEMP => t.max_gddr_temperature_c = e.data,
-            tag::GDDR01_TEMP => t.gddr_temperature_c[0] = e.data,
-            tag::GDDR23_TEMP => t.gddr_temperature_c[1] = e.data,
-            tag::GDDR45_TEMP => t.gddr_temperature_c[2] = e.data,
-            tag::GDDR67_TEMP => t.gddr_temperature_c[3] = e.data,
+            tag::GDDR01_TEMP => t.gddr_temperature_c[0] = max_byte_u32(e.data),
+            tag::GDDR23_TEMP => t.gddr_temperature_c[1] = max_byte_u32(e.data),
+            tag::GDDR45_TEMP => t.gddr_temperature_c[2] = max_byte_u32(e.data),
+            tag::GDDR67_TEMP => t.gddr_temperature_c[3] = max_byte_u32(e.data),
             tag::GDDR01_CORR_ERRS => t.gddr_corr_errs[0] = e.data,
             tag::GDDR23_CORR_ERRS => t.gddr_corr_errs[1] = e.data,
             tag::GDDR45_CORR_ERRS => t.gddr_corr_errs[2] = e.data,
@@ -434,6 +449,40 @@ mod tests {
         let (min, max) = vdd_limits(raw);
         assert_eq!(min, 0x1234);
         assert_eq!(max, 0x4321);
+    }
+
+    #[test]
+    fn gddr_pair_temp_decodes_as_max_of_packed_bytes() {
+        // Real-hardware sample (Blackhole, idle/light load):
+        //   pair01 raw = 0x32363436  → bytes 50, 54, 52, 54 → max 54
+        //   pair23 raw = 0x00003434  → bytes  0,  0, 52, 52 → max 52
+        //   pair45 raw = 0x30343634  → bytes 48, 52, 54, 52 → max 54
+        //   pair67 raw = 0x32363034  → bytes 50, 54, 48, 52 → max 54
+        // The overall max (54) must match what ARC publishes as
+        // MAX_GDDR_TEMP — that's the cross-check that confirms the
+        // packed-byte interpretation.
+        let entries = vec![
+            entry(tag::GDDR01_TEMP, 0x32363436),
+            entry(tag::GDDR23_TEMP, 0x00003434),
+            entry(tag::GDDR45_TEMP, 0x30343634),
+            entry(tag::GDDR67_TEMP, 0x32363034),
+            entry(tag::MAX_GDDR_TEMP, 54),
+        ];
+        let t = decode_entries(0x0001_0000, entries.len() as u32, &entries);
+        assert_eq!(t.gddr_temperature_c, [54, 52, 54, 54]);
+        assert_eq!(t.max_gddr_temperature_c, 54);
+        assert_eq!(
+            *t.gddr_temperature_c.iter().max().unwrap(),
+            t.max_gddr_temperature_c
+        );
+    }
+
+    #[test]
+    fn max_byte_u32_picks_largest_byte() {
+        assert_eq!(max_byte_u32(0x00000000), 0);
+        assert_eq!(max_byte_u32(0x000000FF), 0xFF);
+        assert_eq!(max_byte_u32(0xFF000000), 0xFF);
+        assert_eq!(max_byte_u32(0x12345678), 0x78);
     }
 
     #[test]
