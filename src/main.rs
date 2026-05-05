@@ -250,7 +250,14 @@ enum Commands {
     /// Stop an L2CPU's device workers (chip stays up; warm-reattach works).
     Stop,
     /// Show daemon + per-L2CPU status.
-    Status,
+    Status {
+        /// Include the OpenSBI purgatory status word, peer-convergence
+        /// mask, and the release / force-park metadata PAs. Off by
+        /// default — those fields are debug breadcrumbs for the soft-
+        /// reboot path, not something a regular user needs to read.
+        #[arg(long)]
+        debug: bool,
+    },
     /// Attach a disk image to a running L2CPU.
     AddDisk {
         /// Path to the disk image (.ext4 / .img).
@@ -393,7 +400,14 @@ enum DaemonAction {
         metrics_port: Option<u16>,
     },
     /// Show daemon + per-L2CPU status.
-    Status,
+    Status {
+        /// Include the OpenSBI purgatory status word, peer-convergence
+        /// mask, and the release / force-park metadata PAs. Off by
+        /// default — those fields are debug breadcrumbs for the soft-
+        /// reboot path, not something a regular user needs to read.
+        #[arg(long)]
+        debug: bool,
+    },
     /// Tail the daemon log.
     Logs {
         #[arg(long, default_value_t = 200)]
@@ -977,7 +991,9 @@ fn main() -> std::process::ExitCode {
             let mut sock = daemon::client::connect(card)?;
             daemon::client::stop_l2cpu(&mut sock, l2cpu)
         }
-        Some(Commands::Status) => daemon::runner::status(resolve_card(&cli.l2cpu, cli.ttdevice)?),
+        Some(Commands::Status { debug }) => {
+            daemon::runner::status(resolve_card(&cli.l2cpu, cli.ttdevice)?, debug)
+        }
         Some(Commands::AddDisk { path, name }) => {
             // Canonicalize client-side — daemon runs with cwd=/ after
             // double-fork, so relative paths from the user's shell would
@@ -2544,7 +2560,7 @@ fn run_daemon_cmd(card: u32, action: DaemonAction) -> std::io::Result<()> {
             !no_sandbox,
             metrics_port,
         ),
-        DaemonAction::Status => daemon::runner::status(card),
+        DaemonAction::Status { debug } => daemon::runner::status(card, debug),
         DaemonAction::Logs { lines, no_follow } => daemon::runner::logs(daemon::runner::LogsOpts {
             card,
             follow: !no_follow,

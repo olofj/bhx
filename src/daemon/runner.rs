@@ -252,7 +252,7 @@ pub fn restart(
     })
 }
 
-pub fn status(card: u32) -> io::Result<()> {
+pub fn status(card: u32, debug: bool) -> io::Result<()> {
     if !lifetime::is_running(card) {
         println!("daemon: not running for card {}", card);
         return Ok(());
@@ -300,54 +300,54 @@ pub fn status(card: u32) -> io::Result<()> {
                         "  l2cpu {}: {:?} disk={} net={} vconsole={} clients={}",
                         l.idx, l.state, disk, net, vc, l.clients
                     );
-                    // (#166 Phase 1) Surface OpenSBI's purgatory status
-                    // word when the slot is alive. PARKED magic
-                    // ("PARKED__") = SBI SRST fall-through reached
-                    // sbi_platform_final_exit; 0 = still running guest.
-                    if let Some(p) = l.purgatory_status {
-                        let label = if p == crate::regs::purgatory::STATUS_PARKED {
-                            "PARKED"
-                        } else if p == 0 {
-                            "running (no SRST yet)"
-                        } else {
-                            "unknown"
-                        };
-                        let peers_str = match l.purgatory_peers {
-                            Some(mask) if p == crate::regs::purgatory::STATUS_PARKED => {
-                                // Number of peer harts that converged to STOPPED.
-                                // The SRST-issuing hart's bit is intentionally
-                                // not set; full convergence on a 4-hart tile is
-                                // count == 3.
-                                format!(
-                                    " peers_stopped=0b{:04b}({})",
-                                    mask & 0xF,
-                                    mask.count_ones()
-                                )
-                            }
-                            _ => String::new(),
-                        };
-                        println!("    purgatory: {} ({:#018x}){}", label, p, peers_str);
-                        // Phase 4a: when PARKED, the OpenSBI hook publishes
-                        // the PAs the host needs to release hart 0. Surface
-                        // them so the operator can sanity-check.
-                        if let Some(m) = &l.purgatory_release_meta {
-                            if m.next_addr_pa > 0 {
-                                println!(
-                                    "      release: next_addr@{:#x} next_mode@{:#x} next_arg1@{:#x}",
-                                    m.next_addr_pa, m.next_mode_pa, m.next_arg1_pa
-                                );
-                                println!(
-                                    "               hsm_state@{:#x} msip@{:#x}",
-                                    m.hsm_state_pa, m.msip_pa
-                                );
-                            }
-                            if let (Some(req_pa), Some(req_val)) =
-                                (m.force_park_request_pa, m.force_park_request_value)
-                            {
-                                println!(
-                                    "      force-park: req@{:#x} val={:#x} msip@{:#x}",
-                                    req_pa, req_val, m.msip_pa
-                                );
+                    // The OpenSBI bhx-purgatory status word + release
+                    // metadata are debug breadcrumbs for the soft-reboot
+                    // path. Hidden by default; surfaced under `--debug`
+                    // when an operator is investigating why a slot didn't
+                    // park or release as expected.
+                    if debug {
+                        if let Some(p) = l.purgatory_status {
+                            let label = if p == crate::regs::purgatory::STATUS_PARKED {
+                                "PARKED"
+                            } else if p == 0 {
+                                "running (no SRST yet)"
+                            } else {
+                                "unknown"
+                            };
+                            let peers_str = match l.purgatory_peers {
+                                Some(mask) if p == crate::regs::purgatory::STATUS_PARKED => {
+                                    // Number of peer harts that converged to STOPPED.
+                                    // The SRST-issuing hart's bit is intentionally
+                                    // not set; full convergence on a 4-hart tile is
+                                    // count == 3.
+                                    format!(
+                                        " peers_stopped=0b{:04b}({})",
+                                        mask & 0xF,
+                                        mask.count_ones()
+                                    )
+                                }
+                                _ => String::new(),
+                            };
+                            println!("    purgatory: {} ({:#018x}){}", label, p, peers_str);
+                            if let Some(m) = &l.purgatory_release_meta {
+                                if m.next_addr_pa > 0 {
+                                    println!(
+                                        "      release: next_addr@{:#x} next_mode@{:#x} next_arg1@{:#x}",
+                                        m.next_addr_pa, m.next_mode_pa, m.next_arg1_pa
+                                    );
+                                    println!(
+                                        "               hsm_state@{:#x} msip@{:#x}",
+                                        m.hsm_state_pa, m.msip_pa
+                                    );
+                                }
+                                if let (Some(req_pa), Some(req_val)) =
+                                    (m.force_park_request_pa, m.force_park_request_value)
+                                {
+                                    println!(
+                                        "      force-park: req@{:#x} val={:#x} msip@{:#x}",
+                                        req_pa, req_val, m.msip_pa
+                                    );
+                                }
                             }
                         }
                     }
