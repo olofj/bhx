@@ -259,6 +259,22 @@ impl ConsoleHub {
         let start = len - take;
         s.scrollback.iter().skip(start).copied().collect()
     }
+
+    /// Throw away the scrollback ring. Called on the Running → Parked
+    /// transition: the bytes from the dead kernel's lifetime aren't
+    /// useful to a future `bhx connect` against a re-released slot,
+    /// and replaying them breaks things — operator terminals respond
+    /// to `\x1b[6n` queries embedded in the old output, the writer
+    /// pump forwards those CPR responses to the chip, and U-Boot on
+    /// the next release reads them as keystrokes that interrupt
+    /// autoboot. Operators who want a post-mortem can use the tail
+    /// captured at `internal_stop` time (#160) once the slot reaches
+    /// the Stopped state.
+    pub fn clear_scrollback(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.scrollback.clear();
+        }
+    }
 }
 
 /// `send()` with `MSG_DONTWAIT`. Loops only on EINTR; any partial write (or

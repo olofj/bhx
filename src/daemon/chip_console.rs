@@ -217,6 +217,20 @@ fn uart_pass(
                     l2cpu.idx(),
                     l2cpu.idx()
                 ));
+                // Throw away the hub's scrollback. Bytes from the
+                // dead kernel aren't useful to a future re-attach,
+                // and stale `\x1b[6n` queries embedded in them would
+                // re-prompt the operator's terminal for a CPR
+                // response that the writer pump then forwards to
+                // U-Boot's interactive prompt — the same
+                // autoboot-interrupted-by-stale-input symptom the
+                // chip-side ring drain (below) addresses, but on
+                // the host side via terminal-replied control
+                // sequences. Operators who want a post-mortem of
+                // what the previous kernel printed can use the tail
+                // captured by `internal_stop` (#160) on a Stopped
+                // slot.
+                hub.clear_scrollback();
                 // Drain any input the kernel didn't consume before it
                 // poweroff'd: bytes still in the daemon-side mpsc
                 // channel from the writer client, plus bytes already
