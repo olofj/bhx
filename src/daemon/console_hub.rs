@@ -497,6 +497,117 @@ mod tests {
         assert_eq!(hub.client_count(), 0);
     }
 
+    #[test]
+    fn partial_fan_out_drops_only_the_staller_and_keeps_the_drainers() {
+        // Three attached clients. Two drain promptly between pushes; the
+        // third never reads. Eventually the third's socket buffer fills
+        // and push_chip_output drops it on the next push. The drainers
+        // must (a) remain attached, (b) have received every byte sent
+        // up to and including the last successful push.
+        let hub = ConsoleHub::new(2);
+        let (d1, c1) = pair_nonblocking();
+        let (d2, c2) = pair_nonblocking();
+        let (d3, _c3_never_drains) = pair_nonblocking();
+
+        let (r1, _) = hub.attach(d1, ConsoleMode::Ro);
+        let (r2, _) = hub.attach(d2, ConsoleMode::Ro);
+        let (r3, _) = hub.attach(d3, ConsoleMode::Ro);
+        assert_eq!(hub.client_count(), 3);
+
+        let chunk = vec![b'P'; 8 * 1024];
+        let mut total_sent: usize = 0;
+        let mut dropped = Vec::new();
+
+        // Drain c1/c2 between pushes so their buffers don't backfill;
+        // c3 never gets drained, so the kernel-side buffer climbs each
+        // push until the next send_all_dontwait() EAGAINs.
+        let mut received_c1: Vec<u8> = Vec::new();
+        let mut received_c2: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 32 * 1024];
+        for _ in 0..256 {
+            dropped = hub.push_chip_output(&chunk);
+            // The push either succeeds for everyone (returns []) or
+            // succeeds for c1/c2 and drops c3. In neither case do c1/c2
+            // miss bytes — we only count `total_sent` when the drainers
+            // were retained.
+            if dropped.is_empty() || dropped == vec![r3.id] {
+                total_sent += chunk.len();
+            }
+            // Drain c1 and c2 best-effort (non-blocking).
+            while let Ok(n) = (&c1).read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                received_c1.extend_from_slice(&buf[..n]);
+            }
+            while let Ok(n) = (&c2).read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                received_c2.extend_from_slice(&buf[..n]);
+            }
+            if !dropped.is_empty() {
+                break;
+            }
+        }
+
+        assert_eq!(dropped, vec![r3.id], "only the staller should drop");
+        // The drainers stay attached — c3's stall must not cascade.
+        assert_eq!(hub.client_count(), 2);
+        let writer = hub.current_writer_id();
+        assert!(
+            writer.is_none() || writer == Some(r1.id) || writer == Some(r2.id),
+            "writer state shouldn't promote c3"
+        );
+
+        // Drain whatever c1/c2 still have buffered (post-drop pushes go
+        // only to them; even pre-drop the drainers may have bytes the
+        // tight in-loop drain didn't reach).
+        c1.set_nonblocking(false).unwrap();
+        c2.set_nonblocking(false).unwrap();
+        let timeout = Some(std::time::Duration::from_millis(200));
+        c1.set_read_timeout(timeout).unwrap();
+        c2.set_read_timeout(timeout).unwrap();
+        loop {
+            match (&c1).read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received_c1.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        loop {
+            match (&c2).read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received_c2.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+
+        // Every retained-push byte must reach c1 and c2. (>= because of
+        // the stop-at-drop loop semantics — the *post*-drop pushes also
+        // succeed for the drainers but we don't count those into
+        // total_sent.)
+        assert!(
+            received_c1.len() >= total_sent,
+            "c1 received {} of {} sent",
+            received_c1.len(),
+            total_sent
+        );
+        assert!(received_c1.iter().all(|&b| b == b'P'));
+        assert!(
+            received_c2.len() >= total_sent,
+            "c2 received {} of {} sent",
+            received_c2.len(),
+            total_sent
+        );
+        assert!(received_c2.iter().all(|&b| b == b'P'));
+
+        // r2 keeps a useful side check: it was not promoted to writer
+        // simply because r3 dropped (its mode was Ro). Assert role
+        // hasn't shifted.
+        assert!(!r2.is_writer);
+    }
+
     // ---- shutdown tail (#160) ----
 
     #[test]
