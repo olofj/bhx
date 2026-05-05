@@ -51,6 +51,102 @@ fn clamp_consumer_to_ring(producer: u32, consumer: u32, ring_entries: u32) -> u3
     }
 }
 
+/// Subset of `TensixEngine`'s API used by `consume_kick_ring_pass`.
+/// Production code uses the engine directly; tests substitute a
+/// fake that reads from an in-memory ring without touching the chip.
+pub(crate) trait KickRingReader {
+    fn kick_producer_seq(&self) -> u32;
+    fn read_kick_entry(&self, idx: u32) -> [u32; 4];
+    fn set_kick_consumer_seq(&self, seq: u32);
+}
+
+impl KickRingReader for TensixEngine {
+    fn kick_producer_seq(&self) -> u32 {
+        TensixEngine::kick_producer_seq(self)
+    }
+    fn read_kick_entry(&self, idx: u32) -> [u32; 4] {
+        TensixEngine::read_kick_entry(self, idx)
+    }
+    fn set_kick_consumer_seq(&self, seq: u32) {
+        TensixEngine::set_kick_consumer_seq(self, seq);
+    }
+}
+
+/// One decoded kick-ring entry, as packed by `kick_ring_push` in
+/// `brisc-firmware/virtio.c`: word 0 is `(queue_idx << 16) | slot`,
+/// word 1 is the producer-side `seq`, word 2 is the per-slot epoch
+/// (bumped on STATUS=0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecodedKick {
+    pub slot: u16,
+    pub queue_idx: u16,
+    pub seq: u32,
+    pub epoch: u32,
+}
+
+pub(crate) fn decode_kick_entry(raw: [u32; 4]) -> DecodedKick {
+    DecodedKick {
+        slot: (raw[0] & 0xFFFF) as u16,
+        queue_idx: (raw[0] >> 16) as u16,
+        seq: raw[1],
+        epoch: raw[2],
+    }
+}
+
+/// Drain the kick ring from `*consumer` up to the engine's current
+/// `kick_producer_seq()`, invoking `on_kick` for each entry in
+/// arrival order. Returns the count of entries delivered. Updates
+/// the engine-side consumer register only when there's progress to
+/// commit. Applies `clamp_consumer_to_ring` first so a runaway
+/// producer doesn't make us replay overwritten ring slots.
+pub(crate) fn consume_kick_ring_pass(
+    engine: &impl KickRingReader,
+    consumer: &mut u32,
+    mut on_kick: impl FnMut(DecodedKick),
+) -> u64 {
+    let producer = engine.kick_producer_seq();
+    let clamped =
+        clamp_consumer_to_ring(producer, *consumer, crate::tensix_proto::KICK_RING_ENTRIES);
+    if clamped != *consumer {
+        crate::dlog!(
+            "[kick-poller] producer {} consumer {} > ring ({}); fast-forwarding consumer to {}",
+            producer,
+            *consumer,
+            crate::tensix_proto::KICK_RING_ENTRIES,
+            clamped
+        );
+        *consumer = clamped;
+    }
+    let mut consumed = 0u64;
+    while *consumer != producer {
+        let raw = engine.read_kick_entry(*consumer);
+        on_kick(decode_kick_entry(raw));
+        *consumer = consumer.wrapping_add(1);
+        consumed += 1;
+    }
+    if consumed > 0 {
+        engine.set_kick_consumer_seq(*consumer);
+    }
+    consumed
+}
+
+/// Snapshot the ratchet-style counter pattern the kick poller uses
+/// for chip-side stats (kick drops, sel/ready races, queue setup
+/// counts, etc): "if the value changed, log/account the wrapping
+/// delta and remember the new value." Returns `Some(delta)` on
+/// change, `None` otherwise. Critically uses `wrapping_sub` — the
+/// counters are u32 monotonics on the chip side that can wrap
+/// across long-running sessions, and a saturating subtract here
+/// would silently lose deltas.
+pub(crate) fn take_delta(current: u32, last: &mut u32) -> Option<u32> {
+    if current == *last {
+        return None;
+    }
+    let delta = current.wrapping_sub(*last);
+    *last = current;
+    Some(delta)
+}
+
 /// One registered (slot, device) pair the kick poller dispatches to
 /// when a kick arrives. The fields mirror what `virtio::run_device`
 /// holds per device today: an `Arc<L2Cpu>` for guest DRAM access,
@@ -403,51 +499,19 @@ fn run_poll_loop(
     let mut last_status: HashMap<u32, u32> = HashMap::new();
 
     while !exit.load(Ordering::Relaxed) {
-        let producer = engine.kick_producer_seq();
-
-        // Defensive: if the firmware's fullness check ever regresses
-        // (or we're talking to an older firmware), `producer -
-        // consumer > KICK_RING_ENTRIES` means BRISC has overwritten
-        // entries we never read. Fast-forward the consumer to the
-        // oldest still-readable position so we drop the ring's worth
-        // of stale entries instead of replaying garbage. See #101.
-        let clamped =
-            clamp_consumer_to_ring(producer, consumer, crate::tensix_proto::KICK_RING_ENTRIES);
-        if clamped != consumer {
-            crate::dlog!(
-                "[kick-poller] producer {} consumer {} > ring ({}); fast-forwarding consumer to {}",
-                producer,
-                consumer,
-                crate::tensix_proto::KICK_RING_ENTRIES,
-                clamped
-            );
-            consumer = clamped;
-        }
-        let mut consumed_this_pass = 0u64;
-        while consumer != producer {
-            let raw = engine.read_kick_entry(consumer);
-            // raw[0] = (queue_idx << 16) | slot ; matches the
-            // firmware's `kick_ring_push` packing. Kick ring is
-            // virtio-only at v3 (#79) — UART traffic moved to per-
-            // L2CPU feed rings polled below.
-            let slot = (raw[0] & 0xFFFF) as u16;
-            let queue_idx = (raw[0] >> 16) as u16;
-            let seq = raw[1];
-            let epoch = raw[2];
-            let _ = seq;
-
+        let consumed_this_pass = consume_kick_ring_pass(&*engine, &mut consumer, |kick| {
             // #94 guest-OS shutdown: BRISC routes SBI-SRST observations
             // to slots 20..23 (one per L2CPU). queue_idx encodes the
             // command kind (0 = poweroff, 1 = reboot — reboot is
             // recognized by the firmware but daemon-side dispatch is
             // currently poweroff-only; #141 adds reboot semantics).
-            if let Some(l2cpu_idx) = crate::regs::shutdown::l2cpu_for_slot(slot as u32) {
-                match queue_idx {
+            if let Some(l2cpu_idx) = crate::regs::shutdown::l2cpu_for_slot(kick.slot as u32) {
+                match kick.queue_idx {
                     crate::regs::shutdown::KIND_POWEROFF => {
                         crate::dlog!(
                             "[kick-poller] guest poweroff for l2cpu {} (slot {})",
                             l2cpu_idx,
-                            slot
+                            kick.slot
                         );
                         let _ = guest_poweroff_tx.send(l2cpu_idx);
                     }
@@ -459,7 +523,7 @@ fn run_poll_loop(
                             "[kick-poller] guest reboot for l2cpu {} (slot {}) — \
                              ignoring; reboot semantics tracked in #141",
                             l2cpu_idx,
-                            slot
+                            kick.slot
                         );
                     }
                     other => {
@@ -468,64 +532,52 @@ fn run_poll_loop(
                              (slot {}); dropping",
                             other,
                             l2cpu_idx,
-                            slot
+                            kick.slot
                         );
                     }
                 }
-                stats.last_kick_slot_queue.store(
-                    ((slot as u64) << 16) | (queue_idx as u64),
-                    Ordering::Relaxed,
-                );
-                stats.kicks_consumed.fetch_add(1, Ordering::Relaxed);
-                consumer = consumer.wrapping_add(1);
-                consumed_this_pass += 1;
-                continue;
-            }
-
-            let mut map = registry.lock().unwrap();
-            if let Some(reg) = map.get_mut(&(slot as u32)) {
-                // STATUS=0 epoch tracking: BRISC bumps per-slot epoch
-                // on every guest STATUS=0 (see brisc-firmware
-                // virtio.c::handle_status_change). When a kick lands
-                // with an epoch we haven't seen before, the guest has
-                // reinit'd the queue — reset `processed[]` so the
-                // first dispatch reads avail.ring[0] for the fresh
-                // session instead of avail.ring[stale_idx]. Without
-                // this, AlmaLinux's U-Boot→kernel handoff (U-Boot
-                // probes virtio_blk, writes STATUS=0 on cleanup,
-                // kernel re-probes) had us pulling stale indices from
-                // the kernel's freshly-zeroed avail ring and writing
-                // id=0 into the used ring, tripping the kernel's
-                // "id 0 is not a head" guard.
-                if epoch != reg.last_epoch {
-                    for p in reg.processed.iter_mut() {
-                        *p = 0;
-                    }
-                    reg.last_epoch = epoch;
-                }
-                if let Some(used_idx) = dispatch_chain(&engine, reg, queue_idx) {
-                    // Push a completion to BRISC for diagnostics +
-                    // future BRISC-side IRQ dispatch. The PLIC IRQ
-                    // itself is fired daemon-side today.
-                    engine.push_completion(slot, queue_idx, used_idx);
-                }
             } else {
-                crate::dlog!(
-                    "[kick-poller]   no registration for slot {}, dropping kick",
-                    slot
-                );
+                let mut map = registry.lock().unwrap();
+                if let Some(reg) = map.get_mut(&(kick.slot as u32)) {
+                    // STATUS=0 epoch tracking: BRISC bumps per-slot epoch
+                    // on every guest STATUS=0 (see brisc-firmware
+                    // virtio.c::handle_status_change). When a kick lands
+                    // with an epoch we haven't seen before, the guest has
+                    // reinit'd the queue — reset `processed[]` so the
+                    // first dispatch reads avail.ring[0] for the fresh
+                    // session instead of avail.ring[stale_idx]. Without
+                    // this, AlmaLinux's U-Boot→kernel handoff (U-Boot
+                    // probes virtio_blk, writes STATUS=0 on cleanup,
+                    // kernel re-probes) had us pulling stale indices from
+                    // the kernel's freshly-zeroed avail ring and writing
+                    // id=0 into the used ring, tripping the kernel's
+                    // "id 0 is not a head" guard.
+                    if kick.epoch != reg.last_epoch {
+                        for p in reg.processed.iter_mut() {
+                            *p = 0;
+                        }
+                        reg.last_epoch = kick.epoch;
+                    }
+                    if let Some(used_idx) = dispatch_chain(&engine, reg, kick.queue_idx) {
+                        // Push a completion to BRISC for diagnostics +
+                        // future BRISC-side IRQ dispatch. The PLIC IRQ
+                        // itself is fired daemon-side today.
+                        engine.push_completion(kick.slot, kick.queue_idx, used_idx);
+                    }
+                } else {
+                    crate::dlog!(
+                        "[kick-poller]   no registration for slot {}, dropping kick",
+                        kick.slot
+                    );
+                }
             }
-            drop(map);
             stats.last_kick_slot_queue.store(
-                ((slot as u64) << 16) | (queue_idx as u64),
+                ((kick.slot as u64) << 16) | (kick.queue_idx as u64),
                 Ordering::Relaxed,
             );
             stats.kicks_consumed.fetch_add(1, Ordering::Relaxed);
-            consumer = consumer.wrapping_add(1);
-            consumed_this_pass += 1;
-        }
+        });
         if consumed_this_pass > 0 {
-            engine.set_kick_consumer_seq(consumer);
             last_active = std::time::Instant::now();
         }
 
@@ -627,15 +679,13 @@ fn run_poll_loop(
         // plenty of headroom; even at the FAST tier (50 µs) the
         // overhead is two extra L1 reads per registered L2CPU.
         let kick_drops = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_KICK_DROPS);
-        if kick_drops != last_kick_drops {
-            let delta = kick_drops.wrapping_sub(last_kick_drops);
+        if let Some(delta) = take_delta(kick_drops, &mut last_kick_drops) {
             crate::dlog!(
                 "[kick-poller] BRISC dropped {} kick(s) (cumulative {})",
                 delta,
                 kick_drops
             );
             crate::daemon::metrics::KICK_DROPS_TOTAL.add(delta as u64);
-            last_kick_drops = kick_drops;
         }
         let sel_ready_races = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_SEL_READY_RACES);
         if sel_ready_races != last_sel_ready_races {
@@ -1050,6 +1100,8 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+
     use super::*;
 
     #[test]
@@ -1097,5 +1149,253 @@ mod tests {
         // gap > ring is the trigger.
         assert_eq!(clamp_consumer_to_ring(64, 0, 64), 0);
         assert_eq!(clamp_consumer_to_ring(65, 0, 64), 65 - 64);
+    }
+
+    // ---- decode_kick_entry ----
+
+    #[test]
+    fn decode_kick_entry_unpacks_word0_into_slot_and_queue() {
+        // word 0 = (queue_idx << 16) | slot ; matches BRISC firmware's
+        // kick_ring_push packing.
+        let raw = [(7u32 << 16) | 0x12, 0xdead_beef, 0x42, 0];
+        let kick = decode_kick_entry(raw);
+        assert_eq!(kick.slot, 0x12);
+        assert_eq!(kick.queue_idx, 7);
+        assert_eq!(kick.seq, 0xdead_beef);
+        assert_eq!(kick.epoch, 0x42);
+    }
+
+    #[test]
+    fn decode_kick_entry_handles_max_field_widths() {
+        // Both halves of word 0 saturated. Slot and queue_idx are u16 so
+        // the upper bits of word 0 must not bleed into slot.
+        let raw = [0xFFFF_FFFFu32, 0xFFFF_FFFF, 0xFFFF_FFFF, 0];
+        let kick = decode_kick_entry(raw);
+        assert_eq!(kick.slot, 0xFFFF);
+        assert_eq!(kick.queue_idx, 0xFFFF);
+        assert_eq!(kick.seq, 0xFFFF_FFFF);
+        assert_eq!(kick.epoch, 0xFFFF_FFFF);
+    }
+
+    // ---- take_delta ----
+
+    #[test]
+    fn take_delta_returns_none_when_value_is_unchanged() {
+        let mut last = 7u32;
+        assert_eq!(take_delta(7, &mut last), None);
+        assert_eq!(last, 7);
+    }
+
+    #[test]
+    fn take_delta_returns_simple_difference_and_advances_last() {
+        let mut last = 7u32;
+        assert_eq!(take_delta(10, &mut last), Some(3));
+        assert_eq!(last, 10);
+        assert_eq!(take_delta(15, &mut last), Some(5));
+        assert_eq!(last, 15);
+    }
+
+    #[test]
+    fn take_delta_uses_wrapping_sub_across_u32_max() {
+        // Long-running counters wrap; saturating_sub would silently
+        // lose the delta and the metric would understate drops.
+        let mut last = u32::MAX - 2;
+        assert_eq!(take_delta(3, &mut last), Some(6));
+        assert_eq!(last, 3);
+    }
+
+    // ---- consume_kick_ring_pass + a hand-rolled FakeKickRing ----
+
+    /// Backing store for the ring tests. Mirrors the BRISC-side ring's
+    /// shape: a `KICK_RING_ENTRIES`-deep array of 4-word slots, plus
+    /// monotonic producer/consumer sequences. Production code goes
+    /// through `TensixEngine`; tests drive this directly so we can
+    /// pin ordering, wraparound, and clamp behavior without a chip.
+    struct FakeKickRing {
+        producer: Cell<u32>,
+        consumer_writes: RefCell<Vec<u32>>,
+        slots: RefCell<Vec<[u32; 4]>>,
+    }
+
+    impl FakeKickRing {
+        fn new() -> Self {
+            FakeKickRing {
+                producer: Cell::new(0),
+                consumer_writes: RefCell::new(Vec::new()),
+                slots: RefCell::new(vec![
+                    [0u32; 4];
+                    crate::tensix_proto::KICK_RING_ENTRIES as usize
+                ]),
+            }
+        }
+
+        /// Push at the current producer seq and advance. Mirrors the
+        /// firmware's `kick_ring_push` (slot index = seq mod ring_entries).
+        fn push(&self, slot: u16, queue_idx: u16, seq: u32, epoch: u32) {
+            let prod = self.producer.get();
+            let idx = (prod % crate::tensix_proto::KICK_RING_ENTRIES) as usize;
+            self.slots.borrow_mut()[idx] =
+                [(queue_idx as u32) << 16 | (slot as u32), seq, epoch, 0];
+            self.producer.set(prod.wrapping_add(1));
+        }
+
+        /// Push without bumping `producer` — for tests that need to set
+        /// up a stale slot the consumer should skip.
+        fn plant(&self, slot_index: u32, raw: [u32; 4]) {
+            let idx = (slot_index % crate::tensix_proto::KICK_RING_ENTRIES) as usize;
+            self.slots.borrow_mut()[idx] = raw;
+        }
+
+        /// Force `producer` to a specific value — for tests that exercise
+        /// runaway-producer semantics.
+        fn set_producer(&self, seq: u32) {
+            self.producer.set(seq);
+        }
+    }
+
+    impl KickRingReader for FakeKickRing {
+        fn kick_producer_seq(&self) -> u32 {
+            self.producer.get()
+        }
+        fn read_kick_entry(&self, idx: u32) -> [u32; 4] {
+            let i = (idx % crate::tensix_proto::KICK_RING_ENTRIES) as usize;
+            self.slots.borrow()[i]
+        }
+        fn set_kick_consumer_seq(&self, seq: u32) {
+            self.consumer_writes.borrow_mut().push(seq);
+        }
+    }
+
+    fn drain(ring: &FakeKickRing, consumer: &mut u32) -> Vec<DecodedKick> {
+        let collected: RefCell<Vec<DecodedKick>> = RefCell::new(Vec::new());
+        let count = consume_kick_ring_pass(ring, consumer, |k| collected.borrow_mut().push(k));
+        let v = collected.into_inner();
+        assert_eq!(v.len() as u64, count, "callback count must match return");
+        v
+    }
+
+    #[test]
+    fn consume_pass_delivers_entries_in_arrival_order() {
+        let ring = FakeKickRing::new();
+        ring.push(0, 0, 1, 0);
+        ring.push(1, 2, 2, 0);
+        ring.push(5, 0, 3, 0);
+        let mut consumer = 0u32;
+
+        let got = drain(&ring, &mut consumer);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].slot, 0);
+        assert_eq!(got[1].slot, 1);
+        assert_eq!(got[1].queue_idx, 2);
+        assert_eq!(got[2].slot, 5);
+        // Consumer advanced to producer.
+        assert_eq!(consumer, 3);
+        // The engine-side consumer register was committed exactly once.
+        assert_eq!(*ring.consumer_writes.borrow(), vec![3]);
+    }
+
+    #[test]
+    fn consume_pass_returns_zero_and_skips_commit_when_ring_empty() {
+        let ring = FakeKickRing::new();
+        let mut consumer = 17u32;
+        ring.set_producer(17);
+
+        let got = drain(&ring, &mut consumer);
+        assert!(got.is_empty());
+        assert_eq!(consumer, 17);
+        // No progress -> no consumer-register write. This matters
+        // because every L1 write is an MMIO transaction; spamming
+        // them on idle ticks would burn PCIe bandwidth.
+        assert!(ring.consumer_writes.borrow().is_empty());
+    }
+
+    #[test]
+    fn consume_pass_tolerates_seq_zero_payload() {
+        // The ring entry's seq word can legitimately be zero (the
+        // first push after a fresh boot, or just on wrap). The
+        // consumer should NOT treat seq=0 as a sentinel; it's a
+        // real entry and must be delivered.
+        let ring = FakeKickRing::new();
+        ring.push(3, 0, 0, 0); // <-- seq=0
+        ring.push(4, 0, 1, 0);
+        let mut consumer = 0u32;
+
+        let got = drain(&ring, &mut consumer);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].slot, 3);
+        assert_eq!(got[0].seq, 0);
+        assert_eq!(got[1].slot, 4);
+    }
+
+    #[test]
+    fn consume_pass_walks_full_ring_around_physical_slots() {
+        // Push exactly one ring's worth of entries, all with distinct
+        // monotonically-bumped slots (mod 31 to fit u8). Drain. Even
+        // though the physical slot index in L1 wraps, the consumer
+        // sees them all in arrival order because it tracks the u32
+        // monotonic seq, not the modular index.
+        let ring = FakeKickRing::new();
+        let n = crate::tensix_proto::KICK_RING_ENTRIES;
+        for i in 0..n {
+            ring.push((i % 31) as u16, 0, i, 0);
+        }
+        let mut consumer = 0u32;
+
+        let got = drain(&ring, &mut consumer);
+        assert_eq!(got.len() as u32, n);
+        for (i, kick) in got.iter().enumerate() {
+            assert_eq!(kick.slot, (i as u16) % 31);
+            assert_eq!(kick.seq, i as u32);
+        }
+        assert_eq!(consumer, n);
+    }
+
+    #[test]
+    fn consume_pass_clamps_when_producer_outpaced_consumer_by_more_than_ring() {
+        // Producer ran a full ring + a few entries ahead while the
+        // consumer was stalled. Those overrun entries are lost — their
+        // ring slots have already been overwritten by newer pushes.
+        // The clamp drops the unreachable head and resumes from the
+        // oldest still-readable position.
+        let ring = FakeKickRing::new();
+        let n = crate::tensix_proto::KICK_RING_ENTRIES;
+        // Plant one "newest" entry at every physical slot; if the
+        // consumer ever reaches a stale slot, we'd see a mismatch.
+        for s in 0..n {
+            ring.plant(s, [0xAA, n + s, 0, 0]);
+        }
+        // Producer is `n + 5`; consumer is at 0. Gap is n + 5, bigger
+        // than the ring — the first 5 entries (seqs 0..4) are gone.
+        ring.set_producer(n + 5);
+        let mut consumer = 0u32;
+
+        let got = drain(&ring, &mut consumer);
+        // Clamp reset the consumer to producer - n = 5; we then
+        // delivered n entries (5..n+5).
+        assert_eq!(got.len() as u32, n);
+        assert_eq!(consumer, n + 5);
+    }
+
+    #[test]
+    fn consume_pass_advances_consumer_through_u32_wraparound() {
+        // Consumer near u32::MAX; producer has wrapped to a small
+        // positive value. wrapping_sub keeps the gap correct.
+        let ring = FakeKickRing::new();
+        let start: u32 = u32::MAX - 1;
+        // Plant 3 entries; we only need them at the right physical slots.
+        for offset in 0..3u32 {
+            let seq = start.wrapping_add(offset);
+            ring.plant(seq, [offset, seq, 0, 0]);
+        }
+        ring.set_producer(start.wrapping_add(3));
+        let mut consumer = start;
+
+        let got = drain(&ring, &mut consumer);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].slot, 0);
+        assert_eq!(got[1].slot, 1);
+        assert_eq!(got[2].slot, 2);
+        // Consumer ended at start + 3 (modular).
+        assert_eq!(consumer, start.wrapping_add(3));
     }
 }
