@@ -386,39 +386,16 @@ pub fn modify_dtb(
         );
     }
 
-    // (#170 followup) Reserve OpenSBI's text + RW region up front in
-    // the daemon-patched DTB. OpenSBI's generic platform runtime
-    // fixup adds `mmode_resv0`/`mmode_resv1` itself on cold boot, so
-    // historically (#119) we relied on that and produced
-    // `OF: reserved mem: OVERLAP DETECTED!` warnings if we added our
-    // own. But release-from-purgatory re-images this DTB AS-IS via
-    // dispatch_release without OpenSBI re-running its fixups — so
-    // without an explicit entry here the kernel's allocator uses
-    // OpenSBI's text/BSS as free pages, hits PMP store-access faults
-    // on the M-mode-only region (`Oops - store access fault` at
-    // badaddr `mem_start`), and after a few reboots even U-Boot's
-    // first SBI DBCN call crashes because OpenSBI's scratch tables
-    // got clobbered. Sizing 0x60000 = 384 KiB matches the documented
-    // R/X (256 KiB) + R/W (128 KiB) regions OpenSBI's banner reports
-    // on this platform. Overlap with OpenSBI's own runtime add on
-    // cold boot is harmless — the kernel takes the union of
-    // `/reserved-memory` entries.
-    {
-        let opensbi_pa = mem_start;
-        let opensbi_size: u64 = 0x60000;
-        let opensbi_node =
-            fdt.add_subnode(reserved, &format!("bhx-opensbi-firmware@{:x}", opensbi_pa))?;
-        let mut opensbi_reg = Vec::with_capacity(16);
-        opensbi_reg.extend_from_slice(&opensbi_pa.to_be_bytes());
-        opensbi_reg.extend_from_slice(&opensbi_size.to_be_bytes());
-        fdt.setprop(opensbi_node, "reg", &opensbi_reg)?;
-        fdt.setprop(opensbi_node, "no-map", &[])?;
-        crate::dlog!(
-            "[modify_dtb]   adding /reserved-memory/bhx-opensbi-firmware@{:x} size={:#x} (#170)",
-            opensbi_pa,
-            opensbi_size
-        );
-    }
+    // (#170 followup) On cold boot, OpenSBI's generic platform
+    // runtime fixup adds `mmode_resv0` (R/X) + `mmode_resv1` (R/W)
+    // covering [mem_start, mem_start + 0x60000). We deliberately
+    // do NOT add a duplicate `bhx-opensbi-firmware` here: the kernel
+    // logs a loud `OF: reserved mem: OVERLAP DETECTED!` for
+    // every overlapping pair. Release-from-purgatory's re-image
+    // path adds its own reservation via
+    // [`add_opensbi_reservation_for_release`] because OpenSBI's
+    // fixup doesn't re-run on the wake. See
+    // `daemon::server::dispatch_release`.
 
     // /soc and PLIC phandle
     let soc = fdt
@@ -503,7 +480,181 @@ pub fn modify_dtb(
 
     let packed = fdt.pack()?;
     crate::dlog!("[modify_dtb] packed DTB {} bytes", packed.len());
+    verify_dtb_invariants(&packed, mem_start)?;
     Ok(packed)
+}
+
+/// Parse the patched DTB back and assert load-bearing invariants.
+/// Called from `modify_dtb` so every code path that produces a DTB
+/// hits the check — daemon boot, release-from-purgatory's cached
+/// re-image, hardware-free tests. Each invariant is something the
+/// chip falls over without:
+///
+/// - `/reserved-memory/bhx-purgatory@<purg_pa>` size `0x1000` with
+///   `no-map` (#166 Phase 4 — without it the kernel's allocator
+///   clobbers the bhx-purgatory status block after ~20 reboot
+///   cycles, manifesting as a parked-hart wake reading stale
+///   next_addr/next_mode/etc).
+/// - `/memory@<mem_start>` exists (otherwise OpenSBI / the kernel
+///   has no idea where DRAM is).
+/// - `/chosen/bootargs` exists (kernel needs it for at minimum the
+///   `console=` and `root=` fragments).
+///
+/// Notably absent: `/reserved-memory/bhx-opensbi-firmware`. Cold
+/// boot relies on OpenSBI's runtime DTB fixup to add `mmode_resv0/1`,
+/// so adding our own here would just produce kernel
+/// `OF: reserved mem: OVERLAP DETECTED!` warnings. The
+/// release-from-purgatory path in `daemon::server::dispatch_release`
+/// adds its own reservation via
+/// [`add_opensbi_reservation_for_release`] because OpenSBI's fixup
+/// doesn't re-run on the wake.
+///
+/// Failure here is fatal: a daemon that produces a DTB missing any
+/// of the above is going to wedge a guest, and the operator should
+/// see the panic-style error message at the producer site rather
+/// than chase a kernel oops three minutes into boot.
+pub fn verify_dtb_invariants(dtb: &[u8], mem_start: u64) -> crate::Result<()> {
+    let fdt = Fdt::open_into(dtb, 0)
+        .map_err(|e| crate::Error::fdt("verify_dtb_invariants/open", format!("{}", e)))?;
+
+    let purg_pa = mem_start + crate::regs::purgatory::STATUS_OFFSET;
+    expect_node_with_reg_and_no_map(
+        &fdt,
+        &format!("/reserved-memory/bhx-purgatory@{:x}", purg_pa),
+        purg_pa,
+        0x1000,
+    )?;
+    expect_node_exists(&fdt, &format!("/memory@{:x}", mem_start))?;
+    let chosen = fdt
+        .path_offset("/chosen")
+        .map_err(|e| crate::Error::fdt("verify/chosen", format!("{}", e)))?
+        .ok_or_else(|| {
+            crate::Error::fdt(
+                "verify_dtb_invariants",
+                "missing /chosen node in patched DTB",
+            )
+        })?;
+    if fdt.getprop(chosen, "bootargs").is_none() {
+        return Err(crate::Error::fdt(
+            "verify_dtb_invariants",
+            "missing /chosen/bootargs in patched DTB",
+        ));
+    }
+    Ok(())
+}
+
+/// Splice `/reserved-memory/bhx-opensbi-firmware@<mem_start>` (size
+/// `0x60000`, `no-map`) into a previously-patched DTB and return the
+/// repacked bytes. Used by `daemon::server::dispatch_release` only —
+/// cold boot's `modify_dtb` deliberately omits this node because
+/// OpenSBI's runtime fixup adds `mmode_resv0/1` covering the same
+/// range, and a duplicate produces kernel `OF: reserved mem: OVERLAP
+/// DETECTED!` warnings.
+///
+/// Why it's needed at release time: release-from-purgatory wakes a
+/// parked hart that already ran OpenSBI's `sbi_init` once. The fixup
+/// is one-shot and doesn't re-run, so the re-imaged DTB the next
+/// kernel reads has no protection over `[mem_start, mem_start +
+/// 0x60000)` — the kernel's allocator hands those pages out, the
+/// kernel writes a memset, and we hit a PMP store-access fault on
+/// OpenSBI's M-mode-only region. After a few reboots OpenSBI's
+/// scratch tables corrupt and even U-Boot crashes on its first SBI
+/// DBCN call. Sizing matches the R/X (256 KiB) + R/W (128 KiB)
+/// regions OpenSBI's banner reports on this platform.
+pub fn add_opensbi_reservation_for_release(dtb: &[u8], mem_start: u64) -> crate::Result<Vec<u8>> {
+    let mut fdt = Fdt::open_into(dtb, 4096)
+        .map_err(|e| crate::Error::fdt("add_opensbi_reservation/open", format!("{}", e)))?;
+    let reserved = fdt.path_offset("/reserved-memory")?.ok_or_else(|| {
+        crate::Error::fdt(
+            "add_opensbi_reservation_for_release",
+            "missing /reserved-memory in patched DTB",
+        )
+    })?;
+    let opensbi_size: u64 = 0x60000;
+    let opensbi_node =
+        fdt.add_subnode(reserved, &format!("bhx-opensbi-firmware@{:x}", mem_start))?;
+    let mut reg = Vec::with_capacity(16);
+    reg.extend_from_slice(&mem_start.to_be_bytes());
+    reg.extend_from_slice(&opensbi_size.to_be_bytes());
+    fdt.setprop(opensbi_node, "reg", &reg)?;
+    fdt.setprop(opensbi_node, "no-map", &[])?;
+    let packed = fdt.pack()?;
+    crate::dlog!(
+        "[add_opensbi_reservation_for_release] added \
+         bhx-opensbi-firmware@{:x} size={:#x} -> {} bytes",
+        mem_start,
+        opensbi_size,
+        packed.len()
+    );
+    Ok(packed)
+}
+
+fn expect_node_exists(fdt: &Fdt, path: &str) -> crate::Result<()> {
+    fdt.path_offset(path)
+        .map_err(|e| crate::Error::fdt(path, format!("{}", e)))?
+        .ok_or_else(|| {
+            crate::Error::fdt(
+                "verify_dtb_invariants",
+                format!("missing {} in patched DTB", path),
+            )
+        })?;
+    Ok(())
+}
+
+fn expect_node_with_reg_and_no_map(
+    fdt: &Fdt,
+    path: &str,
+    expected_addr: u64,
+    expected_size: u64,
+) -> crate::Result<()> {
+    let node = fdt
+        .path_offset(path)
+        .map_err(|e| crate::Error::fdt(path, format!("{}", e)))?
+        .ok_or_else(|| {
+            crate::Error::fdt(
+                "verify_dtb_invariants",
+                format!("missing {} in patched DTB", path),
+            )
+        })?;
+
+    let reg = fdt.getprop(node, "reg").ok_or_else(|| {
+        crate::Error::fdt(
+            "verify_dtb_invariants",
+            format!("{} has no `reg` property", path),
+        )
+    })?;
+    if reg.len() != 16 {
+        return Err(crate::Error::fdt(
+            "verify_dtb_invariants",
+            format!(
+                "{} `reg` is {} bytes, expected 16 (u64 addr + u64 size)",
+                path,
+                reg.len()
+            ),
+        ));
+    }
+    let addr = u64::from_be_bytes(reg[..8].try_into().unwrap());
+    let size = u64::from_be_bytes(reg[8..16].try_into().unwrap());
+    if addr != expected_addr || size != expected_size {
+        return Err(crate::Error::fdt(
+            "verify_dtb_invariants",
+            format!(
+                "{} `reg` is ({:#x}, {:#x}), expected ({:#x}, {:#x})",
+                path, addr, size, expected_addr, expected_size
+            ),
+        ));
+    }
+
+    if fdt.getprop(node, "no-map").is_none() {
+        return Err(crate::Error::fdt(
+            "verify_dtb_invariants",
+            format!(
+                "{} missing `no-map` — kernel must not allocate over it",
+                path
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -577,23 +728,26 @@ mod tests {
     }
 
     #[test]
-    fn modify_dtb_does_not_add_opensbi_subnode_overlapping_mmode_resv() {
-        // #119: we used to add an `opensbi@<mem_start>` subnode here
-        // (#110), but OpenSBI's generic platform fixup already plants
-        // `mmode_resv0`/`mmode_resv1` covering the same M-mode region.
-        // The redundant entry produced `OF: reserved mem: OVERLAP
-        // DETECTED!` warnings in the guest dmesg. Make sure we don't
-        // regress and start adding it back.
+    fn modify_dtb_does_not_emit_opensbi_firmware_reservation_on_cold_boot() {
+        // OpenSBI's generic-platform runtime fixup adds
+        // `mmode_resv0`/`mmode_resv1` itself on cold boot, so the
+        // daemon-patched DTB must NOT include a duplicate
+        // `bhx-opensbi-firmware` — that produced loud kernel
+        // `OF: reserved mem: OVERLAP DETECTED!` warnings (and
+        // confused operators reading dmesg). The
+        // release-from-purgatory path adds its own reservation via
+        // `add_opensbi_reservation_for_release` because OpenSBI's
+        // fixup doesn't re-run on the wake.
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x1_0000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
         let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
 
         let fdt = Fdt::open_into(&out, 0).unwrap();
-        let path = format!("/reserved-memory/opensbi@{:x}", mem_start);
+        let path = format!("/reserved-memory/bhx-opensbi-firmware@{:x}", mem_start);
         assert!(
             fdt.path_offset(&path).unwrap().is_none(),
-            "{} should not exist — OpenSBI's mmode_resv* covers this range",
+            "{} must NOT exist on cold boot — would overlap with OpenSBI's mmode_resv0/1",
             path,
         );
 
@@ -605,6 +759,41 @@ mod tests {
                 .is_some(),
             "virtio MMIO reservation must still be present",
         );
+    }
+
+    #[test]
+    fn add_opensbi_reservation_for_release_inserts_node() {
+        // Round-trip: cold-boot DTB has no bhx-opensbi-firmware.
+        // After splicing via the release helper, the node must be
+        // present with the right (reg, no-map) shape so the
+        // re-imaged DTB protects OpenSBI's text + .bss from the
+        // kernel allocator's first memset.
+        let mem_start = 0x4000_3000_0000u64;
+        let mem_size = 0x1_0000_0000u64;
+        let dev = BootDevice::Vda("vda".to_string());
+        let cold = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
+        let path = format!("/reserved-memory/bhx-opensbi-firmware@{:x}", mem_start);
+        let pre = Fdt::open_into(&cold, 0).unwrap();
+        assert!(pre.path_offset(&path).unwrap().is_none());
+
+        let release = add_opensbi_reservation_for_release(&cold, mem_start).unwrap();
+        let post = Fdt::open_into(&release, 0).unwrap();
+        let node = post.path_offset(&path).unwrap().unwrap();
+        let reg = post.getprop(node, "reg").unwrap();
+        assert_eq!(reg.len(), 16);
+        let addr = u64::from_be_bytes(reg[..8].try_into().unwrap());
+        let size = u64::from_be_bytes(reg[8..16].try_into().unwrap());
+        assert_eq!(addr, mem_start);
+        assert_eq!(size, 0x60000, "OpenSBI R/X + RW = 256 KiB + 128 KiB");
+        assert!(
+            post.getprop(node, "no-map").is_some(),
+            "OpenSBI region must be no-map",
+        );
+
+        // verify_dtb_invariants must still pass after the splice:
+        // the helper only adds, never removes.
+        verify_dtb_invariants(&release, mem_start)
+            .expect("post-splice DTB must still satisfy cold-boot invariants");
     }
 
     #[test]
@@ -806,5 +995,41 @@ mod tests {
                 path
             );
         }
+    }
+
+    // ---- verify_dtb_invariants ----
+    //
+    // The verifier is the runtime safety net that fires for every
+    // modify_dtb call. These tests pin its happy and negative
+    // paths: the verifier accepts a correctly-built cold-boot
+    // DTB and rejects one missing the bhx-purgatory reservation.
+
+    #[test]
+    fn verify_dtb_invariants_accepts_good_modify_dtb_output() {
+        // Sanity: every successful modify_dtb call has already gone
+        // through the verifier, so this is a tautology — but making
+        // it explicit guards against a future refactor that drops
+        // the verify call from modify_dtb's return path.
+        let mem_start = 0x4000_3000_0000u64;
+        let dev = BootDevice::Vda("vda".to_string());
+        let dtb = modify_dtb(FIXTURE_DTB, &dev, mem_start, 0x1_0000_0000, &[], None, true).unwrap();
+        verify_dtb_invariants(&dtb, mem_start).expect("happy-path DTB must verify");
+    }
+
+    #[test]
+    fn verify_dtb_invariants_rejects_raw_blackhole_card_dtb() {
+        // The vendored chip DTB before our patches has none of the
+        // daemon-side structures the verifier requires. The
+        // verifier short-circuits on the first failure; we assert
+        // it's the bhx-purgatory complaint because that's the next
+        // load-bearing entry the verifier checks.
+        let mem_start = 0x4000_3000_0000u64;
+        let err = verify_dtb_invariants(FIXTURE_DTB, mem_start).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("bhx-purgatory"),
+            "expected bhx-purgatory complaint, got {:?}",
+            msg
+        );
     }
 }

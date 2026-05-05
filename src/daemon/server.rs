@@ -1637,19 +1637,28 @@ fn dispatch_release(
     // without this stash; if the bytes happened to survive in DRAM
     // the wake works anyway, otherwise the operator sees the same
     // U-Boot error and needs a cold boot.
+    //
+    // Splice in `bhx-opensbi-firmware` before writing — OpenSBI's
+    // runtime DTB fixup ran exactly once at cold boot and added
+    // `mmode_resv0/1` covering OpenSBI's text + .bss. It does NOT
+    // re-run on the parked-hart wake we're about to fire, so the
+    // re-imaged DTB needs its own reservation or the next kernel's
+    // allocator hits PMP store-access faults at `mem_base`.
     if let Some(bytes) = dtb_bytes {
+        let with_opensbi_resv = crate::boot::add_opensbi_reservation_for_release(&bytes, mem_base)?;
         dlog!(
-            "[release l2cpu {}] re-writing patched DTB ({} bytes) at {:#x}",
+            "[release l2cpu {}] re-writing patched DTB ({} bytes, +OpenSBI resv -> {} bytes) at {:#x}",
             l2cpu_idx,
             bytes.len(),
+            with_opensbi_resv.len(),
             dtb_addr
         );
-        crate::boot::l2cpu_noc_write_bulk_pub(&meta.l2cpu, dtb_addr, &bytes).map_err(|e| {
-            crate::Error::Io {
+        crate::boot::l2cpu_noc_write_bulk_pub(&meta.l2cpu, dtb_addr, &with_opensbi_resv).map_err(
+            |e| crate::Error::Io {
                 ctx: "dtb re-image".into(),
                 source: e,
-            }
-        })?;
+            },
+        )?;
     } else {
         dlog!(
             "[release l2cpu {}] no cached DTB bytes (warm-resumed slot); \
