@@ -6,10 +6,16 @@
 /blackhole-card.dtb
 /blackhole-p100*.dtb
 
-# Disk images (rootfs.ext4, images/*.ext4).
+# Disk images (rootfs.ext4, rootfs.ext2, images/*.ext4, FreeBSD-*.img, etc.).
 *.ext4
+*.ext2
+/*.img
 /images/
 /ramdisks/
+
+# Soak campaign output trees.
+/multi-l2cpu-soak/
+/scripts/soak-output/
 
 # fetch::download_to_cached sidecars next to downloaded artifacts.
 *.fetch.json
