@@ -144,7 +144,6 @@ Currently shipped:
 | `fedora-42`            | whole partitioned disk  | U-Boot + EFI                 | Server Host Generic                                  |
 | `fedora-42-cloud`      | whole partitioned disk  | U-Boot + EFI                 | Cloud Base; needs cloud-init                         |
 | `almalinux-10-kitten`  | whole partitioned disk  | U-Boot + EFI                 | Alias `alma`/`kitten`                                |
-| `opensuse-tumbleweed`  | whole partitioned disk  | U-Boot + EFI                 | Aliases `opensuse`/`tumbleweed`/`suse`. Minimal-VM rolling-release; cloud-init enabled |
 
 There are two boot shapes in the catalog, and `bhx boot` picks the
 right path automatically based on the registry entry:
