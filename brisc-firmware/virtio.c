@@ -412,7 +412,25 @@ static void init_device(unsigned slot) {
     // skipped it because its kernel never re-probes after a soft
     // reset. virtio 1.2 §4.2.2.2 lets device-specific config persist
     // across guest-driven STATUS=0; we exploit that.
-    zero_region(reg_addr(slot, 0), VIRTIO_MMIO_CONFIG);
+    //
+    // Skip STATUS (offset 0x70) in the wipe (#180). The guest just
+    // wrote STATUS=0 itself (that's what triggered
+    // handle_status_change → init_device), so we have nothing to
+    // clear here. Wiping STATUS would race the guest's *next* writes:
+    // U-Boot's pre_probe issues `virtio_reset` (STATUS=0) → BRISC
+    // starts init_device's ~64-iter zero_region → U-Boot continues
+    // immediately with `add_status(DRIVER)` (STATUS=2). If the guest's
+    // STATUS=2 write lands during BRISC's wipe loop before BRISC has
+    // reached offset 0x70, BRISC overwrites the DRIVER bit back to 0;
+    // U-Boot's next `add_status(FEATURES_OK)` reads STATUS=0, writes
+    // 8, and `add_status(DRIVER_OK)` lands at 0x0c instead of the
+    // spec-clean 0x0e. Empirically this fired for the late-probed
+    // slots (rng, BLK1) where the X280's caches were warm and the
+    // guest-side gap between writes shrank below init_device's wipe
+    // duration. Skipping STATUS removes the race entirely.
+    zero_region(reg_addr(slot, 0), VIRTIO_MMIO_STATUS);
+    zero_region(reg_addr(slot, VIRTIO_MMIO_STATUS + 4),
+                VIRTIO_MMIO_CONFIG - (VIRTIO_MMIO_STATUS + 4));
     // Wipe the shadow region (per-queue state + snapshots).
     zero_region(shadow_addr(slot, 0), SHADOW_PER_DEVICE);
 
