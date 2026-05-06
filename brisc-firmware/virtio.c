@@ -36,7 +36,6 @@
 #include "tensix_proto.h"
 #include "uart_layout.h"
 #include "virtio_layout.h"
-#include "shutdown_layout.h"
 
 // Firmware version, inspected via the stats page. Format:
 // `<build_id 24-bit><protocol 8-bit>`. Both sides verify a match
@@ -1255,56 +1254,6 @@ static void brisc_drive_trisc2_lifecycle(uint32_t virtio_active) {
     }
 }
 
-// Guest-OS shutdown poll (#94). For each registered shutdown slot
-// (one per L2CPU, 4 max), check whether the guest has written a
-// magic value to the per-L2CPU shutdown command register. On match,
-// push a kick-ring entry with a reserved slot id (20..23) and the
-// command kind in the queue_idx field, then clear the cell back to
-// the sentinel so we don't re-fire on the next sweep.
-//
-// Currently only POWEROFF (kind=0) is acted on by the daemon.
-// REBOOT (kind=1) is recognized at the firmware level so the BRISC
-// side won't change shape when the reboot follow-up (#141) lands —
-// daemon-side dispatch will route it to a re-run of the boot
-// pipeline. Unknown magics are clear-and-ignore; an operator could
-// see them via the kick ring's drop counter if they ever fire.
-//
-// Cost: one L1 read per active L2CPU per sweep. With 4 L2CPUs that's
-// ~20 BRISC cycles when all are active, ~5 cycles in the
-// no-shutdown-slots-active mask check that gates entry. Sub-µs.
-static void poll_shutdown_slots(uint32_t active) {
-    if ((active & BRISC_SHUTDOWN_SLOT_MASK) == 0u) {
-        return;
-    }
-    for (unsigned i = 0; i < BRISC_KICK_SHUTDOWN_NUM_SLOTS; i++) {
-        unsigned slot = BRISC_KICK_SHUTDOWN_SLOT_BASE + i;
-        if (((active >> slot) & 1u) == 0u) {
-            continue;
-        }
-        uintptr_t reg = brisc_shutdown_regs_base(i) + BRISC_SHUTDOWN_OFF_COMMAND;
-        uint32_t cmd = read_u32(reg);
-        if (cmd == BRISC_SHUTDOWN_SENTINEL) {
-            continue;
-        }
-        uint32_t kind;
-        if (cmd == BRISC_SHUTDOWN_MAGIC_POWEROFF) {
-            kind = 0u;
-        } else if (cmd == BRISC_SHUTDOWN_MAGIC_REBOOT) {
-            kind = 1u;
-        } else {
-            // Unknown magic — clear and ignore. Don't push a kick;
-            // we don't want to teardown an L2CPU on a glitch / stray
-            // write to this address from a misbehaving guest.
-            *l1_u32(reg) = BRISC_SHUTDOWN_SENTINEL;
-            FENCE_W();
-            continue;
-        }
-        kick_ring_push(slot, kind);
-        *l1_u32(reg) = BRISC_SHUTDOWN_SENTINEL;
-        FENCE_W();
-    }
-}
-
 // ----- TRISC0 entry (M6.1 #79 Phase B) -----
 //
 // Steady-state UART poll loop. TRISC0 is held in soft reset until
@@ -1479,18 +1428,6 @@ void main(void) {
                     // (re)registration. Skip the virtio re-init.
                     continue;
                 }
-                if (slot >= BRISC_KICK_SHUTDOWN_SLOT_BASE
-                    && slot < (BRISC_KICK_SHUTDOWN_SLOT_BASE + BRISC_KICK_SHUTDOWN_NUM_SLOTS)) {
-                    // Shutdown-slot activation (#94). Wipe the per-L2CPU
-                    // shutdown command cell to the sentinel so a stale
-                    // value from a prior boot doesn't immediately fire
-                    // a kick on the new lifecycle.
-                    unsigned idx = slot - BRISC_KICK_SHUTDOWN_SLOT_BASE;
-                    uintptr_t reg = brisc_shutdown_regs_base(idx) + BRISC_SHUTDOWN_OFF_COMMAND;
-                    *l1_u32(reg) = BRISC_SHUTDOWN_SENTINEL;
-                    FENCE_W();
-                    continue;
-                }
                 init_device(slot);
                 // Same outlier-tag as handle_status_change(STATUS=0):
                 // each init_device is a ~1240-cycle wipe and shouldn't
@@ -1519,7 +1456,6 @@ void main(void) {
         brisc_drive_trisc0_lifecycle(active);
         brisc_drive_trisc1_lifecycle(virtio_active);
         brisc_drive_trisc2_lifecycle(virtio_active);
-        poll_shutdown_slots(active);
         poll_completion_ring();
         heartbeat += 1u;
         // Don't fence on every iteration — heartbeat is observed at

@@ -106,10 +106,9 @@ $(OUT_DIR)/hello.o: hello.c | $(OUT_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Glob all headers as deps so any header touch triggers a rebuild.
-# Pre-fix this listed virtio_layout.h, uart_layout.h, tensix_proto.h
-# explicitly — and silently missed shutdown_layout.h, so a stride bump
-# there didn't actually rebuild the firmware. Globbing everything in
-# include/ avoids the next instance of this trap.
+# An earlier listing enumerated headers explicitly and silently missed
+# one, so a stride bump there didn't actually rebuild the firmware.
+# Globbing everything in include/ avoids the next instance of this trap.
 FW_HEADERS := $(wildcard include/*.h)
 $(OUT_DIR)/virtio.o: virtio.c $(FW_HEADERS) | $(OUT_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
