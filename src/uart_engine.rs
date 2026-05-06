@@ -8,18 +8,24 @@
 //! `BASE = 0x40000` with a 16 KiB stride; the existing engine TLB
 //! window covers it at offset `OFFSET_FROM_ENGINE_BASE = 0x30000`
 //! from each L2CPU's window base, so we don't program a second TLB
-//! slot. The kick ring is shared with virtio: slots 16..19 carry per-
-//! L2CPU TX bytes, with the byte payload in the `queue_idx` field of
-//! the existing `KickEntry`.
+//! slot. The active-slots bitmap is shared with virtio: each L2CPU's
+//! UART takes the in-window slot at offset
+//! [`UART_SLOT_OFFSET_IN_L2CPU`] (= 6 of 8), so the kick-ring slots
+//! land at 6, 14, 22, 30 — disjoint from every L2CPU's virtio
+//! dev_idx range (0..6). See #175 for the bitmap collision this
+//! layout fixed.
 //!
 //! Module-wide `#![allow(dead_code)]` — feed-ring offset constants are
 //! kept named to mirror the firmware header even where the host path
 //! doesn't currently read them.
 #![allow(dead_code)]
 //!
-//! TX-only on this side too — the daemon's kick consumer routes
-//! `slot >= UART_SLOT_BASE` kicks into `console_hub::push_chip_output`.
-//! RX is intentionally a future commit (see `uart_layout.h`).
+//! TX-only on this side too — the daemon drains each L2CPU's TRISC0
+//! feed ring directly via the chip TLB and pushes bytes into
+//! `console_hub::push_chip_output`. RX is intentionally a future
+//! commit (see `uart_layout.h`).
+
+use crate::virtio_engine::DEVS_PER_L2CPU;
 
 /// Per-L2CPU stride between UART reg files in BRISC L1.
 pub const UART_PER_L2CPU_STRIDE: u32 = 0x0000_4000;
@@ -31,23 +37,31 @@ pub const UART_REG_FILE_SIZE: u32 = 0x0000_1000;
 /// PA for the DTB `reg` property.
 pub const UART_OFFSET_FROM_ENGINE_BASE: u32 = 0x0003_0000;
 
-/// Kick-ring slot enumeration: virtio occupies 0..16, UART claims
-/// 16..20, one per L2CPU.
-pub const UART_SLOT_BASE: u16 = 16;
-pub const UART_NUM_SLOTS: u16 = 4;
+/// Within a per-L2CPU 8-slot region, the index that carries the UART
+/// kick. Slots 0..5 are virtio dev_idx (BLK / NET / CONSOLE / RNG /
+/// BLK1 / BLK2); slot 6 is UART; slot 7 is reserved padding.
+///
+/// Mirrored as `BRISC_UART_SLOT_OFFSET_IN_L2CPU` in
+/// `brisc-firmware/include/uart_layout.h`. Both sides must move in
+/// lockstep.
+pub const UART_SLOT_OFFSET_IN_L2CPU: u32 = 6;
 
 /// Convenience: the kick-ring slot for L2CPU `idx`'s UART.
 #[inline]
 pub fn slot_for_l2cpu(l2cpu_idx: u8) -> u16 {
-    UART_SLOT_BASE + l2cpu_idx as u16
+    (l2cpu_idx as u32 * DEVS_PER_L2CPU + UART_SLOT_OFFSET_IN_L2CPU) as u16
 }
 
 /// Inverse: returns the L2CPU index if `slot` is a UART slot, else
-/// `None`.
+/// `None`. UART slots are exactly the slots whose in-L2CPU offset is
+/// [`UART_SLOT_OFFSET_IN_L2CPU`].
 #[inline]
 pub fn l2cpu_for_slot(slot: u16) -> Option<u8> {
-    if (UART_SLOT_BASE..UART_SLOT_BASE + UART_NUM_SLOTS).contains(&slot) {
-        Some((slot - UART_SLOT_BASE) as u8)
+    let s = slot as u32;
+    if s % DEVS_PER_L2CPU == UART_SLOT_OFFSET_IN_L2CPU
+        && s / DEVS_PER_L2CPU < crate::virtio_engine::NUM_L2CPUS
+    {
+        Some((s / DEVS_PER_L2CPU) as u8)
     } else {
         None
     }
@@ -109,12 +123,24 @@ mod tests {
 
     #[test]
     fn slot_assignment_matches_firmware() {
-        assert_eq!(slot_for_l2cpu(0), 16);
-        assert_eq!(slot_for_l2cpu(3), 19);
-        assert_eq!(l2cpu_for_slot(16), Some(0));
-        assert_eq!(l2cpu_for_slot(19), Some(3));
-        assert_eq!(l2cpu_for_slot(15), None);
-        assert_eq!(l2cpu_for_slot(20), None);
+        // Per-L2CPU offset 6 — the UART slot for L2CPU N is N*8+6.
+        assert_eq!(slot_for_l2cpu(0), 6);
+        assert_eq!(slot_for_l2cpu(1), 14);
+        assert_eq!(slot_for_l2cpu(2), 22);
+        assert_eq!(slot_for_l2cpu(3), 30);
+        assert_eq!(l2cpu_for_slot(6), Some(0));
+        assert_eq!(l2cpu_for_slot(14), Some(1));
+        assert_eq!(l2cpu_for_slot(22), Some(2));
+        assert_eq!(l2cpu_for_slot(30), Some(3));
+        // Virtio slots in any L2CPU's range must NOT decode as UART
+        // — these are the exact bits that #175 was about.
+        for cpu in 0..4u32 {
+            for dev_idx in 0..6u32 {
+                assert_eq!(l2cpu_for_slot((cpu * 8 + dev_idx) as u16), None);
+            }
+            // dev_idx 7 is reserved padding; not UART.
+            assert_eq!(l2cpu_for_slot((cpu * 8 + 7) as u16), None);
+        }
     }
 
     // The engine TLB window is 2 MiB (small TLB default). UART at
@@ -149,7 +175,7 @@ mod tests {
     const _TRISC0_GLOBALS_AFTER_PER_L2CPU: () = {
         assert!(
             TRISC0_GLOBAL_BASE
-                >= UART_PRIVATE_BASE + (UART_NUM_SLOTS as u32) * UART_PRIVATE_PER_L2CPU
+                >= UART_PRIVATE_BASE + crate::virtio_engine::NUM_L2CPUS * UART_PRIVATE_PER_L2CPU
         );
     };
 

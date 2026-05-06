@@ -303,8 +303,9 @@ impl KickPoller {
     /// Recompute the active-slots bitmap from the virtio + UART
     /// registries and write it into BRISC L1 at CTRL_OFF_ACTIVE_SLOTS.
     /// BRISC reads this on every sweep iteration; bit `i` set means
-    /// "poll slot `i`." Virtio slots live in 0..16; UART slots at
-    /// `uart::UART_SLOT_BASE` + l2cpu_idx (16..20).
+    /// "poll slot `i`." Both virtio dev_idx 0..5 and UART (dev_idx 6)
+    /// share each L2CPU's 8-slot region — see #175 and
+    /// `uart::UART_SLOT_OFFSET_IN_L2CPU` for the layout.
     fn publish_active_mask(&self) {
         let mut virtio_mask: u32 = 0;
         for &slot in self.registry.lock().unwrap().keys() {
@@ -352,9 +353,9 @@ impl KickPoller {
     }
 
     /// Register an L2CPU's 16550 UART. Future kicks with slot
-    /// `uart::UART_SLOT_BASE + l2cpu_idx` route the byte payload
-    /// through the registered `console_hub` via `push_chip_output`.
-    /// Sets bit `16+idx` of the active-slots bitmap so BRISC starts
+    /// `uart::slot_for_l2cpu(idx)` route the byte payload through the
+    /// registered `console_hub` via `push_chip_output`. Sets the
+    /// corresponding bit in the active-slots bitmap so BRISC starts
     /// sweeping the L2CPU's UART reg file.
     pub fn register_uart(&self, l2cpu_idx: u8, hub: Arc<ConsoleHub>) {
         self.uart_registry.lock().unwrap().insert(l2cpu_idx, hub);
@@ -412,8 +413,8 @@ fn run_poll_loop(
     // is 4 bytes (one byte in low 8 bits) and there are 1024 slots,
     // so a stock-distro boot's ~10 KB of TX fits comfortably without
     // any rate limiting.
-    let mut uart_consumer: [u32; uart::UART_NUM_SLOTS as usize] =
-        [0; uart::UART_NUM_SLOTS as usize];
+    let mut uart_consumer: [u32; crate::virtio_engine::NUM_L2CPUS as usize] =
+        [0; crate::virtio_engine::NUM_L2CPUS as usize];
 
     // Last-seen drop counters (#101). BRISC and TRISC0 expose
     // monotonic u32s; we cache the last value we saw and surface
@@ -429,8 +430,8 @@ fn run_poll_loop(
     let mut last_max_sweep_cycles: u32 = 0;
     let mut last_max_steady_sweep_cycles: u32 = 0;
     let mut last_max_sel_path_cycles: u32 = 0;
-    let mut last_uart_drops: [u32; uart::UART_NUM_SLOTS as usize] =
-        [0; uart::UART_NUM_SLOTS as usize];
+    let mut last_uart_drops: [u32; crate::virtio_engine::NUM_L2CPUS as usize] =
+        [0; crate::virtio_engine::NUM_L2CPUS as usize];
     // Track per-slot STATUS transitions. Bench harnesses (and
     // operators debugging probe failures — see #123) need a
     // definitive "kernel finished probing this device" signal.
@@ -540,7 +541,7 @@ fn run_poll_loop(
         {
             let map = uart_registry.lock().unwrap();
             for (&l2cpu_idx, hub) in map.iter() {
-                if (l2cpu_idx as u32) >= uart::UART_NUM_SLOTS as u32 {
+                if (l2cpu_idx as u32) >= crate::virtio_engine::NUM_L2CPUS {
                     continue;
                 }
                 let priv_base = uart::uart_private_base(l2cpu_idx);
@@ -778,7 +779,7 @@ fn run_poll_loop(
         {
             let map = uart_registry.lock().unwrap();
             for (&l2cpu_idx, _) in map.iter() {
-                if (l2cpu_idx as u32) >= uart::UART_NUM_SLOTS as u32 {
+                if (l2cpu_idx as u32) >= crate::virtio_engine::NUM_L2CPUS {
                     continue;
                 }
                 let priv_base = uart::uart_private_base(l2cpu_idx);

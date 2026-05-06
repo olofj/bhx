@@ -956,11 +956,12 @@ static void poll_one_device(unsigned slot) {
 // as `ttyS0` and writes boot output there.
 //
 // M6.1 (#79) split: TRISC0 polls the UART reg files and feeds bytes
-// through a per-L2CPU SPSC ring in BRISC L1; BRISC drains the rings
-// and pushes kick-ring entries to the daemon. Same on-the-wire shape
-// as M6 (slot=BRISC_KICK_UART_SLOT_BASE+idx, byte in queue_idx); the
-// dedicated TRISC0 sweep closes the LSR-write race that drove the
-// 30–60% byte-loss observed on BRISC-only polling.
+// through a per-L2CPU SPSC ring in BRISC L1. M6.1 v3 (Phase B
+// revised) had the daemon read the feed rings directly — no kick-
+// ring round-trip. The dedicated TRISC0 sweep closes the LSR-write
+// race that drove the 30–60% byte-loss observed on BRISC-only
+// polling. Active-slot bit per UART is at
+// `brisc_uart_slot_for_l2cpu(i)` (= i*8+6, see uart_layout.h).
 //
 // RX is intentionally not implemented. A static MMIO reg file can't
 // observe the kernel's RBR reads, so it can't safely advance an RX
@@ -1010,7 +1011,7 @@ static void uart_init_one(unsigned l2cpu_idx) {
 }
 
 static void uart_init_devices(void) {
-    for (unsigned i = 0; i < BRISC_KICK_UART_NUM_SLOTS; i++) {
+    for (unsigned i = 0; i < BRISC_VIRTIO_NUM_L2CPUS; i++) {
         uart_init_one(i);
     }
 }
@@ -1330,8 +1331,8 @@ void trisc0_main(void) {
     uint32_t c = 0;
     for (;;) {
         uint32_t active = *active_p;
-        for (unsigned i = 0; i < BRISC_KICK_UART_NUM_SLOTS; i++) {
-            unsigned slot = BRISC_KICK_UART_SLOT_BASE + i;
+        for (unsigned i = 0; i < BRISC_VIRTIO_NUM_L2CPUS; i++) {
+            unsigned slot = brisc_uart_slot_for_l2cpu(i);
             if (((active >> slot) & 1u) == 0) {
                 continue;
             }
@@ -1462,18 +1463,18 @@ void main(void) {
         uint32_t virtio_active = read_u32(ctrl_addr(CTRL_OFF_ACTIVE_VIRTIO_SLOTS));
         uint32_t newly_active = active & ~prev_active;
         if (newly_active != 0u) {
-            // Don't re-init bits in the UART range (16..19) — those
-            // are TRISC0 lifecycle bits, not virtio slots, and
-            // re-running init_device on the UART range's collision
-            // partners (L2CPU 2 dev 0..3) would clobber state if
-            // L2CPU 2 happened to be booted alongside L2CPU 0's UART.
-            // Slot indices in 0..NUM_SLOTS only.
+            // Don't re-init bits whose in-L2CPU offset is the UART
+            // slot — those are TRISC0 lifecycle bits, not virtio
+            // dev slots, and re-running init_device would wipe a
+            // BRISC L1 region that backs the UART reg file. Per
+            // #175 the UART now lives at offset 6 inside each
+            // L2CPU's 8-slot region (slots 6, 14, 22, 30) so the
+            // gating is `(slot % 8) == 6`.
             for (unsigned slot = 0; slot < BRISC_VIRTIO_NUM_SLOTS; slot++) {
                 if (((newly_active >> slot) & 1u) == 0u) {
                     continue;
                 }
-                if (slot >= BRISC_KICK_UART_SLOT_BASE
-                    && slot < (BRISC_KICK_UART_SLOT_BASE + BRISC_KICK_UART_NUM_SLOTS)) {
+                if ((slot % BRISC_VIRTIO_DEVS_PER_L2CPU) == BRISC_UART_SLOT_OFFSET_IN_L2CPU) {
                     // UART activation, not a virtio slot
                     // (re)registration. Skip the virtio re-init.
                     continue;

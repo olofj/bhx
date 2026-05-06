@@ -1723,7 +1723,7 @@ fn run_uart_loopback(
 
     // Set the UART slot's bit so BRISC releases TRISC0. We don't run
     // a kick poller here — we read the feed ring directly below.
-    let uart_bit = 1u32 << (uart_engine::UART_SLOT_BASE + l2cpu_idx as u16);
+    let uart_bit = 1u32 << uart_engine::slot_for_l2cpu(l2cpu_idx);
     engine.write_active_slots(uart_bit);
     // Give BRISC's main loop a beat to observe the bitmap and
     // release TRISC0, plus TRISC0 a beat to enter its poll loop.

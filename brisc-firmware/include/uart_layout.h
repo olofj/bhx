@@ -169,26 +169,45 @@ static inline uintptr_t brisc_uart_private_base(unsigned l2cpu_idx) {
 
 // ----- Kick-ring slot encoding for UART -----
 //
-// Virtio uses slots 0..15 (4 L2CPUs × 4 devices). UART claims slots
-// 16..19, one per L2CPU. The kick-entry's `queue_idx` field (16
-// bits) carries the byte payload in its low 8 bits — daemon-side
-// dispatch reads `(slot, queue_idx)` from `raw[0]`, sees `slot >=
-// BRISC_KICK_UART_SLOT_BASE`, decodes `l2cpu_idx = slot -
-// BRISC_KICK_UART_SLOT_BASE`, and pulls the byte out of queue_idx.
+// Each L2CPU owns 8 contiguous slots in the active-slots bitmap (the
+// virtio engine's per-L2CPU window stride). Within an L2CPU's region
+// the layout is:
+//   dev_idx 0..5 -> virtio (BLK / NET / CONSOLE / RNG / BLK1 / BLK2)
+//   dev_idx 6    -> UART
+//   dev_idx 7    -> reserved
 //
-// The active-slots bitmap (CTRL_OFF_ACTIVE_SLOTS) is u32, so bits
-// 16..19 are valid; the daemon flips the bit on register-uart and
-// off on unregister-uart, mirroring the virtio register flow. BRISC
-// only polls UARTs whose bit is set.
+// So the absolute UART slot for L2CPU `i` is
+// `i * BRISC_VIRTIO_DEVS_PER_L2CPU + BRISC_UART_SLOT_OFFSET_IN_L2CPU`,
+// landing at 6, 14, 22, 30. Disjoint from every L2CPU's virtio
+// dev_idx range — fixes #175 (the prior contiguous slots 16..19
+// layout collided with L2CPU 2's virtio range 16..23 once
+// DEVS_PER_L2CPU was bumped from 4 to 8).
+//
+// The active-slots bitmap (CTRL_OFF_ACTIVE_SLOTS) is u32, so the
+// highest UART bit (slot 30) fits. The daemon flips the bit on
+// register-uart and off on unregister-uart, mirroring the virtio
+// register flow. BRISC only polls UARTs whose bit is set.
 
-#define BRISC_KICK_UART_SLOT_BASE  16u
-#define BRISC_KICK_UART_NUM_SLOTS  4u
+#include "virtio_layout.h"
 
-// All 4 UART bits combined — used by BRISC to drive TRISC0's reset
+#define BRISC_UART_SLOT_OFFSET_IN_L2CPU  6u
+
+// Absolute slot for L2CPU `i`'s UART.
+static inline unsigned brisc_uart_slot_for_l2cpu(unsigned l2cpu_idx) {
+    return l2cpu_idx * BRISC_VIRTIO_DEVS_PER_L2CPU + BRISC_UART_SLOT_OFFSET_IN_L2CPU;
+}
+
+// All UART bits combined — used by BRISC to drive TRISC0's reset
 // lifecycle in M6.1 (#79). If any bit in this mask is set, TRISC0
 // runs (polls UARTs); if all clear, TRISC0 is held in soft reset.
-#define BRISC_UART_SLOT_MASK \
-    (((1u << BRISC_KICK_UART_NUM_SLOTS) - 1u) << BRISC_KICK_UART_SLOT_BASE)
+//
+// With offset 6 in each 8-slot region this is bits {6, 14, 22, 30}
+// = 0x40404040.
+#define BRISC_UART_SLOT_MASK                                                                       \
+    ((1u << (0u * BRISC_VIRTIO_DEVS_PER_L2CPU + BRISC_UART_SLOT_OFFSET_IN_L2CPU))                  \
+     | (1u << (1u * BRISC_VIRTIO_DEVS_PER_L2CPU + BRISC_UART_SLOT_OFFSET_IN_L2CPU))                \
+     | (1u << (2u * BRISC_VIRTIO_DEVS_PER_L2CPU + BRISC_UART_SLOT_OFFSET_IN_L2CPU))                \
+     | (1u << (3u * BRISC_VIRTIO_DEVS_PER_L2CPU + BRISC_UART_SLOT_OFFSET_IN_L2CPU)))
 
 // ----- TRISC0 globals (M6.1, #79) -----
 //
