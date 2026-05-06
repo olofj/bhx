@@ -97,26 +97,55 @@ mod imp {
                 ));
             }
         }
-        // Operator's cwd at daemon start time — read+write at the cwd
-        // level. Captures rootfs.ext4 + Image + fw_jump.bin +
-        // blackhole-card.dtb + any path the operator might pass to
-        // add-disk. WriteFile is needed for the disk image, which the
-        // virtio-blk worker opens O_RDWR. Landlock checks the symlink
-        // path (not the resolved target), so a cwd-rooted symlink
-        // pointing to a sibling project (the typical
-        // ../bhx/rootfs.ext4 layout) traverses fine.
-        if let Ok(cwd) = std::env::current_dir() {
-            allow.push((
-                cwd,
+        // bhx-managed XDG data dirs — `bhx image pull`, the in-tree
+        // U-Boot/OpenSBI/DTB build, and `bhx boot -i <name>` all
+        // resolve to fixed subpaths under `$XDG_DATA_HOME/bhx/`. The
+        // daemon mmaps disk images (read+write) and reads firmware
+        // blobs, so it needs explicit allow rules for these — the
+        // operator should never have to invent a sandbox-policy
+        // override for a path bhx itself manages. See #181.
+        for (subdir, access) in [
+            (
+                "images",
                 AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir,
-            ));
+            ),
+            ("firmware", AccessFs::ReadFile | AccessFs::ReadDir),
+            (
+                "instances",
+                AccessFs::ReadFile
+                    | AccessFs::WriteFile
+                    | AccessFs::ReadDir
+                    | AccessFs::MakeReg
+                    | AccessFs::MakeDir,
+            ),
+        ] {
+            if let Ok(p) = crate::xdg::data_subdir(subdir) {
+                allow.push((p, access));
+            }
         }
-        // Parent of cwd: read-only — covers a sibling-of-cwd checkout
-        // pattern (e.g. third_party/buildroot/rootfs.ext4 referencing a
-        // buildroot output dir).
-        if let Ok(cwd) = std::env::current_dir() {
-            if let Some(parent) = cwd.parent() {
-                allow.push((parent.to_path_buf(), AccessFs::ReadFile | AccessFs::ReadDir));
+        // Operator's cwd at daemon-start time — read+write, covering
+        // the project-dir workflow (`bhx boot -d ./rootfs.ext4` from
+        // within a checkout, the M3+ buildroot/uboot/dtb in-tree
+        // builds writing into `third_party/`, etc.). Captured by
+        // `runner::run_daemonized` BEFORE the daemon's chdir-to-`/`,
+        // exposed via `BHX_OPERATOR_CWD` because env survives fork
+        // while `current_dir()` resolves to `/` after chdir.
+        //
+        // Scope is intentionally narrow vs. allowing all of `$HOME`:
+        // a dotfile-only attacker pivot from a virtio bug doesn't
+        // gain free read of `~/.ssh`, browser data, password
+        // managers, etc. Operator paths outside the project tree and
+        // outside the bhx XDG tree need `--no-sandbox` for now;
+        // a future `--allow-path` would let the operator opt-in
+        // selectively without dropping the sandbox entirely. See
+        // #181.
+        if let Some(cwd) = std::env::var_os("BHX_OPERATOR_CWD") {
+            let cwd = PathBuf::from(cwd);
+            if cwd.exists() {
+                allow.push((
+                    cwd,
+                    AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir,
+                ));
             }
         }
         // System read-only paths slirp + libc + dynamic-linker need,
@@ -148,7 +177,11 @@ mod imp {
 
         // Convert (path, access) tuples into landlock rules. Skip
         // paths that don't open (e.g. a missing /lib64 on a glibc-
-        // only system).
+        // only system). Log every rule so an operator hitting an
+        // EPERM under the sandbox can grep `[sandbox] allow:` to
+        // see whether the path's parent landed in the allow list
+        // and adjust accordingly (move the artifact under the
+        // project dir / `$XDG_DATA_HOME/bhx/`, or `--no-sandbox`).
         for (path, access) in allow {
             match PathFd::new(&path) {
                 Ok(fd) => {
@@ -156,10 +189,14 @@ mod imp {
                     ruleset = ruleset.add_rule(rule).map_err(|e| {
                         Error::internal(format!("landlock add_rule({}): {}", path.display(), e))
                     })?;
+                    crate::dlog!("[sandbox] allow: {} ({:?})", path.display(), access);
                 }
-                Err(_) => {
-                    // Path doesn't exist yet (e.g. log file's parent
-                    // before first write). Not fatal.
+                Err(e) => {
+                    crate::dlog!(
+                        "[sandbox] skip (PathFd::new({}) failed: {})",
+                        path.display(),
+                        e
+                    );
                 }
             }
         }

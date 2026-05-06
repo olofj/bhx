@@ -191,6 +191,17 @@ fn run_daemonized(
     // let's not take the risk).
     drop(pid_guard);
 
+    // Capture the operator's cwd before the fork so the sandbox can
+    // narrow filesystem access to "the project dir the operator
+    // launched from", instead of the post-fork chdir-to-`/` which
+    // would otherwise collapse a `current_dir()`-rooted allow rule
+    // into "all of /". Goes via an env var because env survives the
+    // fork+chdir, the alternative being to thread a parameter through
+    // five layers of daemon plumbing. See sandbox.rs and #181.
+    if let Ok(cwd) = std::env::current_dir() {
+        std::env::set_var("BHX_OPERATOR_CWD", cwd);
+    }
+
     use crate::daemon::fork::{double_fork, Outcome};
     match double_fork(Path::new("/"), 0o027, log_out, log_err)? {
         Outcome::Parent => {
