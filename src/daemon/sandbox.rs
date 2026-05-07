@@ -243,6 +243,7 @@ mod imp {
             libc::SYS_fcntl,
             libc::SYS_lseek,
             libc::SYS_fstat,
+            libc::SYS_newfstatat,
             libc::SYS_statx,
             libc::SYS_flock,
             libc::SYS_ftruncate,
