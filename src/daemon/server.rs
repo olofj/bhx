@@ -1290,11 +1290,40 @@ fn maybe_opportunistic_reset_board(
     target_idx: u8,
     card: u32,
 ) -> crate::Result<()> {
-    // Snapshot non-target slot states without holding all four mutexes
-    // simultaneously: identify Running siblings and Parked siblings in
-    // separate passes. Running detection: slot is Some AND its
-    // purgatory cell does NOT read PARKED. Parked detection: slot is
-    // Some AND purgatory cell == PARKED magic.
+    // Hold boot_lock across the entire decide-and-do flow so a parallel
+    // cold-boot RPC can't race past the sibling scan while we're mid-
+    // reset. Without this, 4 simultaneous cold boots all snapshot
+    // "no Running siblings" (because each in-flight boot hasn't yet
+    // populated the slot table), each enters the reset branch, and
+    // the second through fourth resets blip the chip while the first
+    // boot is mid-`L2Cpu::new` — invalidates its mmap pages and the
+    // worker threads SIGBUS on the next L1 access.
+    let _boot_guard = state
+        .boot_lock
+        .lock()
+        .map_err(|_| crate::Error::internal("daemon boot_lock poisoned"))?;
+
+    // Once any boot in this session has reset the chip, the chip is
+    // "ours" — subsequent cold boots don't need to re-reset, and
+    // doing so would punch holes in earlier-booted L2CPU mmaps. The
+    // flag lives for the duration of the daemon process; an external
+    // `tt-smi -r` between boots is operator-initiated recovery, and
+    // the operator is expected to restart the daemon afterwards.
+    if state
+        .chip_reset_this_session
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        dlog!(
+            "[boot l2cpu {}] opportunistic reset_board skipped — \
+             chip was already reset this session",
+            target_idx
+        );
+        return Ok(());
+    }
+
+    // Snapshot non-target slot states. Running detection: slot is
+    // Some AND its purgatory cell does NOT read PARKED. Parked
+    // detection: slot is Some AND purgatory cell == PARKED magic.
     let mut running_siblings = Vec::new();
     let mut parked_siblings = Vec::new();
     for i in 0..4u8 {
@@ -1347,16 +1376,11 @@ fn maybe_opportunistic_reset_board(
 
     // Drop the engine + kick poller before the PCIe LDS reset. Their
     // fds point at the about-to-be-reset chardev; holding them across
-    // the reset would leave them pointing at unmapped BARs.
+    // the reset would leave them pointing at unmapped BARs. Dropping
+    // the poller joins its thread synchronously.
     let _ = state.kick_poller.lock_or_internal_error()?.take();
     let _ = state.tensix_engine.lock_or_internal_error()?.take();
 
-    // Hold the boot_lock across reset_board so a concurrent boot RPC
-    // (different thread, different L2CPU) doesn't race with the reset.
-    let _boot_guard = state
-        .boot_lock
-        .lock()
-        .map_err(|_| crate::Error::internal("daemon boot_lock poisoned"))?;
     state
         .shared_chip
         .reset_board(card)
@@ -1364,6 +1388,9 @@ fn maybe_opportunistic_reset_board(
             ctx: "opportunistic reset_board".into(),
             source: e,
         })?;
+    state
+        .chip_reset_this_session
+        .store(true, std::sync::atomic::Ordering::Release);
     dlog!(
         "[boot l2cpu {}] opportunistic reset_board complete",
         target_idx
