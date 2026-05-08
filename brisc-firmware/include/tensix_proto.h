@@ -91,7 +91,12 @@
 // 0x20000 to 0x40000 to clear the larger reg-file region. A v3
 // daemon talking to v4 firmware (or vice versa) reads/writes shadow
 // state at the wrong address — every kick gets silently dropped.
-#define TENSIX_PROTOCOL_VERSION 4u
+// v5 (#188) replaces the V1 kick + completion rings with the V2
+// per-queue dirty bitmap + processed-cursor table at
+// `CTRL_OFF_DIRTY` / `CTRL_OFF_PROCESSED`. Cold-start handshake
+// path is unchanged; the version bump is the daemon's signal to
+// switch to bitmap drain instead of kick-ring consumer.
+#define TENSIX_PROTOCOL_VERSION 5u
 
 // L1 control-plane region (within the BRISC firmware tile's L1).
 //

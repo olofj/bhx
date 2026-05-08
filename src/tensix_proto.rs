@@ -53,7 +53,12 @@
 /// state at the wrong address — the kick poller silently drops every
 /// kick. Warm-resume on a `firmware_version` mismatch must refuse to
 /// adopt and force a fresh firmware load.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v5 (#188) replaces the V1 kick + completion rings with the V2
+/// per-queue dirty bitmap (`CTRL_OFF_DIRTY`) and processed-cursor
+/// table (`CTRL_OFF_PROCESSED`). The cold-start handshake stays at
+/// HELLO/HELLO_ACK; the version bump is the daemon's signal to drain
+/// via bitmap instead of kick-ring consumer.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 // ----- L1 control-plane region (BRISC L1) -----
 //
@@ -260,7 +265,7 @@ impl CompletionEntry {
 
 // Lock the wire-format protocol version against the firmware. A bump to
 // PROTOCOL_VERSION must be matched on both sides simultaneously.
-const _PROTOCOL_VERSION_PINNED: () = assert!(PROTOCOL_VERSION == 4);
+const _PROTOCOL_VERSION_PINNED: () = assert!(PROTOCOL_VERSION == 5);
 
 #[cfg(test)]
 mod tests {

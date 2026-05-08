@@ -713,10 +713,10 @@ static void handle_queue_ready_change(unsigned slot, uint32_t sel, uint32_t read
         *l1_u32(shadow_queue_addr(slot, sel, SHADOW_Q_OFF_DEVICE_HI)) = 0;
         inc_stat(STATS_OFF_QUEUE_TEARDOWNS);
     }
-    // No FENCE_W here: shadow is BRISC-private and the next kick
-    // for this queue will fence inside `kick_ring_push` before the
-    // producer-seq bump, which transitively orders these stores
-    // against any daemon-side shadow read.
+    // V2 (#188): the daemon walks ring metadata from guest DRAM via
+    // its own mmap path; shadow remains a BRISC-private snapshot
+    // used only inside the firmware's poll loop. No fence needed —
+    // the next sweep's reads of these stores stay within this hart.
     inc_stat(STATS_OFF_READY_EVENTS);
 }
 
@@ -733,51 +733,20 @@ static inline uintptr_t epoch_addr(unsigned slot) {
     return shadow_addr(slot, SNAP_BASE_OFF + 0x10);
 }
 
-// Append one KickEntry to the L1 kick ring and bump the producer
-// counter. The daemon polls `producer_seq` via the chip-side TLB
-// and drains entries in `[consumer_seq..producer_seq)`. Same SPSC
-// pattern as a virtio split virtqueue, but with the ring in BRISC
-// L1 rather than guest DRAM.
+// Guest wrote QUEUE_NOTIFY=q. Set the per-(slot, queue) dirty flag
+// in `CTRL_OFF_DIRTY`. Daemon clears the flag and dispatches each
+// pass; a single-byte store on RV32I is atomic, so no fence and no
+// ring overflow. Replaces V1's kick-ring producer (#188).
 //
-// Pre-#101 we wrote unconditionally; under daemon backpressure (slow
-// `process_one_chain_for_queue` on a disk stall etc.) BRISC would
-// overwrite unread entries and the daemon would consume garbage
-// re-runs of the ring. Now we check fullness first: if the ring is
-// already at `KICK_RING_ENTRIES - 1` outstanding, drop the kick and
-// bump `STATS_OFF_KICK_DROPS` so the daemon can surface the
-// pressure rather than silently corrupting state. We don't block —
-// BRISC is preemption-free and a stalled daemon will only get worse
-// if firmware also stalls.
-static void kick_ring_push(unsigned slot, uint32_t queue_idx) {
-    uint32_t seq = read_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_PRODUCER_SEQ));
-    uint32_t consumer = read_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_CONSUMER_SEQ));
-    uint32_t outstanding = seq - consumer;
-    if (outstanding >= KICK_RING_ENTRIES) {
-        uint32_t drops = read_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_KICK_DROPS);
-        // Stat counter — no fence; daemon reads at ms timescale.
-        store_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_KICK_DROPS, drops + 1u);
-        return;
-    }
-    uint32_t epoch = read_u32(epoch_addr(slot));
-    uint32_t idx = seq & (KICK_RING_ENTRIES - 1u);
-    uintptr_t entry = ctrl_addr(CTRL_OFF_KICK_RING + idx * KICK_ENTRY_SIZE);
-    *l1_u32(entry + KICK_ENTRY_OFF_SLOT) = ((uint32_t)slot & 0xFFFFu) | ((queue_idx & 0xFFFFu) << 16);
-    *l1_u32(entry + KICK_ENTRY_OFF_SEQ) = seq;
-    *l1_u32(entry + KICK_ENTRY_OFF_EPOCH) = epoch;
-    FENCE_W();
-    // Bump the producer AFTER the entry is fully written so a
-    // racing daemon read either misses the entry entirely or sees
-    // it in a consistent state.
-    write_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_PRODUCER_SEQ), seq + 1u);
-}
-
-// Guest wrote QUEUE_NOTIFY=q. Append a KickEntry to the kick ring so
-// the daemon's poll loop wakes up and drains the device's avail
-// ring. Also records (slot, q) in the stats page for diagnostics.
+// The MAX_QUEUES_PER_SLOT bound guards against a misbehaving guest
+// writing an out-of-range queue index. Real virtio drivers stay
+// well below the cap (block=1, net=2, console=2-4).
 static void handle_queue_notify(unsigned slot, uint32_t q) {
     *l1_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_LAST_NOTIFY) =
         ((uint32_t)slot << 16) | (q & 0xFFFFu);
-    kick_ring_push(slot, q);
+    if (q < MAX_QUEUES_PER_SLOT) {
+        *((volatile uint8_t *)ctrl_addr(CTRL_OFF_DIRTY + slot * MAX_QUEUES_PER_SLOT + q)) = 1u;
+    }
     inc_stat(STATS_OFF_NOTIFY_EVENTS);
 }
 
@@ -803,36 +772,6 @@ static void handle_status_change(unsigned slot, uint32_t status, uint32_t prev) 
         init_device_fired_this_iter = 1;
     }
     inc_stat(STATS_OFF_STATUS_CHANGES);
-}
-
-// Drain the completion ring (daemon → BRISC). Each entry tells us
-// "slot S queue Q has a new used_idx; please IRQ the L2CPU." In
-// this M5 first cut we only record the event in stats; the actual
-// PLIC IRQ to the L2CPU stays daemon-driven (the NIU register
-// dance for BRISC-side NoC writes lands in a follow-up).
-static void poll_completion_ring(void) {
-    uint32_t producer = read_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_PRODUCER_SEQ));
-    uint32_t consumer = read_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_CONSUMER_SEQ));
-    if (consumer == producer) {
-        // Steady state: nothing to drain. Skip the publish — writing
-        // the same CONSUMER_SEQ back with a FENCE_W on every main-loop
-        // iteration is pure overhead and widens the SEL→READY race
-        // window we're trying to shrink (#123).
-        return;
-    }
-    do {
-        uint32_t idx = consumer & (COMPL_RING_ENTRIES - 1u);
-        uintptr_t entry = ctrl_addr(CTRL_OFF_COMPL_RING + idx * COMPL_ENTRY_SIZE);
-        uint32_t slot_q = *l1_u32(entry);  // [15:0] slot, [31:16] queue
-        // Stash for diagnostics; same packed format as LAST_NOTIFY.
-        *l1_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_LAST_COMPL) = slot_q;
-        inc_stat(STATS_OFF_COMPL_EVENTS);
-        consumer += 1u;
-    } while (consumer != producer);
-    // No fence: the daemon polls CONSUMER_SEQ for backpressure
-    // diagnostics, not for ordering with anything BRISC writes after.
-    // Microsecond visibility delay is fine.
-    store_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_CONSUMER_SEQ), consumer);
 }
 
 // ----- Main poll loop -----
@@ -1330,17 +1269,19 @@ void trisc0_main(void) {
 // ----- M5 (#71) handshake -----
 
 // Initialize the control-plane region: zero the hello/hello-ack/
-// kick-ring/compl-ring slots, then publish ring sizes. Daemon must
-// not write its hello until BRISC has done this — but in practice
-// the daemon waits for the M3 stats-magic before issuing hello, and
-// stats-magic is published only after `init_proto`, so the
-// ordering is enforced by construction.
+// dirty/processed slots. Daemon must not write its hello until
+// BRISC has done this — but in practice the daemon waits for the
+// M3 stats-magic before issuing hello, and stats-magic is published
+// only after `init_proto`, so the ordering is enforced by
+// construction.
+//
+// V2 (#188): the zero-sweep is the only init the bitmap path needs.
+// DIRTY + PROCESSED arrays are sized implicitly by NUM_SLOTS *
+// MAX_QUEUES_PER_SLOT and need no published header.
 static void init_proto(void) {
     for (unsigned off = 0; off < CTRL_SIZE; off += 4) {
         *l1_u32(ctrl_addr(off)) = 0;
     }
-    *l1_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_RING_ENTRIES)) = KICK_RING_ENTRIES;
-    *l1_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_RING_ENTRIES)) = COMPL_RING_ENTRIES;
     FENCE_W();
 }
 
@@ -1488,7 +1429,6 @@ void main(void) {
         brisc_drive_trisc0_lifecycle(active);
         brisc_drive_trisc1_lifecycle(virtio_active);
         brisc_drive_trisc2_lifecycle(virtio_active);
-        poll_completion_ring();
         heartbeat += 1u;
         // Don't fence on every iteration — heartbeat is observed at
         // human timescales (debug status), so once per ~1024 sweeps
