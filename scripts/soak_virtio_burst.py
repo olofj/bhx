@@ -3,34 +3,36 @@
 # SPDX-License-Identifier: MIT
 
 """
-Sustained multi-queue virtio burst regression test (#184 / #186).
+Sustained multi-queue virtio burst regression test for V2 dispatch.
 
 Drives concurrent block (fio randwrite at high iodepth) and console
 (tight printf loop to /dev/console) workload inside the guest for
 DURATION_SEC seconds. While the workload runs, the host samples the
 daemon's `/metrics` endpoint every 1 s and writes a CSV.
 
-After the workload window, the script asserts based on `--mode`:
+After the workload window, the script asserts:
 
-  --mode baseline  — V1 dispatch path (current `main`):
-      max(bhx_kick_ring_high_water) >= KICK_RING_ENTRIES * 0.5
-      Confirms the workload is intense enough to be a meaningful
-      gate. Drops are NOT asserted on; presence of drops is
-      informational and indicates the V1 failure mode that V2.1
-      will fix. This mode is the script's own self-test on V1.
-
-  --mode v2  — V2 dispatch path (after #189 / #190 land):
-      No daemon-log line matches `kick.*drop|rescue|throttle.*ENGAGE`.
-      bhx_dispatch_passes_total > 0 (workload reached the new path).
-      No virtio timeout messages in the guest's dmesg.
-      This mode is the permanent regression gate.
+  - No daemon-log line matches `kick.*drop|rescue|throttle.*ENGAGE`
+    (regex catches V1 path activity that should not exist post-V2;
+    `kick` is also the natural English word for guest QUEUE_NOTIFY,
+    so a future stray dlog using "kick" in V2 vocab would also
+    flag — false positive on a synonym is preferable to silently
+    missing a real V1-path regression).
+  - `bhx_dispatch_passes_total > 0` (workload reached the V2
+    dispatch path; not just bench-ran but didn't actually dispatch
+    anything).
 
 Targets the buildroot rootfs in `third_party/buildroot/`. Auto-login
-on `# `, fio + iperf3 in target/bin (we use fio here; iperf3 is
-available if a future variant adds network burst).
+on `# `, fio in target/bin.
+
+Originally (#186) this script also had a `--mode baseline` for
+measuring V1 ring-fill against pre-V2 main. After V2.1 (#187 / #188
+/ #189 / #190) merged, the V1 metrics it relied on were deleted from
+the daemon, so baseline mode would forever read 0 and FAIL its
+high-water gate. Removed in the V2.1 cleanup pass — anyone
+benchmarking V1 against pre-V2 builds can `git checkout 0ff063f^`.
 
 Env / args:
-  --mode {baseline,v2}    MODE env (default baseline)
   --duration-sec N        DURATION_SEC env (default 300)
   --l2cpu N               L2CPU env (default 0)
   --ttdevice N            CARD env (default 0)
@@ -42,10 +44,8 @@ Env / args:
   ROOTFS                  rootfs path (auto-detected from buildroot)
 
 CSV columns:
-  ts_iso, elapsed_s, kick_ring_high_water, kick_ring_current_gap,
-  kick_drops_total, kick_throttle_engaged, kick_throttle_transitions_total,
-  kick_rescued_total, dispatch_passes_total, notify_events_total
-  (V2-only metrics emit 0 if absent in V1.)
+  ts_iso, elapsed_s, dispatch_passes_total, dispatch_queues_drained,
+  notify_events_total
 
 Output: writes CSV; prints summary; PASS/FAIL line on exit.
 """
@@ -68,12 +68,6 @@ import urllib.request
 # --- args & env ------------------------------------------------------------
 parser = argparse.ArgumentParser(
     description=__doc__.split("\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter
-)
-parser.add_argument(
-    "--mode",
-    default=os.environ.get("MODE", "baseline"),
-    choices=["baseline", "v2"],
-    help="assertion mode (baseline against V1 dispatch, v2 against V2)",
 )
 parser.add_argument(
     "--duration-sec", type=int, default=int(os.environ.get("DURATION_SEC", "300"))
@@ -376,14 +370,8 @@ def stop_workload() -> None:
 
 # --- metrics sampler -------------------------------------------------------
 METRIC_KEYS = [
-    "bhx_kick_ring_high_water",
-    "bhx_kick_ring_current_gap",
-    "bhx_kick_drops_total",
-    "bhx_kick_throttle_engaged",
-    "bhx_kick_throttle_transitions_total",
-    "bhx_kick_rescued_total",
-    # V2 metrics (absent on V1 — recorded as 0).
     "bhx_dispatch_passes_total",
+    "bhx_dispatch_queues_drained",
     "bhx_notify_events_total",
 ]
 METRIC_RE = re.compile(rb"^([a-z_]+)(?:\{[^}]*\})?\s+([0-9.eE+\-]+)\s*$", re.M)
@@ -393,8 +381,9 @@ def fetch_metrics() -> dict[str, float]:
     """Pull the daemon's /metrics endpoint and reduce to METRIC_KEYS.
 
     Per-label series collapse to a sum across labels (e.g. per-l2cpu
-    counters become a single number). The kick-ring metrics aren't
-    labeled today but the parser is forgiving in case future ones are.
+    counters become a single number). Today's V2 dispatch metrics
+    are unlabeled, but the parser tolerates labels for forward
+    compatibility.
     """
     out: dict[str, float] = {k: 0.0 for k in METRIC_KEYS}
     try:
@@ -445,11 +434,12 @@ while slept < args.duration_sec:
     slept += chunk
     if slept < args.duration_sec:
         cur = samples[-1] if samples else {}
-        hw = cur.get("bhx_kick_ring_high_water", 0)
-        gap = cur.get("bhx_kick_ring_current_gap", 0)
-        drops = cur.get("bhx_kick_drops_total", 0)
+        passes = cur.get("bhx_dispatch_passes_total", 0)
+        queues = cur.get("bhx_dispatch_queues_drained", 0)
+        notifies = cur.get("bhx_notify_events_total", 0)
         note(
-            f"[{slept}/{args.duration_sec}s] high_water={hw} gap={gap} drops={drops}"
+            f"[{slept}/{args.duration_sec}s] dispatch_passes={passes} "
+            f"queues_drained={queues} notifies={notifies}"
         )
 
 note("workload window complete; stopping sampler + in-guest workload")
@@ -477,34 +467,21 @@ def col_last(name: str) -> float:
     return float(samples[-1].get(name, 0)) if samples else 0.0
 
 
-KICK_RING_ENTRIES = int(os.environ.get("KICK_RING_ENTRIES", "2048"))
-THRESHOLD_PCT = 50
-THRESHOLD = KICK_RING_ENTRIES * THRESHOLD_PCT // 100
-
-max_high_water = col_max("bhx_kick_ring_high_water")
-total_drops = col_last("bhx_kick_drops_total")
-max_throttle = col_max("bhx_kick_throttle_engaged")
-throttle_transitions = col_last("bhx_kick_throttle_transitions_total")
-total_rescued = col_last("bhx_kick_rescued_total")
 total_dispatch_passes = col_last("bhx_dispatch_passes_total")
+total_queues_drained = col_last("bhx_dispatch_queues_drained")
 total_notifies = col_last("bhx_notify_events_total")
 
 print()
-print(f"=== summary ({args.mode}) ===")
-print(f"  duration                     : {args.duration_sec}s")
-print(f"  samples                      : {len(samples)}")
-print(f"  max bhx_kick_ring_high_water : {max_high_water:.0f}/{KICK_RING_ENTRIES} "
-      f"({max_high_water * 100 / KICK_RING_ENTRIES:.1f}%)")
-print(f"  bhx_kick_drops_total (final) : {total_drops:.0f}")
-print(f"  max bhx_kick_throttle_engaged: {max_throttle:.0f}")
-print(f"  throttle transitions (final) : {throttle_transitions:.0f}")
-print(f"  rescued total (final)        : {total_rescued:.0f}")
-print(f"  dispatch_passes_total (final): {total_dispatch_passes:.0f}")
-print(f"  notify_events_total (final)  : {total_notifies:.0f}")
+print("=== summary ===")
+print(f"  duration                       : {args.duration_sec}s")
+print(f"  samples                        : {len(samples)}")
+print(f"  bhx_dispatch_passes_total      : {total_dispatch_passes:.0f}")
+print(f"  bhx_dispatch_queues_drained    : {total_queues_drained:.0f}")
+print(f"  bhx_notify_events_total        : {total_notifies:.0f}")
 print()
 
 
-# --- daemon-log scan (used by v2 mode) ------------------------------------
+# --- daemon-log scan: V1-path activity should not appear -------------------
 DAEMON_LOG_RE = re.compile(rb"kick.*drop|rescue|throttle.*ENGAGE", re.IGNORECASE)
 
 
@@ -519,48 +496,29 @@ def scan_daemon_log() -> list[bytes]:
     return hits
 
 
-# --- assertions per mode ---------------------------------------------------
+# --- assertions ------------------------------------------------------------
 exit_code = 0
-if args.mode == "baseline":
-    if max_high_water >= THRESHOLD:
-        print(
-            f"PASS: baseline workload reached {max_high_water * 100 / KICK_RING_ENTRIES:.1f}% "
-            f"ring fill ({max_high_water:.0f} / {KICK_RING_ENTRIES}); meets >= {THRESHOLD_PCT}% gate."
-        )
-    else:
-        print(
-            f"FAIL: baseline workload only reached {max_high_water * 100 / KICK_RING_ENTRIES:.1f}% "
-            f"ring fill ({max_high_water:.0f} / {KICK_RING_ENTRIES}); needs >= {THRESHOLD_PCT}%. "
-            f"Increase iodepth/numjobs/duration or add a second concurrent backend."
-        )
-        exit_code = 2
-    if total_drops > 0:
-        print(
-            f"  (informational) {total_drops:.0f} kick(s) dropped during the run — "
-            f"this is the V1 failure mode that V2.1 will fix."
-        )
-elif args.mode == "v2":
-    log_hits = scan_daemon_log()
-    issues = []
-    if log_hits:
-        issues.append(
-            f"daemon log has {len(log_hits)} matches for kick.*drop|rescue|throttle.*ENGAGE; "
-            f"first: {log_hits[0]!r}"
-        )
-    if total_dispatch_passes <= 0:
-        issues.append(
-            "bhx_dispatch_passes_total stayed at 0 — workload didn't reach the V2 dispatch path "
-            "(or the metric isn't yet exported)."
-        )
-    if issues:
-        for i in issues:
-            print(f"FAIL: {i}")
-        exit_code = 3
-    else:
-        print(
-            f"PASS: v2 mode clean — {total_dispatch_passes:.0f} dispatch passes, "
-            f"{total_notifies:.0f} guest NOTIFYs, no drop/rescue/throttle log lines."
-        )
+log_hits = scan_daemon_log()
+issues = []
+if log_hits:
+    issues.append(
+        f"daemon log has {len(log_hits)} matches for kick.*drop|rescue|throttle.*ENGAGE; "
+        f"first: {log_hits[0]!r}"
+    )
+if total_dispatch_passes <= 0:
+    issues.append(
+        "bhx_dispatch_passes_total stayed at 0 — workload didn't reach the V2 dispatch path "
+        "(or the metric isn't exported)."
+    )
+if issues:
+    for i in issues:
+        print(f"FAIL: {i}")
+    exit_code = 3
+else:
+    print(
+        f"PASS: clean — {total_dispatch_passes:.0f} dispatch passes, "
+        f"{total_notifies:.0f} guest NOTIFYs, no drop/rescue/throttle log lines."
+    )
 
 # Always print the CSV path so a CI run captures it.
 print(f"  csv: {args.csv}")
