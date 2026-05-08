@@ -77,9 +77,9 @@
 #define STATS_OFF_NOTIFY_EVENTS   0x018  // count of QUEUE_NOTIFY write events
 #define STATS_OFF_READY_EVENTS    0x01c  // count of QUEUE_READY write events
 #define STATS_OFF_LAST_NOTIFY     0x020  // last (slot << 16 | queue_idx)
-#define STATS_OFF_COMPL_EVENTS    0x024  // count of completion entries consumed
-#define STATS_OFF_LAST_COMPL      0x028  // last (slot << 16 | queue_idx) consumed
-#define STATS_OFF_KICK_DROPS      0x02c  // count of kick_ring_push drops (#101)
+// 0x024 / 0x028 / 0x02c retired with V1: STATS_OFF_COMPL_EVENTS,
+// STATS_OFF_LAST_COMPL, STATS_OFF_KICK_DROPS. Reserved — don't reuse
+// without bumping TENSIX_PROTOCOL_VERSION.
 // SEL→READY race-window detector: number of times BRISC processed a
 // QUEUE_SEL change while the previous SEL's QUEUE_READY was still 1.
 // During that window, a guest doing `writel(SEL=N+1); readl(QUEUE_

@@ -2287,49 +2287,32 @@ fn run_tensix_virtio(card: u32, x: u16, y: u16) -> std::io::Result<()> {
         errors += 1;
     }
 
-    // M5 (#71) kick-ring path: drive QUEUE_NOTIFY=2 on slot 5,
-    // expect the kick ring's producer_seq to advance and the entry
-    // at the new ring index to record (slot=5, queue_idx=2).
+    // V2 dispatch path (#187 / #188): drive QUEUE_NOTIFY=2 on slot 5,
+    // expect the per-(slot, queue) byte at CTRL_OFF_DIRTY to flip
+    // from 0 to 1.
     use tensix_proto as proto;
     {
         eprintln!("[tensix-virtio] driving QUEUE_NOTIFY=2 on slot 5 (L2CPU 1 net)");
         let slot5_notify = ve::slot_regs_base(5) + ve::MMIO_QUEUE_NOTIFY;
-        let producer_addr =
-            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_PRODUCER_SEQ;
-        let before_seq = tile.read_l1_u32(producer_addr);
+        let dirty_addr =
+            proto::CTRL_BASE + proto::CTRL_OFF_DIRTY + 5 * proto::MAX_QUEUES_PER_SLOT + 2;
+        // Clear first so the test is robust against prior runs.
+        let dirty_word_addr = dirty_addr & !3;
+        let dirty_byte_shift = (dirty_addr & 3) * 8;
+        let pre = tile.read_l1_u32(dirty_word_addr);
+        tile.write_l1_u32(dirty_word_addr, pre & !(0xFFu32 << dirty_byte_shift));
         tile.write_l1_u32(slot5_notify, 2);
         sleep(Duration::from_millis(5));
-        let after_seq = tile.read_l1_u32(producer_addr);
-        if after_seq != before_seq.wrapping_add(1) {
+        let after = tile.read_l1_u32(dirty_word_addr);
+        let dirty_byte = ((after >> dirty_byte_shift) & 0xFF) as u8;
+        if dirty_byte == 1 {
+            eprintln!("  CTRL_OFF_DIRTY[slot=5, q=2] = 1 — DIRTY BITMAP PASS");
+        } else {
             eprintln!(
-                "  kick ring did NOT advance: producer_seq {} → {} (expected +1)",
-                before_seq, after_seq
+                "  DIRTY BITMAP FAIL: CTRL_OFF_DIRTY[slot=5, q=2] = {} (expected 1)",
+                dirty_byte
             );
             errors += 1;
-        } else {
-            // Read the entry at index `before_seq % KICK_RING_ENTRIES`
-            // and verify it records the (slot, queue_idx) we wrote.
-            let idx = before_seq % proto::KICK_RING_ENTRIES;
-            let entry_off =
-                proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING + idx * proto::KICK_ENTRY_SIZE;
-            let slot_field = tile.read_l1_u32(entry_off);
-            let entry_seq = tile.read_l1_u32(entry_off + 4);
-            let recorded_slot = (slot_field & 0xFFFF) as u16;
-            let recorded_queue = (slot_field >> 16) as u16;
-            if recorded_slot == 5 && recorded_queue == 2 && entry_seq == before_seq {
-                eprintln!(
-                    "  kick ring advanced to seq {}, entry[{}] = (slot={}, queue={}) — \
-                     KICK PATH PASS",
-                    after_seq, idx, recorded_slot, recorded_queue
-                );
-            } else {
-                eprintln!(
-                    "  kick ring entry mismatch: idx={} recorded (slot={}, queue={}, seq={}), \
-                     expected (slot=5, queue=2, seq={})",
-                    idx, recorded_slot, recorded_queue, entry_seq, before_seq
-                );
-                errors += 1;
-            }
         }
     }
 
@@ -2412,52 +2395,9 @@ fn run_tensix_virtio(card: u32, x: u16, y: u16) -> std::io::Result<()> {
         }
     }
 
-    // M5 (#71) completion-ring path: write a CompletionEntry into
-    // L1 at the next producer index, bump producer_seq, then poll
-    // the firmware's `compl_events` stat to confirm BRISC consumed
-    // the entry. This exercises the daemon→BRISC half of the
-    // bridge.
-    {
-        eprintln!("[tensix-virtio] driving completion entry on slot 7 (L2CPU 1 rng)");
-        let producer_addr =
-            proto::CTRL_BASE + proto::CTRL_OFF_COMPL_RING_HDR + proto::COMPL_HDR_OFF_PRODUCER_SEQ;
-        let compl_events_addr = ve::STATS_BASE + ve::STATS_OFF_COMPL_EVENTS;
-        let last_compl_addr = ve::STATS_BASE + ve::STATS_OFF_LAST_COMPL;
-        let before_compl = tile.read_l1_u32(compl_events_addr);
-        let producer_before = tile.read_l1_u32(producer_addr);
-        let idx = producer_before % proto::COMPL_RING_ENTRIES;
-        let entry_off =
-            proto::CTRL_BASE + proto::CTRL_OFF_COMPL_RING + idx * proto::COMPL_ENTRY_SIZE;
-        // CompletionEntry: slot=7 (low 16), queue_idx=0 (high 16)
-        // packed into a single u32 — same packed format the
-        // firmware reads for kicks. Queue 0 happens to be the
-        // numeric value, but we write it explicitly via shifts so
-        // future tweaks (queue=1, queue=N) don't have to remember
-        // the layout.
-        let expected = 7u32; // (slot=7, queue=0) packs to just 7.
-        tile.write_l1_u32(entry_off, expected);
-        tile.write_l1_u32(entry_off + 4, 42); // used_idx
-        tile.write_l1_u32(producer_addr, producer_before.wrapping_add(1));
-        sleep(Duration::from_millis(5));
-        let after_compl = tile.read_l1_u32(compl_events_addr);
-        let last_compl = tile.read_l1_u32(last_compl_addr);
-        if after_compl > before_compl && last_compl == expected {
-            eprintln!(
-                "  compl_events advanced ({} → {}), last_compl=({}, {}) — \
-                 COMPLETION PATH PASS",
-                before_compl,
-                after_compl,
-                (last_compl & 0xFFFF) as u16,
-                (last_compl >> 16) as u16
-            );
-        } else {
-            eprintln!(
-                "  COMPLETION PATH FAIL: compl_events {} → {}, last_compl={:#010x}",
-                before_compl, after_compl, last_compl
-            );
-            errors += 1;
-        }
-    }
+    // V2 has no daemon→BRISC completion ring (#188); the daemon fires
+    // PLIC IRQs directly. Nothing to probe here that we don't already
+    // exercise via `bhx daemon start` + `bhx boot` end-to-end.
 
     if errors == 0 {
         eprintln!("[tensix-virtio] PASS");

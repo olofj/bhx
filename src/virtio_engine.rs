@@ -154,14 +154,10 @@ pub const STATS_OFF_SEL_CHANGES: u32 = 0x014;
 pub const STATS_OFF_NOTIFY_EVENTS: u32 = 0x018;
 pub const STATS_OFF_READY_EVENTS: u32 = 0x01c;
 pub const STATS_OFF_LAST_NOTIFY: u32 = 0x020;
-pub const STATS_OFF_COMPL_EVENTS: u32 = 0x024;
-pub const STATS_OFF_LAST_COMPL: u32 = 0x028;
-/// Cumulative count of `kick_ring_push` calls dropped due to a full
-/// kick ring (#101). BRISC bumps this when daemon backpressure leaves
-/// `(producer - consumer) >= KICK_RING_ENTRIES` at the moment a new
-/// kick would be appended; the daemon polls this and surfaces deltas
-/// via `bhx_kick_drops_total`.
-pub const STATS_OFF_KICK_DROPS: u32 = 0x02c;
+// 0x024 / 0x028 / 0x02c retired with the V1 kick + completion rings
+// (#188): STATS_OFF_COMPL_EVENTS, STATS_OFF_LAST_COMPL,
+// STATS_OFF_KICK_DROPS. Reserved — don't reuse without bumping
+// PROTOCOL_VERSION.
 /// Cumulative count of QUEUE_SEL changes BRISC processed while the
 /// previous SEL's QUEUE_READY was still 1 — i.e. the race window
 /// the M7.2 fix (#71, commit 1345f3e) was designed to close re-opened.

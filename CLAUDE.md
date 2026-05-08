@@ -109,7 +109,7 @@ scripts/  (see scripts/README.md)
 
 brisc-firmware/        # BRISC + TRISC0 firmware for the Tensix virtio engine
 ├── start.S            # multi-core entry; hart-ID dispatch via reset-PC override
-├── virtio.c           # register-file emulation + UART poll + kick ring + handshake
+├── virtio.c           # register-file emulation + UART poll + V2 dirty bitmap + handshake
 ├── hello.c            # minimal heartbeat-only firmware (#67 M1 smoke)
 ├── include/           # virtio_layout.h, uart_layout.h, tensix_proto.h shared with Rust
 ├── prebuilt/          # checked-in *.bin fallback when sfpi toolchain absent

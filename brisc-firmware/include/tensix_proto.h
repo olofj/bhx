@@ -2,71 +2,53 @@
 // SPDX-License-Identifier: MIT
 //
 // Wire protocol between the host daemon and the BRISC virtio engine
-// firmware (M5, #71). Shared between the C firmware and the Rust
-// host crate (`src/tensix_proto.rs`); both sides MUST stay in sync,
-// and both sides bump `TENSIX_PROTOCOL_VERSION` together on any
-// observable change.
+// firmware. Shared between the C firmware and the Rust host crate
+// (`src/tensix_proto.rs`); both sides MUST stay in sync, and both
+// sides bump `TENSIX_PROTOCOL_VERSION` together on any observable
+// change.
 //
-// Protocol overview:
+// Protocol overview (V2, #187 / #188 / #189):
 //
 //   1. Boot-time handshake:
 //      - Daemon writes a `HelloMsg` to L1 at `CTRL_OFF_HELLO`,
 //        finishing with a non-zero magic word.
 //      - BRISC polls for the magic, reads the rest, then writes a
 //        `HelloAckMsg` to L1 at `CTRL_OFF_HELLO_ACK`.
-//      - Daemon polls for the hello-ack magic, validates protocol
-//        version, latches `firmware_version` and
-//        `l1_completion_fifo_addr` for later use.
-//      - Mismatch on protocol version → daemon refuses to boot. The
-//        firmware version moves independently for diagnostics; the
+//      - Daemon polls for the hello-ack magic and validates the
+//        protocol version. Mismatch refuses to boot the L2CPU; the
+//        firmware version moves independently for diagnostics, the
 //        protocol version is the load-bearing contract.
 //
-//   2. Steady state — kick FIFO (BRISC → daemon):
-//      - Whenever BRISC observes a guest QUEUE_NOTIFY write, it
-//        appends a `KickEntry` to the host's kick-FIFO ring (at the
-//        NoC address `daemon_kick_fifo_noc_addr` from the hello)
-//        and bumps the ring's producer counter.
-//      - Daemon polls the producer counter; on advance, drains
-//        entries from `[consumer..producer)`, processes the
-//        descriptor chain via the existing virtio infra
-//        (`src/virtio/`), and increments `consumer`.
+//   2. Steady state — dirty bitmap (BRISC → daemon):
+//      - On every guest QUEUE_NOTIFY MMIO write, BRISC sets the
+//        per-(slot, queue) byte at
+//        `CTRL_OFF_DIRTY + slot * MAX_QUEUES_PER_SLOT + q` to 1.
+//      - Daemon polls the bitmap each pass, clears every set byte,
+//        and dispatches via `dispatch_chain` (avail-ring walk +
+//        descriptor processor + used-ring commit + PLIC IRQ).
+//      - The bitmap is level-sensitive — concurrent NOTIFY storms
+//        coalesce into a single set byte, so the dispatch path
+//        cannot fall behind.
 //
-//   3. Steady state — completion ring (daemon → BRISC):
-//      - When the daemon finishes a descriptor chain it appends a
-//        `CompletionEntry` to a ring at L1 `CTRL_OFF_COMPL_RING`
-//        and bumps the producer counter.
-//      - BRISC's poll loop sweeps the producer counter; on advance,
-//        consumes entries and pokes the relevant L2CPU's PLIC IRQ
-//        line so the guest's virtio IRQ handler runs.
+//   3. Steady state — processed cursor (daemon → BRISC):
+//      - After each successful dispatch, the daemon publishes the
+//        post-commit `used.idx` into
+//        `CTRL_OFF_PROCESSED + slot * MAX_QUEUES_PER_SLOT * 2 + q*2`.
+//      - On warm-resume, a freshly-spawned daemon reads the cursor
+//        directly instead of probing guest DRAM, so it doesn't
+//        re-deliver chains the previous daemon already committed.
 //
-// L1 control-plane region layout (extends the M3 #69 layout):
+// L1 control-plane region layout:
 //
-//   `CTRL_BASE = 0x0000_5000`, 4 KiB total.
+//   `CTRL_BASE = 0x0000_5000`, `CTRL_SIZE = 0x0000_1000` (4 KiB).
 //
-//     0x5000 .. 0x5040    HelloMsg slot (64 bytes — 16 for fields,
-//                          rest reserved/zero)
+//     0x5000 .. 0x5040    HelloMsg slot
 //     0x5040 .. 0x5080    HelloAckMsg slot
-//     0x5080 .. 0x5100    Kick FIFO control (size + producer / consumer
-//                          *shadow*; the canonical pointers live in
-//                          host RAM — these are diagnostic copies BRISC
-//                          maintains)
-//     0x5100 .. 0x5200    Completion ring header (producer u32,
-//                          consumer u32, plus reserved)
-//     0x5200 .. 0x5C00    Completion ring entries
-//                          (CTRL_COMPL_RING_ENTRIES × 16 bytes)
-//
-// The kick FIFO lives in host RAM (allocated via tt-kmd's
-// IOCTL_ALLOCATE_DMA_BUF with NOC_DMA), reachable from BRISC via
-// the iATU outbound region tt-kmd programs alongside the buffer.
-// Layout in host RAM:
-//
-//     [ producer_seq: u32 ] [ consumer_seq: u32 ] [ ring_size: u32 ] [ rsvd: u32 ]
-//     [ entries: KickEntry × KICK_FIFO_ENTRIES ]
-//
-// `producer_seq` is a monotonically-increasing counter (no wrap
-// until u32::MAX, which at one kick per microsecond gives ~71 min
-// before wrap — plenty for any single boot but not infinity, see
-// the Wire-protocol notes below). `consumer_seq` lags behind.
+//     0x50C0 .. 0x50C8    Active-slots bitmaps (full + virtio-only)
+//     0x5100 .. 0x5200    DIRTY array (NUM_SLOTS × MAX_QUEUES_PER_SLOT bytes)
+//     0x5200 .. 0x5400    PROCESSED array (NUM_SLOTS × MAX_QUEUES_PER_SLOT × 2 bytes)
+//     0x5400 .. 0x5600    STATE_LOG (reserved 64 × 8-byte ring; not yet read)
+//     0x5600 .. 0x6000    Free / future use
 
 #ifndef BRISC_TENSIX_PROTO_H
 #define BRISC_TENSIX_PROTO_H
@@ -77,50 +59,27 @@
 
 // Protocol version. v1 = M5 (#71) virtio kick ring + completion ring.
 // v2 = M6 (#78) extended the kick-ring slot encoding so slots 16..19
-// carried per-L2CPU 16550 UART TX bytes — one byte per 16-byte kick
-// entry, which overflowed the 64-entry ring during stock-distro boot
-// bursts.
-// v3 = M6.1 (#79) splits UART traffic off the kick ring entirely:
-// TRISC0 produces bytes into a per-L2CPU 1024-entry SPSC feed ring at
-// `BRISC_UART_PRIVATE_BASE + idx*0x2000` (see uart_layout.h), and the
-// daemon polls those rings directly through the chip-side TLB. BRISC
-// is no longer in the UART data path. Kick ring stays virtio-only at
-// its original 64-entry size and layout.
-// v4 (#81) extends DEVS_PER_L2CPU from 4 to 8 (6 populated + 2
-// padding for power-of-two modulo) and shifts SHADOW_BASE from
-// 0x20000 to 0x40000 to clear the larger reg-file region. A v3
-// daemon talking to v4 firmware (or vice versa) reads/writes shadow
-// state at the wrong address — every kick gets silently dropped.
-// v5 (#188) replaces the V1 kick + completion rings with the V2
+// carried per-L2CPU 16550 UART TX bytes — overflowed the 64-entry
+// ring during stock-distro boot bursts.
+// v3 = M6.1 (#79) split UART traffic off the kick ring (TRISC0 feed
+// rings in BRISC L1).
+// v4 (#81) extended DEVS_PER_L2CPU 4 → 8 and shifted SHADOW_BASE
+// 0x20000 → 0x40000 to clear the larger reg-file region.
+// v5 (#188) replaces the kick + completion rings with the V2
 // per-queue dirty bitmap + processed-cursor table at
 // `CTRL_OFF_DIRTY` / `CTRL_OFF_PROCESSED`. Cold-start handshake
 // path is unchanged; the version bump is the daemon's signal to
-// switch to bitmap drain instead of kick-ring consumer.
+// drain via bitmap instead of kick-ring consumer.
 #define TENSIX_PROTOCOL_VERSION 5u
 
 // L1 control-plane region (within the BRISC firmware tile's L1).
-//
-// First-cut M5: the kick FIFO (BRISC → daemon) lives in BRISC L1
-// rather than host RAM. The daemon polls L1 via the existing chip-
-// side TLB, same loop pattern as the chip-DRAM virtio path. A
-// future optimization will move the kick FIFO to a host-RAM
-// `HostDmaBuf` so the daemon polls native memory; that change
-// requires BRISC firmware to issue NoC writes via the NIU register
-// interface (`0xFFB2_0000+`), which we punt on for now in favor of
-// landing the basic mechanism. See #71.
+// 4 KiB is more than enough for the V2 layout (~1.5 KiB used) with
+// room for a future state-log / counters / lifecycle bits.
 #define CTRL_BASE                 0x00005000u
-// 36 KiB control region. Bumped from 16 KiB when KICK_RING_ENTRIES
-// grew 512 → 2048 (32 KiB ring); previous 16 KiB region couldn't
-// hold the 32 KiB kick ring at all. L1 budget allows up to 44 KiB
-// for the CTRL region (0x10000 - 0x5000); we use 36 KiB, leaving
-// ~8 KiB headroom for future header/control growth. Going larger
-// would require relocating REGS_BASE or moving the kick ring into
-// host DRAM via NoC writes.
-#define CTRL_SIZE                 0x00009000u
+#define CTRL_SIZE                 0x00001000u
 
 #define CTRL_OFF_HELLO            0x0000u
 #define CTRL_OFF_HELLO_ACK        0x0040u
-#define CTRL_OFF_KICK_RING_HDR    0x0080u
 // u32 bitmap of "active" slots. Daemon sets the bit on
 // register_slot (virtio), register_uart (UART), and shutdown
 // registry add; clears on unregister. BRISC's main poll loop reads
@@ -128,46 +87,19 @@
 //
 // With NUM_L2CPUS=4 and DEVS_PER_L2CPU=8 the virtio slot space is
 // 0..32, which OVERLAPS UART slots (16..20) and shutdown slots
-// (20..24). For dispatch this is fine — a kick on slot N decodes
-// against the unified registry — but TRISC1's race-watch loop must
-// distinguish virtio slots from UART/shutdown bits, otherwise it
-// either skips L2CPU 2/3's actual virtio devices (when masked out
-// as "UART range") or clobbers UART/shutdown reg files (when
-// unmasked). `CTRL_OFF_ACTIVE_VIRTIO_SLOTS` carries virtio bits
-// only — TRISC1 reads it.
+// (20..24). For dispatch this is fine, but TRISC1's race-watch
+// loop must distinguish virtio slots from UART/shutdown bits —
+// `CTRL_OFF_ACTIVE_VIRTIO_SLOTS` carries virtio bits only.
 #define CTRL_OFF_ACTIVE_SLOTS         0x00C0u
 #define CTRL_OFF_ACTIVE_VIRTIO_SLOTS  0x00C4u
-#define CTRL_OFF_KICK_RING        0x0100u  // ends at 0x8100 (2048 × 16)
-#define CTRL_OFF_COMPL_RING_HDR   0x8100u
-#define CTRL_OFF_COMPL_RING       0x8200u  // ends at 0x8600 (64 × 16)
 
-// ----- V2 layout (#187, used by #188 + #189) -----
-//
-// V2 retires the kick ring (BRISC → daemon edge-buffer) and
-// completion ring (daemon → BRISC PLIC poke ring). Replaces both
-// with two L1-resident arrays:
-//
-//   - DIRTY: u8[NUM_SLOTS][MAX_QUEUES_PER_SLOT]. BRISC writes 1 on
-//     every QUEUE_NOTIFY MMIO write. Daemon reads + clears each
-//     pass. A single-byte store is atomic on RV32I and can't
-//     overflow under any load.
-//   - PROCESSED: u16[NUM_SLOTS][MAX_QUEUES_PER_SLOT]. Daemon writes
-//     the published `used.idx` after each successful dispatch.
-//     Survives daemon restart so warm-resume reads cursors directly
-//     instead of probing guest DRAM.
-//
-// V2 coexists with V1 in this header until #190 deletes the V1
-// constants. Address ranges DO overlap (DIRTY at 0x0100 sits where
-// V1's KICK_RING is) — only one layout is active per boot, gated
-// by the firmware/daemon protocol version handshake.
-//
-// Sizing: NUM_SLOTS=32, MAX_QUEUES_PER_SLOT=8 → DIRTY=256 B,
-// PROCESSED=512 B. Total V2 footprint is 0x600 B; the V1 kick ring
-// alone was 32 KiB. CTRL_SIZE stays at 0x9000 in this commit; #190
-// shrinks it.
-
+// V2 dispatch arrays. DIRTY is u8[NUM_SLOTS][MAX_QUEUES_PER_SLOT];
+// BRISC writes 1 on every QUEUE_NOTIFY, daemon reads + clears each
+// pass. PROCESSED is u16[NUM_SLOTS][MAX_QUEUES_PER_SLOT]; daemon
+// writes the post-dispatch `used.idx` so warm-resume reads cursors
+// directly. NUM_SLOTS=32, MAX_QUEUES_PER_SLOT=8 → DIRTY=256 B,
+// PROCESSED=512 B.
 #define MAX_QUEUES_PER_SLOT       BRISC_VIRTIO_MAX_QUEUES
-
 #define CTRL_OFF_DIRTY            0x0100u
 #define CTRL_OFF_PROCESSED        0x0200u
 // 64-entry × 8-byte diagnostic ring. Reserved for future use; the
@@ -196,123 +128,37 @@
 #define HELLO_ACK_OFF_FIRMWARE_VERSION  0x04u
 #define HELLO_ACK_OFF_MAGIC             0x08u
 
-// Kick ring header (in L1 at CTRL_OFF_KICK_RING_HDR; ring entries
-// follow at CTRL_OFF_KICK_RING):
-//   u32 producer_seq    (BRISC writes; monotonic, wraps at u32::MAX)
-//   u32 consumer_seq    (daemon writes; monotonic)
-//   u32 ring_entries    (constant; BRISC publishes on init)
-//   u32 reserved
-#define KICK_HDR_OFF_PRODUCER_SEQ     0x00u
-#define KICK_HDR_OFF_CONSUMER_SEQ     0x04u
-#define KICK_HDR_OFF_RING_ENTRIES     0x08u
-#define KICK_HDR_OFF_RESERVED         0x0Cu
-
-// Completion ring header (in L1 at CTRL_OFF_COMPL_RING_HDR):
-//   u32 producer_seq    (daemon writes; monotonic)
-//   u32 consumer_seq    (BRISC writes; monotonic)
-//   u32 ring_entries    (constant; BRISC publishes on init)
-//   u32 reserved
-#define COMPL_HDR_OFF_PRODUCER_SEQ    0x00u
-#define COMPL_HDR_OFF_CONSUMER_SEQ    0x04u
-#define COMPL_HDR_OFF_RING_ENTRIES    0x08u
-#define COMPL_HDR_OFF_RESERVED        0x0Cu
-
-// Per-entry sizes (in bytes; both sides allocate buffers as
-// `entries × sizeof(*Entry)`).
+// ----- Compile-time invariants -----
 //
-// KickEntry — BRISC → daemon:
-//   u16 slot          (0..15: l2cpu_idx*4 + device_idx)
-//   u16 queue_idx     (the QUEUE_NOTIFY value)
-//   u32 seq           (monotonic per entry, equals producer_seq at
-//                      the moment of write — useful for catching
-//                      lost writes via gap detection)
-//   u32 epoch         (incremented when BRISC sees STATUS=0 on a
-//                      device — daemon uses this to invalidate
-//                      stale kicks for a device that just got reset)
-//   u32 reserved
-#define KICK_ENTRY_SIZE       16u
-#define KICK_ENTRY_OFF_SLOT       0x00u
-#define KICK_ENTRY_OFF_QUEUE_IDX  0x02u
-#define KICK_ENTRY_OFF_SEQ        0x04u
-#define KICK_ENTRY_OFF_EPOCH      0x08u
-#define KICK_ENTRY_OFF_RESERVED   0x0Cu
-
-// CompletionEntry — daemon → BRISC:
-//   u16 slot          (0..15)
-//   u16 queue_idx
-//   u32 used_idx      (the new used_ring index; BRISC echoes via PLIC IRQ)
-//   u32 reserved[2]
-#define COMPL_ENTRY_SIZE        16u
-#define COMPL_ENTRY_OFF_SLOT      0x00u
-#define COMPL_ENTRY_OFF_QUEUE_IDX 0x02u
-#define COMPL_ENTRY_OFF_USED_IDX  0x04u
-
-// Ring sizing. Powers of 2 so wrap is a mask.
-// 2048 entries = 32 KiB. Bumped from 512 (8 KiB) after disk-to-disk
-// install workloads (e.g., openSUSE NET ISO → empty target image)
-// overflowed the 512-entry ring with bursts of 600-1300+ dropped
-// kicks per overflow window (#184). 2048 is the practical max
-// without restructuring the L1 layout: CTRL sits at 0x5000,
-// REGS_BASE is at 0x10000, leaving 44 KiB for CTRL — and
-// 32 KiB ring + 4 KiB headers/compl + slack just fits.
-#define KICK_RING_ENTRIES        2048u  // 2048 × 16 = 32 KiB at CTRL_OFF_KICK_RING
-#define COMPL_RING_ENTRIES       64u    // 64 × 16 = 1 KiB at CTRL_OFF_COMPL_RING
-
-// ----- Compile-time invariants (firmware-side) -----
-//
-// Mirrored against `_PROTO_INVARIANTS` in `src/tensix_proto.rs`. If
-// the daemon-side bump diverges from the firmware-side bump, one
-// side's static asserts will fire. Every constant referenced here
-// is a compile-time integer literal in this same file, so these
-// resolve at preprocess time without dragging in other layout
-// headers.
-
-_Static_assert(
-    CTRL_OFF_KICK_RING + KICK_RING_ENTRIES * KICK_ENTRY_SIZE <= CTRL_OFF_COMPL_RING_HDR,
-    "kick ring overflows into completion ring header");
-_Static_assert(
-    CTRL_OFF_COMPL_RING + COMPL_RING_ENTRIES * COMPL_ENTRY_SIZE <= CTRL_SIZE,
-    "completion ring overflows CTRL_SIZE");
-// Power-of-two ring sizes — required so wrap is a mask AND, not a
-// modulo (the bare-metal toolchain doesn't link __umodsi3).
-_Static_assert(
-    (KICK_RING_ENTRIES & (KICK_RING_ENTRIES - 1)) == 0,
-    "KICK_RING_ENTRIES must be a power of two");
-_Static_assert(
-    (COMPL_RING_ENTRIES & (COMPL_RING_ENTRIES - 1)) == 0,
-    "COMPL_RING_ENTRIES must be a power of two");
-// Cross-region: CTRL must end before BRISC_VIRTIO_REGS_BASE
-// (0x10000). A bump that overflows CTRL_SIZE silently aliases the
-// kick ring onto the virtio reg files — exactly the kind of
-// post-resize aliasing bug we want the compiler to catch. Hard-
-// coded value matches the constant in virtio_layout.h; cross-
-// header references are clumsier than restating the literal.
-_Static_assert(
-    CTRL_BASE + CTRL_SIZE <= 0x00010000u,
-    "CTRL region overlaps BRISC_VIRTIO_REGS_BASE (0x10000)");
-
-// ----- V2 invariants (#187) -----
-//
-// Mirrored against `_V2_LAYOUT_INVARIANTS` in `src/tensix_proto.rs`.
-// DIRTY is 1 byte per (slot, queue); PROCESSED is 2 bytes per (slot,
-// queue). Each array has its own carved 256 / 512 byte range.
+// Mirrored against `_PROTO_INVARIANTS` and `_V2_LAYOUT_INVARIANTS`
+// in `src/tensix_proto.rs`. Cross-module check in
+// `src/virtio_engine.rs` pins NUM_SLOTS to 32 so the array sizing
+// here stays in lockstep.
 _Static_assert(
     CTRL_OFF_DIRTY + BRISC_VIRTIO_NUM_SLOTS * MAX_QUEUES_PER_SLOT
         <= CTRL_OFF_PROCESSED,
-    "V2 DIRTY array overflows into PROCESSED");
+    "DIRTY array overflows into PROCESSED");
 _Static_assert(
     CTRL_OFF_PROCESSED + BRISC_VIRTIO_NUM_SLOTS * MAX_QUEUES_PER_SLOT * 2u
         <= CTRL_OFF_STATE_LOG,
-    "V2 PROCESSED array overflows into STATE_LOG");
+    "PROCESSED array overflows into STATE_LOG");
 _Static_assert(
     CTRL_OFF_STATE_LOG + 64u * 8u <= CTRL_OFF_V2_END,
-    "V2 STATE_LOG overflows V2_END");
+    "STATE_LOG overflows V2_END");
 _Static_assert(
     CTRL_OFF_V2_END <= CTRL_SIZE,
     "V2 region overflows CTRL_SIZE");
-// V2 layout reuses CTRL_OFF_HELLO / _HELLO_ACK from V1; these checks
-// fire if anyone ever moves them.
-_Static_assert(CTRL_OFF_HELLO == 0x0000u, "V2 HELLO offset moved");
-_Static_assert(CTRL_OFF_HELLO_ACK == 0x0040u, "V2 HELLO_ACK offset moved");
+// CTRL must end before BRISC_VIRTIO_REGS_BASE (0x10000). A bump
+// that overflows CTRL_SIZE silently aliases CTRL onto the virtio
+// reg files. Hard-coded value matches the constant in
+// virtio_layout.h; cross-header references are clumsier than
+// restating the literal.
+_Static_assert(
+    CTRL_BASE + CTRL_SIZE <= 0x00010000u,
+    "CTRL region overlaps BRISC_VIRTIO_REGS_BASE (0x10000)");
+// Pin handshake offsets — the daemon and firmware both hard-code
+// 0x0000 / 0x0040 in the hello path.
+_Static_assert(CTRL_OFF_HELLO == 0x0000u, "HELLO offset moved");
+_Static_assert(CTRL_OFF_HELLO_ACK == 0x0040u, "HELLO_ACK offset moved");
 
 #endif  // BRISC_TENSIX_PROTO_H

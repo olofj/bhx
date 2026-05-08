@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 Olof Johansson
 // SPDX-License-Identifier: MIT
 
-//! Host-side mirror of the daemon ↔ BRISC wire protocol (M5, #71).
+//! Host-side mirror of the daemon ↔ BRISC wire protocol.
 //!
 //! The C firmware-side header lives at
 //! `brisc-firmware/include/tensix_proto.h`. Both sides MUST keep
@@ -9,99 +9,66 @@
 //! talking to a firmware with a different protocol version refuses
 //! to boot, with a clear error message naming both versions.
 //!
-//! Module-wide `#![allow(dead_code)]` — kick / completion ring offset
-//! constants are kept named for future use even when the current host
-//! path doesn't read all of them.
-#![allow(dead_code)]
+//! The protocol has three phases (V2, #187 / #188 / #189):
 //!
-//! The protocol has three phases:
-//!
-//!   1. **Handshake.** Daemon writes [`HelloMsg`] to L1, BRISC
-//!      writes [`HelloAckMsg`] back. Daemon validates and latches
-//!      the firmware version + completion-ring address.
-//!   2. **Kick FIFO** (BRISC → daemon). On a guest `QUEUE_NOTIFY`,
-//!      BRISC appends a [`KickEntry`] to a host-RAM SPSC ring
-//!      (allocated via `HostDmaBuf`) and bumps a producer counter.
-//!      Daemon polls the counter and drains entries.
-//!   3. **Completion ring** (daemon → BRISC). After the daemon
-//!      finishes a descriptor chain, it appends a
-//!      [`CompletionEntry`] to an SPSC ring in BRISC L1 and bumps
-//!      the producer. BRISC's poll loop sweeps the ring and pokes
-//!      the relevant L2CPU's PLIC IRQ line.
-//!
-//! Why both sides are SPSC-and-not-MPSC: the daemon serializes its
-//! data-plane work through the existing virtio worker model; BRISC
-//! is single-threaded by construction. The control-plane registers
-//! that motivated #66 are deterministic on-chip and don't need ring
-//! buffers; this module is only the data plane.
+//!   1. **Handshake.** Daemon writes [`HelloMsg`] to L1, BRISC writes
+//!      [`HelloAckMsg`] back. Daemon validates the protocol version
+//!      and latches the firmware version.
+//!   2. **Dirty bitmap** (BRISC → daemon). On every guest
+//!      `QUEUE_NOTIFY`, BRISC sets the per-(slot, queue) byte at
+//!      [`CTRL_OFF_DIRTY`] to 1. The daemon poll loop reads + clears
+//!      and dispatches via `dispatch_chain`. Level-sensitive — burst
+//!      NOTIFYs coalesce into a single set byte and cannot overflow.
+//!   3. **Processed cursor** (daemon → BRISC). After each successful
+//!      dispatch the daemon publishes the post-commit `used.idx`
+//!      into [`CTRL_OFF_PROCESSED`]. A freshly-spawned daemon reads
+//!      cursors directly on warm-resume instead of probing guest
+//!      DRAM, so it doesn't re-deliver chains the previous daemon
+//!      already committed.
 
 /// Protocol version. Bump on any wire-incompatible change.
 ///
 /// v1 = M5 (#71) virtio kick ring + completion ring.
 /// v2 = M6 (#78) extended the kick-ring slot encoding so slots 16..19
-/// carried per-L2CPU UART TX bytes (one byte per 16-byte kick entry —
-/// later found to overflow the 64-entry ring on boot bursts, see #79).
-/// v3 = M6.1 (#79) splits UART traffic off the kick ring entirely.
-/// TRISC0 produces bytes into per-L2CPU feed rings in BRISC L1, and
-/// the daemon polls those rings directly through the chip-side TLB
-/// (4 bytes per slot, 1024 slots per ring, one ring per L2CPU). The
-/// kick ring is virtio-only at v3, original 64-entry layout.
-/// v4 (#81) extends DEVS_PER_L2CPU from 4 to 8 (6 populated + 2
-/// padding for power-of-two modulo) and shifts SHADOW_BASE from
-/// 0x20000 to 0x40000 to clear the larger reg-file region. A v3
-/// daemon talking to v4 firmware (or vice versa) reads/writes shadow
-/// state at the wrong address — the kick poller silently drops every
-/// kick. Warm-resume on a `firmware_version` mismatch must refuse to
-/// adopt and force a fresh firmware load.
+/// carried per-L2CPU UART TX bytes — overflowed the 64-entry ring on
+/// boot bursts (#79).
+/// v3 = M6.1 (#79) split UART traffic off the kick ring (TRISC0 feed
+/// rings in BRISC L1).
+/// v4 (#81) extended DEVS_PER_L2CPU 4 → 8 and shifted SHADOW_BASE
+/// 0x20000 → 0x40000 to clear the larger reg-file region.
 /// v5 (#188) replaces the V1 kick + completion rings with the V2
-/// per-queue dirty bitmap (`CTRL_OFF_DIRTY`) and processed-cursor
-/// table (`CTRL_OFF_PROCESSED`). The cold-start handshake stays at
+/// per-queue dirty bitmap ([`CTRL_OFF_DIRTY`]) and processed-cursor
+/// table ([`CTRL_OFF_PROCESSED`]). The cold-start handshake stays at
 /// HELLO/HELLO_ACK; the version bump is the daemon's signal to drain
 /// via bitmap instead of kick-ring consumer.
 pub const PROTOCOL_VERSION: u32 = 5;
 
 // ----- L1 control-plane region (BRISC L1) -----
-//
-// First-cut M5: kick ring lives in BRISC L1, daemon polls via the
-// existing chip-side TLB. A future optimization could move it to a
-// host-RAM `HostDmaBuf` so the daemon polls native memory (requires
-// BRISC NoC-write capability via the NIU register interface).
 
 pub const CTRL_BASE: u32 = 0x0000_5000;
-/// 36 KiB control region. Bumped from 16 KiB when KICK_RING_ENTRIES
-/// grew 512 → 2048 (32 KiB ring); previous 16 KiB region couldn't
-/// hold the 32 KiB kick ring at all. L1 budget allows up to 44 KiB
-/// for the CTRL region (0x10000 - 0x5000); we use 36 KiB, leaving
-/// ~8 KiB headroom for future header/control growth. Going larger
-/// would require relocating REGS_BASE (the virtio reg-file region)
-/// or moving the kick ring into host DRAM via NoC writes.
-pub const CTRL_SIZE: u32 = 0x0000_9000;
+/// 4 KiB CTRL region. V2's full footprint is ~1.5 KiB; the rest is
+/// reserved for future state-log / counters / lifecycle bits. CTRL
+/// must end before `BRISC_VIRTIO_REGS_BASE = 0x10000`.
+pub const CTRL_SIZE: u32 = 0x0000_1000;
 
 pub const CTRL_OFF_HELLO: u32 = 0x0000;
 pub const CTRL_OFF_HELLO_ACK: u32 = 0x0040;
-pub const CTRL_OFF_KICK_RING_HDR: u32 = 0x0080;
 pub const CTRL_OFF_ACTIVE_SLOTS: u32 = 0x00C0;
 pub const CTRL_OFF_ACTIVE_VIRTIO_SLOTS: u32 = 0x00C4;
-pub const CTRL_OFF_KICK_RING: u32 = 0x0100; // ends at 0x8100 (2048 × 16)
-pub const CTRL_OFF_COMPL_RING_HDR: u32 = 0x8100;
-pub const CTRL_OFF_COMPL_RING: u32 = 0x8200; // ends at 0x8600 (64 × 16)
 
-// ----- V2 layout (#187) -----
-//
-// Replaces the V1 kick ring + completion ring with two L1-resident
-// arrays: a per-(slot, queue) dirty flag (BRISC writes 1 on every
-// QUEUE_NOTIFY; daemon reads + clears) and a processed-cursor table
-// (daemon publishes `used.idx` so warm-resume reads it directly).
-// V1 and V2 coexist in this module until #190 deletes V1; only one
-// layout is active per boot, gated by the protocol-version handshake.
-//
-// Mirrors `brisc-firmware/include/tensix_proto.h`. `MAX_QUEUES_PER_SLOT`
-// matches `BRISC_VIRTIO_MAX_QUEUES`; `NUM_SLOTS` is the same value
-// as `crate::virtio_engine::NUM_SLOTS` and pinned by the cross-module
-// invariants below.
+/// Mirrors `BRISC_VIRTIO_MAX_QUEUES` from `virtio_layout.h`. The
+/// per-(slot, queue) DIRTY / PROCESSED arrays size against this.
 pub const MAX_QUEUES_PER_SLOT: u32 = 8;
+/// `u8[NUM_SLOTS][MAX_QUEUES_PER_SLOT]`. BRISC writes 1 on every
+/// guest QUEUE_NOTIFY; daemon reads + clears each pass.
 pub const CTRL_OFF_DIRTY: u32 = 0x0100;
+/// `u16[NUM_SLOTS][MAX_QUEUES_PER_SLOT]`. Daemon writes the post-
+/// dispatch `used.idx` so warm-resume reads cursors directly
+/// instead of probing guest DRAM.
 pub const CTRL_OFF_PROCESSED: u32 = 0x0200;
+/// 64-entry × 8-byte diagnostic ring. Reserved for future use; the
+/// daemon doesn't read it yet. Carving the address out now so we
+/// don't have to renumber when adding it later.
 pub const CTRL_OFF_STATE_LOG: u32 = 0x0400;
 pub const CTRL_OFF_V2_END: u32 = 0x0600;
 
@@ -121,57 +88,6 @@ pub const HELLO_ACK_OFF_PROTOCOL_VERSION: u32 = 0x00;
 pub const HELLO_ACK_OFF_FIRMWARE_VERSION: u32 = 0x04;
 pub const HELLO_ACK_OFF_MAGIC: u32 = 0x08;
 
-// ----- Kick ring header offsets (within CTRL_OFF_KICK_RING_HDR) -----
-
-pub const KICK_HDR_OFF_PRODUCER_SEQ: u32 = 0x00;
-pub const KICK_HDR_OFF_CONSUMER_SEQ: u32 = 0x04;
-pub const KICK_HDR_OFF_RING_ENTRIES: u32 = 0x08;
-
-// ----- Completion ring header offsets (within CTRL_OFF_COMPL_RING_HDR) -----
-
-pub const COMPL_HDR_OFF_PRODUCER_SEQ: u32 = 0x00;
-pub const COMPL_HDR_OFF_CONSUMER_SEQ: u32 = 0x04;
-pub const COMPL_HDR_OFF_RING_ENTRIES: u32 = 0x08;
-
-// ----- KickEntry layout (BRISC → daemon, in host RAM ring) -----
-
-pub const KICK_ENTRY_SIZE: u32 = 16;
-pub const KICK_ENTRY_OFF_SLOT: u32 = 0x00;
-pub const KICK_ENTRY_OFF_QUEUE_IDX: u32 = 0x02;
-pub const KICK_ENTRY_OFF_SEQ: u32 = 0x04;
-pub const KICK_ENTRY_OFF_EPOCH: u32 = 0x08;
-
-// ----- CompletionEntry layout (daemon → BRISC, in BRISC L1 ring) -----
-
-pub const COMPL_ENTRY_SIZE: u32 = 16;
-pub const COMPL_ENTRY_OFF_SLOT: u32 = 0x00;
-pub const COMPL_ENTRY_OFF_QUEUE_IDX: u32 = 0x02;
-pub const COMPL_ENTRY_OFF_USED_IDX: u32 = 0x04;
-
-// ----- Ring sizing -----
-
-/// 2048 entries = 32 KiB. Bumped from 512 (8 KiB) after disk-to-disk
-/// install workloads (e.g., openSUSE NET ISO → empty target image)
-/// overflowed the 512-entry ring with bursts of 600-1300+ dropped
-/// kicks per overflow window (#184). 2048 is the practical max
-/// without restructuring the L1 layout: the CTRL region sits at
-/// 0x5000, REGS_BASE is at 0x10000, leaving 44 KiB for CTRL — and
-/// 32 KiB ring + 4 KiB headers/compl + slack just fits.
-pub const KICK_RING_ENTRIES: u32 = 2048;
-pub const COMPL_RING_ENTRIES: u32 = 64;
-
-// Compile-time invariants.
-const _PROTO_INVARIANTS: () = {
-    // Kick + completion rings + headers fit inside the control-plane
-    // region.
-    assert!(CTRL_OFF_KICK_RING + KICK_RING_ENTRIES * KICK_ENTRY_SIZE <= CTRL_OFF_COMPL_RING_HDR);
-    assert!(CTRL_OFF_COMPL_RING + COMPL_RING_ENTRIES * COMPL_ENTRY_SIZE <= CTRL_SIZE);
-    // Power-of-two ring sizes — important if we add a wrap-mask
-    // optimization later.
-    assert!(KICK_RING_ENTRIES.is_power_of_two());
-    assert!(COMPL_RING_ENTRIES.is_power_of_two());
-};
-
 // V2 layout invariants. NUM_SLOTS is hard-coded as the literal 32 to
 // keep this module self-contained (the firmware-side mirror in
 // `tensix_proto.h` uses `BRISC_VIRTIO_NUM_SLOTS` from
@@ -179,92 +95,23 @@ const _PROTO_INVARIANTS: () = {
 // `crate::virtio_engine` pins both values to match
 // `virtio_engine::NUM_SLOTS`.
 const _V2_NUM_SLOTS: u32 = 32;
-const _V2_LAYOUT_INVARIANTS: () = {
+const _LAYOUT_INVARIANTS: () = {
     // DIRTY: 1 byte per (slot, queue), placed at 0x0100.
     assert!(CTRL_OFF_DIRTY + _V2_NUM_SLOTS * MAX_QUEUES_PER_SLOT <= CTRL_OFF_PROCESSED);
     // PROCESSED: 2 bytes per (slot, queue), placed at 0x0200.
     assert!(CTRL_OFF_PROCESSED + _V2_NUM_SLOTS * MAX_QUEUES_PER_SLOT * 2 <= CTRL_OFF_STATE_LOG);
     // STATE_LOG: reserved 64 × 8-byte ring (diagnostic, not yet read).
     assert!(CTRL_OFF_STATE_LOG + 64 * 8 <= CTRL_OFF_V2_END);
-    // V2 region fits within the existing CTRL_SIZE.
+    // V2 region fits within CTRL_SIZE.
     assert!(CTRL_OFF_V2_END <= CTRL_SIZE);
-    // HELLO / HELLO_ACK are shared between V1 and V2 — the handshake
-    // path doesn't change. Pin the offsets so a V1-side rename can't
-    // silently break the V2 handshake.
+    // Pin handshake offsets — both sides hard-code 0x0000 / 0x0040
+    // in the hello path.
     assert!(CTRL_OFF_HELLO == 0x0000);
     assert!(CTRL_OFF_HELLO_ACK == 0x0040);
 };
 
-/// Strongly-typed kick entry, mirroring `KickEntry` in the C header.
-/// Used for unit-testable serialization/deserialization tests; the
-/// hot path on both sides reads/writes the offset-keyed u16/u32
-/// fields directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-pub struct KickEntry {
-    pub slot: u16,
-    pub queue_idx: u16,
-    pub seq: u32,
-    pub epoch: u32,
-    pub reserved: u32,
-}
-
-impl KickEntry {
-    pub fn to_le_bytes(self) -> [u8; 16] {
-        let mut out = [0u8; 16];
-        out[0..2].copy_from_slice(&self.slot.to_le_bytes());
-        out[2..4].copy_from_slice(&self.queue_idx.to_le_bytes());
-        out[4..8].copy_from_slice(&self.seq.to_le_bytes());
-        out[8..12].copy_from_slice(&self.epoch.to_le_bytes());
-        out[12..16].copy_from_slice(&self.reserved.to_le_bytes());
-        out
-    }
-
-    pub fn from_le_bytes(b: &[u8; 16]) -> Self {
-        KickEntry {
-            slot: u16::from_le_bytes([b[0], b[1]]),
-            queue_idx: u16::from_le_bytes([b[2], b[3]]),
-            seq: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
-            epoch: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
-            reserved: u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-pub struct CompletionEntry {
-    pub slot: u16,
-    pub queue_idx: u16,
-    pub used_idx: u32,
-    pub reserved0: u32,
-    pub reserved1: u32,
-}
-
-impl CompletionEntry {
-    pub fn to_le_bytes(self) -> [u8; 16] {
-        let mut out = [0u8; 16];
-        out[0..2].copy_from_slice(&self.slot.to_le_bytes());
-        out[2..4].copy_from_slice(&self.queue_idx.to_le_bytes());
-        out[4..8].copy_from_slice(&self.used_idx.to_le_bytes());
-        out[8..12].copy_from_slice(&self.reserved0.to_le_bytes());
-        out[12..16].copy_from_slice(&self.reserved1.to_le_bytes());
-        out
-    }
-
-    pub fn from_le_bytes(b: &[u8; 16]) -> Self {
-        CompletionEntry {
-            slot: u16::from_le_bytes([b[0], b[1]]),
-            queue_idx: u16::from_le_bytes([b[2], b[3]]),
-            used_idx: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
-            reserved0: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
-            reserved1: u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
-        }
-    }
-}
-
-// Lock the wire-format protocol version against the firmware. A bump to
-// PROTOCOL_VERSION must be matched on both sides simultaneously.
+// Lock the wire-format protocol version against the firmware. A bump
+// to PROTOCOL_VERSION must be matched on both sides simultaneously.
 const _PROTOCOL_VERSION_PINNED: () = assert!(PROTOCOL_VERSION == 5);
 
 #[cfg(test)]
@@ -277,74 +124,9 @@ mod tests {
         assert_eq!(HELLO_ACK_MAGIC.to_le_bytes(), *b"ACK!");
     }
 
-    #[test]
-    fn kick_entry_round_trips() {
-        let e = KickEntry {
-            slot: 5,
-            queue_idx: 2,
-            seq: 0xDEAD_BEEF,
-            epoch: 7,
-            reserved: 0,
-        };
-        let b = e.to_le_bytes();
-        assert_eq!(KickEntry::from_le_bytes(&b), e);
-    }
-
-    #[test]
-    fn kick_entry_field_offsets_match_header() {
-        // The host-side reader parses entries by raw offset; verify
-        // the offsets the C header uses match the Rust struct layout.
-        let e = KickEntry {
-            slot: 0xAAAA,
-            queue_idx: 0xBBBB,
-            seq: 0xCCCC_CCCC,
-            epoch: 0xDDDD_DDDD,
-            reserved: 0xEEEE_EEEE,
-        };
-        let b = e.to_le_bytes();
-        assert_eq!(
-            u16::from_le_bytes([b[0], b[1]]),
-            e.slot,
-            "slot at offset {}",
-            KICK_ENTRY_OFF_SLOT
-        );
-        assert_eq!(u16::from_le_bytes([b[2], b[3]]), e.queue_idx);
-        assert_eq!(KICK_ENTRY_OFF_QUEUE_IDX, 2);
-        assert_eq!(KICK_ENTRY_OFF_SEQ, 4);
-        assert_eq!(KICK_ENTRY_OFF_EPOCH, 8);
-    }
-
-    #[test]
-    fn completion_entry_round_trips() {
-        let e = CompletionEntry {
-            slot: 9,
-            queue_idx: 0,
-            used_idx: 42,
-            reserved0: 0,
-            reserved1: 0,
-        };
-        assert_eq!(CompletionEntry::from_le_bytes(&e.to_le_bytes()), e);
-    }
-
-    // Layout invariants — all inputs are `const`, so this is a
-    // compile-time check. `assert!` would trigger
-    // `clippy::assertions_on_constants`; `const { assert!(...) }`
-    // fails the build instead, which is what we want.
-    const _CTRL_LAYOUT_INVARIANTS: () = {
-        assert!(CTRL_OFF_HELLO < CTRL_OFF_HELLO_ACK);
-        assert!(CTRL_OFF_HELLO_ACK < CTRL_OFF_KICK_RING_HDR);
-        assert!(CTRL_OFF_KICK_RING_HDR < CTRL_OFF_KICK_RING);
-        assert!(
-            CTRL_OFF_KICK_RING + KICK_RING_ENTRIES * KICK_ENTRY_SIZE <= CTRL_OFF_COMPL_RING_HDR
-        );
-        assert!(CTRL_OFF_COMPL_RING_HDR < CTRL_OFF_COMPL_RING);
-        assert!(CTRL_OFF_COMPL_RING + COMPL_RING_ENTRIES * COMPL_ENTRY_SIZE <= CTRL_SIZE);
-    };
-
-    // V2 layout sanity. Pinned literals catch accidental edits to any
-    // V2 constant; a future revision that legitimately moves an offset
-    // updates this test along with the const definition. Pairs with
-    // `_V2_LAYOUT_INVARIANTS` (compile-time fence on overlap).
+    /// Pinned literals catch accidental edits to any V2 constant; a
+    /// future revision that legitimately moves an offset updates this
+    /// test along with the const definition.
     #[test]
     fn v2_constants_pinned_to_expected_values() {
         assert_eq!(MAX_QUEUES_PER_SLOT, 8);
@@ -355,9 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_handshake_offsets_match_v1() {
-        // V2 reuses V1's HELLO / HELLO_ACK slots — the handshake path
-        // is unchanged across the version bump.
+    fn handshake_offsets_pinned() {
         assert_eq!(CTRL_OFF_HELLO, 0x0000);
         assert_eq!(CTRL_OFF_HELLO_ACK, 0x0040);
     }
