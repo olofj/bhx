@@ -1548,15 +1548,9 @@ fn run_tensix_engine(card: u32, chip: &shared_chip::SharedChip) -> std::io::Resu
         engine.firmware_version,
         engine.protocol_version,
     );
-    let (producer, consumer, entries) = engine.kick_ring_header();
-    eprintln!(
-        "[tensix-engine]   kick ring: producer={}, consumer={}, entries={}",
-        producer, consumer, entries
-    );
-
-    // Spawn the daemon-side kick poller (M5.5a) and verify it
-    // consumes a kick we drive directly. This proves the full path:
-    // host write → BRISC pickup → kick ring push → poller consume.
+    // Spawn the daemon-side kick poller and verify it dispatches a
+    // synthetic NOTIFY. Proves the full path: host write →
+    // BRISC pickup → V2 dirty bitmap → poller drain.
     eprintln!("[tensix-engine] spawning kick poller and driving a synthetic kick");
     let mut poller = tensix_data_plane::KickPoller::spawn(Arc::clone(&engine));
     let stats = Arc::clone(&poller.stats);

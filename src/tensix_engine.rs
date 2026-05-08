@@ -388,58 +388,6 @@ impl TensixEngine {
         })
     }
 
-    /// Snapshot of the kick ring header. Diagnostic; the actual
-    /// data-plane consumer in M5+ will read producer_seq in a tight
-    /// loop and consume entries.
-    pub fn kick_ring_header(&self) -> (u32, u32, u32) {
-        let producer = self.tile.read_l1_u32(
-            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_PRODUCER_SEQ,
-        );
-        let consumer = self.tile.read_l1_u32(
-            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_CONSUMER_SEQ,
-        );
-        let entries = self.tile.read_l1_u32(
-            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_RING_ENTRIES,
-        );
-        (producer, consumer, entries)
-    }
-
-    /// Read one kick entry by ring index (`producer_seq` modulo the
-    /// ring-entries count). Returns the raw 4 u32s; the M5 consumer
-    /// in the daemon parses them via `tensix_proto::KickEntry`.
-    pub fn read_kick_entry(&self, idx: u32) -> [u32; 4] {
-        let off = proto::CTRL_BASE
-            + proto::CTRL_OFF_KICK_RING
-            + (idx % proto::KICK_RING_ENTRIES) * proto::KICK_ENTRY_SIZE;
-        [
-            self.tile.read_l1_u32(off),
-            self.tile.read_l1_u32(off + 4),
-            self.tile.read_l1_u32(off + 8),
-            self.tile.read_l1_u32(off + 12),
-        ]
-    }
-
-    /// Read the kick ring's producer sequence — what the kick poller
-    /// thread tight-loops on to detect new entries.
-    pub fn kick_producer_seq(&self) -> u32 {
-        self.tile.read_l1_u32(
-            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_PRODUCER_SEQ,
-        )
-    }
-
-    /// Update the kick ring's consumer sequence. The kick poller
-    /// thread bumps this after consuming each batch of entries; BRISC
-    /// could (in a future flow-control extension) read it to know
-    /// when to stop producing if the ring is full. Today BRISC
-    /// doesn't read it, but we still update it for accurate
-    /// diagnostics in `daemon status`.
-    pub fn set_kick_consumer_seq(&self, seq: u32) {
-        self.tile.write_l1_u32(
-            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_CONSUMER_SEQ,
-            seq,
-        );
-    }
-
     /// Read a u32 anywhere in the engine tile's L1 — used by the
     /// data-plane worker to fetch per-queue desc/avail/used pointers
     /// from the firmware's shadow region. Generic so we don't have
@@ -451,42 +399,20 @@ impl TensixEngine {
     /// Write a u32 anywhere in the engine tile's L1. Counterpart to
     /// `read_l1_u32`; useful for debug commands that simulate a
     /// guest MMIO write directly into the reg file (skipping the
-    /// L2CPU's own TLB), and for the M5.5b daemon-driven init path
-    /// when we set up per-queue state.
+    /// L2CPU's own TLB), and for the daemon-driven init path when
+    /// we set up per-queue state.
     pub fn write_l1_u32(&self, addr: u32, value: u32) {
         self.tile.write_l1_u32(addr, value);
     }
 
     /// Host VA pointing at L1 byte `addr`. Used by paths that need a
-    /// raw `*mut u32` into the reg file — notably
-    /// `InterruptController::set_interrupt`, which RMWs
-    /// `MMIO_INTERRUPT_STATUS` before kicking the PLIC. The pointer
-    /// is valid as long as the engine (and its `TensixTile`) is
-    /// alive.
+    /// raw `*mut u8` into the reg file — `InterruptController::set_interrupt`
+    /// (RMW on `MMIO_INTERRUPT_STATUS`), and the V2 dirty-bitmap
+    /// drain (volatile `read_volatile` / `write_volatile` of single
+    /// bytes / u16 cursor entries). The pointer is valid as long as
+    /// the engine (and its `TensixTile`) is alive.
     pub fn l1_ptr(&self, addr: u32) -> *mut u8 {
         self.tile.l1_ptr(addr)
-    }
-
-    /// Append a CompletionEntry to the L1 completion ring and bump
-    /// producer_seq. Called from the data-plane worker after writing
-    /// a used-ring entry, so BRISC's poll loop wakes up and (in a
-    /// future PLIC IRQ extension) signals the L2CPU directly. Today
-    /// the daemon-side worker fires the PLIC IRQ itself; the
-    /// completion ring entry is for diagnostics + future use.
-    pub fn push_completion(&self, slot: u16, queue_idx: u16, used_idx: u32) {
-        let producer_addr =
-            proto::CTRL_BASE + proto::CTRL_OFF_COMPL_RING_HDR + proto::COMPL_HDR_OFF_PRODUCER_SEQ;
-        let producer = self.tile.read_l1_u32(producer_addr);
-        let idx = producer % proto::COMPL_RING_ENTRIES;
-        let entry_off =
-            proto::CTRL_BASE + proto::CTRL_OFF_COMPL_RING + idx * proto::COMPL_ENTRY_SIZE;
-        // Pack slot + queue_idx into the first u32 the same way the
-        // firmware reads it.
-        self.tile
-            .write_l1_u32(entry_off, (slot as u32) | ((queue_idx as u32) << 16));
-        self.tile.write_l1_u32(entry_off + 4, used_idx);
-        self.tile
-            .write_l1_u32(producer_addr, producer.wrapping_add(1));
     }
 
     /// Read TRISC0's heartbeat (M6.1, #79). Bumped each iteration of
