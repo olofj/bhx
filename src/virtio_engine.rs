@@ -363,6 +363,22 @@ const _LAYOUT_INVARIANTS: () = {
     // boot. Mirrored on the firmware side as `SHADOW_BASE` in
     // `brisc-firmware/virtio.c`.
     assert!(SHADOW_BASE + NUM_SLOTS * SHADOW_PER_DEVICE <= 0x0004_0000);
+
+    // V2 layout cross-pin (#187). `tensix_proto::_V2_NUM_SLOTS` is
+    // hard-coded as 32 to keep that module self-contained; this pins
+    // it to `NUM_SLOTS` so a future change here can't silently desync
+    // the V2 dirty / processed arrays.
+    assert!(NUM_SLOTS == 32);
+    assert!(
+        crate::tensix_proto::CTRL_OFF_DIRTY + NUM_SLOTS * crate::tensix_proto::MAX_QUEUES_PER_SLOT
+            <= crate::tensix_proto::CTRL_OFF_PROCESSED
+    );
+    assert!(
+        crate::tensix_proto::CTRL_OFF_PROCESSED
+            + NUM_SLOTS * crate::tensix_proto::MAX_QUEUES_PER_SLOT * 2
+            <= crate::tensix_proto::CTRL_OFF_STATE_LOG
+    );
+    assert!(crate::tensix_proto::CTRL_OFF_V2_END <= crate::tensix_proto::CTRL_SIZE);
 };
 
 #[cfg(test)]

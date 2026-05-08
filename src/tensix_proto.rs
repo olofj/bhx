@@ -81,6 +81,25 @@ pub const CTRL_OFF_KICK_RING: u32 = 0x0100; // ends at 0x8100 (2048 × 16)
 pub const CTRL_OFF_COMPL_RING_HDR: u32 = 0x8100;
 pub const CTRL_OFF_COMPL_RING: u32 = 0x8200; // ends at 0x8600 (64 × 16)
 
+// ----- V2 layout (#187) -----
+//
+// Replaces the V1 kick ring + completion ring with two L1-resident
+// arrays: a per-(slot, queue) dirty flag (BRISC writes 1 on every
+// QUEUE_NOTIFY; daemon reads + clears) and a processed-cursor table
+// (daemon publishes `used.idx` so warm-resume reads it directly).
+// V1 and V2 coexist in this module until #190 deletes V1; only one
+// layout is active per boot, gated by the protocol-version handshake.
+//
+// Mirrors `brisc-firmware/include/tensix_proto.h`. `MAX_QUEUES_PER_SLOT`
+// matches `BRISC_VIRTIO_MAX_QUEUES`; `NUM_SLOTS` is the same value
+// as `crate::virtio_engine::NUM_SLOTS` and pinned by the cross-module
+// invariants below.
+pub const MAX_QUEUES_PER_SLOT: u32 = 8;
+pub const CTRL_OFF_DIRTY: u32 = 0x0100;
+pub const CTRL_OFF_PROCESSED: u32 = 0x0200;
+pub const CTRL_OFF_STATE_LOG: u32 = 0x0400;
+pub const CTRL_OFF_V2_END: u32 = 0x0600;
+
 // ----- Magic words (written last in each side's slot) -----
 
 pub const HELLO_MAGIC: u32 = 0x4F4C_4548; // "HELO" little-endian
@@ -146,6 +165,29 @@ const _PROTO_INVARIANTS: () = {
     // optimization later.
     assert!(KICK_RING_ENTRIES.is_power_of_two());
     assert!(COMPL_RING_ENTRIES.is_power_of_two());
+};
+
+// V2 layout invariants. NUM_SLOTS is hard-coded as the literal 32 to
+// keep this module self-contained (the firmware-side mirror in
+// `tensix_proto.h` uses `BRISC_VIRTIO_NUM_SLOTS` from
+// `virtio_layout.h`); a separate cross-module assert in
+// `crate::virtio_engine` pins both values to match
+// `virtio_engine::NUM_SLOTS`.
+const _V2_NUM_SLOTS: u32 = 32;
+const _V2_LAYOUT_INVARIANTS: () = {
+    // DIRTY: 1 byte per (slot, queue), placed at 0x0100.
+    assert!(CTRL_OFF_DIRTY + _V2_NUM_SLOTS * MAX_QUEUES_PER_SLOT <= CTRL_OFF_PROCESSED);
+    // PROCESSED: 2 bytes per (slot, queue), placed at 0x0200.
+    assert!(CTRL_OFF_PROCESSED + _V2_NUM_SLOTS * MAX_QUEUES_PER_SLOT * 2 <= CTRL_OFF_STATE_LOG);
+    // STATE_LOG: reserved 64 × 8-byte ring (diagnostic, not yet read).
+    assert!(CTRL_OFF_STATE_LOG + 64 * 8 <= CTRL_OFF_V2_END);
+    // V2 region fits within the existing CTRL_SIZE.
+    assert!(CTRL_OFF_V2_END <= CTRL_SIZE);
+    // HELLO / HELLO_ACK are shared between V1 and V2 — the handshake
+    // path doesn't change. Pin the offsets so a V1-side rename can't
+    // silently break the V2 handshake.
+    assert!(CTRL_OFF_HELLO == 0x0000);
+    assert!(CTRL_OFF_HELLO_ACK == 0x0040);
 };
 
 /// Strongly-typed kick entry, mirroring `KickEntry` in the C header.
@@ -293,4 +335,25 @@ mod tests {
         assert!(CTRL_OFF_COMPL_RING_HDR < CTRL_OFF_COMPL_RING);
         assert!(CTRL_OFF_COMPL_RING + COMPL_RING_ENTRIES * COMPL_ENTRY_SIZE <= CTRL_SIZE);
     };
+
+    // V2 layout sanity. Pinned literals catch accidental edits to any
+    // V2 constant; a future revision that legitimately moves an offset
+    // updates this test along with the const definition. Pairs with
+    // `_V2_LAYOUT_INVARIANTS` (compile-time fence on overlap).
+    #[test]
+    fn v2_constants_pinned_to_expected_values() {
+        assert_eq!(MAX_QUEUES_PER_SLOT, 8);
+        assert_eq!(CTRL_OFF_DIRTY, 0x0100);
+        assert_eq!(CTRL_OFF_PROCESSED, 0x0200);
+        assert_eq!(CTRL_OFF_STATE_LOG, 0x0400);
+        assert_eq!(CTRL_OFF_V2_END, 0x0600);
+    }
+
+    #[test]
+    fn v2_handshake_offsets_match_v1() {
+        // V2 reuses V1's HELLO / HELLO_ACK slots — the handshake path
+        // is unchanged across the version bump.
+        assert_eq!(CTRL_OFF_HELLO, 0x0000);
+        assert_eq!(CTRL_OFF_HELLO_ACK, 0x0040);
+    }
 }

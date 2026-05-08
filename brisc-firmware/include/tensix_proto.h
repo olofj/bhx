@@ -73,6 +73,8 @@
 
 #include <stdint.h>
 
+#include "virtio_layout.h"  // for BRISC_VIRTIO_NUM_SLOTS / _MAX_QUEUES
+
 // Protocol version. v1 = M5 (#71) virtio kick ring + completion ring.
 // v2 = M6 (#78) extended the kick-ring slot encoding so slots 16..19
 // carried per-L2CPU 16550 UART TX bytes — one byte per 16-byte kick
@@ -133,6 +135,41 @@
 #define CTRL_OFF_KICK_RING        0x0100u  // ends at 0x8100 (2048 × 16)
 #define CTRL_OFF_COMPL_RING_HDR   0x8100u
 #define CTRL_OFF_COMPL_RING       0x8200u  // ends at 0x8600 (64 × 16)
+
+// ----- V2 layout (#187, used by #188 + #189) -----
+//
+// V2 retires the kick ring (BRISC → daemon edge-buffer) and
+// completion ring (daemon → BRISC PLIC poke ring). Replaces both
+// with two L1-resident arrays:
+//
+//   - DIRTY: u8[NUM_SLOTS][MAX_QUEUES_PER_SLOT]. BRISC writes 1 on
+//     every QUEUE_NOTIFY MMIO write. Daemon reads + clears each
+//     pass. A single-byte store is atomic on RV32I and can't
+//     overflow under any load.
+//   - PROCESSED: u16[NUM_SLOTS][MAX_QUEUES_PER_SLOT]. Daemon writes
+//     the published `used.idx` after each successful dispatch.
+//     Survives daemon restart so warm-resume reads cursors directly
+//     instead of probing guest DRAM.
+//
+// V2 coexists with V1 in this header until #190 deletes the V1
+// constants. Address ranges DO overlap (DIRTY at 0x0100 sits where
+// V1's KICK_RING is) — only one layout is active per boot, gated
+// by the firmware/daemon protocol version handshake.
+//
+// Sizing: NUM_SLOTS=32, MAX_QUEUES_PER_SLOT=8 → DIRTY=256 B,
+// PROCESSED=512 B. Total V2 footprint is 0x600 B; the V1 kick ring
+// alone was 32 KiB. CTRL_SIZE stays at 0x9000 in this commit; #190
+// shrinks it.
+
+#define MAX_QUEUES_PER_SLOT       BRISC_VIRTIO_MAX_QUEUES
+
+#define CTRL_OFF_DIRTY            0x0100u
+#define CTRL_OFF_PROCESSED        0x0200u
+// 64-entry × 8-byte diagnostic ring. Reserved for future use; the
+// daemon doesn't read it yet. Carving the address out now so we
+// don't have to renumber when adding it later.
+#define CTRL_OFF_STATE_LOG        0x0400u
+#define CTRL_OFF_V2_END           0x0600u
 
 // Magic words. Both sides write the magic *last* in their respective
 // slot so a partial write is observable as "not yet ready" by the
@@ -248,5 +285,29 @@ _Static_assert(
 _Static_assert(
     CTRL_BASE + CTRL_SIZE <= 0x00010000u,
     "CTRL region overlaps BRISC_VIRTIO_REGS_BASE (0x10000)");
+
+// ----- V2 invariants (#187) -----
+//
+// Mirrored against `_V2_LAYOUT_INVARIANTS` in `src/tensix_proto.rs`.
+// DIRTY is 1 byte per (slot, queue); PROCESSED is 2 bytes per (slot,
+// queue). Each array has its own carved 256 / 512 byte range.
+_Static_assert(
+    CTRL_OFF_DIRTY + BRISC_VIRTIO_NUM_SLOTS * MAX_QUEUES_PER_SLOT
+        <= CTRL_OFF_PROCESSED,
+    "V2 DIRTY array overflows into PROCESSED");
+_Static_assert(
+    CTRL_OFF_PROCESSED + BRISC_VIRTIO_NUM_SLOTS * MAX_QUEUES_PER_SLOT * 2u
+        <= CTRL_OFF_STATE_LOG,
+    "V2 PROCESSED array overflows into STATE_LOG");
+_Static_assert(
+    CTRL_OFF_STATE_LOG + 64u * 8u <= CTRL_OFF_V2_END,
+    "V2 STATE_LOG overflows V2_END");
+_Static_assert(
+    CTRL_OFF_V2_END <= CTRL_SIZE,
+    "V2 region overflows CTRL_SIZE");
+// V2 layout reuses CTRL_OFF_HELLO / _HELLO_ACK from V1; these checks
+// fire if anyone ever moves them.
+_Static_assert(CTRL_OFF_HELLO == 0x0000u, "V2 HELLO offset moved");
+_Static_assert(CTRL_OFF_HELLO_ACK == 0x0040u, "V2 HELLO_ACK offset moved");
 
 #endif  // BRISC_TENSIX_PROTO_H
