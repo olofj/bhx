@@ -66,11 +66,11 @@ pub const CTRL_OFF_DIRTY: u32 = 0x0100;
 /// dispatch `used.idx` so warm-resume reads cursors directly
 /// instead of probing guest DRAM.
 pub const CTRL_OFF_PROCESSED: u32 = 0x0200;
-/// 64-entry × 8-byte diagnostic ring. Reserved for future use; the
-/// daemon doesn't read it yet. Carving the address out now so we
-/// don't have to renumber when adding it later.
-pub const CTRL_OFF_STATE_LOG: u32 = 0x0400;
-pub const CTRL_OFF_V2_END: u32 = 0x0600;
+/// First byte after the V2 layout. Anything between
+/// `CTRL_OFF_END` and `CTRL_SIZE` is reserved for future fields;
+/// adding one bumps `PROTOCOL_VERSION` so a mismatched daemon ↔
+/// firmware pair refuses to attach loudly.
+pub const CTRL_OFF_END: u32 = 0x0400;
 
 // ----- Magic words (written last in each side's slot) -----
 
@@ -88,22 +88,22 @@ pub const HELLO_ACK_OFF_PROTOCOL_VERSION: u32 = 0x00;
 pub const HELLO_ACK_OFF_FIRMWARE_VERSION: u32 = 0x04;
 pub const HELLO_ACK_OFF_MAGIC: u32 = 0x08;
 
-// V2 layout invariants. NUM_SLOTS is hard-coded as the literal 32 to
+// Layout invariants. `NUM_SLOTS` is hard-coded as the literal 32 to
 // keep this module self-contained (the firmware-side mirror in
 // `tensix_proto.h` uses `BRISC_VIRTIO_NUM_SLOTS` from
 // `virtio_layout.h`); a separate cross-module assert in
 // `crate::virtio_engine` pins both values to match
 // `virtio_engine::NUM_SLOTS`.
-const _V2_NUM_SLOTS: u32 = 32;
+const _NUM_SLOTS: u32 = 32;
 const _LAYOUT_INVARIANTS: () = {
     // DIRTY: 1 byte per (slot, queue), placed at 0x0100.
-    assert!(CTRL_OFF_DIRTY + _V2_NUM_SLOTS * MAX_QUEUES_PER_SLOT <= CTRL_OFF_PROCESSED);
+    assert!(CTRL_OFF_DIRTY + _NUM_SLOTS * MAX_QUEUES_PER_SLOT <= CTRL_OFF_PROCESSED);
     // PROCESSED: 2 bytes per (slot, queue), placed at 0x0200.
-    assert!(CTRL_OFF_PROCESSED + _V2_NUM_SLOTS * MAX_QUEUES_PER_SLOT * 2 <= CTRL_OFF_STATE_LOG);
-    // STATE_LOG: reserved 64 × 8-byte ring (diagnostic, not yet read).
-    assert!(CTRL_OFF_STATE_LOG + 64 * 8 <= CTRL_OFF_V2_END);
-    // V2 region fits within CTRL_SIZE.
-    assert!(CTRL_OFF_V2_END <= CTRL_SIZE);
+    assert!(CTRL_OFF_PROCESSED + _NUM_SLOTS * MAX_QUEUES_PER_SLOT * 2 <= CTRL_OFF_END);
+    // The V2 region (HELLO/HELLO_ACK + ACTIVE bitmaps + DIRTY +
+    // PROCESSED) fits within CTRL_SIZE with the rest reserved for
+    // future fields.
+    assert!(CTRL_OFF_END <= CTRL_SIZE);
     // Pin handshake offsets — both sides hard-code 0x0000 / 0x0040
     // in the hello path.
     assert!(CTRL_OFF_HELLO == 0x0000);
@@ -124,16 +124,15 @@ mod tests {
         assert_eq!(HELLO_ACK_MAGIC.to_le_bytes(), *b"ACK!");
     }
 
-    /// Pinned literals catch accidental edits to any V2 constant; a
-    /// future revision that legitimately moves an offset updates this
-    /// test along with the const definition.
+    /// Pinned literals catch accidental edits to any layout constant;
+    /// a future revision that legitimately moves an offset updates
+    /// this test along with the const definition.
     #[test]
-    fn v2_constants_pinned_to_expected_values() {
+    fn layout_constants_pinned_to_expected_values() {
         assert_eq!(MAX_QUEUES_PER_SLOT, 8);
         assert_eq!(CTRL_OFF_DIRTY, 0x0100);
         assert_eq!(CTRL_OFF_PROCESSED, 0x0200);
-        assert_eq!(CTRL_OFF_STATE_LOG, 0x0400);
-        assert_eq!(CTRL_OFF_V2_END, 0x0600);
+        assert_eq!(CTRL_OFF_END, 0x0400);
     }
 
     #[test]

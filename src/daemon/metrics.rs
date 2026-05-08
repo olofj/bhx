@@ -613,29 +613,30 @@ pub static RNG_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
 /// The daemon polls `STATS_OFF_NOTIFY_EVENTS` and adds each delta
 /// to this counter. Used by the burst regression test (#186) to
 /// confirm the workload reached the dispatch path.
-pub static BHX_NOTIFY_EVENTS_TOTAL: Counter = Counter::new();
+pub static NOTIFY_EVENTS_TOTAL: Counter = Counter::new();
 
 /// Cumulative count of poll iterations where the daemon dispatched
 /// at least one (slot, queue) pair via the V2 dirty bitmap. The
 /// burst regression test asserts `> 0` to confirm V2 dispatch is
 /// active.
-pub static BHX_DISPATCH_PASSES_TOTAL: Counter = Counter::new();
+pub static DISPATCH_PASSES_TOTAL: Counter = Counter::new();
 
 /// Cumulative count of (slot, queue) pairs the V2 bitmap drain has
-/// dispatched. Sums to roughly the cumulative count of guest kicks
-/// the daemon processed (one per dirty bit cleared with non-empty
-/// avail).
-pub static BHX_DISPATCH_QUEUES_DRAINED: Counter = Counter::new();
+/// dispatched. Sums to roughly the cumulative count of guest
+/// QUEUE_NOTIFYs the daemon processed (one per dirty bit cleared
+/// with a non-empty avail ring).
+pub static DISPATCH_QUEUES_DRAINED: Counter = Counter::new();
 
 /// Cumulative count of QUEUE_SEL changes BRISC processed while the
 /// previous SEL's QUEUE_READY was still 1 — the race window the M7.2
 /// fix (#71, commit 1345f3e) was designed to close. Non-zero means
 /// BRISC's sweep is borderline against a stock kernel's
 /// `writel(SEL=N+1); readl(QUEUE_READY)` — that kernel can read the
-/// stale 1 and bail virtio probe with -ENOENT. Bumped from the daemon
-/// poller when `STATS_OFF_SEL_READY_RACES` advances. Surfaces as
-/// `bhx_sel_ready_races_total` in /metrics; pairs with the `[kick-
-/// poller] BRISC observed N SEL→READY race window(s)` log line.
+/// stale 1 and bail virtio probe with -ENOENT. Bumped by the
+/// dispatcher when `STATS_OFF_SEL_READY_RACES` advances; surfaces
+/// as `bhx_sel_ready_races_total` in /metrics. (Per-event dlog
+/// removed in #189 per the loud-counters memory note — surface via
+/// the metric only, not via every-iter log spam.)
 pub static SEL_READY_RACES_TOTAL: Counter = Counter::new();
 
 /// Cumulative count of OLD-sel rescue captures BRISC made — the
@@ -991,14 +992,14 @@ pub fn render_prometheus(state: &DaemonState) -> String {
         "bhx_notify_events_total",
         "Cumulative count of guest QUEUE_NOTIFY events BRISC has \
          observed. Mirrors STATS_OFF_NOTIFY_EVENTS.",
-        BHX_NOTIFY_EVENTS_TOTAL.get(),
+        NOTIFY_EVENTS_TOTAL.get(),
     );
     write_counter(
         &mut out,
         "bhx_dispatch_passes_total",
         "Cumulative count of poll iterations that dispatched at least \
          one (slot, queue) pair via the V2 dirty bitmap.",
-        BHX_DISPATCH_PASSES_TOTAL.get(),
+        DISPATCH_PASSES_TOTAL.get(),
     );
     write_counter(
         &mut out,
@@ -1006,7 +1007,7 @@ pub fn render_prometheus(state: &DaemonState) -> String {
         "Cumulative count of (slot, queue) pairs dispatched via the \
          V2 dirty bitmap. Roughly the count of guest kicks the daemon \
          turned into a non-empty avail walk.",
-        BHX_DISPATCH_QUEUES_DRAINED.get(),
+        DISPATCH_QUEUES_DRAINED.get(),
     );
     write_counter(
         &mut out,

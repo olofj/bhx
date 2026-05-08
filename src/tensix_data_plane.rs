@@ -50,12 +50,12 @@ fn clamp_consumer_to_ring(producer: u32, consumer: u32, ring_entries: u32) -> u3
     }
 }
 
-/// Snapshot the ratchet-style counter pattern the kick poller uses
-/// for chip-side stats (kick drops, sel/ready races, queue setup
-/// counts, etc): "if the value changed, log/account the wrapping
-/// delta and remember the new value." Returns `Some(delta)` on
-/// change, `None` otherwise. Critically uses `wrapping_sub` — the
-/// counters are u32 monotonics on the chip side that can wrap
+/// Snapshot the ratchet-style counter pattern the dispatcher uses
+/// for chip-side stats (sel/ready races, queue setup counts,
+/// notify events, etc): "if the value changed, log/account the
+/// wrapping delta and remember the new value." Returns `Some(delta)`
+/// on change, `None` otherwise. Critically uses `wrapping_sub` —
+/// the counters are u32 monotonics on the chip side that can wrap
 /// across long-running sessions, and a saturating subtract here
 /// would silently lose deltas.
 pub(crate) fn take_delta(current: u32, last: &mut u32) -> Option<u32> {
@@ -67,12 +67,13 @@ pub(crate) fn take_delta(current: u32, last: &mut u32) -> Option<u32> {
     Some(delta)
 }
 
-/// One registered (slot, device) pair the kick poller dispatches to
-/// when a kick arrives. The fields mirror what `virtio::run_device`
-/// holds per device today: an `Arc<L2Cpu>` for guest DRAM access,
-/// the device implementation for descriptor processing, and the
-/// per-L2CPU interrupt controller + IRQ number for the
-/// completion-side PLIC poke.
+/// One registered (slot, device) pair the dispatcher routes to
+/// when a guest QUEUE_NOTIFY sets the slot's dirty byte. The
+/// fields mirror what the legacy `virtio::run_device` worker held
+/// per device: an `Arc<L2Cpu>` for guest DRAM access, the device
+/// implementation for descriptor processing, and the per-L2CPU
+/// interrupt controller + IRQ number for the completion-side PLIC
+/// poke.
 ///
 /// `processed` tracks the queue's avail-ring head we've consumed up
 /// to, mirroring `run_device`'s `processed[qi]` vector. All-zeros
@@ -111,7 +112,7 @@ impl RegEntry {
     }
 
     /// Diagnostic helper used in dlog output during debugging. Used
-    /// by the kick-poller's per-slot probe-status logging (#123) so
+    /// by the dispatcher's per-slot probe-status logging (#123) so
     /// operators can grep daemon logs for "[probe-status] slot N
     /// (virtio_net) reached STATUS_DRIVER_OK".
     pub fn interrupt_kind_name(&self) -> &'static str {
@@ -147,6 +148,16 @@ pub struct PollerStats {
 /// `register_slot` / `unregister_slot` mutate from the boot path.
 /// Per-slot keys are the firmware's `slot = l2cpu_idx*8 +
 /// device_idx` packing (0..32).
+//
+// FIXME(perf): `drain_dirty_bitmap` holds this lock for the entire
+// drain pass — including every `dispatch_chain` it kicks off, which
+// can walk an arbitrarily-deep avail ring. While the lock is held,
+// `register_slot` / `unregister_slot` (= add-disk / remove-disk
+// RPCs) block. V1 had the same shape so this isn't a regression,
+// and at current workloads the latency is fine (~215 ms remove-disk
+// observed under 100-iter fio soak). If add/remove SLAs need
+// tightening, replace with a per-slot RwLock or a snapshotted
+// view that the drain can iterate lock-free. Not blocking V2.2.
 pub type Registry = Arc<Mutex<HashMap<u32, RegEntry>>>;
 
 /// Per-L2CPU UART (#78) registry. Maps `l2cpu_idx` → the slot's
@@ -372,8 +383,8 @@ fn run_poll_loop(
         // throttle, and rescue paths.
         let dispatched = drain_dirty_bitmap(&engine, &registry, &stats);
         if dispatched > 0 {
-            crate::daemon::metrics::BHX_DISPATCH_PASSES_TOTAL.add(1);
-            crate::daemon::metrics::BHX_DISPATCH_QUEUES_DRAINED.add(dispatched);
+            crate::daemon::metrics::DISPATCH_PASSES_TOTAL.add(1);
+            crate::daemon::metrics::DISPATCH_QUEUES_DRAINED.add(dispatched);
             last_active = std::time::Instant::now();
         }
 
@@ -473,7 +484,7 @@ fn run_poll_loop(
         // actually hit the dispatch path.
         let notify_events = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_NOTIFY_EVENTS);
         if let Some(delta) = take_delta(notify_events, &mut last_notify_events) {
-            crate::daemon::metrics::BHX_NOTIFY_EVENTS_TOTAL.add(delta as u64);
+            crate::daemon::metrics::NOTIFY_EVENTS_TOTAL.add(delta as u64);
         }
 
         let sel_ready_races = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_SEL_READY_RACES);
@@ -524,8 +535,8 @@ fn run_poll_loop(
         // BRISC has snapshotted; TEARDOWNS counts disable events.
         // SEL_RACES counts mid-capture SEL changes that forced an abort
         // (kernel raced past us into the next queue) — those leave the
-        // shadow at its prior value, which usually means the kick that
-        // follows will see stale or zero address halves.
+        // shadow at its prior value, which usually means the next
+        // dispatch will see stale or zero address halves.
         let setups = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_QUEUE_SETUPS);
         if setups != last_queue_setups {
             let delta = setups.wrapping_sub(last_queue_setups);
@@ -575,11 +586,20 @@ fn run_poll_loop(
         // Per-slot STATUS transitions. Snapshot registry under lock,
         // then do chip-side L1 reads outside the lock.
         //
+        // TOCTOU: the snapshot captures (slot, kind) tuples; we
+        // release the registry lock before the chip reads. Between
+        // the snapshot and the per-slot lock re-acquire (in the
+        // STATUS=0 → wipe `processed[]` branch), another thread
+        // can `unregister_slot` the entry — that's why the wipe
+        // uses `if let Some(reg) = ...get_mut(...)` and silently
+        // skips a missing entry. Don't change this to `unwrap()`
+        // even after a refactor: the gap window is real.
+        //
         // We read the visible-as-MMIO `MMIO_STATUS` register, NOT
         // BRISC's private `SNAP_OFF_STATUS` snap. The snap is BRISC's
-        // own diffing buffer (`brisc-firmware/virtio.c::poll_one_device`
-        // line ~818, comment: "Snap is BRISC-private; no fence needed.
-        // The next sweep's diff against snap is local to this hart so
+        // own diffing buffer (`brisc-firmware/virtio.c::poll_one_device`,
+        // comment: "Snap is BRISC-private; no fence needed. The
+        // next sweep's diff against snap is local to this hart so
         // ordering is automatic; the daemon never reads snap_addr.").
         // Pre-#159 the logger here read snap, so under sustained
         // multi-L2CPU load BRISC's store-coalescing queue could leave
@@ -742,14 +762,14 @@ fn drain_dirty_bitmap(
     dispatched
 }
 
-/// PLIC IRQ on success. Returns `true` if a chain was posted.
 /// Drain pending chains for one (slot, queue). Returns `Some(used_idx)`
 /// if at least one chain was processed, where `used_idx` is the
 /// kernel-visible `VringUsed::idx` after our final commit (read back
 /// from guest DRAM via volatile load). `None` if nothing was drained.
+/// On non-empty drain, fires the PLIC IRQ before returning.
 fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16) -> Option<u32> {
-    // Drop the kick if it references a queue index past what the
-    // device announced at registration. Out of bounds shouldn't
+    // Skip if the NOTIFY references a queue index past what the
+    // device announced at registration. Out-of-range shouldn't
     // happen for a well-behaved guest, but a misbehaving guest
     // shouldn't crash the daemon.
     if (queue_idx as usize) >= reg.processed.len() {
@@ -812,15 +832,15 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
 
     if desc_addr == 0 || avail_addr == 0 || used_addr == 0 {
         // Queue not yet configured — guest hasn't published the
-        // shadow pointers yet. Drop the kick silently; otherwise the
-        // RX-side polling loop spams this for every idle iteration
-        // while net's queue 0 is unconfigured.
+        // shadow pointers yet. Bail silently; otherwise the RX-side
+        // polling loop spams this for every idle iteration while
+        // net's queue 0 is unconfigured.
         return None;
     }
     if queue_num == 0 || queue_num > u16::MAX as u32 {
         // Kernel hasn't published QUEUE_NUM yet, or it published
         // something larger than u16. Either way we can't index the
-        // ring; drop the kick.
+        // ring; bail.
         crate::dlog!(
             "[dispatcher]   slot {} queue {} bad queue_num={}, dropping",
             reg.slot,
@@ -858,12 +878,13 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
     let used_q = unsafe { memory.add((used_addr - starting) as usize) as *mut VringUsed };
 
     let queue_header_size = reg.device.queue_header_size();
-    // Drain the avail ring fully — the kernel batches multiple chains
-    // behind a single QUEUE_NOTIFY (each kick covers everything the
-    // driver has queued so far). With one chain processed per kick,
-    // we'd leak (avail.idx - processed) chains and stall on the next
-    // batch. One IRQ per drain at the end is enough; the kernel's
-    // virtblk_done loops over completions anyway.
+    // Drain the avail ring fully — the kernel batches multiple
+    // chains behind a single QUEUE_NOTIFY (each NOTIFY signals
+    // everything the driver has queued so far). Processing one
+    // chain per dispatch would leak `avail.idx - processed` chains
+    // and stall on the next batch. One IRQ per drain at the end
+    // is enough; the kernel's virtblk_done loops over completions
+    // anyway.
     let mut posted = false;
     loop {
         let one = process_one_chain_for_queue(

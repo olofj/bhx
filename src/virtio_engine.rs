@@ -145,73 +145,60 @@ pub const STATUS_DEVICE_NEEDS_RESET: u32 = 64;
 pub const STATUS_FAILED: u32 = 128;
 
 // ----- Stats page offsets (must match firmware's STATS_OFF_*) -----
+//
+// Layout repacked post-V2.1 cleanup; offsets are the wire contract,
+// no backwards compatibility — `proto::PROTOCOL_VERSION` gates this.
+// See `brisc-firmware/virtio.c` for the full per-field rationale.
 
+// --- Identity / liveness ---
 pub const STATS_OFF_VERSION: u32 = 0x000;
 pub const STATS_OFF_MAGIC: u32 = 0x004;
 pub const STATS_OFF_HEARTBEAT: u32 = 0x008;
+
+// --- MMIO event counters ---
 pub const STATS_OFF_STATUS_CHANGES: u32 = 0x010;
 pub const STATS_OFF_SEL_CHANGES: u32 = 0x014;
 pub const STATS_OFF_NOTIFY_EVENTS: u32 = 0x018;
 pub const STATS_OFF_READY_EVENTS: u32 = 0x01c;
 pub const STATS_OFF_LAST_NOTIFY: u32 = 0x020;
-// 0x024 / 0x028 / 0x02c retired with the V1 kick + completion rings
-// (#188): STATS_OFF_COMPL_EVENTS, STATS_OFF_LAST_COMPL,
-// STATS_OFF_KICK_DROPS. Reserved — don't reuse without bumping
-// PROTOCOL_VERSION.
-/// Cumulative count of QUEUE_SEL changes BRISC processed while the
-/// previous SEL's QUEUE_READY was still 1 — i.e. the race window
-/// the M7.2 fix (#71, commit 1345f3e) was designed to close re-opened.
-/// During that window a stock kernel doing
-/// `writel(SEL=N+1); readl(QUEUE_READY)` back-to-back can read the
-/// stale 1 and bail with -ENOENT. Bumped by the firmware's
-/// `handle_queue_sel_change`. Mirrored on the firmware side as
-/// `STATS_OFF_SEL_READY_RACES` in `brisc-firmware/virtio.c`.
-pub const STATS_OFF_SEL_READY_RACES: u32 = 0x030;
-/// #124 BRISC timing probe (BRISC mcycle CSR samples). All in cycles
-/// at the BRISC clock — convert to ns by dividing by AICLK in GHz
-/// (1.35 GHz at MAX_AI_CLK ⟹ ~0.74 ns/cycle).
-///
-/// `MAX_SWEEP_CYCLES`: worst-case top-of-main-loop to top-of-main-loop
-/// duration since stats reset. The relevant number for racing the
-/// kernel's `writel(QUEUE_SEL); readl(QUEUE_READY)` gap.
-///
-/// `MAX_SEL_PATH_CYCLES`: worst-case `handle_queue_sel_change` entry
-/// to right-after-FENCE_W (the moment QUEUE_READY=0 is published).
-/// The duration BRISC holds the kernel waiting on its readl response.
-///
-/// `LAST_SWEEP_CYCLES`: most recent sweep period. Useful when MAX
-/// looks suspicious (e.g., a single early outlier from cold-cache
-/// effects swamps everything).
-pub const STATS_OFF_MAX_SWEEP_CYCLES: u32 = 0x034;
-pub const STATS_OFF_MAX_SEL_PATH_CYCLES: u32 = 0x038;
-pub const STATS_OFF_LAST_SWEEP_CYCLES: u32 = 0x03c;
-/// #120 atomic capture stats. `READY_CAPTURE_SEL_RACES` counts cases
-/// where the kernel advanced SEL between BRISC's setup-field reads
-/// and BRISC's post-read SEL re-check (mixed-queue snapshot, discarded).
-/// `QUEUE_SETUPS` counts successful captures (queue activations);
-/// `QUEUE_TEARDOWNS` counts READY=0 events. Together they replace the
-/// lumped READY_EVENTS for "how many virtio commands has BRISC actually
-/// processed" — useful both as forward-progress evidence and as a
-/// soak-time sanity check that capture isn't quietly losing setups.
-pub const STATS_OFF_READY_CAPTURE_SEL_RACES: u32 = 0x04c;
-pub const STATS_OFF_QUEUE_SETUPS: u32 = 0x050;
-pub const STATS_OFF_QUEUE_TEARDOWNS: u32 = 0x054;
-/// #155 BRISC OLD-sel rescue captures. Mirrors the firmware
-/// `STATS_OFF_BRISC_OLD_SEL_RESCUE`. Fires when BRISC observes a SEL
-/// change with no prior successful capture for the old sel — snapshots
-/// the still-visible kernel writes for old sel into shadow.
-pub const STATS_OFF_BRISC_OLD_SEL_RESCUE: u32 = 0x06c;
-/// #132 DEVICE_FEATURES_SEL change observations from TRISC1.
-pub const STATS_OFF_DEV_FEAT_SEL_CHANGES: u32 = 0x058;
-/// Sweep-cycle histogram. Each bucket counts iterations whose sweep
-/// fell in the bucket's range (in BRISC cycles). Useful for
-/// distinguishing typical sweep cost from one-shot outliers like
-/// `init_device` running on STATUS=0 (~1200 cycles in a 320-store
-/// wipe, lands once per probe round per slot).
-/// Steady-state sweep max — same as `STATS_OFF_MAX_SWEEP_CYCLES`
-/// but excludes iters where `init_device` fired (one-shot ~1240-cycle
-/// wipe on STATUS=0). This is the race-relevant max.
-pub const STATS_OFF_MAX_STEADY_SWEEP_CYCLES: u32 = 0x068;
+
+// --- SEL→READY race-window diagnostics ---
+//
+// `STATS_OFF_SEL_READY_RACES` is BRISC's count of SEL changes
+// observed while the prior SEL's QUEUE_READY was still 1 — closing
+// that window prevents the kernel's `writel(SEL); readl(READY)`
+// from reading stale 1 and bailing with -ENOENT.
+pub const STATS_OFF_SEL_READY_RACES: u32 = 0x024;
+pub const STATS_OFF_READY_CAPTURE_SEL_RACES: u32 = 0x028;
+pub const STATS_OFF_QUEUE_SETUPS: u32 = 0x02c;
+pub const STATS_OFF_QUEUE_TEARDOWNS: u32 = 0x030;
+pub const STATS_OFF_BRISC_OLD_SEL_RESCUE: u32 = 0x034;
+pub const STATS_OFF_DEV_FEAT_SEL_CHANGES: u32 = 0x038;
+pub const STATS_OFF_TRISC1_SEL_RACES: u32 = 0x03c;
+
+// --- Timing probes (all in BRISC mcycle low-half cycles) ---
+//
+// `MAX_SWEEP_CYCLES`: worst-case top-of-loop to top-of-loop period.
+// `MAX_STEADY_SWEEP_CYCLES`: same but excludes iters where
+//   `init_device` fired (the one-shot ~1240-cycle wipe on STATUS=0
+//   dominates max but doesn't overlap the SEL→READY race window).
+// `MAX_SEL_PATH_CYCLES`: handle_queue_sel_change entry to just
+//   after the QUEUE_READY=0 + FENCE_W.
+// `LAST_SWEEP_CYCLES`: most recent sweep period — useful when MAX
+//   is dominated by a single cold-cache outlier.
+// `MAX_TRISC1_REACTION_CYCLES`: TRISC1 SEL-change observation to
+//   READY=0 publish.
+// `MAX_TRISC1_OUTER_CYCLES`: TRISC1 full sweep period.
+pub const STATS_OFF_MAX_SWEEP_CYCLES: u32 = 0x040;
+pub const STATS_OFF_MAX_STEADY_SWEEP_CYCLES: u32 = 0x044;
+pub const STATS_OFF_MAX_SEL_PATH_CYCLES: u32 = 0x048;
+pub const STATS_OFF_LAST_SWEEP_CYCLES: u32 = 0x04c;
+pub const STATS_OFF_MAX_TRISC1_REACTION_CYCLES: u32 = 0x050;
+pub const STATS_OFF_MAX_TRISC1_OUTER_CYCLES: u32 = 0x054;
+
+// 0x058–0x0FC: reserved for future stats. Bump
+// `proto::PROTOCOL_VERSION` when adding fields here so a
+// daemon ↔ firmware mismatch is loud.
 
 // ----- Per-queue shadow region (BRISC L1, M5.5b firmware) -----
 //
@@ -334,11 +321,11 @@ const _LAYOUT_INVARIANTS: () = {
     // overlap with the shadow region.
     assert!(STATS_BASE >= CODE_BASE + CODE_SIZE);
     assert!(REGS_BASE >= STATS_BASE + STATS_SIZE);
-    // Cross-module check: the control region (kick + completion
-    // rings, hello/hello-ack, active-slots bitmap) lives between
+    // Cross-module check: the control region (hello/hello-ack +
+    // active-slots bitmap + V2 dirty + V2 processed) lives between
     // STATS and REGS. A future bump of CTRL_SIZE that sneaks past
-    // REGS_BASE would silently alias the kick ring onto the virtio
-    // reg files. Pin both edges.
+    // REGS_BASE would silently alias CTRL onto the virtio reg
+    // files. Pin both edges.
     assert!(crate::tensix_proto::CTRL_BASE >= STATS_BASE + STATS_SIZE);
     assert!(crate::tensix_proto::CTRL_BASE + crate::tensix_proto::CTRL_SIZE <= REGS_BASE);
     // 32 reg files (4 L2CPUs × 8 devices, 6 populated + 2 padding) of
@@ -355,15 +342,15 @@ const _LAYOUT_INVARIANTS: () = {
     // uart_layout.h) — a previous bump put SHADOW at 0x40000 which
     // overlapped the host-facing UART register file and caused
     // BRISC's shadow writes to land on top of UART regs (and vice
-    // versa). The kick poller saw partial avail addresses on every
+    // versa). The dispatcher saw partial avail addresses on every
     // boot. Mirrored on the firmware side as `SHADOW_BASE` in
     // `brisc-firmware/virtio.c`.
     assert!(SHADOW_BASE + NUM_SLOTS * SHADOW_PER_DEVICE <= 0x0004_0000);
 
-    // V2 layout cross-pin (#187). `tensix_proto::_V2_NUM_SLOTS` is
-    // hard-coded as 32 to keep that module self-contained; this pins
-    // it to `NUM_SLOTS` so a future change here can't silently desync
-    // the V2 dirty / processed arrays.
+    // Cross-module pin: `tensix_proto::_NUM_SLOTS` is hard-coded as
+    // 32 there so the layout asserts stay self-contained. This pins
+    // it to `NUM_SLOTS` so a future change here can't silently
+    // desync the dirty / processed arrays.
     assert!(NUM_SLOTS == 32);
     assert!(
         crate::tensix_proto::CTRL_OFF_DIRTY + NUM_SLOTS * crate::tensix_proto::MAX_QUEUES_PER_SLOT
@@ -372,9 +359,9 @@ const _LAYOUT_INVARIANTS: () = {
     assert!(
         crate::tensix_proto::CTRL_OFF_PROCESSED
             + NUM_SLOTS * crate::tensix_proto::MAX_QUEUES_PER_SLOT * 2
-            <= crate::tensix_proto::CTRL_OFF_STATE_LOG
+            <= crate::tensix_proto::CTRL_OFF_END
     );
-    assert!(crate::tensix_proto::CTRL_OFF_V2_END <= crate::tensix_proto::CTRL_SIZE);
+    assert!(crate::tensix_proto::CTRL_OFF_END <= crate::tensix_proto::CTRL_SIZE);
 };
 
 #[cfg(test)]

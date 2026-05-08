@@ -1701,7 +1701,7 @@ fn run_tensix_engine(card: u32, chip: &shared_chip::SharedChip) -> std::io::Resu
 ///     (kernel saw stale THRE=1 and overwrote a byte before TRISC0
 ///     could read it, OR TRISC0 missed a byte for some other reason).
 ///   * **errors**: how many of the bytes TRISC0 captured don't match
-///     the expected pattern at the position the kick poller delivered
+///     the expected pattern at the position the dispatcher delivered
 ///     them. Tells us if there's a *content* corruption bug separate
 ///     from byte loss.
 fn run_uart_loopback(
@@ -1731,7 +1731,7 @@ fn run_uart_loopback(
     );
 
     // Set the UART slot's bit so BRISC releases TRISC0. We don't run
-    // a kick poller here — we read the feed ring directly below.
+    // a dispatcher here — we read the feed ring directly below.
     let uart_bit = 1u32 << uart_engine::slot_for_l2cpu(l2cpu_idx);
     engine.write_active_slots(uart_bit);
     // Give BRISC's main loop a beat to observe the bitmap and

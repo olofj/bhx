@@ -47,8 +47,8 @@
 //     0x50C0 .. 0x50C8    Active-slots bitmaps (full + virtio-only)
 //     0x5100 .. 0x5200    DIRTY array (NUM_SLOTS × MAX_QUEUES_PER_SLOT bytes)
 //     0x5200 .. 0x5400    PROCESSED array (NUM_SLOTS × MAX_QUEUES_PER_SLOT × 2 bytes)
-//     0x5400 .. 0x5600    STATE_LOG (reserved 64 × 8-byte ring; not yet read)
-//     0x5600 .. 0x6000    Free / future use
+//     0x5400 .. 0x6000    Reserved for future fields (bump
+//                          TENSIX_PROTOCOL_VERSION when adding any).
 
 #ifndef BRISC_TENSIX_PROTO_H
 #define BRISC_TENSIX_PROTO_H
@@ -102,11 +102,9 @@
 #define MAX_QUEUES_PER_SLOT       BRISC_VIRTIO_MAX_QUEUES
 #define CTRL_OFF_DIRTY            0x0100u
 #define CTRL_OFF_PROCESSED        0x0200u
-// 64-entry × 8-byte diagnostic ring. Reserved for future use; the
-// daemon doesn't read it yet. Carving the address out now so we
-// don't have to renumber when adding it later.
-#define CTRL_OFF_STATE_LOG        0x0400u
-#define CTRL_OFF_V2_END           0x0600u
+// First byte after the V2 layout. 0x0400 .. CTRL_SIZE is reserved
+// for future fields; bump TENSIX_PROTOCOL_VERSION on any addition.
+#define CTRL_OFF_END              0x0400u
 
 // Magic words. Both sides write the magic *last* in their respective
 // slot so a partial write is observable as "not yet ready" by the
@@ -130,23 +128,19 @@
 
 // ----- Compile-time invariants -----
 //
-// Mirrored against `_PROTO_INVARIANTS` and `_V2_LAYOUT_INVARIANTS`
-// in `src/tensix_proto.rs`. Cross-module check in
-// `src/virtio_engine.rs` pins NUM_SLOTS to 32 so the array sizing
-// here stays in lockstep.
+// Mirrored against `_LAYOUT_INVARIANTS` in `src/tensix_proto.rs`.
+// Cross-module check in `src/virtio_engine.rs` pins NUM_SLOTS to
+// 32 so the array sizing here stays in lockstep.
 _Static_assert(
     CTRL_OFF_DIRTY + BRISC_VIRTIO_NUM_SLOTS * MAX_QUEUES_PER_SLOT
         <= CTRL_OFF_PROCESSED,
     "DIRTY array overflows into PROCESSED");
 _Static_assert(
     CTRL_OFF_PROCESSED + BRISC_VIRTIO_NUM_SLOTS * MAX_QUEUES_PER_SLOT * 2u
-        <= CTRL_OFF_STATE_LOG,
-    "PROCESSED array overflows into STATE_LOG");
+        <= CTRL_OFF_END,
+    "PROCESSED array overflows the V2 region");
 _Static_assert(
-    CTRL_OFF_STATE_LOG + 64u * 8u <= CTRL_OFF_V2_END,
-    "STATE_LOG overflows V2_END");
-_Static_assert(
-    CTRL_OFF_V2_END <= CTRL_SIZE,
+    CTRL_OFF_END <= CTRL_SIZE,
     "V2 region overflows CTRL_SIZE");
 // CTRL must end before BRISC_VIRTIO_REGS_BASE (0x10000). A bump
 // that overflows CTRL_SIZE silently aliases CTRL onto the virtio

@@ -192,7 +192,7 @@ fn probe_initial_chip_state(shared: &crate::shared_chip::SharedChip, card: u32) 
 /// which disk image or network config was attached before, so the user
 /// must re-issue `add-disk` / `add-net` to rewire those. The chip's
 /// guest kernel stays up throughout; virtio descriptor chains re-sync
-/// on the next queue kick once workers come back.
+/// on the next QUEUE_NOTIFY once the dispatcher comes back up.
 fn warm_resume_released(state: &Arc<DaemonState>, released: &[u8]) {
     // Engine path: if any L2CPU is live across the daemon restart,
     // the BRISC firmware on the engine tile is also live (same chip
@@ -943,7 +943,7 @@ fn dispatch_boot(
         slot.blk_dtb_dev_idx
     );
 
-    // Register virtio device handlers with the engine's kick poller.
+    // Register virtio device handlers with the engine's dispatcher.
     // When the guest writes QUEUE_NOTIFY for a registered slot, the
     // poller looks up the entry, walks the descriptor chain via
     // `process_one_chain_for_queue`, and fires the PLIC IRQ.
@@ -1134,13 +1134,13 @@ fn dispatch_boot(
             let _ = extra_fwd;
             if console {
                 // virtio-console wants two halves: the device side
-                // (registered with the kick poller for TX/RX) and a
+                // (registered with the dispatcher for TX/RX) and a
                 // VirtioConsoleSlot on the per-L2CPU slot so the
                 // attach-console RPC + the input-fanout in
                 // dispatch_attach_console can find the input_buf.
                 // Same shape as `start_virtio_console` for the legacy
                 // host-buffer path; the only difference is we skip
-                // spawning a worker (the kick poller handles dispatch).
+                // spawning a worker (the dispatcher handles dispatch).
                 let input_buf = Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::with_capacity(
                         crate::virtio::console::RX_BUFFER_CAP,
@@ -1159,7 +1159,7 @@ fn dispatch_boot(
                 );
                 slot.virtio_console = Some(crate::daemon::VirtioConsoleSlot {
                     // Stub WorkerHandle — the engine path doesn't
-                    // spawn a per-device worker; the kick poller
+                    // spawn a per-device worker; the dispatcher
                     // handles dispatch. Keeping the slot field
                     // populated lets the rest of the daemon (attach,
                     // shutdown, status) treat the engine path
@@ -1185,7 +1185,7 @@ fn dispatch_boot(
             );
         } else {
             dlog!(
-                "[run_boot l2cpu {}] virtio-engine: engine + kick poller not up — \
+                "[run_boot l2cpu {}] virtio-engine: engine + dispatcher not up — \
                  skipping device registration",
                 l2cpu_idx
             );
@@ -1232,7 +1232,7 @@ fn handle_existing_slot(
         // dispatch into the slot we're about to tear down), then
         // slot.shutdown() joins workers and drops the L2Cpu Arc. A
         // reorder that put shutdown() before the unregister would
-        // leave a one-iteration window where the kick poller could
+        // leave a one-iteration window where the dispatcher could
         // dereference a freed Arc<L2Cpu>. See CLAUDE.md's "Boot must
         // not race with live workers during board reset" invariant.
         prior
@@ -1363,7 +1363,7 @@ fn maybe_opportunistic_reset_board(
 
     // Drop parked-sibling L2Cpu instances + transition slots to None.
     // Console-hub clients (if any) get the goodbye; engine slots
-    // unregister so the kick poller stops dispatching to them.
+    // unregister so the dispatcher stops dispatching to them.
     for &i in &parked_siblings {
         if let Ok(true) = internal_stop(state, i, "opportunistic reset_board") {
             dlog!(
@@ -1374,7 +1374,7 @@ fn maybe_opportunistic_reset_board(
         }
     }
 
-    // Drop the engine + kick poller before the PCIe LDS reset. Their
+    // Drop the engine + dispatcher before the PCIe LDS reset. Their
     // fds point at the about-to-be-reset chardev; holding them across
     // the reset would leave them pointing at unmapped BARs. Dropping
     // the poller joins its thread synchronously.
@@ -1797,7 +1797,7 @@ fn dispatch_release(
 
     // No need to re-spawn workers or update slot bookkeeping: the
     // existing console worker keeps draining the virt UART, the
-    // virtio handlers stay registered with the kick poller, the
+    // virtio handlers stay registered with the dispatcher, the
     // slot's L2Cpu Arc lives on. Status will flip from Parked back
     // to Running on the next status query (we cleared the magic).
     let _ = (rootfs_addr,); // unused on this path until DTB rebuild lands
@@ -2043,7 +2043,7 @@ fn run_boot_sequence(
         //
         // The 8250 *register file* is still set up in BRISC L1 so a
         // patched guest that writes to the fixed UART PA gets its
-        // bytes drained by TRISC0 + the kick poller. Leaving it
+        // bytes drained by TRISC0 + the dispatcher. Leaving it
         // visible to OpenSBI was the regression. Re-add the DTB node
         // (set `uart_addr_for_dtb = Some(uart_pa)`) only when
         // bringing up a distro that *requires* `console=ttyS0` AND
@@ -2065,7 +2065,7 @@ fn run_boot_sequence(
     // patches/0002-bhx-purgatory-magic.patch) which writes the "PARKED__"
     // magic at mem_base + 0xE0000. The host re-releases hart 0 from the
     // parked state on the next `bhx boot` (no chip reset). The pre-#166
-    // BRISC shutdown register + kick-poller event path is gone.
+    // BRISC shutdown register + dispatcher event path is gone.
     let _ = x280_base_for_shutdown;
     let dtb_patched = boot::modify_dtb(
         &dtb_raw,
@@ -2499,13 +2499,13 @@ fn dispatch_add_disk(
     })?;
     let irq = irq_for_blk_dev_idx(dev_idx);
 
-    // Engine path: register a fresh VirtioBlk with the kick poller
+    // Engine path: register a fresh VirtioBlk with the dispatcher
     // and push a stub DiskWorker so `daemon status` reflects the
-    // attach. The kick poller drops kicks for unregistered slots
+    // attach. The dispatcher's drain skips unregistered slots
     // (#71 M5.5b), so a guest probe before this call simply doesn't
     // see the device — same effect as the legacy worker not having
     // started yet. There is no per-device worker thread to spawn;
-    // the kick poller handles dispatch.
+    // the dispatcher handles dispatch.
 
     {
         if let (Some(dispatcher), Some(engine)) = (
@@ -2585,7 +2585,7 @@ fn dispatch_remove_disk(
     validate_l2cpu(l2cpu_idx)?;
 
     // Take the matching disks out under the lock; unregister their
-    // kick-poller slots while still holding the slot mutex (so the
+    // dispatcher slots while still holding the slot mutex (so the
     // poller can't race a fresh kick against a half-detached
     // VirtioBlk); release the lock; then join workers outside.
     // `stop_and_join` blocks until the worker's poll loop notices its
@@ -2642,7 +2642,7 @@ fn dispatch_remove_disk(
                 }
             }
         }
-        // Drop the kick-poller registrations for the slots we're
+        // Drop the dispatcher registrations for the slots we're
         // taking. Done under the slot mutex so a concurrent boot RPC
         // for this L2CPU can't observe a torn state.
         if let Some(dispatcher) = state.dispatcher.lock_or_internal_error()?.as_ref() {
@@ -2713,7 +2713,7 @@ fn dispatch_add_net(
     }
 
     // Engine path: build the VirtioNet directly + register with the
-    // kick poller. No worker thread; the kick poller's RX poll loop
+    // dispatcher. No worker thread; the dispatcher's RX poll loop
     // (#71 M5.5e) drives slirp's recv side.
 
     {
@@ -2787,7 +2787,7 @@ fn dispatch_remove_net(
 ) -> crate::Result<()> {
     dlog!("[remove_net l2cpu {}] dispatch entry", l2cpu_idx);
     validate_l2cpu(l2cpu_idx)?;
-    // Engine path: drop the kick poller's net registration first
+    // Engine path: drop the dispatcher's net registration first
     // (frees the VirtioNet's slirp connection too via Box drop).
     // No-op when there's no engine registration for this slot.
 
@@ -2888,7 +2888,7 @@ fn dispatch_remove_console(
 ) -> crate::Result<()> {
     dlog!("[remove_console l2cpu {}] dispatch entry", l2cpu_idx);
     validate_l2cpu(l2cpu_idx)?;
-    // Engine path: drop kick-poller registration first (frees the
+    // Engine path: drop dispatcher registration first (frees the
     // VirtioConsole's input_buf reference too).
 
     if let Some(dispatcher) = state.dispatcher.lock_or_internal_error()?.as_ref() {
@@ -2917,7 +2917,7 @@ fn dispatch_remove_console(
 // Stop / Shutdown
 // ---------------------------------------------------------------------------
 
-/// Drop every kick-poller registration for `l2cpu_idx` before the
+/// Drop every dispatcher registration for `l2cpu_idx` before the
 /// caller tears down the L2CpuSlot. Without this the poller keeps
 /// holding `Arc<L2Cpu>` for a stale slot — when the operator
 /// re-boots that L2CPU, the now-stale L2Cpu sticks around behind the
