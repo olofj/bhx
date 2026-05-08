@@ -102,12 +102,14 @@
 // interface (`0xFFB2_0000+`), which we punt on for now in favor of
 // landing the basic mechanism. See #71.
 #define CTRL_BASE                 0x00005000u
-// 16 KiB control region. Bumped from 4 KiB when KICK_RING_ENTRIES
-// went 64 → 512 (8 KiB ring), since the prior 4 KiB region couldn't
-// hold the larger ring + COMPL_RING + headers. L1 has 40+ KiB of
-// unused space between the previous CTRL end (0x6000) and REGS_BASE
-// (0x10000), so growing the region is free.
-#define CTRL_SIZE                 0x00004000u
+// 36 KiB control region. Bumped from 16 KiB when KICK_RING_ENTRIES
+// grew 512 → 2048 (32 KiB ring); previous 16 KiB region couldn't
+// hold the 32 KiB kick ring at all. L1 budget allows up to 44 KiB
+// for the CTRL region (0x10000 - 0x5000); we use 36 KiB, leaving
+// ~8 KiB headroom for future header/control growth. Going larger
+// would require relocating REGS_BASE or moving the kick ring into
+// host DRAM via NoC writes.
+#define CTRL_SIZE                 0x00009000u
 
 #define CTRL_OFF_HELLO            0x0000u
 #define CTRL_OFF_HELLO_ACK        0x0040u
@@ -128,9 +130,9 @@
 // only — TRISC1 reads it.
 #define CTRL_OFF_ACTIVE_SLOTS         0x00C0u
 #define CTRL_OFF_ACTIVE_VIRTIO_SLOTS  0x00C4u
-#define CTRL_OFF_KICK_RING        0x0100u  // ends at 0x2100 (512 × 16)
-#define CTRL_OFF_COMPL_RING_HDR   0x2100u
-#define CTRL_OFF_COMPL_RING       0x2200u  // ends at 0x2600 (64 × 16)
+#define CTRL_OFF_KICK_RING        0x0100u  // ends at 0x8100 (2048 × 16)
+#define CTRL_OFF_COMPL_RING_HDR   0x8100u
+#define CTRL_OFF_COMPL_RING       0x8200u  // ends at 0x8600 (64 × 16)
 
 // Magic words. Both sides write the magic *last* in their respective
 // slot so a partial write is observable as "not yet ready" by the
@@ -204,11 +206,47 @@
 #define COMPL_ENTRY_OFF_USED_IDX  0x04u
 
 // Ring sizing. Powers of 2 so wrap is a mask.
-// Bumped from 64 (1 KiB) — dual-guest cold boot can burst-produce
-// >250 kicks while the daemon is still consuming, overflowing a 64-
-// entry ring and dropping kicks. 512 entries = 8 KiB absorbs the
-// burst comfortably; L1 budget after CTRL_SIZE bump to 16 KiB is fine.
-#define KICK_RING_ENTRIES        512u  // 512 × 16 = 8 KiB at CTRL_OFF_KICK_RING
-#define COMPL_RING_ENTRIES       64u   // 64 × 16 = 1 KiB at CTRL_OFF_COMPL_RING
+// 2048 entries = 32 KiB. Bumped from 512 (8 KiB) after disk-to-disk
+// install workloads (e.g., openSUSE NET ISO → empty target image)
+// overflowed the 512-entry ring with bursts of 600-1300+ dropped
+// kicks per overflow window (#184). 2048 is the practical max
+// without restructuring the L1 layout: CTRL sits at 0x5000,
+// REGS_BASE is at 0x10000, leaving 44 KiB for CTRL — and
+// 32 KiB ring + 4 KiB headers/compl + slack just fits.
+#define KICK_RING_ENTRIES        2048u  // 2048 × 16 = 32 KiB at CTRL_OFF_KICK_RING
+#define COMPL_RING_ENTRIES       64u    // 64 × 16 = 1 KiB at CTRL_OFF_COMPL_RING
+
+// ----- Compile-time invariants (firmware-side) -----
+//
+// Mirrored against `_PROTO_INVARIANTS` in `src/tensix_proto.rs`. If
+// the daemon-side bump diverges from the firmware-side bump, one
+// side's static asserts will fire. Every constant referenced here
+// is a compile-time integer literal in this same file, so these
+// resolve at preprocess time without dragging in other layout
+// headers.
+
+_Static_assert(
+    CTRL_OFF_KICK_RING + KICK_RING_ENTRIES * KICK_ENTRY_SIZE <= CTRL_OFF_COMPL_RING_HDR,
+    "kick ring overflows into completion ring header");
+_Static_assert(
+    CTRL_OFF_COMPL_RING + COMPL_RING_ENTRIES * COMPL_ENTRY_SIZE <= CTRL_SIZE,
+    "completion ring overflows CTRL_SIZE");
+// Power-of-two ring sizes — required so wrap is a mask AND, not a
+// modulo (the bare-metal toolchain doesn't link __umodsi3).
+_Static_assert(
+    (KICK_RING_ENTRIES & (KICK_RING_ENTRIES - 1)) == 0,
+    "KICK_RING_ENTRIES must be a power of two");
+_Static_assert(
+    (COMPL_RING_ENTRIES & (COMPL_RING_ENTRIES - 1)) == 0,
+    "COMPL_RING_ENTRIES must be a power of two");
+// Cross-region: CTRL must end before BRISC_VIRTIO_REGS_BASE
+// (0x10000). A bump that overflows CTRL_SIZE silently aliases the
+// kick ring onto the virtio reg files — exactly the kind of
+// post-resize aliasing bug we want the compiler to catch. Hard-
+// coded value matches the constant in virtio_layout.h; cross-
+// header references are clumsier than restating the literal.
+_Static_assert(
+    CTRL_BASE + CTRL_SIZE <= 0x00010000u,
+    "CTRL region overlaps BRISC_VIRTIO_REGS_BASE (0x10000)");
 
 #endif  // BRISC_TENSIX_PROTO_H

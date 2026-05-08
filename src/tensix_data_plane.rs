@@ -118,13 +118,38 @@ pub(crate) fn consume_kick_ring_pass(
         *consumer = clamped;
     }
     let mut consumed = 0u64;
+    // Publish the consumer to BRISC every PUBLISH_BATCH kicks during
+    // the drain — not just at the end. BRISC's `kick_ring_push`
+    // checks `(producer - consumer) >= KICK_RING_ENTRIES` against
+    // the LAST consumer value the daemon published. If the daemon
+    // is inside a long drain pass (e.g., 1000+ kicks at 10-100 µs
+    // dispatch each = many ms total) and only updates the consumer
+    // at the end, BRISC sees the stale pre-pass consumer the whole
+    // time — and drops new kicks once `producer - stale_consumer`
+    // reaches 2048, even though the daemon is actively making
+    // progress. Periodic mid-drain updates fix this: BRISC sees
+    // free space open up batch by batch, bursts that exceed ring
+    // size in raw count are absorbed as long as our drain rate
+    // keeps up. Cost is one extra L1 NoC write per 64 kicks
+    // (~50 ns each) — negligible vs the 10-100 µs per-kick
+    // dispatch. Batch size 64 is a round-number compromise: small
+    // enough that BRISC's view stays within ~3-6 ms of reality
+    // even at slow per-kick dispatch, large enough to amortize the
+    // NoC writes across many kicks.
+    const PUBLISH_BATCH: u64 = 64;
     while *consumer != producer {
         let raw = engine.read_kick_entry(*consumer);
         on_kick(decode_kick_entry(raw));
         *consumer = consumer.wrapping_add(1);
         consumed += 1;
+        if consumed.is_multiple_of(PUBLISH_BATCH) {
+            engine.set_kick_consumer_seq(*consumer);
+        }
     }
-    if consumed > 0 {
+    if consumed > 0 && !consumed.is_multiple_of(PUBLISH_BATCH) {
+        // Final tail update so BRISC sees the post-drain consumer.
+        // The mid-drain publish above already covers full batches;
+        // this catches the residual.
         engine.set_kick_consumer_seq(*consumer);
     }
     consumed
@@ -398,7 +423,16 @@ fn run_poll_loop(
     // briefly, IDLE during long quiet stretches. Saves CPU when the
     // guest is doing nothing without sacrificing notify latency
     // when it picks up.
-    const FAST_SLEEP: Duration = Duration::from_micros(50);
+    //
+    // FAST tier was 50µs originally; bumped to 10µs after the
+    // 2048-entry ring (#184) absorbed peak bursts but still let
+    // 200-1000 kicks drop on sustained disk-to-disk I/O. The
+    // shorter poll lets the drain pass start sooner after each
+    // batch lands, narrowing the producer-vs-consumer gap. Per-
+    // poll cost is one L1 read for the kick-ring header (~100 ns
+    // NoC RTT), so 10µs polling is ~1% of one CPU core in NoC
+    // overhead during sustained activity — comfortable.
+    const FAST_SLEEP: Duration = Duration::from_micros(10);
     const SLOW_SLEEP: Duration = Duration::from_millis(1);
     const IDLE_SLEEP: Duration = Duration::from_millis(10);
     const FAST_WINDOW: Duration = Duration::from_millis(200);
@@ -406,6 +440,13 @@ fn run_poll_loop(
 
     let mut consumer: u32 = engine.kick_ring_header().1;
     let mut last_active = std::time::Instant::now();
+    // Last time we emitted an idle-snapshot log line. Reset to
+    // `last_active` after each snapshot so the next active period
+    // re-arms it. See `log_used_flags_snapshot` rationale: when a
+    // hang lands, we want one diagnostic dump of every queue's
+    // used.flags to tell daemon-state issues from guest-cache
+    // staleness, but we don't want to spam after that.
+    let mut last_snapshot = last_active;
 
     // Per-L2CPU UART feed-ring consumer state. M6.1 #79 v3 (Phase B
     // revised): the daemon polls these rings directly via the chip
@@ -451,7 +492,142 @@ fn run_poll_loop(
     // probe shows as zero DRIVER_OK lines after the reset.
     let mut last_status: HashMap<u32, u32> = HashMap::new();
 
+    // High-water-mark tracking for the kick ring (#184). Diagnostic
+    // for "how close are we skirting overflow" without having to
+    // wait for an actual drop. `hw_mark` is the all-time max
+    // (producer - consumer) gap observed; `hw_logged_threshold`
+    // is the highest fill-percentage bucket we've already emitted
+    // a log line for, so we don't spam — one log per crossing of
+    // 50%, 75%, 90%, 95%.
+    let mut hw_mark: u32 = 0;
+    let mut hw_logged_threshold: u32 = 0;
+
+    // Backpressure state (#184). When the kick ring crosses
+    // THROTTLE_HIGH_PCT fill, the daemon writes
+    // VRING_USED_F_NO_NOTIFY into every active queue's used.flags
+    // so the guest's `virtqueue_kick_prepare` skips the
+    // QUEUE_NOTIFY MMIO write — throttling kick production at the
+    // source rather than letting BRISC drop them downstream.
+    // Released at THROTTLE_LOW_PCT (hysteresis to avoid bouncing).
+    //
+    // Why so low (25%/5%): the throttle is reactive, applied only
+    // on poll-iteration boundaries. If a single dispatch pass
+    // takes unusually long (slow disk write, page-cache flush),
+    // BRISC can pile in many kicks before the next poll.
+    // Empirically observed bursts of ~2000 kicks added between
+    // two polls during install workloads, putting an earlier 75%
+    // (1536) threshold miles too late: the throttle engaged at
+    // the same millisecond as the overflow drop fired. Engage at
+    // 25% (512 of 2048) so even a ~150 ms dispatch outlier at 3K
+    // kicks/s only lands at ~1000, safely under the ring size.
+    // Tradeoff: more time spent throttled, lower peak throughput.
+    // Acceptable when the alternative is install death.
+    const THROTTLE_HIGH_PCT: u32 = 25;
+    const THROTTLE_LOW_PCT: u32 = 5;
+    let throttle_high_gap =
+        crate::tensix_proto::KICK_RING_ENTRIES.saturating_mul(THROTTLE_HIGH_PCT) / 100;
+    let throttle_low_gap =
+        crate::tensix_proto::KICK_RING_ENTRIES.saturating_mul(THROTTLE_LOW_PCT) / 100;
+    let mut throttled = false;
+
     while !exit.load(Ordering::Relaxed) {
+        // Snapshot the producer BEFORE the drain so we can compute
+        // the pre-drain ring fill. Costs one extra L1 read per
+        // iter (~100 ns NoC RTT) — acceptable at 10µs poll cadence.
+        let pre_producer = engine.kick_producer_seq();
+        let pre_gap = pre_producer.wrapping_sub(consumer);
+        crate::daemon::metrics::KICK_RING_CURRENT_GAP.set(pre_gap as i64);
+
+        // Backpressure: hysteretic guest-side throttle via
+        // VRING_USED_F_NO_NOTIFY. Engage at HIGH, release at LOW.
+        let want_throttle = if throttled {
+            pre_gap > throttle_low_gap
+        } else {
+            pre_gap >= throttle_high_gap
+        };
+        if want_throttle != throttled {
+            let refresh_irqs = set_used_no_notify_for_all_queues(&engine, &registry, want_throttle);
+            crate::daemon::metrics::KICK_THROTTLE_ENGAGED.set(if want_throttle { 1 } else { 0 });
+            if want_throttle {
+                crate::daemon::metrics::KICK_THROTTLE_TRANSITIONS_TOTAL.add(1);
+            }
+            crate::dlog!(
+                "[kick-poller] backpressure {} at gap {}/{} (high={}, low={})",
+                if want_throttle { "ENGAGED" } else { "RELEASED" },
+                pre_gap,
+                crate::tensix_proto::KICK_RING_ENTRIES,
+                throttle_high_gap,
+                throttle_low_gap,
+            );
+            if !want_throttle && refresh_irqs > 0 {
+                crate::dlog!(
+                    "[kick-poller] backpressure release: fired {} cache-refresh IRQs",
+                    refresh_irqs,
+                );
+            }
+            // Rescue any descriptors the guest queued during the
+            // throttle window whose QUEUE_NOTIFY happened while
+            // `used.flags=1` and was silently suppressed. Without
+            // this, a single suppressed kick on (say) the console
+            // TX queue leaves one `lag=1` chain in avail forever
+            // and the guest hangs waiting on its completion.
+            // Idempotent — caught-up queues are no-ops.
+            if !want_throttle {
+                let rescued = rescan_all_queues(&engine, &registry);
+                if rescued > 0 {
+                    crate::dlog!(
+                        "[kick-poller] backpressure release: rescued {} avail-ring entries",
+                        rescued,
+                    );
+                    crate::daemon::metrics::KICK_RESCUED_TOTAL.add(rescued);
+                    last_active = std::time::Instant::now();
+                }
+            }
+            throttled = want_throttle;
+        }
+
+        if pre_gap > hw_mark {
+            hw_mark = pre_gap;
+            crate::daemon::metrics::KICK_RING_HIGH_WATER.set(hw_mark as i64);
+            // Emit a log line the FIRST time we cross each
+            // fill-bucket boundary, so an operator chasing #184
+            // sees how close we got without having to scrape
+            // metrics. Buckets pinned to engineering interest
+            // levels: 50% = "approaching margin", 75% = "tight",
+            // 90% = "imminent", 95% = "skid mark".
+            let pct = pre_gap.saturating_mul(100) / crate::tensix_proto::KICK_RING_ENTRIES;
+            let bucket = if pct >= 95 {
+                95
+            } else if pct >= 90 {
+                90
+            } else if pct >= 75 {
+                75
+            } else if pct >= 50 {
+                50
+            } else {
+                0
+            };
+            if bucket > hw_logged_threshold {
+                let now = std::time::Instant::now();
+                let elapsed = now.duration_since(last_active);
+                let tier = if elapsed < FAST_WINDOW {
+                    "FAST"
+                } else if elapsed < IDLE_WINDOW {
+                    "SLOW"
+                } else {
+                    "IDLE"
+                };
+                crate::dlog!(
+                    "[kick-poller] kick ring fill new high-water: {}/{} ({}%, bucket {}%, tier {})",
+                    pre_gap,
+                    crate::tensix_proto::KICK_RING_ENTRIES,
+                    pct,
+                    bucket,
+                    tier
+                );
+                hw_logged_threshold = bucket;
+            }
+        }
         let consumed_this_pass = consume_kick_ring_pass(&*engine, &mut consumer, |kick| {
             // Dispatch every kick through the virtio registry. There
             // used to be a slots-20..23 carve-out here for the legacy
@@ -610,6 +786,36 @@ fn run_poll_loop(
                 kick_drops
             );
             crate::daemon::metrics::KICK_DROPS_TOTAL.add(delta as u64);
+            // Rescue path (#184): a dropped kick means BRISC discarded
+            // the notify, but the descriptor is still sitting in the
+            // guest's avail ring untouched — `dispatch_chain` walks
+            // from `processed[qi]` to current avail.idx, so calling
+            // it on every active (slot, queue) pair processes
+            // anything BRISC failed to notify us about. Without this,
+            // the guest's kernel virtio-blk waits ~30 s for its I/O
+            // timeout, retries, and the install workload usually
+            // gives up before the timeout-retry cycle catches up.
+            // With it, the dropped kick becomes a temporary latency
+            // hit (fixed cost: scan all queues once) instead of a
+            // multi-second stall.
+            //
+            // Cost: one dispatch_chain call per (slot, queue) pair.
+            // With ~5 active slots × 1-2 queues each, that's ~10
+            // calls. Each is a no-op (early return) if the queue's
+            // processed[qi] already matches avail.idx — i.e., we
+            // didn't actually miss anything for that queue. Real
+            // work happens only on queues that have unprocessed
+            // entries. Runs only when drops are detected, so no
+            // cost in steady state.
+            let rescued = rescan_all_queues(&engine, &registry);
+            if rescued > 0 {
+                crate::dlog!(
+                    "[kick-poller] rescued {} avail-ring entries via post-drop rescan",
+                    rescued
+                );
+                crate::daemon::metrics::KICK_RESCUED_TOTAL.add(rescued);
+                last_active = std::time::Instant::now();
+            }
         }
         let sel_ready_races = engine.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_SEL_READY_RACES);
         if let Some(delta) = take_delta(sel_ready_races, &mut last_sel_ready_races) {
@@ -802,6 +1008,19 @@ fn run_poll_loop(
         }
 
         let idle = last_active.elapsed();
+        // Once-per-idle-period diagnostic for #184. After a chunk
+        // of activity goes quiet for SNAPSHOT_AFTER seconds, dump
+        // every active queue's used.flags. If the daemon's view
+        // shows flag=0 across the board but no kicks are
+        // arriving, that's evidence of host→guest cache staleness
+        // (the workaround for which is the cache-refresh IRQ on
+        // throttle release). If anything shows flag=1 unexpectedly,
+        // our state machine has a bug.
+        const SNAPSHOT_AFTER: Duration = Duration::from_secs(5);
+        if idle >= SNAPSHOT_AFTER && last_snapshot < last_active {
+            log_used_flags_snapshot(&engine, &registry);
+            last_snapshot = std::time::Instant::now();
+        }
         let sleep = if idle < FAST_WINDOW {
             FAST_SLEEP
         } else if idle < IDLE_WINDOW {
@@ -813,11 +1032,178 @@ fn run_poll_loop(
     }
 }
 
+/// Per-queue idle snapshot for #184 hang diagnosis. For each
+/// active (slot, queue) pair logs: used.flags (daemon-side read
+/// of what we wrote), avail.idx (what the guest has published),
+/// processed[qi] (how far we've drained), used.idx (what we've
+/// committed back to the guest).
+///
+/// If `avail.idx > processed[qi]` while idle, the guest queued
+/// requests we never saw a kick for — typical of throttle-window
+/// suppression that the guest never recovered from. If
+/// `used.idx == processed[qi]` and the guest is waiting on a
+/// completion, the guest's cache likely holds a stale `used.idx`
+/// (host wrote the new value, guest's L1 still has the old one).
+fn log_used_flags_snapshot(engine: &Arc<TensixEngine>, registry: &Registry) {
+    use crate::virtio_engine::{
+        shadow_queue_addr, SHADOW_Q_OFF_DEVICE_HI, SHADOW_Q_OFF_DEVICE_LO, SHADOW_Q_OFF_DRIVER_HI,
+        SHADOW_Q_OFF_DRIVER_LO,
+    };
+    let map = registry.lock().unwrap();
+    if map.is_empty() {
+        return;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for reg in map.values() {
+        let starting = reg.l2cpu.starting_address();
+        let mem_end = starting + reg.l2cpu.memory_size();
+        let memory = reg.l2cpu.get_memory_ptr();
+        let n_queues = reg.processed.len() as u32;
+        for qi in 0..n_queues {
+            let used_lo =
+                engine.read_l1_u32(shadow_queue_addr(reg.slot, qi, SHADOW_Q_OFF_DEVICE_LO));
+            let used_hi =
+                engine.read_l1_u32(shadow_queue_addr(reg.slot, qi, SHADOW_Q_OFF_DEVICE_HI));
+            let used_addr = ((used_hi as u64) << 32) | (used_lo as u64);
+            let avail_lo =
+                engine.read_l1_u32(shadow_queue_addr(reg.slot, qi, SHADOW_Q_OFF_DRIVER_LO));
+            let avail_hi =
+                engine.read_l1_u32(shadow_queue_addr(reg.slot, qi, SHADOW_Q_OFF_DRIVER_HI));
+            let avail_addr = ((avail_hi as u64) << 32) | (avail_lo as u64);
+            if used_addr == 0
+                || used_addr < starting
+                || used_addr >= mem_end
+                || avail_addr == 0
+                || avail_addr < starting
+                || avail_addr >= mem_end
+            {
+                continue;
+            }
+            let used_flags_ptr =
+                unsafe { memory.add((used_addr - starting) as usize) as *const u16 };
+            let used_idx_ptr =
+                unsafe { memory.add((used_addr - starting) as usize + 2) as *const u16 };
+            let avail_idx_ptr =
+                unsafe { memory.add((avail_addr - starting) as usize + 2) as *const u16 };
+            let used_flags = unsafe { std::ptr::read_volatile(used_flags_ptr) };
+            let used_idx = unsafe { std::ptr::read_volatile(used_idx_ptr) };
+            let avail_idx = unsafe { std::ptr::read_volatile(avail_idx_ptr) };
+            let processed = reg.processed[qi as usize];
+            let lag = avail_idx.wrapping_sub(processed);
+            parts.push(format!(
+                "({},{}) flags={} avail.idx={} proc={} (lag={}) used.idx={}",
+                reg.slot, qi, used_flags, avail_idx, processed, lag, used_idx,
+            ));
+        }
+    }
+    if parts.is_empty() {
+        return;
+    }
+    crate::dlog!("[kick-poller] idle snapshot: {}", parts.join(" | "));
+}
+
 /// Walk one descriptor chain on `(slot, queue_idx)` via the
 /// existing virtio descriptor processor. Reads per-queue
 /// desc/avail/used pointers from BRISC L1 shadow, maps them into
 /// the L2CPU's memory namespace, calls the device's
 /// `process_queue_*` hooks, writes the used-ring entry, fires the
+/// Walk every registered (slot, queue) and call `dispatch_chain`
+/// on it. Idempotent: a queue whose `processed[qi]` already
+/// matches `avail.idx` is a no-op. Used by both the
+/// kick-drop recovery path (BRISC dropped notifies, descriptors
+/// sit in the avail ring) and the backpressure-release path (a
+/// guest QUEUE_NOTIFY that lined up with `used.flags=1` got
+/// silently suppressed; the descriptor is in avail but no kick
+/// will ever come). Returns the number of (slot, queue) pairs
+/// that actually had work to do.
+fn rescan_all_queues(engine: &Arc<TensixEngine>, registry: &Registry) -> u64 {
+    let mut rescued = 0u64;
+    let mut map = registry.lock().unwrap();
+    for (slot, reg) in map.iter_mut() {
+        let n_queues = reg.processed.len() as u16;
+        for qi in 0..n_queues {
+            if let Some(used_idx) = dispatch_chain(engine, reg, qi) {
+                engine.push_completion(*slot as u16, qi, used_idx);
+                rescued += 1;
+            }
+        }
+    }
+    rescued
+}
+
+/// Toggle `VRING_USED_F_NO_NOTIFY` in every active queue's used.flags
+/// across every registered slot (#184 backpressure path). When
+/// `enable=true`, the bit is set — the guest's
+/// `virtqueue_kick_prepare` will check the flag, see it set, and
+/// skip the QUEUE_NOTIFY MMIO write. The kick ring stops getting
+/// new entries while the daemon drains. When `enable=false`, the
+/// bit is cleared and one PLIC IRQ is fired per slot that received
+/// a write — see the cache-refresh rationale below. Returns the
+/// number of slots that received the cache-refresh IRQ so the
+/// caller can log it.
+///
+/// Per-queue used-ring address comes from BRISC L1 shadow (the
+/// `SHADOW_Q_OFF_DEVICE_LO/HI` fields), captured at QUEUE_READY=1
+/// commit. Skips queues whose `used_addr` is zero (uninitialized)
+/// or out-of-range vs the L2CPU's DRAM window (defensive — guest
+/// shouldn't be able to publish a bad address but treat it as
+/// suspicious if observed).
+///
+/// Cache-refresh IRQ on release: the X280 doesn't snoop host-side
+/// PCIe stores, so writing flag=0 from the daemon lands in DRAM
+/// but the guest's L1 cache may hold the prior flag=1 value
+/// indefinitely. `virtqueue_kick_prepare` does a plain READ_ONCE
+/// of `used->flags`, hits cached =1, and keeps skipping the
+/// QUEUE_NOTIFY MMIO write — I/O hangs after a single
+/// throttle/release cycle. Firing a spurious PLIC IRQ forces the
+/// guest's virtio IRQ handler to read used.idx; used.idx and
+/// used.flags share the same 64-byte cache line, so the load
+/// refreshes the whole line and the next `virtqueue_kick_prepare`
+/// sees the host's flag=0.
+fn set_used_no_notify_for_all_queues(
+    engine: &Arc<TensixEngine>,
+    registry: &Registry,
+    enable: bool,
+) -> usize {
+    use crate::virtio_engine::{shadow_queue_addr, SHADOW_Q_OFF_DEVICE_HI, SHADOW_Q_OFF_DEVICE_LO};
+    let flag_val: u16 = if enable { 1 } else { 0 };
+    let map = registry.lock().unwrap();
+    let mut irqs_fired = 0usize;
+    for reg in map.values() {
+        let starting = reg.l2cpu.starting_address();
+        let mem_end = starting + reg.l2cpu.memory_size();
+        let memory = reg.l2cpu.get_memory_ptr();
+        let n_queues = reg.processed.len() as u32;
+        let mut wrote_any = false;
+        for qi in 0..n_queues {
+            let used_lo =
+                engine.read_l1_u32(shadow_queue_addr(reg.slot, qi, SHADOW_Q_OFF_DEVICE_LO));
+            let used_hi =
+                engine.read_l1_u32(shadow_queue_addr(reg.slot, qi, SHADOW_Q_OFF_DEVICE_HI));
+            let used_addr = ((used_hi as u64) << 32) | (used_lo as u64);
+            if used_addr == 0 || used_addr < starting || used_addr >= mem_end {
+                continue;
+            }
+            // Used ring layout: u16 flags at offset 0. Volatile store
+            // so the compiler doesn't fold consecutive writes.
+            let flags_ptr = unsafe { memory.add((used_addr - starting) as usize) as *mut u16 };
+            unsafe {
+                std::ptr::write_volatile(flags_ptr, flag_val);
+            }
+            wrote_any = true;
+        }
+        if !enable && wrote_any {
+            let interrupt_status_addr_l1 = ve::slot_regs_base(reg.slot) + ve::MMIO_INTERRUPT_STATUS;
+            let interrupt_status_ptr = engine.l1_ptr(interrupt_status_addr_l1) as *mut u32;
+            reg.interrupt_ctl
+                .set_interrupt(interrupt_status_ptr, reg.interrupt_number);
+            crate::virtio::bump_interrupt_metric(reg.interrupt_kind, reg.l2cpu.idx() as u8);
+            irqs_fired += 1;
+        }
+    }
+    irqs_fired
+}
+
 /// PLIC IRQ on success. Returns `true` if a chain was posted.
 /// Drain pending chains for one (slot, queue). Returns `Some(used_idx)`
 /// if at least one chain was processed, where `used_idx` is the

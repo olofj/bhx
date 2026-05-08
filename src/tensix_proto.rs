@@ -63,21 +63,23 @@ pub const PROTOCOL_VERSION: u32 = 4;
 // BRISC NoC-write capability via the NIU register interface).
 
 pub const CTRL_BASE: u32 = 0x0000_5000;
-/// 16 KiB control region. Bumped from 4 KiB when KICK_RING_ENTRIES
-/// grew 64 → 512 (8 KiB ring); the prior 4 KiB region couldn't hold
-/// the larger ring + COMPL_RING + headers. L1 has 40+ KiB of unused
-/// space between the previous CTRL end (0x6000) and REGS_BASE
-/// (0x10000), so growing the region is free.
-pub const CTRL_SIZE: u32 = 0x0000_4000;
+/// 36 KiB control region. Bumped from 16 KiB when KICK_RING_ENTRIES
+/// grew 512 → 2048 (32 KiB ring); previous 16 KiB region couldn't
+/// hold the 32 KiB kick ring at all. L1 budget allows up to 44 KiB
+/// for the CTRL region (0x10000 - 0x5000); we use 36 KiB, leaving
+/// ~8 KiB headroom for future header/control growth. Going larger
+/// would require relocating REGS_BASE (the virtio reg-file region)
+/// or moving the kick ring into host DRAM via NoC writes.
+pub const CTRL_SIZE: u32 = 0x0000_9000;
 
 pub const CTRL_OFF_HELLO: u32 = 0x0000;
 pub const CTRL_OFF_HELLO_ACK: u32 = 0x0040;
 pub const CTRL_OFF_KICK_RING_HDR: u32 = 0x0080;
 pub const CTRL_OFF_ACTIVE_SLOTS: u32 = 0x00C0;
 pub const CTRL_OFF_ACTIVE_VIRTIO_SLOTS: u32 = 0x00C4;
-pub const CTRL_OFF_KICK_RING: u32 = 0x0100; // ends at 0x2100 (512 × 16)
-pub const CTRL_OFF_COMPL_RING_HDR: u32 = 0x2100;
-pub const CTRL_OFF_COMPL_RING: u32 = 0x2200; // ends at 0x2600 (64 × 16)
+pub const CTRL_OFF_KICK_RING: u32 = 0x0100; // ends at 0x8100 (2048 × 16)
+pub const CTRL_OFF_COMPL_RING_HDR: u32 = 0x8100;
+pub const CTRL_OFF_COMPL_RING: u32 = 0x8200; // ends at 0x8600 (64 × 16)
 
 // ----- Magic words (written last in each side's slot) -----
 
@@ -124,11 +126,14 @@ pub const COMPL_ENTRY_OFF_USED_IDX: u32 = 0x04;
 
 // ----- Ring sizing -----
 
-/// Bumped from 64 (1 KiB) — dual-guest cold boot can burst-produce
-/// 250+ kicks while the daemon is still consuming, overflowing a
-/// 64-entry ring and dropping kicks. 512 entries = 8 KiB absorbs the
-/// burst comfortably; L1 budget after CTRL_SIZE bump to 16 KiB is fine.
-pub const KICK_RING_ENTRIES: u32 = 512;
+/// 2048 entries = 32 KiB. Bumped from 512 (8 KiB) after disk-to-disk
+/// install workloads (e.g., openSUSE NET ISO → empty target image)
+/// overflowed the 512-entry ring with bursts of 600-1300+ dropped
+/// kicks per overflow window (#184). 2048 is the practical max
+/// without restructuring the L1 layout: the CTRL region sits at
+/// 0x5000, REGS_BASE is at 0x10000, leaving 44 KiB for CTRL — and
+/// 32 KiB ring + 4 KiB headers/compl + slack just fits.
+pub const KICK_RING_ENTRIES: u32 = 2048;
 pub const COMPL_RING_ENTRIES: u32 = 64;
 
 // Compile-time invariants.

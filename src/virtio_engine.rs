@@ -338,6 +338,13 @@ const _LAYOUT_INVARIANTS: () = {
     // overlap with the shadow region.
     assert!(STATS_BASE >= CODE_BASE + CODE_SIZE);
     assert!(REGS_BASE >= STATS_BASE + STATS_SIZE);
+    // Cross-module check: the control region (kick + completion
+    // rings, hello/hello-ack, active-slots bitmap) lives between
+    // STATS and REGS. A future bump of CTRL_SIZE that sneaks past
+    // REGS_BASE would silently alias the kick ring onto the virtio
+    // reg files. Pin both edges.
+    assert!(crate::tensix_proto::CTRL_BASE >= STATS_BASE + STATS_SIZE);
+    assert!(crate::tensix_proto::CTRL_BASE + crate::tensix_proto::CTRL_SIZE <= REGS_BASE);
     // 32 reg files (4 L2CPUs × 8 devices, 6 populated + 2 padding) of
     // 4 KiB each = 128 KiB, occupying [REGS_BASE, REGS_BASE+0x20000).
     assert!(NUM_SLOTS * REGS_PER_DEV == 32 * 0x1000);

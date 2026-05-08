@@ -217,4 +217,22 @@ static inline uintptr_t brisc_virtio_l2cpu_window_base(unsigned l2cpu_idx) {
                        + l2cpu_idx * BRISC_VIRTIO_PER_L2CPU_SIZE);
 }
 
+// ----- Compile-time invariants (firmware-side) -----
+//
+// Mirror of `_LAYOUT_INVARIANTS` in `src/virtio_engine.rs`. Catches
+// post-resize aliasing if any of {CODE, STATS, REGS, SHADOW, UART}
+// regions get bumped without a matching bump on the daemon side.
+// SHADOW_BASE is defined in virtio.c (BRISC-private), so the
+// REGS-vs-SHADOW invariant is checked there. Here we pin the rest.
+
+_Static_assert(
+    BRISC_VIRTIO_STATS_BASE >= BRISC_VIRTIO_CODE_BASE + BRISC_VIRTIO_CODE_SIZE,
+    "STATS region overlaps CODE region");
+_Static_assert(
+    BRISC_VIRTIO_REGS_BASE >= BRISC_VIRTIO_STATS_BASE + BRISC_VIRTIO_STATS_SIZE,
+    "REGS region overlaps STATS region");
+_Static_assert(
+    (BRISC_VIRTIO_DEVS_PER_L2CPU & (BRISC_VIRTIO_DEVS_PER_L2CPU - 1)) == 0,
+    "BRISC_VIRTIO_DEVS_PER_L2CPU must be a power of two");
+
 #endif // BRISC_VIRTIO_LAYOUT_H

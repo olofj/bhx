@@ -237,6 +237,20 @@
 #define SHADOW_BASE               0x00030000u
 #define SHADOW_PER_DEVICE         0x00000400u  // 1 KiB per slot
 
+// Compile-time invariants for the SHADOW region. SHADOW_BASE is
+// firmware-private (not exported via virtio_layout.h), so the
+// REGS-vs-SHADOW and SHADOW-vs-UART checks live here. The 0x40000
+// upper bound is BRISC_UART_BASE; quoting the literal rather than
+// pulling uart_layout.h here because this file already includes
+// uart_layout.h above and we want the assert to reference well-
+// known constants in the same translation unit.
+_Static_assert(
+    SHADOW_BASE >= BRISC_VIRTIO_REGS_BASE + BRISC_VIRTIO_NUM_SLOTS * BRISC_VIRTIO_REGS_PER_DEV,
+    "SHADOW region overlaps virtio reg-file region");
+_Static_assert(
+    SHADOW_BASE + BRISC_VIRTIO_NUM_SLOTS * SHADOW_PER_DEVICE <= BRISC_UART_BASE,
+    "SHADOW region overlaps BRISC_UART_BASE");
+
 // Within a per-device shadow block, queue `q` lives at offset
 // `q * SHADOW_PER_QUEUE`. Each queue holds the registers that the
 // guest sets via QUEUE_DESC_LOW etc., plus our READY/NUM bookkeeping.

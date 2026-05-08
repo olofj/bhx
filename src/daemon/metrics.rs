@@ -615,6 +615,47 @@ pub static RNG_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
 /// `tensix_data_plane::run_kick_consumer`.
 pub static KICK_DROPS_TOTAL: Counter = Counter::new();
 
+/// All-time max observed (producer - consumer) gap on the kick ring.
+/// Set by the daemon poller in `run_poll_loop` each time it observes
+/// a new high-water mark. Pairs with `bhx_kick_drops_total` to show
+/// "how close are we skirting overflow even when no drops fired
+/// yet" — useful for tuning kick ring size / FAST_SLEEP without
+/// waiting for an actual drop to confirm a margin problem (#184).
+pub static KICK_RING_HIGH_WATER: Gauge = Gauge::new();
+
+/// Most recent observed (producer - consumer) gap on the kick ring,
+/// snapshotted each main-loop iteration. Pairs with the high-water
+/// gauge to distinguish "we hit a peak briefly, but we're idle now"
+/// from "we're sustained at the peak right now."
+pub static KICK_RING_CURRENT_GAP: Gauge = Gauge::new();
+
+/// Cumulative count of avail-ring entries the daemon recovered via
+/// the post-kick-drop rescan path (#184). When BRISC drops a kick,
+/// the descriptor is still sitting in the guest's avail ring; the
+/// daemon scans all active queues and processes anything pending,
+/// turning a dropped kick from a 30 s kernel-timeout-then-retry
+/// stall into a temporary latency hit. A high
+/// `bhx_kick_rescued_total` paired with `bhx_kick_drops_total`
+/// going up means the rescue path is doing its job; the drops
+/// happened but the install (or whatever workload) didn't stall.
+pub static KICK_RESCUED_TOTAL: Counter = Counter::new();
+
+/// Whether kick-ring backpressure is currently engaged (#184). When
+/// the kick-ring fill crosses 75%, the daemon writes
+/// VRING_USED_F_NO_NOTIFY into every active queue's used.flags;
+/// the guest's `virtqueue_kick_prepare` checks this bit and skips
+/// the QUEUE_NOTIFY MMIO write, throttling kick production at
+/// the source. Released at 25% (hysteresis to avoid bouncing).
+/// 0 = released (normal), 1 = engaged (guest is throttled).
+pub static KICK_THROTTLE_ENGAGED: Gauge = Gauge::new();
+
+/// Cumulative count of kick-ring backpressure ENGAGE transitions.
+/// Pairs with `bhx_kick_throttle_engaged`: a steady stream of
+/// transitions means the workload is regularly hitting the high-
+/// water threshold; one transition followed by a long quiet
+/// period means it spiked once.
+pub static KICK_THROTTLE_TRANSITIONS_TOTAL: Counter = Counter::new();
+
 /// Cumulative count of QUEUE_SEL changes BRISC processed while the
 /// previous SEL's QUEUE_READY was still 1 — the race window the M7.2
 /// fix (#71, commit 1345f3e) was designed to close. Non-zero means
@@ -980,6 +1021,51 @@ pub fn render_prometheus(state: &DaemonState) -> String {
         "Cumulative count of kick_ring_push calls dropped because the ring \
          was full (BRISC backpressure).",
         KICK_DROPS_TOTAL.get(),
+    );
+    write_gauge(
+        &mut out,
+        "bhx_kick_ring_high_water",
+        "All-time max observed (producer - consumer) gap on the kick ring \
+         in this daemon session. Surfaces 'how close are we skirting \
+         overflow' even when bhx_kick_drops_total stays at 0 — useful \
+         for tuning kick ring size / FAST_SLEEP under heavy I/O loads.",
+        KICK_RING_HIGH_WATER.get(),
+    );
+    write_gauge(
+        &mut out,
+        "bhx_kick_ring_current_gap",
+        "Most recent observed (producer - consumer) gap on the kick ring. \
+         Pairs with bhx_kick_ring_high_water to distinguish a brief peak \
+         from a sustained backlog.",
+        KICK_RING_CURRENT_GAP.get(),
+    );
+    write_counter(
+        &mut out,
+        "bhx_kick_rescued_total",
+        "Cumulative count of avail-ring entries the daemon recovered via \
+         the post-kick-drop rescan path. A high count paired with \
+         bhx_kick_drops_total advancing means the rescue path is doing \
+         its job — drops happened but the workload didn't stall on \
+         kernel virtio-blk 30s timeouts.",
+        KICK_RESCUED_TOTAL.get(),
+    );
+    write_gauge(
+        &mut out,
+        "bhx_kick_throttle_engaged",
+        "Whether kick-ring backpressure is currently engaged: 0 = \
+         normal, 1 = guest is throttled via VRING_USED_F_NO_NOTIFY \
+         set in every active queue's used.flags. Engages at 75% \
+         kick-ring fill, releases at 25% (hysteresis).",
+        KICK_THROTTLE_ENGAGED.get(),
+    );
+    write_counter(
+        &mut out,
+        "bhx_kick_throttle_transitions_total",
+        "Cumulative count of kick-ring backpressure ENGAGE transitions. \
+         A steady stream of transitions means the workload is regularly \
+         hitting the high-water threshold; a single transition followed \
+         by a long quiet period means it spiked once.",
+        KICK_THROTTLE_TRANSITIONS_TOTAL.get(),
     );
     write_counter(
         &mut out,
