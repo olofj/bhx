@@ -124,7 +124,7 @@ impl RegEntry {
     }
 }
 
-/// Stats the poller updates so `daemon status` (or a future
+/// Stats the dispatcher updates so `daemon status` (or a future
 /// metrics endpoint) can surface progress without a separate
 /// channel back from the worker.
 #[derive(Default)]
@@ -132,52 +132,56 @@ pub struct PollerStats {
     /// Cumulative number of (slot, queue) dispatches the bitmap
     /// drain has processed. One increment per non-empty
     /// `dispatch_chain` invocation.
-    pub kicks_consumed: AtomicU64,
+    pub dispatches_total: AtomicU64,
     /// Cumulative number of full poll iterations. Heartbeat for
-    /// detecting a stalled poller.
+    /// detecting a stalled dispatcher.
     pub poll_iterations: AtomicU64,
     /// Last (slot, queue_idx) pair we processed, packed as
     /// `(slot << 16) | queue_idx` — same shape as the firmware's
     /// `STATS_OFF_LAST_NOTIFY`.
-    pub last_kick_slot_queue: AtomicU64,
+    pub last_dispatch_slot_queue: AtomicU64,
 }
 
 /// Slot → registration map. Wrapped in `Arc<Mutex<...>>` so the
-/// poller thread can look up registrations on each kick while
+/// dispatcher thread can look up registrations on each NOTIFY while
 /// `register_slot` / `unregister_slot` mutate from the boot path.
-/// Per-slot keys are the firmware's `slot = l2cpu_idx*4 +
-/// device_idx` packing (0..16).
+/// Per-slot keys are the firmware's `slot = l2cpu_idx*8 +
+/// device_idx` packing (0..32).
 pub type Registry = Arc<Mutex<HashMap<u32, RegEntry>>>;
 
 /// Per-L2CPU UART (#78) registry. Maps `l2cpu_idx` → the slot's
-/// `console_hub`. The kick poller routes UART TX bytes (kick-ring
-/// slots 16..19) through `push_chip_output` on the appropriate
-/// hub. Separate from the virtio `Registry` so register/unregister
-/// is independent — `register_uart` flips bit `16+idx` in the
-/// active-slots bitmap, telling BRISC to start sweeping that L2CPU's
-/// UART reg file.
+/// `console_hub`. The dispatcher's UART feed-ring drain pushes the
+/// TRISC0-produced bytes through `push_chip_output` on the
+/// appropriate hub. Separate from the virtio `Registry` so
+/// register/unregister is independent — `register_uart` flips the
+/// L2CPU's UART bit in the active-slots bitmap, telling BRISC to
+/// release TRISC0 from soft reset so it starts sweeping that
+/// L2CPU's UART reg file.
 pub type UartRegistry = Arc<Mutex<HashMap<u8, Arc<ConsoleHub>>>>;
 
-/// Daemon-side kick consumer. Owns a thread that loops on
-/// `engine.kick_producer_seq()` and consumes new entries.
-pub struct KickPoller {
+/// Daemon-side V2 dispatcher. Owns a thread that polls the
+/// per-(slot, queue) dirty bitmap in BRISC L1 and dispatches each
+/// set bit through the registered `RegEntry::device`. Also drains
+/// the async RX paths (net, console) and the TRISC0 UART feed
+/// rings on the same loop.
+pub struct Dispatcher {
     pub stats: Arc<PollerStats>,
     pub registry: Registry,
     pub uart_registry: UartRegistry,
     /// Cloned for register/unregister to push the active-slots
     /// bitmap into BRISC L1 — BRISC uses it to skip non-active
-    /// slots in its sweep. Without this, BRISC polls all 16 slots
-    /// and the per-slot revisit period is ~4µs, slow enough to
-    /// lose the SEL→READY race against stock kernels.
+    /// slots in its sweep. Without this, BRISC polls all 32 slots
+    /// and the per-slot revisit period stretches enough to lose the
+    /// SEL→READY race against stock kernels.
     engine: Arc<TensixEngine>,
     exit: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
 
-impl KickPoller {
+impl Dispatcher {
     /// Spawn the poll thread. Returns immediately; the thread runs
-    /// until [`KickPoller::shutdown`] is called or the
-    /// `KickPoller` is dropped.
+    /// until [`Dispatcher::shutdown`] is called or the
+    /// `Dispatcher` is dropped.
     pub fn spawn(engine: Arc<TensixEngine>) -> Self {
         let stats = Arc::new(PollerStats::default());
         let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
@@ -189,7 +193,7 @@ impl KickPoller {
         let exit_thread = Arc::clone(&exit);
         let engine_thread = Arc::clone(&engine);
         let join = thread::Builder::new()
-            .name("tensix-kick-poller".to_string())
+            .name("tensix-dispatcher".to_string())
             .spawn(move || {
                 run_poll_loop(
                     engine_thread,
@@ -199,8 +203,8 @@ impl KickPoller {
                     exit_thread,
                 )
             })
-            .expect("spawn tensix-kick-poller");
-        KickPoller {
+            .expect("spawn tensix-dispatcher");
+        Dispatcher {
             stats,
             registry,
             uart_registry,
@@ -244,9 +248,9 @@ impl KickPoller {
     }
 
     /// Register a (slot, l2cpu, device, interrupt) tuple. Future
-    /// kicks for `slot` will dispatch to `entry.device`'s
-    /// VirtioDeviceImpl methods. dispatch_boot calls this once per
-    /// enabled device.
+    /// guest QUEUE_NOTIFYs for `slot` will dispatch to
+    /// `entry.device`'s `VirtioDeviceImpl` methods. `dispatch_boot`
+    /// calls this once per enabled device.
     pub fn register_slot(&self, entry: RegEntry) {
         let slot = entry.slot;
         self.registry.lock().unwrap().insert(slot, entry);
@@ -255,25 +259,28 @@ impl KickPoller {
 
     /// Unregister a slot — called when an L2CPU is being torn down
     /// (slot.shutdown via daemon stop or boot --force). Future
-    /// kicks for `slot` log a "no registration" warning and bump
-    /// stats; they don't touch the device or fire IRQs.
+    /// dirty bits for `slot` are cleared without dispatch (the slot
+    /// isn't in the registry, so `drain_dirty_bitmap` skips it
+    /// before checking its byte).
     pub fn unregister_slot(&self, slot: u32) {
         self.registry.lock().unwrap().remove(&slot);
         self.publish_active_mask();
     }
 
-    /// Register an L2CPU's 16550 UART. Future kicks with slot
-    /// `uart::slot_for_l2cpu(idx)` route the byte payload through the
+    /// Register an L2CPU's 16550 UART. The dispatcher's per-iter
+    /// UART drain reads bytes from TRISC0's feed ring at
+    /// `uart::uart_private_base(idx)` and pushes them through the
     /// registered `console_hub` via `push_chip_output`. Sets the
-    /// corresponding bit in the active-slots bitmap so BRISC starts
-    /// sweeping the L2CPU's UART reg file.
+    /// corresponding bit in the active-slots bitmap so BRISC
+    /// releases TRISC0 from soft reset.
     pub fn register_uart(&self, l2cpu_idx: u8, hub: Arc<ConsoleHub>) {
         self.uart_registry.lock().unwrap().insert(l2cpu_idx, hub);
         self.publish_active_mask();
     }
 
-    /// Unregister an L2CPU's UART. Clears bit `16+idx` of the
-    /// active-slots bitmap so BRISC stops sweeping that reg file.
+    /// Unregister an L2CPU's UART. Clears the L2CPU's UART bit in
+    /// the active-slots bitmap so BRISC re-asserts TRISC0's soft
+    /// reset (last UART out turns the lights off).
     pub fn unregister_uart(&self, l2cpu_idx: u8) {
         self.uart_registry.lock().unwrap().remove(&l2cpu_idx);
         self.publish_active_mask();
@@ -290,7 +297,7 @@ impl KickPoller {
     }
 }
 
-impl Drop for KickPoller {
+impl Drop for Dispatcher {
     fn drop(&mut self) {
         self.shutdown();
     }
@@ -423,7 +430,7 @@ fn run_poll_loop(
                     clamp_consumer_to_ring(producer, local_consumer, uart::UART_FEED_RING_ENTRIES);
                 if clamped != local_consumer {
                     crate::dlog!(
-                        "[kick-poller] uart l2cpu {} producer {} consumer {} > ring ({}); fast-forwarding consumer to {}",
+                        "[dispatcher] uart l2cpu {} producer {} consumer {} > ring ({}); fast-forwarding consumer to {}",
                         l2cpu_idx,
                         producer,
                         local_consumer,
@@ -655,7 +662,7 @@ fn run_poll_loop(
                 if drops != prev {
                     let delta = drops.wrapping_sub(prev);
                     crate::dlog!(
-                        "[kick-poller] uart l2cpu {} dropped {} byte(s) (cumulative {})",
+                        "[dispatcher] uart l2cpu {} dropped {} byte(s) (cumulative {})",
                         l2cpu_idx,
                         delta,
                         drops
@@ -726,9 +733,9 @@ fn drain_dirty_bitmap(
                 let cur = reg.processed[q as usize];
                 unsafe { std::ptr::write_volatile(p_ptr, cur) };
                 stats
-                    .last_kick_slot_queue
+                    .last_dispatch_slot_queue
                     .store(((slot as u64) << 16) | q as u64, Ordering::Relaxed);
-                stats.kicks_consumed.fetch_add(1, Ordering::Relaxed);
+                stats.dispatches_total.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -747,7 +754,7 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
     // shouldn't crash the daemon.
     if (queue_idx as usize) >= reg.processed.len() {
         crate::dlog!(
-            "[kick-poller]   slot {} queue {} out of range (have {}), dropping",
+            "[dispatcher]   slot {} queue {} out of range (have {}), dropping",
             reg.slot,
             queue_idx,
             reg.processed.len()
@@ -815,7 +822,7 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
         // something larger than u16. Either way we can't index the
         // ring; drop the kick.
         crate::dlog!(
-            "[kick-poller]   slot {} queue {} bad queue_num={}, dropping",
+            "[dispatcher]   slot {} queue {} bad queue_num={}, dropping",
             reg.slot,
             queue_idx,
             queue_num
@@ -834,7 +841,7 @@ fn dispatch_chain(engine: &Arc<TensixEngine>, reg: &mut RegEntry, queue_idx: u16
         |addr: u64, size: u64| -> bool { addr >= starting && addr.saturating_add(size) <= mem_end };
     if !in_range(desc_addr, 16) || !in_range(avail_addr, 4) || !in_range(used_addr, 4) {
         crate::dlog!(
-            "[kick-poller]   slot {} queue {} pointers out of L2CPU memory range \
+            "[dispatcher]   slot {} queue {} pointers out of L2CPU memory range \
              (desc={:#x} avail={:#x} used={:#x}, range=[{:#x},{:#x})), dropping",
             reg.slot,
             queue_idx,
@@ -911,9 +918,9 @@ mod tests {
     #[test]
     fn poller_stats_default_is_zero() {
         let s = PollerStats::default();
-        assert_eq!(s.kicks_consumed.load(Ordering::Relaxed), 0);
+        assert_eq!(s.dispatches_total.load(Ordering::Relaxed), 0);
         assert_eq!(s.poll_iterations.load(Ordering::Relaxed), 0);
-        assert_eq!(s.last_kick_slot_queue.load(Ordering::Relaxed), 0);
+        assert_eq!(s.last_dispatch_slot_queue.load(Ordering::Relaxed), 0);
     }
 
     // ---- clamp_consumer_to_ring (#101) ----

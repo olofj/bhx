@@ -424,7 +424,7 @@ impl TensixEngine {
     }
 
     /// Write the active-slots bitmap directly. Diagnostic — production
-    /// code uses [`crate::tensix_data_plane::KickPoller::register_uart`]
+    /// code uses [`crate::tensix_data_plane::Dispatcher::register_uart`]
     /// and friends, which compute the mask from the registries.
     pub fn write_active_slots(&self, mask: u32) {
         self.tile

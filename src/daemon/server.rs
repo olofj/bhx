@@ -949,8 +949,8 @@ fn dispatch_boot(
     // `process_one_chain_for_queue`, and fires the PLIC IRQ.
     {
         let engine_for_init = state.tensix_engine.lock_or_internal_error()?.clone();
-        if let (Some(poller), Some(engine)) = (
-            state.kick_poller.lock_or_internal_error()?.as_ref(),
+        if let (Some(dispatcher), Some(engine)) = (
+            state.dispatcher.lock_or_internal_error()?.as_ref(),
             engine_for_init,
         ) {
             // Helper closure: register one device + initialize its
@@ -981,7 +981,7 @@ fn dispatch_boot(
                     irq,
                     kind,
                 );
-                poller.register_slot(entry);
+                dispatcher.register_slot(entry);
                 dlog!(
                     "[run_boot l2cpu {}] virtio-engine: registered {} on slot {} \
                          (config @ {:#x})",
@@ -1177,7 +1177,7 @@ fn dispatch_boot(
             // through `push_chip_output`. Always-on with the engine —
             // the DTB node is also unconditionally emitted, so distro
             // kernels with `console=ttyS0` find a real backing device.
-            poller.register_uart(l2cpu_idx, Arc::clone(&slot.console_hub));
+            dispatcher.register_uart(l2cpu_idx, Arc::clone(&slot.console_hub));
             dlog!(
                 "[run_boot l2cpu {}] uart-engine: registered TX path on slot {}",
                 l2cpu_idx,
@@ -1378,7 +1378,7 @@ fn maybe_opportunistic_reset_board(
     // fds point at the about-to-be-reset chardev; holding them across
     // the reset would leave them pointing at unmapped BARs. Dropping
     // the poller joins its thread synchronously.
-    let _ = state.kick_poller.lock_or_internal_error()?.take();
+    let _ = state.dispatcher.lock_or_internal_error()?.take();
     let _ = state.tensix_engine.lock_or_internal_error()?.take();
 
     state
@@ -2508,8 +2508,8 @@ fn dispatch_add_disk(
     // the kick poller handles dispatch.
 
     {
-        if let (Some(poller), Some(engine)) = (
-            state.kick_poller.lock_or_internal_error()?.as_ref(),
+        if let (Some(dispatcher), Some(engine)) = (
+            state.dispatcher.lock_or_internal_error()?.as_ref(),
             state.tensix_engine.lock_or_internal_error()?.clone(),
         ) {
             match crate::virtio::block::VirtioBlk::from_file_with_serial(
@@ -2530,7 +2530,7 @@ fn dispatch_add_disk(
                         irq,
                         crate::virtio::InterruptKind::Block,
                     );
-                    poller.register_slot(entry);
+                    dispatcher.register_slot(entry);
                     slot.disks.push(DiskWorker {
                         path: path.clone(),
                         slot_idx,
@@ -2645,9 +2645,9 @@ fn dispatch_remove_disk(
         // Drop the kick-poller registrations for the slots we're
         // taking. Done under the slot mutex so a concurrent boot RPC
         // for this L2CPU can't observe a torn state.
-        if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
+        if let Some(dispatcher) = state.dispatcher.lock_or_internal_error()?.as_ref() {
             for d in &taken {
-                poller.unregister_slot(d.slot_idx);
+                dispatcher.unregister_slot(d.slot_idx);
             }
         }
         taken
@@ -2717,7 +2717,7 @@ fn dispatch_add_net(
     // (#71 M5.5e) drives slirp's recv side.
 
     {
-        if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
+        if let Some(dispatcher) = state.dispatcher.lock_or_internal_error()?.as_ref() {
             // add-net is a hot-add post-boot path: no profile-pinned
             // hostname here; `format_dhcp_hostname` is fine.
             match crate::virtio::network::VirtioNet::new(&forwards, state.card, l2cpu_idx, None) {
@@ -2732,7 +2732,7 @@ fn dispatch_add_net(
                         crate::regs::virtio_mmio::NET_IRQ,
                         crate::virtio::InterruptKind::Net,
                     );
-                    poller.register_slot(entry);
+                    dispatcher.register_slot(entry);
                     slot.net = Some(WorkerHandle {
                         exit: Arc::new(AtomicBool::new(false)),
                         thread: None,
@@ -2791,10 +2791,10 @@ fn dispatch_remove_net(
     // (frees the VirtioNet's slirp connection too via Box drop).
     // No-op when there's no engine registration for this slot.
 
-    if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
+    if let Some(dispatcher) = state.dispatcher.lock_or_internal_error()?.as_ref() {
         let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
             + crate::virtio_engine::DEV_NET;
-        poller.unregister_slot(slot_idx);
+        dispatcher.unregister_slot(slot_idx);
     }
     // Take the net handle under the lock, join outside (same reasoning as
     // dispatch_remove_disk).
@@ -2839,7 +2839,7 @@ fn dispatch_add_console(
     // doesn't need to special-case engine-vs-legacy.
 
     {
-        if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
+        if let Some(dispatcher) = state.dispatcher.lock_or_internal_error()?.as_ref() {
             let input_buf = Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::with_capacity(crate::virtio::console::RX_BUFFER_CAP),
             ));
@@ -2857,7 +2857,7 @@ fn dispatch_add_console(
                 crate::regs::virtio_mmio::CONSOLE_IRQ,
                 crate::virtio::InterruptKind::Console,
             );
-            poller.register_slot(entry);
+            dispatcher.register_slot(entry);
             slot.virtio_console = Some(crate::daemon::VirtioConsoleSlot {
                 worker: WorkerHandle {
                     exit: Arc::new(AtomicBool::new(false)),
@@ -2891,10 +2891,10 @@ fn dispatch_remove_console(
     // Engine path: drop kick-poller registration first (frees the
     // VirtioConsole's input_buf reference too).
 
-    if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
+    if let Some(dispatcher) = state.dispatcher.lock_or_internal_error()?.as_ref() {
         let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
             + crate::virtio_engine::DEV_CONSOLE;
-        poller.unregister_slot(slot_idx);
+        dispatcher.unregister_slot(slot_idx);
     }
     // Take the slot under the lock, join outside.
     let vc = {
@@ -2930,18 +2930,18 @@ fn dispatch_remove_console(
 /// `virtio_engine::DEVS_PER_L2CPU`).
 fn unregister_engine_slots(state: &Arc<DaemonState>, l2cpu_idx: u8) {
     // Best-effort — called from teardown paths (dispatch_stop,
-    // serve()'s shutdown loop) where a poisoned poller mutex means
-    // the daemon is on its way out anyway. Silently skip in that
-    // case rather than crashing harder.
-    let Ok(poller_guard) = state.kick_poller.lock() else {
+    // serve()'s shutdown loop) where a poisoned dispatcher mutex
+    // means the daemon is on its way out anyway. Silently skip in
+    // that case rather than crashing harder.
+    let Ok(dispatcher_guard) = state.dispatcher.lock() else {
         return;
     };
-    if let Some(poller) = poller_guard.as_ref() {
+    if let Some(dispatcher) = dispatcher_guard.as_ref() {
         let base = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU;
         for dev_idx in 0..crate::virtio_engine::DEVS_PER_L2CPU {
-            poller.unregister_slot(base + dev_idx);
+            dispatcher.unregister_slot(base + dev_idx);
         }
-        poller.unregister_uart(l2cpu_idx);
+        dispatcher.unregister_uart(l2cpu_idx);
     }
 }
 
