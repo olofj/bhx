@@ -1572,29 +1572,23 @@ fn run_tensix_engine(card: u32, chip: &shared_chip::SharedChip) -> std::io::Resu
     // successful dispatch. Use the dirty byte itself: read it back
     // after a few ms and confirm BRISC set then daemon cleared.
     let slot7_notify = virtio_engine::slot_regs_base(7) + virtio_engine::MMIO_QUEUE_NOTIFY;
-    let dirty_addr = tensix_proto::CTRL_BASE
-        + tensix_proto::CTRL_OFF_DIRTY
-        + 7 * tensix_proto::MAX_QUEUES_PER_SLOT
-        + 2;
+    let dirty_addr = tensix_proto::dirty_byte_addr(7, 2);
     // Drain any leftover state from prior firmware activity first.
-    let dirty_word_addr = dirty_addr & !3;
-    let dirty_byte_shift = (dirty_addr & 3) * 8;
-    let pre = engine.read_l1_u32(dirty_word_addr);
-    engine.write_l1_u32(dirty_word_addr, pre & !(0xFFu32 << dirty_byte_shift));
+    engine.write_l1_u8(dirty_addr, 0);
     let _ = stats; // dispatches_total stays 0 in this smoke test (no registry entry)
     engine.write_l1_u32(slot7_notify, 2);
     // BRISC sweeps in <1µs; daemon drain is on a 10µs FAST tier.
-    // 100ms is generous.
+    // 100ms is generous. Catch the SET → CLEAR transition: BRISC
+    // sets the byte to 1 in response to the NOTIFY; the dispatcher
+    // (with no RegEntry registered for slot 7 in this smoke test)
+    // clears it on the next drain pass without dispatching.
     let started = std::time::Instant::now();
     let mut saw_set = false;
     while started.elapsed() < Duration::from_millis(100) {
-        let word = engine.read_l1_u32(dirty_word_addr);
-        let byte = ((word >> dirty_byte_shift) & 0xFF) as u8;
+        let byte = engine.read_l1_u8(dirty_addr);
         if byte != 0 {
             saw_set = true;
         }
-        // After the dispatcher drains, the byte should be back to 0.
-        // Catch the SET → CLEAR transition.
         if saw_set && byte == 0 {
             break;
         }

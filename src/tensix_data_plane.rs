@@ -707,6 +707,57 @@ fn run_poll_loop(
     }
 }
 
+/// L1 byte access surface that `collect_dirty_pairs` needs.
+/// `TensixEngine` implements this directly; tests substitute a
+/// fake that backs into a `Vec<u8>`. Kept narrow on purpose — the
+/// processed-cursor publish happens via `engine.write_l1_u16`
+/// directly (the engine is in scope at the call site, no trait
+/// indirection needed).
+pub(crate) trait CtrlL1Access {
+    fn read_u8(&self, addr: u32) -> u8;
+    fn write_u8(&self, addr: u32, value: u8);
+}
+
+impl CtrlL1Access for TensixEngine {
+    fn read_u8(&self, addr: u32) -> u8 {
+        TensixEngine::read_l1_u8(self, addr)
+    }
+    fn write_u8(&self, addr: u32, value: u8) {
+        TensixEngine::write_l1_u8(self, addr, value);
+    }
+}
+
+/// First-pass scan of the dirty bitmap: for each registered
+/// (slot, queue) pair, read the L1 byte and clear it if set.
+/// Returns the list of pairs that were dirty, in iteration order.
+///
+/// Clearing happens BEFORE the caller dispatches — if a guest
+/// NOTIFY arrives between our clear and the dispatcher's avail-ring
+/// read, BRISC sets the byte again and the next pass picks it up.
+/// No work gets dropped.
+///
+/// `slots_with_queue_count` yields `(slot, num_queues)` for each
+/// registered slot; the caller typically derives it from the
+/// dispatcher's registry under lock.
+fn collect_dirty_pairs<L: CtrlL1Access, I: IntoIterator<Item = (u32, u32)>>(
+    l1: &L,
+    slots_with_queue_count: I,
+) -> Vec<(u32, u16)> {
+    let max_q = crate::tensix_proto::MAX_QUEUES_PER_SLOT;
+    let mut hits = Vec::new();
+    for (slot, n_queues) in slots_with_queue_count {
+        let n_queues = n_queues.min(max_q);
+        for q in 0..n_queues {
+            let addr = crate::tensix_proto::dirty_byte_addr(slot, q);
+            if l1.read_u8(addr) != 0 {
+                l1.write_u8(addr, 0);
+                hits.push((slot, q as u16));
+            }
+        }
+    }
+    hits
+}
+
 /// V2 dispatch (#189): walk every registered (slot, queue) pair,
 /// read the L1 dirty byte, clear it, and dispatch if it was set.
 /// Returns the count of dispatched (slot, queue) pairs.
@@ -725,38 +776,28 @@ fn drain_dirty_bitmap(
     registry: &Registry,
     stats: &Arc<PollerStats>,
 ) -> u64 {
-    use crate::tensix_proto as proto;
-    let dirty_base = proto::CTRL_BASE + proto::CTRL_OFF_DIRTY;
-    let processed_base = proto::CTRL_BASE + proto::CTRL_OFF_PROCESSED;
-    let max_q = proto::MAX_QUEUES_PER_SLOT;
     let mut dispatched = 0u64;
     let mut map = registry.lock().unwrap();
-    for (&slot, reg) in map.iter_mut() {
-        let n_queues = (reg.processed.len() as u32).min(max_q);
-        for q in 0..n_queues {
-            let dirty_addr = dirty_base + slot * max_q + q;
-            let dirty_ptr = engine.l1_ptr(dirty_addr);
-            let dirty = unsafe { std::ptr::read_volatile(dirty_ptr) };
-            if dirty == 0 {
-                continue;
-            }
-            // Clear before dispatch — if a guest NOTIFY arrives
-            // between our clear and the avail read, BRISC sets the
-            // byte again and the next pass picks it up. No work
-            // gets dropped.
-            unsafe { std::ptr::write_volatile(dirty_ptr, 0) };
-            if dispatch_chain(engine, reg, q as u16).is_some() {
-                dispatched += 1;
-                // Publish processed cursor for warm-resume.
-                let p_off = processed_base + slot * max_q * 2 + q * 2;
-                let p_ptr = engine.l1_ptr(p_off) as *mut u16;
-                let cur = reg.processed[q as usize];
-                unsafe { std::ptr::write_volatile(p_ptr, cur) };
-                stats
-                    .last_dispatch_slot_queue
-                    .store(((slot as u64) << 16) | q as u64, Ordering::Relaxed);
-                stats.dispatches_total.fetch_add(1, Ordering::Relaxed);
-            }
+    let slots: Vec<(u32, u32)> = map
+        .iter()
+        .map(|(&slot, reg)| (slot, reg.processed.len() as u32))
+        .collect();
+    let hits = collect_dirty_pairs(engine.as_ref(), slots);
+    for (slot, q) in hits {
+        let Some(reg) = map.get_mut(&slot) else {
+            continue;
+        };
+        if dispatch_chain(engine, reg, q).is_some() {
+            dispatched += 1;
+            let cur = reg.processed[q as usize];
+            engine.write_l1_u16(
+                crate::tensix_proto::processed_cursor_addr(slot, q as u32),
+                cur,
+            );
+            stats
+                .last_dispatch_slot_queue
+                .store(((slot as u64) << 16) | q as u64, Ordering::Relaxed);
+            stats.dispatches_total.fetch_add(1, Ordering::Relaxed);
         }
     }
     dispatched
@@ -1008,5 +1049,194 @@ mod tests {
         let mut last = u32::MAX - 2;
         assert_eq!(take_delta(3, &mut last), Some(6));
         assert_eq!(last, 3);
+    }
+
+    // ---- collect_dirty_pairs ----
+    //
+    // These cover the bitmap-iteration logic in isolation from the
+    // dispatcher's lock + dispatch_chain machinery. The descriptor
+    // walk that follows the dirty observation is covered separately
+    // by `virtio` integration tests + the burst soak.
+
+    /// In-memory `CtrlL1Access` impl: the addressable bytes the V2
+    /// layout uses (CTRL_OFF_DIRTY..CTRL_OFF_END) backed by a `Vec<u8>`,
+    /// plus a record of every read so tests can assert visit order.
+    struct FakeCtrlL1 {
+        bytes: std::cell::RefCell<Vec<u8>>,
+        reads: std::cell::RefCell<Vec<u32>>,
+    }
+
+    impl FakeCtrlL1 {
+        fn new() -> Self {
+            // Cover from CTRL_BASE through CTRL_OFF_END (V2 footprint).
+            let size =
+                (crate::tensix_proto::CTRL_BASE + crate::tensix_proto::CTRL_OFF_END) as usize;
+            FakeCtrlL1 {
+                bytes: std::cell::RefCell::new(vec![0u8; size]),
+                reads: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+        fn set_dirty(&self, slot: u32, q: u32, value: u8) {
+            let addr = crate::tensix_proto::dirty_byte_addr(slot, q) as usize;
+            self.bytes.borrow_mut()[addr] = value;
+        }
+        fn dirty_at(&self, slot: u32, q: u32) -> u8 {
+            let addr = crate::tensix_proto::dirty_byte_addr(slot, q) as usize;
+            self.bytes.borrow()[addr]
+        }
+    }
+
+    impl CtrlL1Access for FakeCtrlL1 {
+        fn read_u8(&self, addr: u32) -> u8 {
+            self.reads.borrow_mut().push(addr);
+            self.bytes.borrow()[addr as usize]
+        }
+        fn write_u8(&self, addr: u32, value: u8) {
+            self.bytes.borrow_mut()[addr as usize] = value;
+        }
+    }
+
+    #[test]
+    fn collect_dirty_pairs_empty_bitmap_returns_no_hits() {
+        let l1 = FakeCtrlL1::new();
+        // Two registered slots, two queues each — all bytes zero.
+        let hits = collect_dirty_pairs(&l1, vec![(0u32, 2u32), (5, 2)]);
+        assert!(hits.is_empty());
+        // Each (slot, queue) was visited exactly once.
+        assert_eq!(l1.reads.borrow().len(), 4);
+    }
+
+    #[test]
+    fn collect_dirty_pairs_returns_set_bytes_and_clears_them() {
+        let l1 = FakeCtrlL1::new();
+        l1.set_dirty(3, 1, 1);
+        l1.set_dirty(7, 0, 1);
+        let hits = collect_dirty_pairs(&l1, vec![(3u32, 4u32), (7, 2)]);
+        // Visit order is slot-major, queue-minor. Slot 3's queues
+        // come before slot 7's.
+        assert_eq!(hits, vec![(3, 1), (7, 0)]);
+        // Both dirty bytes cleared after observation.
+        assert_eq!(l1.dirty_at(3, 1), 0);
+        assert_eq!(l1.dirty_at(7, 0), 0);
+    }
+
+    #[test]
+    fn collect_dirty_pairs_clears_before_dispatch_so_concurrent_notifies_are_preserved() {
+        // Simulate the race: at iter N we read+clear the byte.
+        // BRISC re-sets it (here: we just write it again post-clear).
+        // Iter N+1 must observe the new SET.
+        let l1 = FakeCtrlL1::new();
+        l1.set_dirty(0, 0, 1);
+
+        let hits1 = collect_dirty_pairs(&l1, vec![(0u32, 1u32)]);
+        assert_eq!(hits1, vec![(0, 0)]);
+        assert_eq!(l1.dirty_at(0, 0), 0); // cleared
+
+        // BRISC's concurrent NOTIFY between our read + the next pass.
+        l1.set_dirty(0, 0, 1);
+
+        let hits2 = collect_dirty_pairs(&l1, vec![(0u32, 1u32)]);
+        assert_eq!(hits2, vec![(0, 0)]); // observed again
+    }
+
+    #[test]
+    fn collect_dirty_pairs_idempotent_after_clear() {
+        // Once cleared, repeat passes return empty until the byte
+        // gets re-set externally. Catches a regression where a
+        // partial clear (e.g. misaligned write) would leave a bit
+        // sticky.
+        let l1 = FakeCtrlL1::new();
+        l1.set_dirty(2, 0, 1);
+        let _ = collect_dirty_pairs(&l1, vec![(2u32, 1u32)]);
+        let hits2 = collect_dirty_pairs(&l1, vec![(2u32, 1u32)]);
+        let hits3 = collect_dirty_pairs(&l1, vec![(2u32, 1u32)]);
+        assert!(hits2.is_empty());
+        assert!(hits3.is_empty());
+    }
+
+    #[test]
+    fn collect_dirty_pairs_caps_n_queues_at_max_queues_per_slot() {
+        // RegEntry::processed.len() can technically exceed
+        // MAX_QUEUES_PER_SLOT if a device reports more queues than
+        // the protocol layout allocates. Caller passes the raw
+        // length; collect_dirty_pairs must clamp so we don't read
+        // past the dirty array into PROCESSED.
+        let l1 = FakeCtrlL1::new();
+        // Plant a dirty byte one PAST the cap — would be inside
+        // the PROCESSED array if we didn't clamp. For slot 0, the
+        // first OOB queue index is exactly MAX_QUEUES_PER_SLOT, so
+        // the byte sits MAX_QUEUES_PER_SLOT bytes past the start
+        // of the DIRTY region.
+        let max_q = crate::tensix_proto::MAX_QUEUES_PER_SLOT;
+        let oob_addr = crate::tensix_proto::CTRL_BASE + crate::tensix_proto::CTRL_OFF_DIRTY + max_q;
+        l1.bytes.borrow_mut()[oob_addr as usize] = 1;
+
+        let hits = collect_dirty_pairs(&l1, vec![(0u32, max_q + 4)]);
+        assert!(hits.is_empty());
+        // The OOB byte must still be 1 — we should never have
+        // touched it.
+        assert_eq!(l1.bytes.borrow()[oob_addr as usize], 1);
+    }
+
+    #[test]
+    fn collect_dirty_pairs_visits_every_registered_slot_and_queue_once() {
+        // Three slots × multiple queues; every (slot, queue) the
+        // caller said is registered must be checked exactly once.
+        let l1 = FakeCtrlL1::new();
+        // Mark different queues across the three slots.
+        l1.set_dirty(0, 1, 1);
+        l1.set_dirty(1, 0, 1);
+        l1.set_dirty(1, 2, 1);
+        l1.set_dirty(2, 0, 1);
+
+        let hits = collect_dirty_pairs(&l1, vec![(0u32, 2u32), (1, 3), (2, 1)]);
+        assert_eq!(hits, vec![(0, 1), (1, 0), (1, 2), (2, 0)]);
+        // Total reads = 2 + 3 + 1 = 6.
+        assert_eq!(l1.reads.borrow().len(), 6);
+    }
+
+    #[test]
+    fn dirty_byte_addr_matches_layout() {
+        // Pin the formula. Off-by-one or stride mismatches here
+        // would silently land dirty stores in PROCESSED.
+        let max_q = crate::tensix_proto::MAX_QUEUES_PER_SLOT;
+        assert_eq!(
+            crate::tensix_proto::dirty_byte_addr(0, 0),
+            crate::tensix_proto::CTRL_BASE + crate::tensix_proto::CTRL_OFF_DIRTY
+        );
+        assert_eq!(
+            crate::tensix_proto::dirty_byte_addr(1, 0),
+            crate::tensix_proto::CTRL_BASE + crate::tensix_proto::CTRL_OFF_DIRTY + max_q
+        );
+        assert_eq!(
+            crate::tensix_proto::dirty_byte_addr(0, 7),
+            crate::tensix_proto::CTRL_BASE + crate::tensix_proto::CTRL_OFF_DIRTY + 7
+        );
+        // Last legal slot/queue still falls inside the DIRTY range.
+        let last = crate::tensix_proto::dirty_byte_addr(31, max_q - 1);
+        assert!(last < crate::tensix_proto::CTRL_BASE + crate::tensix_proto::CTRL_OFF_PROCESSED);
+    }
+
+    #[test]
+    fn processed_cursor_addr_matches_layout() {
+        let max_q = crate::tensix_proto::MAX_QUEUES_PER_SLOT;
+        assert_eq!(
+            crate::tensix_proto::processed_cursor_addr(0, 0),
+            crate::tensix_proto::CTRL_BASE + crate::tensix_proto::CTRL_OFF_PROCESSED
+        );
+        // Stride is 2 bytes per cursor; 2 * MAX_QUEUES_PER_SLOT bytes per slot.
+        assert_eq!(
+            crate::tensix_proto::processed_cursor_addr(0, 1),
+            crate::tensix_proto::CTRL_BASE + crate::tensix_proto::CTRL_OFF_PROCESSED + 2
+        );
+        assert_eq!(
+            crate::tensix_proto::processed_cursor_addr(1, 0),
+            crate::tensix_proto::CTRL_BASE + crate::tensix_proto::CTRL_OFF_PROCESSED + max_q * 2
+        );
+        // Last legal cursor still inside the PROCESSED range.
+        let last_addr = crate::tensix_proto::processed_cursor_addr(31, max_q - 1);
+        assert!(
+            last_addr + 2 <= crate::tensix_proto::CTRL_BASE + crate::tensix_proto::CTRL_OFF_END
+        );
     }
 }

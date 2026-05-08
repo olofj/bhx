@@ -72,6 +72,22 @@ pub const CTRL_OFF_PROCESSED: u32 = 0x0200;
 /// firmware pair refuses to attach loudly.
 pub const CTRL_OFF_END: u32 = 0x0400;
 
+/// Address of the dirty-bitmap byte for `(slot, queue)`. Read +
+/// cleared by the dispatcher each pass; set by BRISC's
+/// `handle_queue_notify` on every guest QUEUE_NOTIFY.
+#[inline]
+pub fn dirty_byte_addr(slot: u32, queue: u32) -> u32 {
+    CTRL_BASE + CTRL_OFF_DIRTY + slot * MAX_QUEUES_PER_SLOT + queue
+}
+
+/// Address of the processed-cursor halfword for `(slot, queue)`.
+/// Daemon writes the post-dispatch `used.idx` here; warm-resume
+/// reads it instead of probing guest DRAM.
+#[inline]
+pub fn processed_cursor_addr(slot: u32, queue: u32) -> u32 {
+    CTRL_BASE + CTRL_OFF_PROCESSED + slot * MAX_QUEUES_PER_SLOT * 2 + queue * 2
+}
+
 // ----- Magic words (written last in each side's slot) -----
 
 pub const HELLO_MAGIC: u32 = 0x4F4C_4548; // "HELO" little-endian

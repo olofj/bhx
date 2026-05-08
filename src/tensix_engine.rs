@@ -389,9 +389,9 @@ impl TensixEngine {
     }
 
     /// Read a u32 anywhere in the engine tile's L1 — used by the
-    /// data-plane worker to fetch per-queue desc/avail/used pointers
-    /// from the firmware's shadow region. Generic so we don't have
-    /// to add a per-field accessor for every shadow slot.
+    /// dispatcher to fetch per-queue desc/avail/used pointers from
+    /// the firmware's shadow region. Generic so we don't have to
+    /// add a per-field accessor for every shadow slot.
     pub fn read_l1_u32(&self, addr: u32) -> u32 {
         self.tile.read_l1_u32(addr)
     }
@@ -403,6 +403,25 @@ impl TensixEngine {
     /// we set up per-queue state.
     pub fn write_l1_u32(&self, addr: u32, value: u32) {
         self.tile.write_l1_u32(addr, value);
+    }
+
+    /// Volatile single-byte read from L1. The V2 dispatcher uses
+    /// this to poll `CTRL_OFF_DIRTY[slot][q]`. See `TensixTile`'s
+    /// equivalent for the volatility and alignment story.
+    pub fn read_l1_u8(&self, addr: u32) -> u8 {
+        self.tile.read_l1_u8(addr)
+    }
+
+    /// Volatile single-byte write to L1. The V2 dispatcher uses
+    /// this to clear dirty bits after observation.
+    pub fn write_l1_u8(&self, addr: u32, value: u8) {
+        self.tile.write_l1_u8(addr, value);
+    }
+
+    /// Volatile half-word write to L1. The V2 dispatcher uses
+    /// this to publish the post-dispatch `processed[qi]` cursor.
+    pub fn write_l1_u16(&self, addr: u32, value: u16) {
+        self.tile.write_l1_u16(addr, value);
     }
 
     /// Host VA pointing at L1 byte `addr`. Used by paths that need a
