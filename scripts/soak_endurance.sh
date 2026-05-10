@@ -208,8 +208,20 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
         echo "$status" | grep -qE "l2cpu $L2CPU: Running disk=- net=-" \
             || fail "iter $i: warm-resume didn't readopt l2cpu $L2CPU:\n$status"
 
-        # Re-baseline drift checks against the new pid.
+        # Re-baseline drift checks against the new pid. Warm-resume
+        # leaves the slot with disk=- net=- (only console adopts), but
+        # the *next* iter will immediately add them back, allocating
+        # worker state and bumping RSS by ~1 MiB. To make the new
+        # baseline reflect the same steady state as pre-resume
+        # measurements (not the artificially-low post-resume-pre-readd
+        # snapshot), restore disk+net inline here BEFORE sampling.
+        # Without this, iter (N+1) trips the drift gate on the very
+        # first re-add cycle — false positive that masks real drift.
         pid=$(read_pid)
+        "$BINARY" add-disk -t "$CARD" -l "$L2CPU" "$ROOTFS" >/dev/null \
+            || fail "iter $i: post-warm-resume add-disk failed"
+        "$BINARY" add-net -t "$CARD" -l "$L2CPU" >/dev/null \
+            || fail "iter $i: post-warm-resume add-net failed"
         baseline_rss=$(rss_of "$pid")
         baseline_fd=$(fd_count_of "$pid")
         note "iter $i: warm-resume OK; new baseline rss=${baseline_rss}KiB fd=$baseline_fd"
