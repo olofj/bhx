@@ -218,6 +218,28 @@ impl TensixEngine {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
+        // (#193) Overwrite `STATS_OFF_VERSION` with the daemon's
+        // authoritative build_id + protocol version. The firmware's
+        // own startup write here carries whatever build_id was baked
+        // into the .bin at make-time — `brisc-firmware/Makefile`'s
+        // FW_BUILD_ID is sticky against mtime-based dependency
+        // tracking, so a commit that doesn't touch firmware sources
+        // leaves the .bin re-stamping skipped while build.rs's
+        // computation advances. Past that point, the chip-side value
+        // and `ve::FW_BUILD_ID` diverge, and `adopt_running` below
+        // refuses to attach with "build_id mismatch" until a manual
+        // `make -C brisc-firmware clean`.
+        //
+        // Re-writing the value here from the daemon's constants
+        // makes the daemon's `FW_BUILD_ID` the single source of
+        // truth — the firmware still writes its own value first
+        // (harmless overwrite-by-daemon, also serves as a sensible
+        // fallback if the daemon crashes between firmware-init and
+        // this write), but the steady-state contents reflect the
+        // daemon binary that did the most recent `bring_up`.
+        let stamped_version = (ve::FW_BUILD_ID << 8) | proto::PROTOCOL_VERSION;
+        tile.write_l1_u32(ve::STATS_BASE + ve::STATS_OFF_VERSION, stamped_version);
+
         // M5 (#71) handshake. BRISC blocks in `wait_for_hello_and_ack`
         // until we send hello, so this also gates the firmware's
         // entry into the steady-state poll loop.
@@ -315,15 +337,23 @@ impl TensixEngine {
             .into());
         }
         let firmware_version = tile.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_VERSION);
-        // Firmware encodes BRISC_VIRTIO_FW_VERSION as
-        // `<build_id 24-bit><protocol 8-bit>`. The low byte tracks
-        // `TENSIX_PROTOCOL_VERSION` (the wire-format protocol), the
-        // upper 24 bits are the build_id (git short hash / sha256
-        // prefix of firmware sources). The daemon refuses to adopt
-        // unless BOTH match — protocol mismatch is a wire-format
-        // break, build_id mismatch means the chip's firmware is from
-        // a different daemon build than ours and may have different
-        // behavior even at the same protocol version.
+        // `STATS_OFF_VERSION` carries `<build_id 24-bit><protocol 8-bit>`.
+        // The low byte is `TENSIX_PROTOCOL_VERSION` (wire-format
+        // protocol). The upper 24 bits are the daemon's `FW_BUILD_ID`
+        // — written by `bring_up` after the firmware-side init pass
+        // completes (#193). Pre-#193 the firmware's own init pass
+        // wrote this and the value could drift from `ve::FW_BUILD_ID`
+        // when make's mtime tracking skipped a stamp; now the daemon
+        // overwrites with its authoritative constant so the
+        // chip-side value reflects whichever daemon binary did the
+        // most recent `bring_up`. Mismatch here means:
+        //   - protocol byte differs: wire-format break across daemon
+        //     ↔ firmware versions.
+        //   - build_id differs: the chip's BRISC was loaded by a
+        //     daemon binary built from different firmware sources
+        //     than this one (and we never re-loaded since); behavior
+        //     may diverge even at the same protocol version.
+        // Either way, refuse to adopt and ask for `tt-smi -r`.
         let firmware_protocol = firmware_version & 0xff;
         let firmware_build_id = (firmware_version >> 8) & 0x00ff_ffff;
         let expected_build_id = ve::FW_BUILD_ID & 0x00ff_ffff;

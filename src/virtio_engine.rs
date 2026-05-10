@@ -403,6 +403,24 @@ mod tests {
     }
 
     #[test]
+    fn fw_build_id_fits_in_24_bits() {
+        // `bring_up` (#193) packs the firmware version as
+        // `(FW_BUILD_ID << 8) | PROTOCOL_VERSION` into a u32 and
+        // writes it to STATS_OFF_VERSION. If FW_BUILD_ID ever
+        // overflows 24 bits (build.rs's compute clips to that, but a
+        // future regression that drops the clip would silently
+        // corrupt the protocol byte), this test catches it before
+        // the bit-bashing reaches the chip.
+        assert_eq!(FW_BUILD_ID, FW_BUILD_ID & 0x00ff_ffff);
+        // And the protocol byte must fit in the low 8 bits with
+        // nothing in 0xffff_ff00 — same shape, opposite end.
+        assert_eq!(
+            crate::tensix_proto::PROTOCOL_VERSION,
+            crate::tensix_proto::PROTOCOL_VERSION & 0xff
+        );
+    }
+
+    #[test]
     fn embedded_firmware_is_nonempty_and_aligned() {
         assert!(!VIRTIO_FIRMWARE.is_empty());
         // First 4 bytes must be the entry stub `j main_entry` from
