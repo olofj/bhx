@@ -64,6 +64,9 @@ pub fn serve(
     let shared_chip = Arc::new(crate::shared_chip::SharedChip::new(card)?);
     let state = Arc::new(DaemonState::new(card, shared_chip));
     install_signal_handlers(state.shutdown.clone());
+    // (#195) Read the PLIC latch-window investigation knob from env. No-op
+    // unless BHX_PLIC_LATCH_US is set; default behavior is unchanged.
+    crate::virtio::interrupt::init_latch_window_from_env();
     crate::daemon::metrics::spawn_chip_telemetry_poller(Arc::clone(&state));
 
     listener.set_nonblocking(true)?;
