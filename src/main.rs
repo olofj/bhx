@@ -1852,24 +1852,15 @@ fn print_isa_emu_counter_snapshot(
     if insn != 0 {
         println!();
         let is_compressed = (insn & 0x3) != 0x3;
-        let (encoding_hex, byte_seq) = if is_compressed {
-            let v = insn as u16;
-            (
-                format!("0x{:04x}", v),
-                format!("{:02x} {:02x}", v & 0xff, v >> 8),
-            )
+        let bytes: Vec<u8> = if is_compressed {
+            (insn as u16).to_le_bytes().to_vec()
         } else {
-            let v = insn as u32;
-            (
-                format!("0x{:08x}", v),
-                format!(
-                    "{:02x} {:02x} {:02x} {:02x}",
-                    v & 0xff,
-                    (v >> 8) & 0xff,
-                    (v >> 16) & 0xff,
-                    (v >> 24) & 0xff,
-                ),
-            )
+            (insn as u32).to_le_bytes().to_vec()
+        };
+        let encoding_hex = if is_compressed {
+            format!("0x{:04x}", insn as u16)
+        } else {
+            format!("0x{:08x}", insn as u32)
         };
         println!(
             "First unhandled insn:  {} at guest PC {:#x}{}",
@@ -1877,17 +1868,123 @@ fn print_isa_emu_counter_snapshot(
             mepc,
             if is_compressed { " (compressed)" } else { "" }
         );
-        println!("To disassemble (host):");
-        println!(
-            "  printf '\\x{}' | riscv64-linux-gnu-objdump -D -b binary -m riscv:rv64 /dev/stdin",
-            byte_seq.replace(' ', "\\x")
-        );
+        let class = classify_riscv_major_opcode(insn, is_compressed);
+        println!("Major opcode class:    {class}");
+        match try_disassemble_riscv(&bytes) {
+            Ok(mnemonic) if !mnemonic.starts_with(".word") && !mnemonic.starts_with(".insn") => {
+                println!("Mnemonic:              {mnemonic}");
+            }
+            Ok(_) | Err(_) => {
+                // binutils <= 2.44 doesn't decode RVV insns from raw
+                // bytes (it needs a `.s` source with explicit
+                // mnemonics — the very thing we're trying to recover).
+                // The major-opcode class is the most actionable
+                // answer in that case: it tells the operator whether
+                // they need scalar (Zba/Zbb/...) or vector (Zvbb/
+                // Zvbc/...) emulation work to close the gap.
+                println!("Mnemonic:              (binutils didn't decode — see class above)");
+            }
+        }
         println!("To identify in the guest:");
         println!(
-            "  use the PC ({:#x}) + /proc/<pid>/maps + objdump -d on the matching binary",
+            "  use PC ({:#x}) + /proc/<pid>/maps + objdump -d on the binary",
             mepc
         );
     }
+}
+
+/// Map the 32-bit or 16-bit insn encoding to its major opcode class.
+/// Most actionable when objdump won't produce a real mnemonic — at
+/// minimum the operator learns whether they're missing scalar
+/// (Zba/Zbb/...) or vector (Zvbb/...) emulation to close the gap.
+fn classify_riscv_major_opcode(insn: u64, is_compressed: bool) -> &'static str {
+    if is_compressed {
+        // 16-bit insn — quadrant in bits[1:0]. funct3 in bits[15:13]
+        // would let us narrow further; "which quadrant" is already
+        // enough for the operator to know roughly what kind of
+        // compressed insn this is.
+        return match (insn & 0x3) as u8 {
+            0 => "C0 quadrant (compressed load/store, addi4spn)",
+            1 => "C1 quadrant (compressed arith / jump / branch — Zcb / Zcmop)",
+            2 => "C2 quadrant (compressed load/store/jalr/mv/add — Zcmop)",
+            _ => "unrecognized compressed quadrant",
+        };
+    }
+    // 32-bit insn. The "major opcode" is bits[6:2] (with bits[1:0]
+    // == 11 marking it 32-bit). Names from RISC-V ISA Vol I §27
+    // "RV32/64G Instruction Set Listings."
+    match ((insn >> 2) & 0x1f) as u8 {
+        0x00 => "LOAD",
+        0x01 => "LOAD-FP (Zfhmin / Zfh / D / F loads)",
+        0x03 => "MISC-MEM (fence / fence.i / Zicbom / Zicboz cmo)",
+        0x04 => "OP-IMM (Zba/Zbb/Zbs immediate forms)",
+        0x05 => "AUIPC",
+        0x06 => "OP-IMM-32 (Zba/Zbb 32-bit immediate forms)",
+        0x08 => "STORE",
+        0x09 => "STORE-FP",
+        0x0b => "AMO (A extension / Zacas)",
+        0x0c => "OP (Zba/Zbb/Zbs/Zbc/Zicond register forms)",
+        0x0d => "LUI",
+        0x0e => "OP-32 (Zba/Zbb 32-bit register forms)",
+        0x10 => "MADD",
+        0x11 => "MSUB",
+        0x12 => "NMSUB",
+        0x13 => "NMADD",
+        0x14 => "OP-FP (Zfa / Zfhmin / Zfh / D / F)",
+        0x15 => "OP-V (RVV — Zvbb/Zvbc/Zvfh/...; likely need a vector emulator)",
+        0x18 => "BRANCH",
+        0x19 => "JALR",
+        0x1b => "JAL",
+        0x1c => "SYSTEM (csr / ecall / Zimop / Zawrs)",
+        _ => "unknown major opcode",
+    }
+}
+
+/// Disassemble a single RISC-V instruction via the host cross-objdump.
+/// Returns the mnemonic + operand columns as objdump prints them
+/// (e.g. `vandn.vv v2,v2,v4`). On the host paths that operators
+/// actually use to build bhx, `riscv64-linux-gnu-objdump` is on PATH
+/// because they already have the cross-toolchain installed; if not,
+/// fall back to a copy-pasteable recipe in the caller.
+fn try_disassemble_riscv(bytes: &[u8]) -> std::result::Result<String, String> {
+    use std::io::Write;
+    use std::process::Command;
+
+    let mut tmp = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {e}"))?;
+    tmp.write_all(bytes).map_err(|e| format!("write: {e}"))?;
+    tmp.flush().map_err(|e| format!("flush: {e}"))?;
+
+    let out = Command::new("riscv64-linux-gnu-objdump")
+        .args([
+            "-D",
+            "-b",
+            "binary",
+            "-m",
+            "riscv:rv64",
+            "-M",
+            "numeric,no-aliases",
+        ])
+        .arg(tmp.path())
+        .output()
+        .map_err(|e| format!("objdump not on PATH ({e})"))?;
+    if !out.status.success() {
+        return Err(format!("objdump exited {}", out.status));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // objdump emits one row per insn:
+    //   "   0:\t<hex bytes>\t<mnemonic>[\t<operands>]"
+    // Find the one at offset 0 and strip the leading offset + bytes.
+    for line in stdout.lines() {
+        let t = line.trim_start();
+        if !t.starts_with("0:") {
+            continue;
+        }
+        let mut parts = t.splitn(3, '\t');
+        let _offset = parts.next();
+        let _bytes_col = parts.next();
+        return Ok(parts.next().unwrap_or("(no mnemonic)").trim().to_string());
+    }
+    Err("no instruction line in objdump output".into())
 }
 
 /// Bring up the Tensix virtio engine via `TensixEngine::bring_up` —
