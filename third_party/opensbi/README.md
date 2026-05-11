@@ -15,15 +15,16 @@ favor of in-tree builds, see #84.)
 
 ```bash
 cd third_party/opensbi   # from the bhx project root
-make check-deps          # verifies wget, tar, riscv64-linux-gnu-gcc
-make                     # downloads opensbi-1.7.tar.gz, builds fw_jump.bin
+make check-deps          # verifies git, riscv64-linux-gnu-gcc
+make                     # clones upstream, builds fw_jump.bin
 ```
 
-First build downloads ~480 KB and compiles in <1 minute on a modern
-host. Subsequent builds reuse the extracted source tree under
-`opensbi-1.7/`.
+First build clones `riscv-software-src/opensbi` into `opensbi-src/`,
+checks out the pinned SHA, applies patches, and compiles in <1 minute
+on a modern host.
 
-Output: `fw_jump.bin` (symlink to `opensbi-1.7/build/platform/generic/firmware/fw_jump.bin`).
+Output: `fw_jump.bin` (symlink to
+`opensbi-src/build/platform/generic/firmware/fw_jump.bin`).
 
 ## Use
 
@@ -64,33 +65,69 @@ Build flags pinned in `Makefile`:
   boot. Useful when triaging "is the firmware actually rebuilt"
   questions over the chip console.
 
-## Why upstream OpenSBI plus a Tenstorrent patch
+### Why git clone (not tarball)
+
+The OpenSBI build's `Makefile` runs `git rev-parse --git-dir` from
+inside its own source tree to derive the boot banner string. With a
+tarball extracted under bhx's `.git`, that probe walked up the
+filesystem and found OUR repo — the banner printed
+`OpenSBI v<bhx-cargo-version>-<n>-g<bhx-sha>` instead of the actual
+upstream OpenSBI version. Cloning makes `opensbi-src/.git` the
+closest `.git` ancestor; the banner reflects the real provenance:
+
+```
+OpenSBI v1.8.1
+```
+
+The clone is pinned to a specific commit SHA in the Makefile so
+upstream tag re-points can't silently change what gets built.
+
+## Why upstream OpenSBI plus local patches
 
 `tt-bh-linux` builds OpenSBI from `github.com/tenstorrent/opensbi`
-branch `tt-blackhole`. As of v1.7 the functional delta against
-upstream is one feature: a `debug_descriptor` placed at a fixed
-offset (0x80) of `fw_jump.bin` plus a virtual-UART driver that
-reads/writes through it. The daemon's chip-side console pump
+branch `tt-blackhole`. Its functional delta against upstream is one
+feature: a `debug_descriptor` placed at a fixed offset (0x80) of
+`fw_jump.bin` plus a virtual-UART driver that reads/writes through
+it. The daemon's chip-side console pump
 (`src/daemon/chip_console.rs`) probes that descriptor on warm-resume
 to recover a still-running L2CPU's UART base, so this patch is
 load-bearing — without it `daemon stop` + `daemon start` against a
 live core can't re-adopt the slot and reports `Wedged`.
 
 Rather than vendoring the entire `tt-blackhole` branch, we pin
-upstream `riscv-software-src/opensbi` v1.7 and apply the
-Tenstorrent diff as `patches/0001-tenstorrent-debug-descriptor-
-virtual-uart.patch`. The Makefile picks up any `*.patch` in that
-directory in alphabetical order, idempotently (`patch -N`), so
-adding more later is drop-in.
+upstream `riscv-software-src/opensbi` at a known SHA and apply the
+Tenstorrent diff plus our own downstream patches as files under
+`patches/`. The Makefile picks up any `*.patch` in that directory in
+alphabetical order, so adding more later is drop-in:
+
+- `0001-tenstorrent-debug-descriptor-virtual-uart.patch` — Tenstorrent's
+  debug_descriptor + virtual-UART driver.
+- `0002-bhx-purgatory-magic.patch` — bhx-purgatory soft-reboot hook
+  (#166), force-park IPI event (#166), SRST-type-aware status block
+  (#177).
+- `0003-isa-ext-emu.patch` — Benedikt Freisen's v3 patch 2/3,
+  trap-based emulation of RVA22/RVA23 ISA extensions so the X280
+  (RVA22-class Gen.1) can run stock RVA23 distros like Ubuntu
+  25.10/26.04. The Makefile flips `CONFIG_SBI_ISA_EXT_EMU=y` +
+  `CONFIG_EMU_RVB23=y` in the platform defconfig after the patch
+  applies. See #163.
 
 ## Bumping OpenSBI
 
-1. `wget -O - https://github.com/riscv-software-src/opensbi/archive/refs/tags/vNEW.tar.gz | sha256sum`
-2. Update `OPENSBI_VERSION` in `Makefile`.
-3. Update `sha256sums` with the new tarball's hash.
-4. `make distclean && make` and verify `fw_jump.bin` boots end-to-end
-   on hardware (banner visible via `connect`, kernel hands off to
-   `Image` or U-Boot as expected).
+1. Find the desired upstream tag's SHA:
+   ```bash
+   git ls-remote https://github.com/riscv-software-src/opensbi.git refs/tags/vNEW
+   ```
+2. Update `OPENSBI_VERSION` and `OPENSBI_SHA` in `Makefile` (both must
+   move together — version is for the human-readable status line,
+   SHA is what's checked out).
+3. `make clean && make` — refreshes the clone, applies patches, and
+   builds.
+4. If any of the `patches/*.patch` files fail to apply, refresh them
+   against the new tree (`make` will halt with the hunk that didn't
+   apply — fix and re-run).
+5. Verify `fw_jump.bin` boots end-to-end on hardware (banner visible
+   via `connect`, kernel hands off to `Image` or U-Boot as expected).
 
 ## Reproducibility
 
@@ -100,18 +137,17 @@ Same workflow as `third_party/uboot/`: the Makefile pins
 a byte-identical `fw_jump.bin`. Verify:
 
 ```bash
-make distclean && make && sha256sum fw_jump.bin
-make distclean && make && sha256sum fw_jump.bin   # must match
+make clean && make && sha256sum fw_jump.bin
+make clean && make && sha256sum fw_jump.bin   # must match
 ```
 
 ## Layout
 
 ```
 third_party/opensbi/
-├── README.md           (this file)
-├── Makefile            download + build
-├── sha256sums          pinned tarball checksum
-├── dl/                 (gitignored) download cache
-├── opensbi-1.7/        (gitignored) extracted source tree
-└── fw_jump.bin         (gitignored) symlink to the build output
+├── README.md             (this file)
+├── Makefile              clone + build
+├── patches/              local downstream patches
+├── opensbi-src/          (gitignored) cloned upstream tree
+└── fw_jump.bin           (gitignored) symlink to the build output
 ```

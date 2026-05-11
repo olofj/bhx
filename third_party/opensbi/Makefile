@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: MIT
 #
 # Build OpenSBI for the Blackhole L2CPU. Source is upstream
-# riscv-software-src/opensbi at a pinned tag; build artifacts (dl/,
-# extracted opensbi-<ver>/, fw_jump.bin symlink) are gitignored.
+# riscv-software-src/opensbi at a pinned commit SHA, fetched into
+# opensbi-src/ via `git clone`. Build artifacts (opensbi-src/,
+# fw_jump.bin symlink) are gitignored.
 #
 # The boot chain: OpenSBI fw_jump (M-mode) -> kernel `Image` directly
 # (legacy mode), or -> U-Boot (S-mode) -> kernel + initramfs (#44).
@@ -20,19 +21,32 @@
 # downstream patches in patches/. The build applies *.patch
 # alphabetically, idempotently.
 #
+# Why git clone (not tarball): OpenSBI's own Makefile runs
+# `git rev-parse --git-dir` from inside its source tree to produce
+# the boot banner string. With a tarball extracted under bhx/.git,
+# that probe walks up and finds OUR repo, printing the bhx-side
+# `git describe` in the banner ("OpenSBI v0.9.0-42-gb9ae923"
+# instead of "OpenSBI v1.8.1-..."). Cloning makes opensbi-src/.git
+# the closest .git ancestor; the banner reflects the actual pinned
+# OpenSBI provenance.
+#
 # Usage:
-#   make             # download + verify + build fw_jump.bin
-#   make rebuild     # re-run the build without re-extracting
-#   make clean       # drop the extracted source tree; keep dl/
-#   make distclean   # drop everything including dl/
+#   make             # clone + build fw_jump.bin
+#   make rebuild     # re-run the build without re-cloning
+#   make clean       # drop the source tree
+#   make distclean   # alias of clean (no separate dl/ cache anymore)
 
+# Pinned OpenSBI commit. Update OPENSBI_VERSION (used for display)
+# and OPENSBI_SHA together when bumping. The SHA is what's actually
+# checked out; the version string is for human-readable build banner
+# only and gets propagated to the banner via OpenSBI's own `git
+# describe` against this checkout.
 OPENSBI_VERSION := 1.8.1
-OPENSBI_TARBALL := opensbi-$(OPENSBI_VERSION).tar.gz
-OPENSBI_URL := https://github.com/riscv-software-src/opensbi/archive/refs/tags/v$(OPENSBI_VERSION).tar.gz
+OPENSBI_SHA := 823b88afe71811eb6df556b927fbd6f52d240bf3
+OPENSBI_REPO := https://github.com/riscv-software-src/opensbi.git
 
 TOPDIR := $(CURDIR)
-DL_DIR := $(TOPDIR)/dl
-SB_SRCDIR := $(TOPDIR)/opensbi-$(OPENSBI_VERSION)
+SB_SRCDIR := $(TOPDIR)/opensbi-src
 
 # Build flags. PLATFORM=generic is the canonical RISC-V "boot anything
 # that supplies a DTB" platform. FW_JUMP=y selects the fw_jump payload
@@ -74,30 +88,39 @@ all: $(FW_JUMP)
 
 help:
 	@echo "Targets:"
-	@echo "  all (default)    Build fw_jump.bin. First run downloads + extracts upstream tree."
-	@echo "  rebuild          Re-run the build without re-extracting."
-	@echo "  clean            Drop the extracted source tree. Keeps dl/."
-	@echo "  distclean        Drop everything including dl/."
+	@echo "  all (default)    Build fw_jump.bin. First run clones the upstream repo."
+	@echo "  rebuild          Re-run the build without re-cloning."
+	@echo "  clean            Drop the source tree."
+	@echo "  distclean        Alias of clean."
 	@echo "  check-deps       Verify host tools needed by the OpenSBI build are present."
 	@echo
-	@echo "Pinned OpenSBI version: $(OPENSBI_VERSION)"
+	@echo "Pinned OpenSBI version: $(OPENSBI_VERSION) ($(OPENSBI_SHA))"
 	@echo "Cross-compiler:         $(CROSS_COMPILE)gcc"
 
 PATCH_FILES := $(sort $(wildcard $(TOPDIR)/patches/*.patch))
 
-# Download + verify + extract the OpenSBI tarball.
-$(SB_SRCDIR)/Makefile: $(DL_DIR)/$(OPENSBI_TARBALL) $(PATCH_FILES)
-	@echo "==> Verifying $(OPENSBI_TARBALL)"
-	@cd $(DL_DIR) && sha256sum -c $(TOPDIR)/sha256sums --ignore-missing
-	@echo "==> Extracting"
-	@# Reset the source dir before extracting so patches always apply
-	@# against a known-clean upstream tree. Idempotency via -N is
-	@# unreliable for create-new-file hunks: tar -xf doesn't overwrite
-	@# files that aren't in the tarball, so a patch-created file like
-	@# lib/utils/serial/virtual-uart.c survives a re-extract; patch -N
-	@# then double-applies and the build fails with "redefinition" errors.
+# Clone + checkout + apply patches. The marker file is the upstream
+# Makefile in the source tree — its presence + mtime determines
+# whether we need to re-fetch.
+$(SB_SRCDIR)/Makefile: $(PATCH_FILES)
+	@# Reset the source dir before each fetch so patches always apply
+	@# against a known-clean upstream tree. A previous patched
+	@# checkout would otherwise have `tt-blackhole virtual-UART
+	@# driver` files that aren't in upstream, and patch -N would
+	@# double-apply on top.
 	rm -rf $(SB_SRCDIR)
-	tar -xf $(DL_DIR)/$(OPENSBI_TARBALL) -C $(TOPDIR)
+	@echo "==> Cloning $(OPENSBI_REPO) @ $(OPENSBI_SHA)"
+	git clone --quiet $(OPENSBI_REPO) $(SB_SRCDIR)
+	@echo "==> Checking out $(OPENSBI_SHA)"
+	git -C $(SB_SRCDIR) checkout --quiet $(OPENSBI_SHA)
+	@# Verify the resolved tag matches our pinned version. Belt +
+	@# suspenders: catches the case where upstream re-points a tag
+	@# (rare but technically allowed by git) or where our SHA/version
+	@# pair drifted out of sync in the Makefile.
+	@resolved=$$(git -C $(SB_SRCDIR) describe --tags --exact-match 2>/dev/null); \
+	if [ "$$resolved" != "v$(OPENSBI_VERSION)" ]; then \
+	    echo "WARNING: pinned SHA $(OPENSBI_SHA) resolves to '$$resolved', expected 'v$(OPENSBI_VERSION)'"; \
+	fi
 	@for p in $(PATCH_FILES); do \
 		echo "==> Applying $$(basename $$p)"; \
 		(cd $(SB_SRCDIR) && patch -p1 --quiet < $$p) || exit 1; \
@@ -115,12 +138,6 @@ $(SB_SRCDIR)/Makefile: $(DL_DIR)/$(OPENSBI_TARBALL) $(PATCH_FILES)
 		>> $(SB_SRCDIR)/platform/generic/configs/defconfig
 	@touch $@
 
-$(DL_DIR)/$(OPENSBI_TARBALL):
-	@mkdir -p $(DL_DIR)
-	@echo "==> Downloading $(OPENSBI_URL)"
-	wget -q -O $@.tmp $(OPENSBI_URL)
-	@mv $@.tmp $@
-
 $(FW_JUMP): $(SB_SRCDIR)/Makefile
 	$(MAKE) -C $(SB_SRCDIR) CROSS_COMPILE=$(CROSS_COMPILE) $(SBI_FLAGS)
 
@@ -133,11 +150,10 @@ clean:
 	rm -f $(FW_JUMP_LINK)
 
 distclean: clean
-	rm -rf $(DL_DIR)
 
 check-deps:
 	@missing=; \
-	for tool in wget tar make $(CROSS_COMPILE)gcc; do \
+	for tool in git make $(CROSS_COMPILE)gcc; do \
 		if ! command -v $$tool >/dev/null; then \
 			echo "MISSING: $$tool"; \
 			missing=1; \
@@ -146,7 +162,7 @@ check-deps:
 	if [ -n "$$missing" ]; then \
 		echo; \
 		echo "Install missing tools (Debian/Ubuntu):"; \
-		echo "  sudo apt-get install build-essential wget gcc-riscv64-linux-gnu"; \
+		echo "  sudo apt-get install build-essential git gcc-riscv64-linux-gnu"; \
 		exit 1; \
 	fi; \
 	echo "OK: all host tools present"

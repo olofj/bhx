@@ -1,4 +1,3 @@
 # Build artifacts.
-dl/
-opensbi-*/
+opensbi-src/
 fw_jump.bin
