@@ -241,6 +241,86 @@ pub mod purgatory {
     pub const NEXT_MODE_S: u64 = 1;
 }
 
+/// SBI PMU encoding for the ISA-emulation-trap hit counters that
+/// `third_party/opensbi/patches/0004-isa-ext-emu-pmu.patch` adds.
+///
+/// Each emulated extension has a sub-event ID. Mirrors the C-side
+/// `enum sbi_insn_emu_ext` in
+/// `third_party/opensbi/opensbi-src/include/sbi/sbi_insn_emu_pmu.h`
+/// — the numeric values are part of the wire format guest perf
+/// passes as `event_data`, so this module must stay in sync.
+///
+/// Guest perf attaches with raw `config = PERF_CONFIG_BASE | <event_id>`,
+/// where the top two bits route Linux's `riscv_pmu_sbi.c` to OpenSBI's
+/// platform-firmware-event path.
+pub mod isa_emu_pmu {
+    /// Top-two-bits-set base config: `0b11 << 62`. Linux's
+    /// `riscv_pmu_sbi.c::riscv_pmu_get_event_info` treats this as
+    /// "platform FW event, low 62 bits are SBI event_data."
+    pub const PERF_CONFIG_BASE: u64 = 0xC000_0000_0000_0000;
+
+    /// Mask of bits the guest puts the event ID into. From Linux's
+    /// `RISCV_PMU_PLAT_FW_EVENT_MASK = GENMASK_ULL(61, 0)`.
+    pub const PERF_EVENT_DATA_MASK: u64 = (1u64 << 62) - 1;
+
+    /// Sub-event ID for "no extension matched" — never emitted by
+    /// the firmware on a successful emulation; exists so emulator
+    /// code can pass an un-classified match-tracker without
+    /// branching. Guest configuring a counter with this ID gets
+    /// `SBI_EINVAL`.
+    pub const NONE: u32 = 0;
+    /// Aggregate counter — incremented on every successful emulation
+    /// regardless of which extension matched. The cheapest "is the
+    /// guest hitting the emulator at all" signal.
+    pub const ANY: u32 = 1;
+    pub const ZCB: u32 = 2;
+    pub const ZBA: u32 = 3;
+    pub const ZBB: u32 = 4;
+    pub const ZBS: u32 = 5;
+    pub const ZICOND: u32 = 6;
+    pub const ZIMOP: u32 = 7;
+    pub const ZAWRS: u32 = 8;
+    pub const ZFA: u32 = 9;
+    pub const ZFHMIN: u32 = 10;
+    pub const ZICBOM: u32 = 11;
+    pub const ZICBOZ: u32 = 12;
+    pub const ZCMOP: u32 = 13;
+    /// Reserved — Freisen's patch carries decode for these but the
+    /// bhx OpenSBI build doesn't enable `CONFIG_EMU_ZBC` /
+    /// `CONFIG_EMU_SUPM`. Counters for them will read zero. Kept
+    /// here so the ID space matches the C-side enum.
+    pub const ZBC: u32 = 14;
+    pub const SUPM: u32 = 15;
+
+    /// Compile-time-checkable list of all defined event IDs and the
+    /// short human-readable name used in `bhx debug isa-emu-events`
+    /// output. Order matches the C-side enum so the array index
+    /// equals the event ID.
+    pub const EVENTS: &[(u32, &str)] = &[
+        (NONE, "NONE"),
+        (ANY, "ANY"),
+        (ZCB, "Zcb"),
+        (ZBA, "Zba"),
+        (ZBB, "Zbb"),
+        (ZBS, "Zbs"),
+        (ZICOND, "Zicond"),
+        (ZIMOP, "Zimop"),
+        (ZAWRS, "Zawrs"),
+        (ZFA, "Zfa"),
+        (ZFHMIN, "Zfhmin"),
+        (ZICBOM, "Zicbom"),
+        (ZICBOZ, "Zicboz"),
+        (ZCMOP, "Zcmop"),
+        (ZBC, "Zbc (reserved)"),
+        (SUPM, "Supm (reserved)"),
+    ];
+
+    /// Compose the `perf` raw `config` value for a given event ID.
+    pub const fn perf_config(event_id: u32) -> u64 {
+        PERF_CONFIG_BASE | (event_id as u64 & PERF_EVENT_DATA_MASK)
+    }
+}
+
 /// Slirp host-side port allocation for SSH forwarding to the guest.
 pub mod slirp {
     /// Base host port for the SSH forward of L2CPU 0 on card 0.
@@ -325,4 +405,35 @@ mod tests {
         assert!(boot_image::KERNEL_OFFSET.is_multiple_of(0x1000));
         assert!(boot_image::INITRAMFS_OFFSET.is_multiple_of(0x1000));
     };
+
+    // EVENTS table must enumerate every event ID exactly once, in
+    // ascending order, with the array index equal to the ID. Mirrors
+    // the C-side `enum sbi_insn_emu_ext` declaration order — a guest
+    // perf invocation built from this table must produce the same
+    // event_data the firmware accepts in
+    // `validate_encoding`.
+    #[test]
+    fn isa_emu_pmu_events_are_dense_and_sorted() {
+        for (i, (id, _name)) in isa_emu_pmu::EVENTS.iter().enumerate() {
+            assert_eq!(*id as usize, i, "EVENTS[{i}] = {id}; expected {i}");
+        }
+        // The last entry's ID + 1 is the C-side `_MAX` sentinel.
+        // Hardcoded so a future enum extension on the C side without
+        // a matching Rust update fails this test loudly.
+        assert_eq!(isa_emu_pmu::EVENTS.len(), 16);
+    }
+
+    #[test]
+    fn isa_emu_pmu_perf_config_matches_linux_encoding() {
+        // Zicond → 6. Top 2 bits set (Linux platform-FW selector).
+        assert_eq!(
+            isa_emu_pmu::perf_config(isa_emu_pmu::ZICOND),
+            0xC000_0000_0000_0006,
+        );
+        // ANY aggregate counter.
+        assert_eq!(
+            isa_emu_pmu::perf_config(isa_emu_pmu::ANY),
+            0xC000_0000_0000_0001,
+        );
+    }
 }

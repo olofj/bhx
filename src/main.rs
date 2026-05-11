@@ -573,6 +573,16 @@ enum DebugAction {
     /// an integration check without booting any L2CPU. Bypasses the
     /// daemon.
     TensixEngine,
+    /// Print the SBI PMU event IDs for ISA-extension-emulation hit counters.
+    ///
+    /// Lists each emulated extension with its sub-event ID and a
+    /// copy-pasteable `perf stat -e r<config>` recipe. The counters
+    /// themselves live in M-mode firmware (OpenSBI; see
+    /// `third_party/opensbi/patches/0004-isa-ext-emu-pmu.patch`); to
+    /// read them, run the printed `perf` command inside the guest
+    /// around a workload of interest. Does not touch the chip and
+    /// is safe to run with or without the daemon.
+    IsaEmuEvents,
     /// Drive a known byte pattern through the TRISC0 UART → feed ring.
     ///
     /// Writes from the host into TRISC0's UART input cell (mimicking
@@ -1455,6 +1465,12 @@ fn run_connect_client(
 }
 
 fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Result<()> {
+    // IsaEmuEvents is a pure printer — no chip access, no daemon
+    // interlock needed. Handle it before any chip plumbing so it
+    // works even without `/dev/tenstorrent/<idx>`.
+    if matches!(action, DebugAction::IsaEmuEvents) {
+        return run_isa_emu_events();
+    }
     // Debug ops bypass the daemon and write the chip directly, so if the
     // daemon is up for this card it has no visibility into what we're
     // doing. That's exactly the silent-state-divergence footgun that
@@ -1538,7 +1554,49 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
             gap_us,
             no_lsr_poll,
         } => run_uart_loopback(card, &chip, l2cpu as u8, count, gap_us, no_lsr_poll),
+        // Handled at the top of the function before chip plumbing.
+        DebugAction::IsaEmuEvents => unreachable!(),
     }
+}
+
+/// Print the SBI PMU event-ID table and a copy-pasteable `perf` recipe
+/// for the ISA-emulation hit counters that
+/// `third_party/opensbi/patches/0004-isa-ext-emu-pmu.patch` adds.
+///
+/// The counters live in M-mode firmware on the X280, exposed via SBI
+/// PMU platform firmware events. Linux's `riscv_pmu_sbi` driver routes
+/// raw `config` values with the top two bits set straight through to
+/// the SBI event_data field, so a guest can attach to a specific
+/// emulated extension's counter with `perf stat -e r<config>`.
+fn run_isa_emu_events() -> std::io::Result<()> {
+    use crate::regs::isa_emu_pmu::{perf_config, EVENTS, NONE};
+
+    println!("SBI PMU events for trap-based ISA-extension emulation");
+    println!();
+    println!("Run inside the guest:");
+    println!();
+    println!(
+        "  perf stat -a -e r{:016x} -- <workload>",
+        perf_config(crate::regs::isa_emu_pmu::ANY)
+    );
+    println!();
+    println!("...or pick a specific extension from the table below.");
+    println!();
+    println!("  ID  Extension         perf config (raw)");
+    println!("----  ----------------  -------------------");
+    for (id, name) in EVENTS {
+        // The NONE pseudo-event isn't observable from userspace — the
+        // firmware rejects it in validate_encoding — so don't print a
+        // copy-pasteable line that won't work.
+        if *id == NONE {
+            continue;
+        }
+        println!("{:>4}  {:<16}  r{:016x}", id, name, perf_config(*id));
+    }
+    println!();
+    println!("Counter is 64-bit and never wraps in realistic timeframes.");
+    println!("ANY (id=1) is the aggregate — increments on every emulation.");
+    Ok(())
 }
 
 /// Bring up the Tensix virtio engine via `TensixEngine::bring_up` —
