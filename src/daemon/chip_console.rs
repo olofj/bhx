@@ -214,53 +214,191 @@ fn uart_pass(
             last_parked_check = std::time::Instant::now();
             let parked = read_parked_state(l2cpu, purg_pa);
             if detect_park_transition(last_parked, parked) {
-                // (#177) Read the SRST type the guest issued. If
-                // SHUTDOWN, drop the slot's disk + net workers
-                // before disconnecting clients — operator-visible
-                // status will then correctly show `disk=- net=-`
-                // for the parked slot.
+                // (#177) Discriminate the guest's intent via the SRST
+                // type the bhx-purgatory hook stashed in the status
+                // block. SHUTDOWN (poweroff/init 0) → tear down,
+                // disconnect, scrub. REBOOT (reboot/init 6) →
+                // preserve attachments + clients + scrollback, brief
+                // pause, fire release-from-purgatory automatically
+                // so the operator's reboot is bug-for-bug
+                // indistinguishable from a real hardware reboot.
                 let reset_type = read_parked_reset_type(l2cpu, starting_address);
-                if reset_type == crate::regs::purgatory::RESET_TYPE_SHUTDOWN {
-                    drop_workers_on_shutdown_park(state, l2cpu_idx);
-                }
-                hub.disconnect_all_with_reason(&format!(
-                    "l2cpu {} parked (guest powered off); `bhx boot -l {}` to release",
-                    l2cpu.idx(),
-                    l2cpu.idx()
-                ));
-                // Throw away the hub's scrollback. Bytes from the
-                // dead kernel aren't useful to a future re-attach,
-                // and stale `\x1b[6n` queries embedded in them would
-                // re-prompt the operator's terminal for a CPR
-                // response that the writer pump then forwards to
-                // U-Boot's interactive prompt — the same
-                // autoboot-interrupted-by-stale-input symptom the
-                // chip-side ring drain (below) addresses, but on
-                // the host side via terminal-replied control
-                // sequences. Operators who want a post-mortem of
-                // what the previous kernel printed can use the tail
-                // captured by `internal_stop` (#160) on a Stopped
-                // slot.
-                hub.clear_scrollback();
-                // Drain any input the kernel didn't consume before it
-                // poweroff'd: bytes still in the daemon-side mpsc
-                // channel from the writer client, plus bytes already
-                // pushed into the chip-side virtuart RX ring. Without
-                // this, U-Boot reads them on the next release-from-
-                // purgatory wake and treats them as commands at the
-                // `=>` prompt, interrupting autoboot. Cross-domain
-                // write of `rx_tail` is safe here because the guest
-                // is in OpenSBI's hsm_hart_wait — no kernel is
-                // reading from this ring.
-                let mpsc_dropped = drain_input_channel(input_rx);
-                let ring_dropped = unsafe { drain_rx_ring(q) };
-                if mpsc_dropped > 0 || ring_dropped > 0 {
-                    crate::dlog!(
-                        "[console l2cpu {}] parked: dropped {} byte(s) from input mpsc, {} byte(s) from chip-side RX ring",
-                        l2cpu.idx(),
-                        mpsc_dropped,
-                        ring_dropped
+                if reset_type == crate::regs::purgatory::RESET_TYPE_COLD_REBOOT
+                    || reset_type == crate::regs::purgatory::RESET_TYPE_WARM_REBOOT
+                {
+                    // Operator-visible status line so the reboot
+                    // doesn't appear as silent dead-air. Broadcast
+                    // via push_chip_output (NOT disconnect_all_with_reason
+                    // — we want the clients to stay attached and ride
+                    // through the reboot). Scrollback gets the line
+                    // too, so post-mortem `bhx connect` sees it.
+                    let reason = format!(
+                        "\r\n[bhx: l2cpu {} rebooting (auto-release)…]\r\n",
+                        l2cpu.idx()
                     );
+                    let _ = hub.push_chip_output(reason.as_bytes());
+
+                    // Drain BOTH input channels even though we're not
+                    // disconnecting. Two sources of stale bytes:
+                    //   - mpsc: terminal CPR responses to the kernel's
+                    //     shutdown-time `\x1b[6n` queries (the
+                    //     operator's terminal auto-answers; they
+                    //     arrive after the kernel has stopped
+                    //     reading), plus any pre-reboot keystrokes
+                    //     the kernel's TTY didn't fully consume
+                    //     before shutdown.
+                    //   - chip RX ring: bytes we pushed to the ring
+                    //     during shutdown that the kernel never
+                    //     read.
+                    // Without draining these, U-Boot's "Hit any key
+                    // to stop autoboot" reads them as keystrokes,
+                    // interrupts autoboot, drops to the `=>` prompt
+                    // — exactly the issue reported on the first
+                    // auto-reboot test (terminal CPR `\x1b[97;1R`
+                    // bytes parsed by U-Boot as commands like
+                    // `[97`, `1R`, `428R`).
+                    let mpsc_dropped = drain_input_channel(input_rx);
+                    let ring_dropped = unsafe { drain_rx_ring(q) };
+                    if mpsc_dropped > 0 || ring_dropped > 0 {
+                        crate::dlog!(
+                            "[console l2cpu {}] reboot: dropped {} byte(s) from input mpsc, {} byte(s) from chip-side RX ring",
+                            l2cpu.idx(),
+                            mpsc_dropped,
+                            ring_dropped
+                        );
+                    }
+
+                    // (#177) Drop the slot's net worker NOW (under
+                    // slot lock, with dispatcher unregister + worker
+                    // join) so the slirp NAT / DHCP / port-forward
+                    // state from the pre-reboot session doesn't
+                    // bleed into the next boot. Mid-reset libslirp
+                    // state has caused real fallout: `networkd-
+                    // wait-online` hangs on the post-reboot kernel
+                    // because slirp answers a fresh DHCPDISCOVER
+                    // with state from the dying VM. Disks +
+                    // virtio-console + rng are unaffected by host-
+                    // side state and stay attached. The net is
+                    // re-attached just before the wake IPI fires,
+                    // below, so the new boot's virtio-net probe
+                    // lands on a registered RegEntry.
+                    let cached_extra_fwd = drop_net_for_reboot(state, l2cpu_idx);
+
+                    // Brief pause: gives the operator's terminal a
+                    // visible "guest is rebooting" moment instead of
+                    // the U-Boot banner appearing instantly mid-line
+                    // after `reboot`. The chip is in
+                    // `sbi_hsm_hart_wait` throughout, so pausing the
+                    // polling thread here has no observable cost on
+                    // chip-side progress.
+                    std::thread::sleep(Duration::from_secs(1));
+
+                    // Second drain right before release — catches
+                    // anything the operator typed during the pause
+                    // (intended for the next boot's userspace but
+                    // we can't tell yet; absorb to keep U-Boot's
+                    // autoboot countdown clean). Same rationale as
+                    // the first drain.
+                    let late_mpsc = drain_input_channel(input_rx);
+                    let late_ring = unsafe { drain_rx_ring(q) };
+                    if late_mpsc > 0 || late_ring > 0 {
+                        crate::dlog!(
+                            "[console l2cpu {}] reboot pause: late drop {} mpsc + {} ring byte(s)",
+                            l2cpu.idx(),
+                            late_mpsc,
+                            late_ring
+                        );
+                    }
+
+                    // Re-attach net with the cached extra_fwd, BEFORE
+                    // firing the wake IPI. The dispatcher needs a
+                    // fresh RegEntry for the net slot in place by
+                    // the time the new kernel's virtio-net probe
+                    // walks DRIVER_OK; firing the wake first would
+                    // race the kernel against the daemon's slirp
+                    // setup. `cached_extra_fwd` may be empty if no
+                    // net was ever attached or if drop_net_for_reboot
+                    // observed the slot in an unexpected state.
+                    if let Some(extra) = cached_extra_fwd {
+                        if let Err(e) = reattach_net_for_reboot(state, l2cpu_idx, &extra) {
+                            crate::dlog!(
+                                "[console l2cpu {}] reboot: net re-attach failed: {} — new boot will come up without virtio-net",
+                                l2cpu.idx(),
+                                e
+                            );
+                        } else {
+                            crate::dlog!(
+                                "[console l2cpu {}] reboot: net re-attached with fresh slirp state (extra_fwd={:?})",
+                                l2cpu.idx(),
+                                extra
+                            );
+                        }
+                    }
+
+                    if let Err(e) = auto_release_for_reboot(state, l2cpu_idx) {
+                        crate::dlog!(
+                            "[console l2cpu {}] auto-reboot failed: {} — operator can still `bhx boot -l {}` manually",
+                            l2cpu.idx(),
+                            e,
+                            l2cpu.idx()
+                        );
+                        let fallback = format!(
+                            "[bhx: auto-reboot failed: {}; run `bhx boot -l {}` to release]\r\n",
+                            e,
+                            l2cpu.idx()
+                        );
+                        let _ = hub.push_chip_output(fallback.as_bytes());
+                    } else {
+                        crate::dlog!(
+                            "[console l2cpu {}] auto-reboot fired (reset_type={}); clients + scrollback preserved",
+                            l2cpu.idx(),
+                            reset_type
+                        );
+                    }
+                } else {
+                    // SHUTDOWN (or unknown type — defaults to the
+                    // safe shape that releases resources).
+                    drop_workers_on_shutdown_park(state, l2cpu_idx);
+                    hub.disconnect_all_with_reason(&format!(
+                        "l2cpu {} parked (guest powered off); `bhx boot -l {}` to release",
+                        l2cpu.idx(),
+                        l2cpu.idx()
+                    ));
+                    // Throw away the hub's scrollback. Bytes from the
+                    // dead kernel aren't useful to a future re-attach,
+                    // and stale `\x1b[6n` queries embedded in them would
+                    // re-prompt the operator's terminal for a CPR
+                    // response that the writer pump then forwards to
+                    // U-Boot's interactive prompt — the same
+                    // autoboot-interrupted-by-stale-input symptom the
+                    // chip-side ring drain (below) addresses, but on
+                    // the host side via terminal-replied control
+                    // sequences. Operators who want a post-mortem of
+                    // what the previous kernel printed can use the tail
+                    // captured by `internal_stop` (#160) on a Stopped
+                    // slot.
+                    hub.clear_scrollback();
+                    // Drain any input the kernel didn't consume before
+                    // it poweroff'd: bytes still in the daemon-side
+                    // mpsc channel from the writer client, plus bytes
+                    // already pushed into the chip-side virtuart RX
+                    // ring. Without this, U-Boot reads them on the
+                    // next release-from-purgatory wake and treats them
+                    // as commands at the `=>` prompt, interrupting
+                    // autoboot. Cross-domain write of `rx_tail` is
+                    // safe here because the guest is in OpenSBI's
+                    // hsm_hart_wait — no kernel is reading from this
+                    // ring.
+                    let mpsc_dropped = drain_input_channel(input_rx);
+                    let ring_dropped = unsafe { drain_rx_ring(q) };
+                    if mpsc_dropped > 0 || ring_dropped > 0 {
+                        crate::dlog!(
+                            "[console l2cpu {}] parked: dropped {} byte(s) from input mpsc, {} byte(s) from chip-side RX ring",
+                            l2cpu.idx(),
+                            mpsc_dropped,
+                            ring_dropped
+                        );
+                    }
                 }
             }
             last_parked = parked;
@@ -546,6 +684,141 @@ fn read_parked_reset_type(l2cpu: &L2Cpu, mem_start: u64) -> u32 {
         Ok(v) => v,
         Err(_) => crate::regs::purgatory::RESET_TYPE_SHUTDOWN,
     }
+}
+
+/// (#177) Drop the slot's net worker on a REBOOT-typed park, the
+/// same way `dispatch_remove_net` does it for an explicit operator
+/// RPC. Returns the slot's cached `net_extra_fwd` so the caller can
+/// re-attach with the same port shape — or `None` if there was no
+/// net attached / the slot is gone / boot_payload is missing (warm-
+/// resumed; can't recreate the original shape).
+///
+/// Reason for dropping mid-reboot: libslirp's NAT state from the
+/// pre-reboot session would otherwise answer the new kernel's
+/// DHCPDISCOVER with stale lease info, leaving systemd-networkd-
+/// wait-online stuck for minutes on the new boot. The drop +
+/// re-attach pattern in [`reattach_net_for_reboot`] gives the new
+/// boot a clean slirp instance.
+fn drop_net_for_reboot(
+    state: &std::sync::Arc<crate::daemon::DaemonState>,
+    l2cpu_idx: u8,
+) -> Option<Vec<(u16, u16)>> {
+    let net = {
+        let mut g = state.l2cpus[l2cpu_idx as usize].lock().ok()?;
+        let slot = g.as_mut()?;
+        // Only operate on slots that have a cached payload — warm-
+        // resumed slots don't have the cold-boot RPC context, and
+        // re-attach would have nothing meaningful to use.
+        slot.boot_payload.as_ref()?;
+        let n = slot.net.take()?;
+        let extra = slot.net_extra_fwd.clone();
+        if let Ok(disp) = state.dispatcher.lock() {
+            if let Some(d) = disp.as_ref() {
+                let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
+                    + crate::virtio_engine::DEV_NET;
+                d.unregister_slot(slot_idx);
+            }
+        }
+        (n, extra)
+    };
+    let (worker, extra_fwd) = net;
+    worker.stop_and_join();
+    Some(extra_fwd)
+}
+
+/// (#177) Re-attach net to the slot after `drop_net_for_reboot`
+/// took it down. Mirrors `dispatch_add_net`'s engine path — fresh
+/// `VirtioNet` with the supplied forwards, register with the
+/// dispatcher, push a stub `WorkerHandle` so `daemon status`
+/// shows `net=y` again.
+///
+/// Uses the throwaway-socketpair trick to call `dispatch_add_net`
+/// directly so all the pre-flight checks (port availability, etc.)
+/// run consistently with the hot-add path.
+fn reattach_net_for_reboot(
+    state: &std::sync::Arc<crate::daemon::DaemonState>,
+    l2cpu_idx: u8,
+    extra_fwd: &[(u16, u16)],
+) -> Result<(), String> {
+    use std::os::unix::net::UnixStream;
+    let (throwaway, _drop) =
+        UnixStream::pair().map_err(|e| format!("socketpair for reply: {}", e))?;
+    crate::daemon::server::dispatch_add_net(&throwaway, state, l2cpu_idx, None, extra_fwd.to_vec())
+        .map_err(|e| format!("dispatch_add_net: {}", e))
+}
+
+/// (#177) On a Running → Parked transition with
+/// `reset_type = COLD_REBOOT | WARM_REBOOT`, fire
+/// `dispatch_release` against the parked hart without an operator
+/// RPC. Uses the slot's cached `boot_payload` (kernel/U-Boot path)
+/// and `dtb_bytes` to re-image; passes `disk=None, cloud_init=None,
+/// network=false` so `dispatch_release`'s swap-on-RPC-args path
+/// stays dormant — the existing attachments survive across the
+/// reboot. Result: guest's `reboot` lands back in userspace ~1 s
+/// later, attached `bhx connect` clients ride through (no
+/// disconnect, no scrollback wipe), `daemon status` never reports
+/// Stopped/Parked.
+///
+/// Failures (warm-resumed slot with no cached payload, slot mutex
+/// poisoned, chip read failure, etc.) propagate up so the caller
+/// can log; the slot falls back to the pre-#177 "operator must
+/// `bhx boot -l N` manually" behavior in that case.
+fn auto_release_for_reboot(
+    state: &std::sync::Arc<crate::daemon::DaemonState>,
+    l2cpu_idx: u8,
+) -> Result<(), String> {
+    use std::os::unix::net::UnixStream;
+
+    // Read parked release metadata directly from the chip — same
+    // call dispatch_boot uses on the Parked-slot branch. Returns
+    // Ok(None) if the slot isn't actually parked (e.g. operator
+    // raced us with their own `bhx boot`), which we treat as
+    // "nothing to do."
+    let meta = match crate::daemon::server::read_parked_release_meta(state, l2cpu_idx) {
+        Ok(Some(m)) => m,
+        Ok(None) => return Err("slot not parked when auto-reboot fired".into()),
+        Err(e) => return Err(format!("read_parked_release_meta: {}", e)),
+    };
+
+    // Snapshot the cached payload + dtb_bytes from the slot. Warm-
+    // resumed slots have boot_payload=None; bail with a clear error
+    // so the chip_console caller logs the "manual boot needed" hint.
+    let (payload, dtb_bytes) = {
+        let g = state.l2cpus[l2cpu_idx as usize]
+            .lock()
+            .map_err(|_| "slot mutex poisoned".to_string())?;
+        let slot = g.as_ref().ok_or_else(|| "slot is gone".to_string())?;
+        let p = slot.boot_payload.clone().ok_or_else(|| {
+            "no cached boot_payload (warm-resumed slot has no cold-boot args)".to_string()
+        })?;
+        (p, slot.dtb_bytes.clone())
+    };
+
+    // Throwaway socketpair end catches `dispatch_release`'s
+    // reply_ok — the function writes `Response::Ok` via
+    // `let _ = write_frame(...)`, so a write to a dead half is
+    // swallowed silently. Same trick `swap_attached_for_release`
+    // uses for `dispatch_add_disk` / `dispatch_add_net`.
+    let (throwaway, _drop) =
+        UnixStream::pair().map_err(|e| format!("socketpair for reply: {}", e))?;
+
+    // Call dispatch_release with no swap args (all None/false) so
+    // the existing attachments are preserved. dispatch_release
+    // handles the kernel + DTB re-image, then fires the wake IPI.
+    crate::daemon::server::dispatch_release(
+        state,
+        &throwaway,
+        l2cpu_idx,
+        &payload,
+        meta,
+        dtb_bytes,
+        None,
+        None,
+        false,
+        &[],
+    )
+    .map_err(|e| format!("dispatch_release: {}", e))?;
+    Ok(())
 }
 
 /// (#177) On a Running → Parked transition with `reset_type =

@@ -129,6 +129,25 @@ pub struct L2CpuSlot {
     /// `bhx_l2cpu_uptime_seconds`. Set once at construction; never
     /// updated.
     pub started: Instant,
+    /// (#177) Boot payload the slot was originally cold-booted with
+    /// — kernel or U-Boot path. Cached so the auto-reboot path in
+    /// `chip_console::uart_pass` can fire `dispatch_release` with the
+    /// right re-image target without an explicit operator RPC. Set
+    /// at cold-boot install time; `None` only for warm-resumed slots
+    /// where the prior daemon's cold-boot args are no longer
+    /// available (auto-reboot is skipped in that case, falling back
+    /// to the pre-#177 behavior of "operator must `bhx boot -l N`
+    /// manually").
+    pub boot_payload: Option<crate::daemon::protocol::BootPayload>,
+    /// (#177) Extra TCP forwards (over and above the implicit SSH
+    /// forward) the slot was cold-booted with. Cached so the
+    /// auto-reboot path can recreate the slirp `VirtioNet` with the
+    /// same port shape after dropping the original to flush stale
+    /// slirp state. Empty `Vec` is the common case (no operator
+    /// `--fwd` args); kept on every slot regardless of whether net
+    /// was actually attached so the auto-reboot path doesn't need
+    /// to branch on it.
+    pub net_extra_fwd: Vec<(u16, u16)>,
 }
 
 /// Per-L2CPU virtio-console state — the worker handle plus the

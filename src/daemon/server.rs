@@ -950,6 +950,19 @@ fn dispatch_boot(
     // to OpenSBI's parked state. Re-imaging from this cached buffer
     // gives U-Boot fresh bytes on every wake.
     slot.dtb_bytes = Some(arts.dtb_bytes);
+    // (#177) Cache the boot payload so chip_console's auto-reboot
+    // path knows what to re-image when the guest issues SBI SRST
+    // RESET_TYPE_*REBOOT*. The release-from-purgatory routine needs
+    // a kernel/u-boot path; without this it'd default to whatever
+    // the next operator RPC supplies, which on a guest-driven
+    // reboot is nothing (there's no operator).
+    slot.boot_payload = Some(payload.clone());
+    // (#177) Cache any extra TCP forwards the operator passed at
+    // cold boot. The auto-reboot path drops + re-attaches net to
+    // flush stale slirp state, and needs to reproduce the same
+    // forward shape on the fresh slirp instance. Empty when no
+    // `--fwd` was given.
+    slot.net_extra_fwd = extra_fwd.to_vec();
     // (#117) Record which BLK dev_idx values we emitted DTB nodes for
     // at cold boot. dispatch_add_disk uses this to refuse hot-add of
     // a slot the kernel never saw — Linux's virtio probe walks the DT
@@ -1473,7 +1486,7 @@ pub struct ParkedReleaseMeta {
 /// cell reads as PARKED with valid release metadata, return the
 /// metadata so the caller can drive a release-from-purgatory.
 /// Returns Ok(None) if the slot is None or not parked.
-fn read_parked_release_meta(
+pub(crate) fn read_parked_release_meta(
     state: &Arc<DaemonState>,
     l2cpu_idx: u8,
 ) -> crate::Result<Option<ParkedReleaseMeta>> {
@@ -1746,7 +1759,7 @@ fn take_slot_dtb_bytes(state: &Arc<DaemonState>, l2cpu_idx: u8) -> crate::Result
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_release(
+pub(crate) fn dispatch_release(
     state: &Arc<DaemonState>,
     sock: &UnixStream,
     l2cpu_idx: u8,
@@ -2375,6 +2388,18 @@ fn make_slot_from_l2cpu(
         virtio_console: None,
         virtio_rng: None,
         started: Instant::now(),
+        // (#177) Warm-resumed slots have no record of the original
+        // cold-boot's payload (cold-boot daemon process is gone).
+        // chip_console's auto-reboot path checks this and skips
+        // firing release-from-purgatory when None, falling back to
+        // the pre-#177 "operator must `bhx boot -l N` manually"
+        // behavior.
+        boot_payload: None,
+        // (#177) Same warm-resume story: no record of the original
+        // cold-boot's `--fwd` args. Auto-reboot drops net then
+        // re-attaches with an empty extra_fwd if it gets there at
+        // all (typically blocked earlier by boot_payload=None).
+        net_extra_fwd: Vec::new(),
     })
 }
 
@@ -2828,7 +2853,7 @@ fn dispatch_remove_disk(
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "slirp")]
-fn dispatch_add_net(
+pub(crate) fn dispatch_add_net(
     sock: &UnixStream,
     state: &Arc<DaemonState>,
     l2cpu_idx: u8,
@@ -2925,7 +2950,7 @@ fn dispatch_add_net(
 }
 
 #[cfg(not(feature = "slirp"))]
-fn dispatch_add_net(
+pub(crate) fn dispatch_add_net(
     _sock: &UnixStream,
     _state: &Arc<DaemonState>,
     _l2cpu_idx: u8,
