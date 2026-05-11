@@ -102,6 +102,17 @@ $(SB_SRCDIR)/Makefile: $(DL_DIR)/$(OPENSBI_TARBALL) $(PATCH_FILES)
 		echo "==> Applying $$(basename $$p)"; \
 		(cd $(SB_SRCDIR) && patch -p1 --quiet < $$p) || exit 1; \
 	done
+	@# (bhx#163) Enable the trap-based ISA extension emulator and turn
+	@# on the RVB23 subset that covers the gap between X280 (Gen.1,
+	@# RVA22-class) and a stock RVA23 distro (Ubuntu 25.10+). Skips
+	@# EMU_ALL because that auto-selects EMU_ZBC and EMU_ZVBB, neither
+	@# of which we carry (Zvbb lives in patch v3 3/3, not vendored).
+	@# Append-to-defconfig flow: Kconfiglib picks these up alongside
+	@# the platform's existing defaults during the OpenSBI build's
+	@# olddefconfig pass.
+	@echo "==> Enabling SBI_ISA_EXT_EMU + EMU_RVB23 in generic defconfig"
+	@printf 'CONFIG_SBI_ISA_EXT_EMU=y\nCONFIG_EMU_RVB23=y\n' \
+		>> $(SB_SRCDIR)/platform/generic/configs/defconfig
 	@touch $@
 
 $(DL_DIR)/$(OPENSBI_TARBALL):
