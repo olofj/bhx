@@ -834,6 +834,8 @@ fn dispatch_boot(
             cloud_init.as_deref(),
             network,
             &extra_fwd,
+            rng,
+            console,
         );
     }
 
@@ -865,6 +867,8 @@ fn dispatch_boot(
                 cloud_init.as_deref(),
                 network,
                 &extra_fwd,
+                rng,
+                console,
             );
         }
         dlog!(
@@ -1671,6 +1675,7 @@ fn trigger_force_park_if_available(
 /// add-net` on a freshly-booted-with-no-disks slot. Failures
 /// propagate the standard `Result` error the dispatch_X path
 /// produces, which is exactly what dispatch_release needs.
+#[allow(clippy::too_many_arguments)]
 fn swap_attached_for_release(
     state: &Arc<DaemonState>,
     l2cpu_idx: u8,
@@ -1678,51 +1683,74 @@ fn swap_attached_for_release(
     cloud_init: Option<&str>,
     network: bool,
     extra_fwd: &[(u16, u16)],
+    rng: bool,
+    console: bool,
 ) -> crate::Result<()> {
     use std::os::unix::net::UnixStream;
 
-    // Step 1: take existing disks + net out of the slot under the lock.
-    // Unregister dispatcher entries inside the lock so a concurrent
-    // boot can't observe a half-detached state. Join workers outside.
-    let (old_disks, old_net) = {
+    // Step 1: take existing per-device workers out of the slot
+    // under the lock. Unregister dispatcher entries inside the
+    // lock so a concurrent boot can't observe a half-detached
+    // state. Join workers outside.
+    let (old_disks, old_net, old_vconsole, old_rng) = {
         let mut g = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
         let slot = g.as_mut().ok_or_else(|| {
             crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx))
         })?;
         let disks = std::mem::take(&mut slot.disks);
         let net = slot.net.take();
+        let vc = slot.virtio_console.take();
+        let rng_w = slot.virtio_rng.take();
         if let Some(dispatcher) = state.dispatcher.lock_or_internal_error()?.as_ref() {
+            let base = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU;
             for d in &disks {
                 dispatcher.unregister_slot(d.slot_idx);
             }
             if net.is_some() {
-                let net_slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
-                    + crate::virtio_engine::DEV_NET;
-                dispatcher.unregister_slot(net_slot_idx);
+                dispatcher.unregister_slot(base + crate::virtio_engine::DEV_NET);
+            }
+            if vc.is_some() {
+                dispatcher.unregister_slot(base + crate::virtio_engine::DEV_CONSOLE);
+            }
+            if rng_w.is_some() {
+                dispatcher.unregister_slot(base + crate::virtio_engine::DEV_RNG);
             }
         }
-        (disks, net)
+        (disks, net, vc, rng_w)
     };
     let dropped_n_disks = old_disks.len();
     let had_net = old_net.is_some();
+    let had_vconsole = old_vconsole.is_some();
+    let had_rng = old_rng.is_some();
     for d in old_disks {
         d.worker.stop_and_join();
     }
     if let Some(n) = old_net {
         n.stop_and_join();
     }
-    if dropped_n_disks > 0 || had_net {
+    if let Some(vc) = old_vconsole {
+        vc.worker.stop_and_join();
+    }
+    if let Some(r) = old_rng {
+        r.stop_and_join();
+    }
+    if dropped_n_disks > 0 || had_net || had_vconsole || had_rng {
         dlog!(
-            "[release l2cpu {}] swap: dropped {} disk(s), net={} for re-attach",
+            "[release l2cpu {}] swap: dropped {} disk(s), net={}, vconsole={}, rng={} for re-attach",
             l2cpu_idx,
             dropped_n_disks,
-            had_net
+            had_net,
+            had_vconsole,
+            had_rng
         );
     }
 
     // Step 2: re-attach per RPC, using the existing dispatch_add_*
-    // paths. The throwaway socketpair half catches the reply_ok
-    // writes (reply_ok swallows write errors via `let _`).
+    // paths where they exist (disk, net, console). For rng there's
+    // no hot-add helper; cold-boot uses an inline VirtioRng + a
+    // stub WorkerHandle, do the same here. The throwaway socketpair
+    // half catches the reply_ok writes from dispatch_add_*
+    // (reply_ok swallows write errors via `let _`).
     let (throwaway, _drop) = UnixStream::pair().map_err(|e| crate::Error::Io {
         ctx: "construct throwaway socket for re-attach replies".into(),
         source: e,
@@ -1750,6 +1778,66 @@ fn swap_attached_for_release(
         dispatch_add_net(&throwaway, state, l2cpu_idx, None, extra_fwd.to_vec())?;
         dlog!("[release l2cpu {}] swap: attached net", l2cpu_idx);
     }
+    if console {
+        dispatch_add_console(&throwaway, state, l2cpu_idx)?;
+        dlog!("[release l2cpu {}] swap: attached vconsole", l2cpu_idx);
+    }
+    if rng {
+        attach_rng_inline(state, l2cpu_idx)?;
+        dlog!("[release l2cpu {}] swap: attached rng", l2cpu_idx);
+    }
+    Ok(())
+}
+
+/// (#177) Inline virtio-rng attach for `swap_attached_for_release` —
+/// there's no `dispatch_add_rng` hot-add helper because cold-boot is
+/// the only existing entry point for the rng device. Mirrors the
+/// minimal setup in `run_boot_sequence`'s `register` closure: build
+/// a default `VirtioRng`, write its MMIO config from the daemon side,
+/// register a `RegEntry` with the dispatcher, and push a stub
+/// `WorkerHandle` to `slot.virtio_rng` so `daemon status` reports
+/// `rng=y` again.
+fn attach_rng_inline(state: &Arc<DaemonState>, l2cpu_idx: u8) -> crate::Result<()> {
+    // Engine is held in the slot via `Arc<TensixEngine>`, so cloning
+    // the Arc is cheap; Dispatcher is NOT Clone, so we hold the
+    // dispatcher mutex guard across the full re-attach to keep the
+    // reference live. Same shape `dispatch_add_disk` uses.
+    let engine = state
+        .tensix_engine
+        .lock_or_internal_error()?
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| crate::Error::slot_state("tensix engine not up; can't re-attach rng"))?;
+    let dispatcher_guard = state.dispatcher.lock_or_internal_error()?;
+    let dispatcher = dispatcher_guard
+        .as_ref()
+        .ok_or_else(|| crate::Error::slot_state("dispatcher not running; can't re-attach rng"))?;
+
+    let mut slot_guard = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
+    let slot = slot_guard
+        .as_mut()
+        .ok_or_else(|| crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx)))?;
+
+    let slot_idx =
+        (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU + crate::virtio_engine::DEV_RNG;
+    let config_addr =
+        crate::virtio_engine::slot_regs_base(slot_idx) + crate::virtio_engine::MMIO_CONFIG;
+    let rng = crate::virtio::rng::VirtioRng;
+    crate::virtio::VirtioDeviceImpl::init_config(&rng, engine.l1_ptr(config_addr));
+    let entry = crate::tensix_data_plane::RegEntry::new(
+        slot_idx,
+        Arc::clone(&slot.l2cpu),
+        Box::new(rng),
+        Arc::clone(&slot.interrupt),
+        crate::regs::virtio_mmio::RNG_IRQ,
+        crate::virtio::InterruptKind::Rng,
+    );
+    dispatcher.register_slot(entry);
+    slot.virtio_rng = Some(WorkerHandle {
+        exit: Arc::new(AtomicBool::new(false)),
+        thread: None,
+        description: format!("rng l2cpu {} (engine)", l2cpu_idx),
+    });
     Ok(())
 }
 
@@ -1766,18 +1854,20 @@ pub(crate) fn dispatch_release(
     payload: &crate::daemon::protocol::BootPayload,
     meta: ParkedReleaseMeta,
     dtb_bytes: Option<Vec<u8>>,
-    // (#177) When the boot RPC carries disk/cloud_init/network args,
-    // dispatch_release tears down any current attachments and
-    // re-attaches per the RPC before releasing the hart. This is what
-    // makes `bhx boot --force -d <new.iso>` against a Parked slot
-    // actually boot the new disk rather than the previously-attached
-    // one. If all three are unspecified (None / false), the existing
-    // attachments stay (the "no-arg fast resume" case for a guest
-    // that just rebooted itself).
+    // (#177) When the boot RPC carries any per-device flag set,
+    // dispatch_release tears down current attachments and re-attaches
+    // per the RPC before releasing the hart. This is what makes
+    // `bhx boot --force -i <new>` against a Parked slot actually boot
+    // the new disk rather than the previously-attached one. With all
+    // five flags unspecified (None / false), existing attachments
+    // stay (the "no-arg fast resume" case for a guest that just
+    // rebooted itself).
     disk: Option<&str>,
     cloud_init: Option<&str>,
     network: bool,
     extra_fwd: &[(u16, u16)],
+    rng: bool,
+    console: bool,
 ) -> crate::Result<()> {
     use crate::regs::boot_image;
     let mem_base = crate::l2cpu::L2CPU_STARTING_ADDRESS[l2cpu_idx as usize];
@@ -1842,22 +1932,24 @@ pub(crate) fn dispatch_release(
         );
     }
 
-    // (#177) Swap attached disks/net for what the boot RPC asks for.
-    // - All three RPC args None/false → fast-resume: leave existing
-    //   attachments alone (handles the guest-rebooted-itself case
-    //   where the operator runs `bhx boot -l N` with no new args to
-    //   resume the same guest).
-    // - Any of disk/cloud_init/network set → operator wants a fresh
-    //   attachment config. Tear down whatever's there and attach per
-    //   the RPC, like a cold boot would.
+    // (#177) Swap attached per-device workers for what the boot RPC
+    // asks for. The fast-resume path (all flags None/false) leaves
+    // existing attachments alone — that's the guest-rebooted-itself
+    // case where the operator runs `bhx boot -l N` with no new args.
+    // Any flag set means the operator wants a fresh attachment
+    // config; tear down whatever's there and attach per the RPC.
     //
-    // The chip_console parked-detector (#177) already drops disks+net
-    // on SHUTDOWN-typed park, so for guest-poweroff'd slots the
-    // teardown step below is a no-op. For force-park (which uses
-    // SHUTDOWN type internally) it races chip_console; the explicit
-    // teardown here closes the race window.
-    if disk.is_some() || cloud_init.is_some() || network {
-        swap_attached_for_release(state, l2cpu_idx, disk, cloud_init, network, extra_fwd)?;
+    // The chip_console parked-detector (#177) drops the slot's
+    // disks/net/vconsole/rng on SHUTDOWN-typed park, so for guest-
+    // poweroff'd slots the teardown step below is a no-op (it just
+    // finds empty slots). The re-attach is what gets vconsole + rng
+    // back on the new boot — without re-attaching them here, the
+    // kernel's `console=hvc0` cmdline fails to open a console and
+    // init dies with `Attempted to kill init`.
+    if disk.is_some() || cloud_init.is_some() || network || rng || console {
+        swap_attached_for_release(
+            state, l2cpu_idx, disk, cloud_init, network, extra_fwd, rng, console,
+        )?;
     }
 
     // Clear the PARKED magic before kicking hart 0 so a status read

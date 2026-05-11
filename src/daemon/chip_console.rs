@@ -805,6 +805,11 @@ fn auto_release_for_reboot(
     // Call dispatch_release with no swap args (all None/false) so
     // the existing attachments are preserved. dispatch_release
     // handles the kernel + DTB re-image, then fires the wake IPI.
+    // All five swap flags None/false so dispatch_release stays on
+    // the fast-resume path. The slot's existing disks/vconsole/rng
+    // attachments survive across the reboot — only net was dropped
+    // (by drop_net_for_reboot) and re-attached (by
+    // reattach_net_for_reboot) above, both outside this call.
     crate::daemon::server::dispatch_release(
         state,
         &throwaway,
@@ -816,6 +821,8 @@ fn auto_release_for_reboot(
         None,
         false,
         &[],
+        false,
+        false,
     )
     .map_err(|e| format!("dispatch_release: {}", e))?;
     Ok(())
