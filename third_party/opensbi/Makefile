@@ -13,11 +13,12 @@
 # in `boot::OPENSBI_OFFSET` + `boot_image::*_OFFSET` on the Rust side.
 #
 # Tenstorrent maintains a `tt-blackhole` branch on their opensbi fork.
-# Its functional delta against upstream (v1.7) is the debug_descriptor
-# at offset 0x80 of fw_jump.bin plus a virtual-UART driver — load-
+# Its functional delta against upstream is the debug_descriptor at
+# offset 0x80 of fw_jump.bin plus a virtual-UART driver — load-
 # bearing for daemon warm-resume (chip_console::probe_warm_resume).
-# We pin upstream and apply the Tenstorrent diff as a patch in
-# patches/. The build applies *.patch alphabetically, idempotently.
+# We pin upstream and apply the Tenstorrent diff plus our own
+# downstream patches in patches/. The build applies *.patch
+# alphabetically, idempotently.
 #
 # Usage:
 #   make             # download + verify + build fw_jump.bin
@@ -25,7 +26,7 @@
 #   make clean       # drop the extracted source tree; keep dl/
 #   make distclean   # drop everything including dl/
 
-OPENSBI_VERSION := 1.7
+OPENSBI_VERSION := 1.8.1
 OPENSBI_TARBALL := opensbi-$(OPENSBI_VERSION).tar.gz
 OPENSBI_URL := https://github.com/riscv-software-src/opensbi/archive/refs/tags/v$(OPENSBI_VERSION).tar.gz
 
