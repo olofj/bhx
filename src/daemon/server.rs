@@ -240,7 +240,7 @@ fn warm_resume_released(state: &Arc<DaemonState>, released: &[u8]) {
             "[warm-resume l2cpu {}] probe passed; adopting (console only — use add-disk/add-net to reattach)",
             idx
         );
-        match make_slot_from_l2cpu(l2cpu, idx) {
+        match make_slot_from_l2cpu(state, l2cpu, idx) {
             Ok(slot) => {
                 // Daemon startup; if a slot mutex is already poisoned
                 // here something has gone very wrong — fail loudly via
@@ -823,7 +823,18 @@ fn dispatch_boot(
             l2cpu_idx
         );
         let dtb_bytes = take_slot_dtb_bytes(state, l2cpu_idx)?;
-        return dispatch_release(state, sock, l2cpu_idx, payload, meta, dtb_bytes);
+        return dispatch_release(
+            state,
+            sock,
+            l2cpu_idx,
+            payload,
+            meta,
+            dtb_bytes,
+            disk.as_deref(),
+            cloud_init.as_deref(),
+            network,
+            &extra_fwd,
+        );
     }
 
     // (#166 Phase 5) `bhx boot --force` on a Running slot, when the
@@ -843,7 +854,18 @@ fn dispatch_boot(
                 l2cpu_idx
             );
             let dtb_bytes = take_slot_dtb_bytes(state, l2cpu_idx)?;
-            return dispatch_release(state, sock, l2cpu_idx, payload, meta, dtb_bytes);
+            return dispatch_release(
+                state,
+                sock,
+                l2cpu_idx,
+                payload,
+                meta,
+                dtb_bytes,
+                disk.as_deref(),
+                cloud_init.as_deref(),
+                network,
+                &extra_fwd,
+            );
         }
         dlog!(
             "[boot l2cpu {}] --force: force-park unavailable; falling back to cold-boot teardown path",
@@ -908,7 +930,7 @@ fn dispatch_boot(
         l2cpu_idx
     );
 
-    let mut slot = make_slot_from_l2cpu(arts.l2cpu, l2cpu_idx).map_err(|e| {
+    let mut slot = make_slot_from_l2cpu(state, arts.l2cpu, l2cpu_idx).map_err(|e| {
         dlog!(
             "[boot l2cpu {}] make_slot_from_l2cpu failed: {}",
             l2cpu_idx,
@@ -1622,11 +1644,108 @@ fn trigger_force_park_if_available(
 /// gone, no DTB stash). `dispatch_release` skips the DTB re-image in
 /// that case — the bytes at `dtb_addr` are whatever the previous
 /// kernel left there, which may or may not still be valid.
+/// (#177) Tear down the parked slot's current disks + net, then
+/// re-attach per the boot RPC's `disk` / `cloud_init` / `network`
+/// fields. Called from [`dispatch_release`] when the RPC carries any
+/// of those args (the operator wants a specific attachment config,
+/// not a no-arg fast-resume).
+///
+/// Uses the existing `dispatch_add_disk` / `dispatch_add_net` paths
+/// through a throwaway socketpair end — `reply_ok`'s write to the
+/// dead half is swallowed by `let _ = write_frame(...)`. The pre-
+/// flight checks, dispatcher registration, and slot mutation all run
+/// exactly as if the operator had typed `bhx add-disk` / `bhx
+/// add-net` on a freshly-booted-with-no-disks slot. Failures
+/// propagate the standard `Result` error the dispatch_X path
+/// produces, which is exactly what dispatch_release needs.
+fn swap_attached_for_release(
+    state: &Arc<DaemonState>,
+    l2cpu_idx: u8,
+    disk: Option<&str>,
+    cloud_init: Option<&str>,
+    network: bool,
+    extra_fwd: &[(u16, u16)],
+) -> crate::Result<()> {
+    use std::os::unix::net::UnixStream;
+
+    // Step 1: take existing disks + net out of the slot under the lock.
+    // Unregister dispatcher entries inside the lock so a concurrent
+    // boot can't observe a half-detached state. Join workers outside.
+    let (old_disks, old_net) = {
+        let mut g = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
+        let slot = g.as_mut().ok_or_else(|| {
+            crate::Error::slot_state(format!("l2cpu {} is not booted", l2cpu_idx))
+        })?;
+        let disks = std::mem::take(&mut slot.disks);
+        let net = slot.net.take();
+        if let Some(dispatcher) = state.dispatcher.lock_or_internal_error()?.as_ref() {
+            for d in &disks {
+                dispatcher.unregister_slot(d.slot_idx);
+            }
+            if net.is_some() {
+                let net_slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
+                    + crate::virtio_engine::DEV_NET;
+                dispatcher.unregister_slot(net_slot_idx);
+            }
+        }
+        (disks, net)
+    };
+    let dropped_n_disks = old_disks.len();
+    let had_net = old_net.is_some();
+    for d in old_disks {
+        d.worker.stop_and_join();
+    }
+    if let Some(n) = old_net {
+        n.stop_and_join();
+    }
+    if dropped_n_disks > 0 || had_net {
+        dlog!(
+            "[release l2cpu {}] swap: dropped {} disk(s), net={} for re-attach",
+            l2cpu_idx,
+            dropped_n_disks,
+            had_net
+        );
+    }
+
+    // Step 2: re-attach per RPC, using the existing dispatch_add_*
+    // paths. The throwaway socketpair half catches the reply_ok
+    // writes (reply_ok swallows write errors via `let _`).
+    let (throwaway, _drop) = UnixStream::pair().map_err(|e| crate::Error::Io {
+        ctx: "construct throwaway socket for re-attach replies".into(),
+        source: e,
+    })?;
+
+    if let Some(path) = disk {
+        dispatch_add_disk(&throwaway, state, l2cpu_idx, path.to_string(), None)?;
+        dlog!("[release l2cpu {}] swap: attached disk={}", l2cpu_idx, path);
+    }
+    if let Some(path) = cloud_init {
+        dispatch_add_disk(
+            &throwaway,
+            state,
+            l2cpu_idx,
+            path.to_string(),
+            Some("cidata".to_string()),
+        )?;
+        dlog!(
+            "[release l2cpu {}] swap: attached cidata={}",
+            l2cpu_idx,
+            path
+        );
+    }
+    if network {
+        dispatch_add_net(&throwaway, state, l2cpu_idx, None, extra_fwd.to_vec())?;
+        dlog!("[release l2cpu {}] swap: attached net", l2cpu_idx);
+    }
+    Ok(())
+}
+
 fn take_slot_dtb_bytes(state: &Arc<DaemonState>, l2cpu_idx: u8) -> crate::Result<Option<Vec<u8>>> {
     let guard = state.l2cpus[l2cpu_idx as usize].lock_or_internal_error()?;
     Ok(guard.as_ref().and_then(|s| s.dtb_bytes.clone()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_release(
     state: &Arc<DaemonState>,
     sock: &UnixStream,
@@ -1634,6 +1753,18 @@ fn dispatch_release(
     payload: &crate::daemon::protocol::BootPayload,
     meta: ParkedReleaseMeta,
     dtb_bytes: Option<Vec<u8>>,
+    // (#177) When the boot RPC carries disk/cloud_init/network args,
+    // dispatch_release tears down any current attachments and
+    // re-attaches per the RPC before releasing the hart. This is what
+    // makes `bhx boot --force -d <new.iso>` against a Parked slot
+    // actually boot the new disk rather than the previously-attached
+    // one. If all three are unspecified (None / false), the existing
+    // attachments stay (the "no-arg fast resume" case for a guest
+    // that just rebooted itself).
+    disk: Option<&str>,
+    cloud_init: Option<&str>,
+    network: bool,
+    extra_fwd: &[(u16, u16)],
 ) -> crate::Result<()> {
     use crate::regs::boot_image;
     let mem_base = crate::l2cpu::L2CPU_STARTING_ADDRESS[l2cpu_idx as usize];
@@ -1696,6 +1827,24 @@ fn dispatch_release(
              kernel clobbered it",
             l2cpu_idx
         );
+    }
+
+    // (#177) Swap attached disks/net for what the boot RPC asks for.
+    // - All three RPC args None/false → fast-resume: leave existing
+    //   attachments alone (handles the guest-rebooted-itself case
+    //   where the operator runs `bhx boot -l N` with no new args to
+    //   resume the same guest).
+    // - Any of disk/cloud_init/network set → operator wants a fresh
+    //   attachment config. Tear down whatever's there and attach per
+    //   the RPC, like a cold boot would.
+    //
+    // The chip_console parked-detector (#177) already drops disks+net
+    // on SHUTDOWN-typed park, so for guest-poweroff'd slots the
+    // teardown step below is a no-op. For force-park (which uses
+    // SHUTDOWN type internally) it races chip_console; the explicit
+    // teardown here closes the race window.
+    if disk.is_some() || cloud_init.is_some() || network {
+        swap_attached_for_release(state, l2cpu_idx, disk, cloud_init, network, extra_fwd)?;
     }
 
     // Clear the PARKED magic before kicking hart 0 so a status read
@@ -2169,7 +2318,11 @@ fn release_l2cpu_from_reset(
 /// Build the runtime slot on top of an already-constructed `L2Cpu`. All
 /// callers (dispatch_boot, warm-resume) construct the `L2Cpu` themselves
 /// so the chip-touching phase runs exactly once per boot / adoption.
-fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlot> {
+fn make_slot_from_l2cpu(
+    state: &Arc<DaemonState>,
+    l2cpu: Arc<L2Cpu>,
+    l2cpu_idx: u8,
+) -> io::Result<L2CpuSlot> {
     dlog!(
         "[make_slot l2cpu {}] L2Cpu ready; mapping PLIC interrupt window",
         l2cpu_idx
@@ -2191,7 +2344,8 @@ fn make_slot_from_l2cpu(l2cpu: Arc<L2Cpu>, l2cpu_idx: u8) -> io::Result<L2CpuSlo
         let l2cpu = l2cpu.clone();
         let hub = hub.clone();
         let exit = exit.clone();
-        move || chip_console::chip_console_main(l2cpu, hub, input_rx, exit)
+        let state = Arc::clone(state);
+        move || chip_console::chip_console_main(l2cpu, hub, input_rx, exit, state, l2cpu_idx)
     });
 
     Ok(L2CpuSlot {

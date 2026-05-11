@@ -206,11 +206,28 @@ pub mod purgatory {
     /// `--force-reset-pcie`.
     pub const FORCE_PARK_REQ_PA_OFFSET: u64 = STATUS_OFFSET + 0x38;
     pub const FORCE_PARK_REQ_VALUE_OFFSET: u64 = STATUS_OFFSET + 0x40;
+    /// (#177) SBI SRST reset_type stashed by `bhx_purgatory_reset_do`
+    /// and published in `final_exit`. Low 32 bits carry the
+    /// `SBI_SRST_RESET_TYPE_*` enum (SHUTDOWN=0, COLD_REBOOT=1,
+    /// WARM_REBOOT=2). The daemon's parked-state detector reads this
+    /// to decide whether to drop the slot's disk + net workers
+    /// (SHUTDOWN — guest is done, release resources) or hold them
+    /// for a fast resume (REBOOT — same guest is about to come
+    /// back). u64 wire field; only the low 32 bits are meaningful.
+    pub const RESET_TYPE_OFFSET: u64 = STATUS_OFFSET + 0x48;
 
     /// "PARKED__" interpreted as little-endian u64. Final_exit hook
     /// writes this exact value to indicate the harts are about to
     /// enter `sbi_hsm_hart_wait`.
     pub const STATUS_PARKED: u64 = 0x5f5f_4445_4b52_4150;
+
+    /// SBI SRST reset_type values (mirror of
+    /// `SBI_SRST_RESET_TYPE_*` from `sbi_ecall_interface.h`). The
+    /// daemon reads `RESET_TYPE_OFFSET` after observing the PARKED
+    /// magic and compares against these.
+    pub const RESET_TYPE_SHUTDOWN: u32 = 0;
+    pub const RESET_TYPE_COLD_REBOOT: u32 = 1;
+    pub const RESET_TYPE_WARM_REBOOT: u32 = 2;
     /// HSM state values (from `SBI_HSM_STATE_*` in OpenSBI's
     /// `sbi_ecall_interface.h`). Used by the release path to validate
     /// that the parked hart reads as STOPPED before the host writes

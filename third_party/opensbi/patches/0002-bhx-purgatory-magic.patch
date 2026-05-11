@@ -198,7 +198,7 @@ to the host's release path (see #166 Phase 4b).
  	return 0;
  }
  
-@@ -331,6 +349,281 @@
+@@ -331,6 +349,321 @@
  	return fdt_mpxy_init(fdt);
  }
  
@@ -255,9 +255,20 @@ to the host's release path (see #166 Phase 4b).
 + *   +0x30 : CLINT MSIP[0] PA. Host writes 1 to fire the M-mode
 + *           software interrupt that wakes hart 0 from `wfi`.
 + *
++ *   +0x48 : reset_type (u64; low 32 bits carry SBI_SRST_RESET_TYPE_*).
++ *           0 = SHUTDOWN  (guest `poweroff` / `init 0` / force-park IPI)
++ *           1 = COLD_REBOOT
++ *           2 = WARM_REBOOT
++ *           Stashed by `bhx_purgatory_reset_do` (which sees the type
++ *           passed by sbi_system_reset) and published here so the host
++ *           can distinguish "fast-resume the same guest" from "guest
++ *           said it's done; release disk + net resources" (bhx#177).
++ *
 + * Metadata is computed at first call. Subsequent SRSTs reuse the
 + * already-published values (they don't change across re-entries
 + * because OpenSBI's bss is preserved through the HSM warmboot loop).
++ * reset_type is re-stashed on every SRST so the host always sees the
++ * type of the *most recent* shutdown when it observes PARKED.
 + */
 +#define BHX_PURGATORY_STATUS_OFFSET	0x000E0000UL
 +#define BHX_PURGATORY_STATUS_PARKED	0x5f5f44454b524150UL  /* "PARKED__" LE */
@@ -276,6 +287,11 @@ to the host's release path (see #166 Phase 4b).
 + * same final_exit + warmboot path the SBI SRST case uses. */
 +#define BHX_PURGATORY_FORCE_PARK_REQ_PA_OFFSET		(BHX_PURGATORY_STATUS_OFFSET + 0x38)
 +#define BHX_PURGATORY_FORCE_PARK_REQ_VALUE_OFFSET	(BHX_PURGATORY_STATUS_OFFSET + 0x40)
++/* (bhx#177) reset_type stashed by `bhx_purgatory_reset_do` and
++ * published by `bhx_purgatory_final_exit`. Lets the host distinguish
++ * SHUTDOWN (drop disk+net workers) from REBOOT (keep them for fast
++ * resume). */
++#define BHX_PURGATORY_RESET_TYPE_OFFSET			(BHX_PURGATORY_STATUS_OFFSET + 0x48)
 +
 +/* L2CPU local CLINT base — see third_party/dtb/blackhole.dtsi
 + * (`tenstorrent,blackhole-clint` / `sifive,clint0` at 0x2000000).
@@ -304,6 +320,16 @@ to the host's release path (see #166 Phase 4b).
 +	}
 +	return mask;
 +}
++
++/* (bhx#177) Last SBI_SRST_RESET_TYPE_* passed to
++ * `bhx_purgatory_reset_do` for the current SRST cycle. BSS-initialized
++ * to 0 (= SHUTDOWN), which is the safe default if final_exit were to
++ * somehow fire without reset_do being called first — host treats it
++ * as "drop disk+net" rather than the more leaky "keep them around."
++ * In practice reset_do is always called before final_exit because
++ * final_exit is invoked from sbi_exit() which is called from
++ * sbi_system_reset() which is what calls reset_do. */
++static u32 bhx_last_reset_type;
 +
 +static void bhx_purgatory_final_exit(void)
 +{
@@ -336,6 +362,9 @@ to the host's release path (see #166 Phase 4b).
 +	volatile unsigned long *msip_pa =
 +		(volatile unsigned long *)(scratch->fw_start +
 +					   BHX_PURGATORY_MSIP_OFFSET);
++	volatile unsigned long *reset_type_pa =
++		(volatile unsigned long *)(scratch->fw_start +
++					   BHX_PURGATORY_RESET_TYPE_OFFSET);
 +
 +	/* Build the expected peer mask: every hart except ourselves. */
 +	for (i = 0; i < hart_count && i < 64; i++)
@@ -358,6 +387,10 @@ to the host's release path (see #166 Phase 4b).
 +		(unsigned long)&hart0_scratch->next_arg1 : 0UL;
 +	*hsm_state_pa = (unsigned long)hart0_state;
 +	*msip_pa = TT_L2CPU_CLINT_MSIP(0);
++	/* (bhx#177) Publish the SRST type the guest issued so the host
++	 * can decide whether to release disk+net resources (SHUTDOWN) or
++	 * keep them warm for fast resume (REBOOT). */
++	*reset_type_pa = (unsigned long)bhx_last_reset_type;
 +
 +	*peers = peers_mask;
 +	__asm__ volatile("fence ow,ow" : : : "memory");
@@ -384,8 +417,15 @@ to the host's release path (see #166 Phase 4b).
 +
 +static void bhx_purgatory_reset_do(u32 reset_type, u32 reset_reason)
 +{
-+	(void)reset_type; (void)reset_reason;
-+	/* No-op: caller's sbi_system_reset() falls through to sbi_exit(). */
++	(void)reset_reason;
++	/* (bhx#177) Stash the type for `bhx_purgatory_final_exit` to
++	 * publish into the status block. final_exit runs after this
++	 * (sbi_system_reset → reset_do → sbi_exit → final_exit), so a
++	 * single static is the right shape: written here, read there,
++	 * no concurrency. */
++	bhx_last_reset_type = reset_type;
++	/* No-op past the stash: caller's sbi_system_reset() falls
++	 * through to sbi_exit() and onward through final_exit. */
 +}
 +
 +static struct sbi_system_reset_device bhx_purgatory_reset_device = {
@@ -480,7 +520,7 @@ to the host's release path (see #166 Phase 4b).
  struct sbi_platform_operations generic_platform_ops = {
  	.cold_boot_allowed	= generic_cold_boot_allowed,
  	.nascent_init		= generic_nascent_init,
-@@ -346,6 +639,7 @@
+@@ -346,6 +679,7 @@
  	.get_tlb_num_entries	= generic_tlb_num_entries,
  	.timer_init		= fdt_timer_init,
  	.mpxy_init		= generic_mpxy_init,

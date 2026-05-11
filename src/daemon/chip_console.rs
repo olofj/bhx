@@ -123,6 +123,8 @@ fn uart_pass(
     hub: &ConsoleHub,
     input_rx: &mpsc::Receiver<u8>,
     exit_flag: &AtomicBool,
+    state: &std::sync::Arc<crate::daemon::DaemonState>,
+    l2cpu_idx: u8,
 ) -> std::io::Result<UartExit> {
     let starting_address = l2cpu.starting_address();
     let tile = l2cpu.coordinates();
@@ -212,6 +214,15 @@ fn uart_pass(
             last_parked_check = std::time::Instant::now();
             let parked = read_parked_state(l2cpu, purg_pa);
             if detect_park_transition(last_parked, parked) {
+                // (#177) Read the SRST type the guest issued. If
+                // SHUTDOWN, drop the slot's disk + net workers
+                // before disconnecting clients — operator-visible
+                // status will then correctly show `disk=- net=-`
+                // for the parked slot.
+                let reset_type = read_parked_reset_type(l2cpu, starting_address);
+                if reset_type == crate::regs::purgatory::RESET_TYPE_SHUTDOWN {
+                    drop_workers_on_shutdown_park(state, l2cpu_idx);
+                }
                 hub.disconnect_all_with_reason(&format!(
                     "l2cpu {} parked (guest powered off); `bhx boot -l {}` to release",
                     l2cpu.idx(),
@@ -523,6 +534,120 @@ pub(crate) fn detect_park_transition(last_parked: bool, current_parked: bool) ->
     !last_parked && current_parked
 }
 
+/// (#177) Read the SBI SRST reset_type the purgatory hook stashed at
+/// `RESET_TYPE_OFFSET`. Only meaningful when the PARKED magic is set;
+/// caller should check that first. Returns `RESET_TYPE_SHUTDOWN` on
+/// read failure — the safe default that releases pinned resources
+/// rather than the more leaky "keep them around."
+fn read_parked_reset_type(l2cpu: &L2Cpu, mem_start: u64) -> u32 {
+    let pa = mem_start + crate::regs::purgatory::RESET_TYPE_OFFSET;
+    // u64 wire field; low 32 bits carry the enum.
+    match l2cpu.read32(pa) {
+        Ok(v) => v,
+        Err(_) => crate::regs::purgatory::RESET_TYPE_SHUTDOWN,
+    }
+}
+
+/// (#177) On a Running → Parked transition with `reset_type =
+/// SHUTDOWN`, drop the slot's per-device workers: disks, net,
+/// virtio-console, virtio-rng. The guest is done; holding the .img
+/// files and slirp ports open would pin host-side resources, and
+/// keeping the virtio-mmio device descriptors registered makes
+/// `daemon status` misleadingly report them as live.
+///
+/// The slot itself stays alive — `bhx connect` still attaches
+/// post-park to see the goodbye line via the chip-side virtUART
+/// (separate from the virtio-mmio console device dropped here), and
+/// a subsequent `bhx boot` re-attaches fresh resources via
+/// `dispatch_release`'s RPC-arg-aware path.
+///
+/// REBOOT-typed parks return early without dropping anything (the
+/// guest is about to come right back; the existing fast-resume path
+/// expects everything still attached).
+fn drop_workers_on_shutdown_park(
+    state: &std::sync::Arc<crate::daemon::DaemonState>,
+    l2cpu_idx: u8,
+) {
+    use crate::daemon::{DiskWorker, VirtioConsoleSlot, WorkerHandle};
+
+    // Take all per-device workers out under the slot lock; unregister
+    // their dispatcher entries while still holding the lock (matches
+    // the shape dispatch_remove_disk / dispatch_remove_net /
+    // dispatch_remove_console use). Then release the lock before
+    // joining so we don't block other RPCs for the join window.
+    let (disks, net, vconsole, rng): (
+        Vec<DiskWorker>,
+        Option<WorkerHandle>,
+        Option<VirtioConsoleSlot>,
+        Option<WorkerHandle>,
+    ) = {
+        let mut g = match state.l2cpus[l2cpu_idx as usize].lock() {
+            Ok(g) => g,
+            Err(_) => {
+                crate::dlog!(
+                    "[console l2cpu {}] shutdown-park: slot mutex poisoned; skipping worker drop",
+                    l2cpu_idx
+                );
+                return;
+            }
+        };
+        let slot = match g.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        let disks = std::mem::take(&mut slot.disks);
+        let net = slot.net.take();
+        let vconsole = slot.virtio_console.take();
+        let rng = slot.virtio_rng.take();
+        if let Ok(disp) = state.dispatcher.lock() {
+            if let Some(d) = disp.as_ref() {
+                let base = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU;
+                for w in &disks {
+                    d.unregister_slot(w.slot_idx);
+                }
+                if net.is_some() {
+                    d.unregister_slot(base + crate::virtio_engine::DEV_NET);
+                }
+                if vconsole.is_some() {
+                    d.unregister_slot(base + crate::virtio_engine::DEV_CONSOLE);
+                }
+                if rng.is_some() {
+                    d.unregister_slot(base + crate::virtio_engine::DEV_RNG);
+                }
+            }
+        }
+        (disks, net, vconsole, rng)
+    };
+
+    let dropped_disks = disks.len();
+    let had_net = net.is_some();
+    let had_vconsole = vconsole.is_some();
+    let had_rng = rng.is_some();
+    for d in disks {
+        d.worker.stop_and_join();
+    }
+    if let Some(n) = net {
+        n.stop_and_join();
+    }
+    if let Some(vc) = vconsole {
+        vc.worker.stop_and_join();
+    }
+    if let Some(r) = rng {
+        r.stop_and_join();
+    }
+    if dropped_disks > 0 || had_net || had_vconsole || had_rng {
+        crate::dlog!(
+            "[console l2cpu {}] shutdown-park: dropped {} disk(s), net={}, vconsole={}, rng={} \
+             (guest issued SBI_SRST_RESET_TYPE_SHUTDOWN — #177)",
+            l2cpu_idx,
+            dropped_disks,
+            had_net,
+            had_vconsole,
+            had_rng
+        );
+    }
+}
+
 /// Pull every queued byte out of the writer-side mpsc channel and
 /// drop them. Returns the count of bytes dropped. Called on the
 /// Parked transition so client keystrokes the kernel didn't consume
@@ -564,9 +689,11 @@ pub fn chip_console_main(
     hub: Arc<ConsoleHub>,
     input_rx: mpsc::Receiver<u8>,
     exit_flag: Arc<AtomicBool>,
+    state: Arc<crate::daemon::DaemonState>,
+    l2cpu_idx: u8,
 ) {
     while !exit_flag.load(Ordering::Relaxed) {
-        match uart_pass(&l2cpu, &hub, &input_rx, &exit_flag) {
+        match uart_pass(&l2cpu, &hub, &input_rx, &exit_flag, &state, l2cpu_idx) {
             Ok(UartExit::Done) => return,
             Ok(UartExit::Retry) => {
                 std::thread::sleep(Duration::from_millis(100));
