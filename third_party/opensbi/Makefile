@@ -1,25 +1,25 @@
 # SPDX-FileCopyrightText: © 2026 Olof Johansson
 # SPDX-License-Identifier: MIT
 #
-# Build OpenSBI for the Blackhole L2CPU. Source is upstream
-# riscv-software-src/opensbi at a pinned commit SHA, fetched into
-# opensbi-src/ via `git clone`. Build artifacts (opensbi-src/,
-# fw_jump.bin symlink) are gitignored.
+# Build OpenSBI for the Blackhole L2CPU. Source is the bhx downstream
+# fork at github.com/olofj/opensbi on the `bhx` branch — pinned to a
+# specific commit SHA. Cloned into opensbi-src/ (gitignored) by this
+# Makefile; build artifacts (opensbi-src/, fw_jump.bin symlink) are
+# all gitignored.
 #
-# The boot chain: OpenSBI fw_jump (M-mode) -> kernel `Image` directly
+# The fork is a real branch with one commit per bhx feature on top of
+# upstream v1.8.1: tenstorrent debug_descriptor + virtual UART, bhx
+# purgatory, Freisen v3 2/3 (scalar ISA emu), bhx PMU hook + publish
+# struct, Freisen v3 3/3 (Zvbb emu), defconfig + PMU wiring for Zvbb.
+# Bumping the upstream base: rebase the bhx branch onto a newer
+# upstream tag, then bump OPENSBI_SHA / OPENSBI_VERSION here.
+#
+# Boot chain: OpenSBI fw_jump (M-mode) -> kernel `Image` directly
 # (legacy mode), or -> U-Boot (S-mode) -> kernel + initramfs (#44).
 # OpenSBI lands at L2CPU DRAM start; the kernel/U-Boot payload is
 # placed at FW_JUMP_OFFSET (+0x20_0000) and the DTB at
 # FW_JUMP_FDT_OFFSET (+0x10_0000). Those offsets match the addresses
 # in `boot::OPENSBI_OFFSET` + `boot_image::*_OFFSET` on the Rust side.
-#
-# Tenstorrent maintains a `tt-blackhole` branch on their opensbi fork.
-# Its functional delta against upstream is the debug_descriptor at
-# offset 0x80 of fw_jump.bin plus a virtual-UART driver — load-
-# bearing for daemon warm-resume (chip_console::probe_warm_resume).
-# We pin upstream and apply the Tenstorrent diff plus our own
-# downstream patches in patches/. The build applies *.patch
-# alphabetically, idempotently.
 #
 # Why git clone (not tarball): OpenSBI's own Makefile runs
 # `git rev-parse --git-dir` from inside its source tree to produce
@@ -36,14 +36,18 @@
 #   make clean       # drop the source tree
 #   make distclean   # alias of clean (no separate dl/ cache anymore)
 
-# Pinned OpenSBI commit. Update OPENSBI_VERSION (used for display)
-# and OPENSBI_SHA together when bumping. The SHA is what's actually
-# checked out; the version string is for human-readable build banner
-# only and gets propagated to the banner via OpenSBI's own `git
-# describe` against this checkout.
-OPENSBI_VERSION := 1.8.1
-OPENSBI_SHA := 823b88afe71811eb6df556b927fbd6f52d240bf3
-OPENSBI_REPO := https://github.com/riscv-software-src/opensbi.git
+# Pinned bhx-fork commit. The upstream base version is informational;
+# OPENSBI_SHA is what's actually checked out.
+OPENSBI_VERSION := 1.8.1+bhx
+OPENSBI_SHA := 4d0e7be5
+OPENSBI_REPO := https://github.com/olofj/opensbi.git
+OPENSBI_BRANCH := bhx
+
+# Allow a local override: a developer working on the fork itself can
+# point at their working tree without push-roundtripping. Default to
+# the public URL above. Example:
+#   make OPENSBI_REPO=$HOME/bh/opensbi-bhx
+OPENSBI_REPO := $(OPENSBI_REPO)
 
 TOPDIR := $(CURDIR)
 SB_SRCDIR := $(TOPDIR)/opensbi-src
@@ -88,60 +92,25 @@ all: $(FW_JUMP)
 
 help:
 	@echo "Targets:"
-	@echo "  all (default)    Build fw_jump.bin. First run clones the upstream repo."
+	@echo "  all (default)    Build fw_jump.bin. First run clones the bhx fork."
 	@echo "  rebuild          Re-run the build without re-cloning."
 	@echo "  clean            Drop the source tree."
 	@echo "  distclean        Alias of clean."
 	@echo "  check-deps       Verify host tools needed by the OpenSBI build are present."
 	@echo
-	@echo "Pinned OpenSBI version: $(OPENSBI_VERSION) ($(OPENSBI_SHA))"
-	@echo "Cross-compiler:         $(CROSS_COMPILE)gcc"
+	@echo "Pinned OpenSBI:   $(OPENSBI_VERSION) ($(OPENSBI_SHA))"
+	@echo "Source repo:      $(OPENSBI_REPO) [$(OPENSBI_BRANCH)]"
+	@echo "Cross-compiler:   $(CROSS_COMPILE)gcc"
 
-PATCH_FILES := $(sort $(wildcard $(TOPDIR)/patches/*.patch))
-
-# Clone + checkout + apply patches. The marker file is the upstream
-# Makefile in the source tree — its presence + mtime determines
-# whether we need to re-fetch.
-$(SB_SRCDIR)/Makefile: $(PATCH_FILES)
-	@# Reset the source dir before each fetch so patches always apply
-	@# against a known-clean upstream tree. A previous patched
-	@# checkout would otherwise have `tt-blackhole virtual-UART
-	@# driver` files that aren't in upstream, and patch -N would
-	@# double-apply on top.
+# Clone + checkout. The marker file is the upstream Makefile in the
+# source tree — its presence + mtime determines whether we need to
+# re-fetch.
+$(SB_SRCDIR)/Makefile:
 	rm -rf $(SB_SRCDIR)
-	@echo "==> Cloning $(OPENSBI_REPO) @ $(OPENSBI_SHA)"
-	git clone --quiet $(OPENSBI_REPO) $(SB_SRCDIR)
+	@echo "==> Cloning $(OPENSBI_REPO) ($(OPENSBI_BRANCH) @ $(OPENSBI_SHA))"
+	git clone --quiet --branch $(OPENSBI_BRANCH) $(OPENSBI_REPO) $(SB_SRCDIR)
 	@echo "==> Checking out $(OPENSBI_SHA)"
 	git -C $(SB_SRCDIR) checkout --quiet $(OPENSBI_SHA)
-	@# Verify the resolved tag matches our pinned version. Belt +
-	@# suspenders: catches the case where upstream re-points a tag
-	@# (rare but technically allowed by git) or where our SHA/version
-	@# pair drifted out of sync in the Makefile.
-	@resolved=$$(git -C $(SB_SRCDIR) describe --tags --exact-match 2>/dev/null); \
-	if [ "$$resolved" != "v$(OPENSBI_VERSION)" ]; then \
-	    echo "WARNING: pinned SHA $(OPENSBI_SHA) resolves to '$$resolved', expected 'v$(OPENSBI_VERSION)'"; \
-	fi
-	@for p in $(PATCH_FILES); do \
-		echo "==> Applying $$(basename $$p)"; \
-		(cd $(SB_SRCDIR) && patch -p1 --quiet < $$p) || exit 1; \
-	done
-	@# (bhx#163) Enable the trap-based ISA extension emulator and turn
-	@# on the RVB23 subset that covers the gap between X280 (Gen.1,
-	@# RVA22-class) and a stock RVA23 distro (Ubuntu 25.10+). RVB23
-	@# pulls in Zicond / Zimop / Zawrs / Zfa / Zcb / Zcmop and (via
-	@# its RVA22 dependency) Zicbom / Zicboz / Zfhmin / Zba / Zbb /
-	@# Zbs. We additionally enable EMU_ZBC + EMU_SUPM because the
-	@# decode for both is already in patch 0003 and the SBI PMU
-	@# patch in 0004 reserves event-data IDs for them; turning them
-	@# on keeps the wire format complete instead of advertising
-	@# always-zero counters. Skips EMU_ALL because that selects
-	@# EMU_ZVBB which lives in Freisen v3 3/3 (not vendored).
-	@# Append-to-defconfig flow: Kconfiglib picks these up alongside
-	@# the platform's existing defaults during the OpenSBI build's
-	@# olddefconfig pass.
-	@echo "==> Enabling ISA-emu configs in generic defconfig"
-	@printf 'CONFIG_SBI_ISA_EXT_EMU=y\nCONFIG_EMU_RVB23=y\nCONFIG_EMU_ZBC=y\nCONFIG_EMU_SUPM=y\n' \
-		>> $(SB_SRCDIR)/platform/generic/configs/defconfig
 	@touch $@
 
 $(FW_JUMP): $(SB_SRCDIR)/Makefile

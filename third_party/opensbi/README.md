@@ -94,44 +94,59 @@ to recover a still-running L2CPU's UART base, so this patch is
 load-bearing — without it `daemon stop` + `daemon start` against a
 live core can't re-adopt the slot and reports `Wedged`.
 
-Rather than vendoring the entire `tt-blackhole` branch, we pin
-upstream `riscv-software-src/opensbi` at a known SHA and apply the
-Tenstorrent diff plus our own downstream patches as files under
-`patches/`. The Makefile picks up any `*.patch` in that directory in
-alphabetical order, so adding more later is drop-in:
+Source: the bhx downstream OpenSBI fork at
+[`github.com/olofj/opensbi`](https://github.com/olofj/opensbi) on the
+`bhx` branch — pinned to a specific commit SHA by `Makefile`. The
+fork is upstream `riscv-software-src/opensbi v1.8.1` plus one commit
+per bhx feature:
 
-- `0001-tenstorrent-debug-descriptor-virtual-uart.patch` — Tenstorrent's
-  debug_descriptor + virtual-UART driver.
-- `0002-bhx-purgatory-magic.patch` — bhx-purgatory soft-reboot hook
-  (#166), force-park IPI event (#166), SRST-type-aware status block
-  (#177).
-- `0003-isa-ext-emu.patch` — Benedikt Freisen's v3 patch 2/3,
-  trap-based emulation of RVA22/RVA23 ISA extensions so the X280
-  (RVA22-class Gen.1) can run stock RVA23 distros like Ubuntu
-  25.10/26.04. The Makefile flips `CONFIG_SBI_ISA_EXT_EMU=y` +
-  `CONFIG_EMU_RVB23=y` + `CONFIG_EMU_ZBC=y` + `CONFIG_EMU_SUPM=y`
-  in the platform defconfig after the patch applies. See #163.
-- `0004-isa-ext-emu-pmu.patch` — bhx downstream PMU device that
-  surfaces per-hart per-extension hit counts via SBI's
-  platform-firmware-event mechanism. Guest perf attaches with raw
-  `config = 0xC000_0000_0000_0000 | <event_id>`; `bhx debug
-  isa-emu-events` prints the event-ID table. See #199.
+1. `tenstorrent: debug_descriptor + virtual-UART driver` —
+   Tenstorrent's debug_descriptor block and virtual UART, vendored
+   from their `tt-blackhole` branch.
+2. `bhx: SRST-type-aware purgatory soft-reboot hook` — bhx-purgatory
+   (#166) + SRST-type-aware status block (#177).
+3. `lib: sbi: trap-based ISA extension emulator (Freisen v3 2/3)` —
+   Benedikt Freisen's scalar ISA-emu series. See #163.
+4. `lib: sbi: ISA-emu PMU hook + bhx PMU device + host-readable
+   publish` — generic emulator counter hook + bhx PMU device + a
+   statically-placed publish struct the host reads over PCIe via a
+   pointer at fw_jump.bin + 0x88. See #199.
+5. `lib: sbi: Zvbb ISA extension emulation (Freisen v3 3/3)` —
+   Freisen's Vector Basic Bit-manipulation emulator, the gating
+   extension for stock RVA23U64 userspaces (Ubuntu 26.04). See
+   #163.
+6. `bhx: enable EMU_ZVBB + wire it into the ISA-emu PMU` — defconfig
+   knobs + PMU event ID for Zvbb hits.
 
-## Bumping OpenSBI
+Local development against the fork: edit + commit in
+`~/bh/opensbi-bhx/` (a working clone of `olofj/opensbi`), then point
+the Makefile at it temporarily and rebuild:
 
-1. Find the desired upstream tag's SHA:
+```bash
+make -C third_party/opensbi OPENSBI_REPO=$HOME/bh/opensbi-bhx \
+                            OPENSBI_SHA=$(git -C $HOME/bh/opensbi-bhx rev-parse HEAD)
+```
+
+When the change is ready, push the branch to `olofj/opensbi:bhx` and
+bump `OPENSBI_SHA` in `Makefile` to point at the new tip.
+
+## Bumping OpenSBI (upstream → bhx fork → bhx)
+
+1. In the fork clone (`~/bh/opensbi-bhx`), rebase the `bhx` branch
+   onto a newer upstream tag:
    ```bash
-   git ls-remote https://github.com/riscv-software-src/opensbi.git refs/tags/vNEW
+   cd ~/bh/opensbi-bhx
+   git fetch upstream
+   git rebase v1.x.y bhx
    ```
-2. Update `OPENSBI_VERSION` and `OPENSBI_SHA` in `Makefile` (both must
-   move together — version is for the human-readable status line,
-   SHA is what's checked out).
-3. `make clean && make` — refreshes the clone, applies patches, and
-   builds.
-4. If any of the `patches/*.patch` files fail to apply, refresh them
-   against the new tree (`make` will halt with the hunk that didn't
-   apply — fix and re-run).
-5. Verify `fw_jump.bin` boots end-to-end on hardware (banner visible
+2. Fix any conflicts in the bhx feature commits (most likely
+   touching `sbi_illegal_insn.c` or `fw_base.S`).
+3. Push: `git push --force-with-lease origin bhx`.
+4. In bhx, bump `OPENSBI_VERSION` and `OPENSBI_SHA` in
+   `third_party/opensbi/Makefile` together (version is for the
+   human-readable banner, SHA is what's checked out).
+5. `make clean && make` — refreshes the clone and builds.
+6. Verify `fw_jump.bin` boots end-to-end on hardware (banner visible
    via `connect`, kernel hands off to `Image` or U-Boot as expected).
 
 ## Reproducibility

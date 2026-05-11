@@ -154,7 +154,7 @@ pub mod virtio_mmio {
 /// Guest-OS shutdown signalling (#94). One u32 register per L2CPU in
 /// (#166 Phase 1) OpenSBI purgatory status block. Mirrors the
 /// `BHX_PURGATORY_STATUS_OFFSET` / `BHX_PURGATORY_STATUS_PARKED`
-/// constants in `third_party/opensbi/patches/0002-bhx-purgatory-magic.patch`.
+/// constants in the `bhx: SRST-type-aware purgatory soft-reboot hook` commit on the `olofj/opensbi` `bhx` branch.
 /// When the SBI SRST fall-through reaches `sbi_platform_final_exit`,
 /// our patched OpenSBI writes the magic at this offset within the
 /// L2CPU's DRAM range; the daemon polls it via `dispatch_status` to
@@ -183,7 +183,7 @@ pub mod purgatory {
     /// Phase 4a (#166) — hart 0 release-metadata block. Each field
     /// is a u64 PA the host writes to via the L2CPU's persistent
     /// TLB window. Layout matches the C #defines in
-    /// `third_party/opensbi/patches/0002-bhx-purgatory-magic.patch`.
+    /// the `bhx: SRST-type-aware purgatory soft-reboot hook` commit on the `olofj/opensbi` `bhx` branch.
     pub const NEXT_ADDR_PA_OFFSET: u64 = STATUS_OFFSET + 0x10;
     pub const NEXT_MODE_PA_OFFSET: u64 = STATUS_OFFSET + 0x18;
     pub const NEXT_ARG1_PA_OFFSET: u64 = STATUS_OFFSET + 0x20;
@@ -242,7 +242,7 @@ pub mod purgatory {
 }
 
 /// SBI PMU encoding for the ISA-emulation-trap hit counters that
-/// `third_party/opensbi/patches/0004-isa-ext-emu-pmu.patch` adds.
+/// the bhx PMU commit on the `olofj/opensbi` `bhx` branch adds.
 ///
 /// Each emulated extension has a sub-event ID. Mirrors the C-side
 /// `enum sbi_insn_emu_ext` in
@@ -293,12 +293,16 @@ pub mod isa_emu_pmu {
     /// Kconfig help in `0003-isa-ext-emu.patch`.
     pub const SUPM: u32 = 15;
     /// Illegal-instruction traps the emulator could not handle —
-    /// opcode-table fall-throughs (e.g. RVV Zvbb) plus inner-decode
-    /// misses inside `sbi_insn_emu_*()` helpers. `ANY - sum(handled
-    /// extensions) == UNHANDLED` is the usable invariant; when this
-    /// counter moves on a workload that fails, another patch (Zvbb,
-    /// Zvbc, …) is needed before the workload can run.
+    /// opcode-table fall-throughs plus inner-decode misses inside
+    /// `sbi_insn_emu_*()` helpers. `ANY - sum(handled extensions)
+    /// == UNHANDLED` is the usable invariant; when this counter
+    /// moves on a workload that fails, another emulator (Zvbc,
+    /// Zvfh, …) is needed before the workload can run.
     pub const UNHANDLED: u32 = 16;
+    /// Vector Basic Bit-manipulation — Freisen v3 3/3. Gating
+    /// extension for stock RVA23U64 userspaces (Ubuntu 26.04 /
+    /// glibc-RVA23) on the X280, which has RVV 1.0 but no Zvbb.
+    pub const ZVBB: u32 = 17;
 
     /// Compile-time-checkable list of all defined event IDs and the
     /// short human-readable name used in `bhx debug isa-emu-events`
@@ -322,6 +326,7 @@ pub mod isa_emu_pmu {
         (ZBC, "Zbc"),
         (SUPM, "Supm"),
         (UNHANDLED, "UNHANDLED"),
+        (ZVBB, "Zvbb"),
     ];
 
     /// Wire-format constants for the host-readable counter mirror
@@ -338,7 +343,13 @@ pub mod isa_emu_pmu {
     pub const PUBLISH_PTR_OFFSET: u64 = 0x88;
     /// "BPMU" interpreted little-endian as a u32.
     pub const PUBLISH_MAGIC: u32 = 0x554d_5042;
-    pub const PUBLISH_VERSION: u32 = 1;
+    /// Wire-format version. Bump whenever the layout or event ID
+    /// space changes; the firmware-side `BHX_EMU_PMU_VERSION`
+    /// must move in lockstep.
+    ///
+    ///   - v1 (initial): NONE..SUPM + UNHANDLED (17 slots).
+    ///   - v2: appended ZVBB (18 slots).
+    pub const PUBLISH_VERSION: u32 = 2;
     /// Static cap on per-hart slots in the publish array — must
     /// match `BHX_EMU_PMU_MAX_HARTS` on the firmware side.
     pub const PUBLISH_MAX_HARTS: usize = 8;
@@ -351,7 +362,7 @@ pub mod isa_emu_pmu {
     /// Total number of event slots in the firmware enum, including
     /// the `NONE` sentinel — equal to `SBI_INSN_EMU_EXT_MAX` on the
     /// C side. The `counts[hart]` array is sized by this.
-    pub const EVENT_COUNT: usize = (UNHANDLED as usize) + 1;
+    pub const EVENT_COUNT: usize = (ZVBB as usize) + 1;
 
     /// Layout-compatible Rust mirror of the firmware-side
     /// `struct bhx_emu_pmu_publish`. `#[repr(C)]` + field order must
@@ -484,8 +495,8 @@ mod tests {
         // The last entry's ID + 1 is the C-side `_MAX` sentinel.
         // Hardcoded so a future enum extension on the C side without
         // a matching Rust update fails this test loudly.
-        assert_eq!(isa_emu_pmu::EVENTS.len(), 17);
-        assert_eq!(isa_emu_pmu::EVENT_COUNT, 17);
+        assert_eq!(isa_emu_pmu::EVENTS.len(), 18);
+        assert_eq!(isa_emu_pmu::EVENT_COUNT, 18);
     }
 
     /// The host PMU reader interprets the firmware-published struct
@@ -502,12 +513,12 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Publish, max_harts), 8);
         assert_eq!(std::mem::offset_of!(Publish, max_events), 12);
         assert_eq!(std::mem::offset_of!(Publish, counts), 16);
-        // counts: 8 harts × 17 events × 8 bytes = 1088. Next field at 16 + 1088 = 1104.
-        assert_eq!(std::mem::offset_of!(Publish, ctr_to_event), 16 + 1088);
+        // counts: 8 harts × 18 events × 8 bytes = 1152. Next field at 16 + 1152 = 1168.
+        assert_eq!(std::mem::offset_of!(Publish, ctr_to_event), 16 + 1152);
         // Struct alignment is 64 (cache line), so size rounds up
-        // accordingly. 1104 + (8 × 16 × 4) = 1616; rounded up to a
-        // multiple of 64 is 1664.
-        assert_eq!(std::mem::size_of::<Publish>(), 1664);
+        // accordingly. 1168 + (8 × 16 × 4) = 1680; rounded up to a
+        // multiple of 64 is 1728.
+        assert_eq!(std::mem::size_of::<Publish>(), 1728);
         assert_eq!(std::mem::align_of::<Publish>(), 64);
     }
 

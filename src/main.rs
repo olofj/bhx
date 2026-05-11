@@ -597,7 +597,7 @@ enum DebugAction {
     /// Lists each emulated extension with its sub-event ID and a
     /// copy-pasteable `perf stat -e r<config>` recipe. The counters
     /// themselves live in M-mode firmware (OpenSBI; see
-    /// `third_party/opensbi/patches/0004-isa-ext-emu-pmu.patch`); to
+    /// the bhx PMU commit on the `olofj/opensbi` `bhx` branch); to
     /// read them, run the printed `perf` command inside the guest
     /// around a workload of interest. Does not touch the chip and
     /// is safe to run with or without the daemon.
@@ -1586,7 +1586,7 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
 
 /// Print the SBI PMU event-ID table and a copy-pasteable `perf` recipe
 /// for the ISA-emulation hit counters that
-/// `third_party/opensbi/patches/0004-isa-ext-emu-pmu.patch` adds.
+/// the bhx PMU commit on the `olofj/opensbi` `bhx` branch adds.
 ///
 /// The counters live in M-mode firmware on the X280, exposed via SBI
 /// PMU platform firmware events. Linux's `riscv_pmu_sbi` driver routes
