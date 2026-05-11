@@ -34,6 +34,7 @@ are read for parity with the bash soaks.
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -163,6 +164,29 @@ def wait_for(needle: bytes, timeout_s: float, from_idx: int = 0) -> int:
     sys.exit(10)
 
 
+def wait_for_re(pattern: bytes, timeout_s: float, from_idx: int = 0) -> int:
+    """`wait_for` variant that takes a regex. Use for markers that can
+    appear both in command echoes (typed input the shell echoed back)
+    and in command output (the shell actually ran the line). Matching
+    against `FIO_STARTED:\\d+` instead of `FIO_STARTED:` only matches
+    the executed `echo FIO_STARTED:$FIO_PID` output (which contains a
+    real PID), not the command echo (which contains the literal
+    `$FIO_PID`)."""
+    deadline = time.time() + timeout_s
+    pat = re.compile(pattern)
+    while time.time() < deadline:
+        with buf_lock:
+            m = pat.search(bytes(buf), from_idx)
+            if m:
+                return m.start()
+        time.sleep(0.05)
+    with buf_lock:
+        tail = bytes(buf)[-400:]
+    note(f"TIMEOUT waiting for {pattern!r} — last 400 bytes: {tail!r}")
+    proc.kill()
+    sys.exit(10)
+
+
 def send(data: bytes) -> None:
     proc.stdin.write(data)
     proc.stdin.flush()
@@ -195,24 +219,50 @@ with buf_lock:
     cursor = len(buf)
 wait_for(prompt, 5, from_idx=cursor)
 
+# Copy fio (and the small set of utilities we'll fork) into tmpfs once.
+# After many remove/add-disk cycles the kernel's page cache for vda-
+# resident binaries gets evicted; the next fork+exec of /usr/bin/fio
+# faults pages back from a freshly-re-attached vda and can hang under
+# the wrong virtio-blk recovery interaction. /tmp is tmpfs, so a copy
+# placed there is never evicted regardless of how many times vda is
+# yanked. `which` is a busybox builtin; cp is a separate applet but
+# only runs once at setup, which is well before the soak loop starts.
+note("staging fio into tmpfs (/tmp/fio) to dodge vda-page-cache eviction")
+with buf_lock:
+    cursor = len(buf)
+send(b"cp $(which fio) /tmp/fio && chmod +x /tmp/fio && echo FIO_STAGED_OK\r")
+# Match the output line: `\nFIO_STAGED_OK`. Line-start anchoring
+# excludes the typed echo (which has `echo FIO_STAGED_OK` with the
+# literal `echo ` prefix). Both command-echo and execution-output
+# lines end in `\r\r\n` in raw mode.
+wait_for_re(rb"\nFIO_STAGED_OK\b", 10, from_idx=cursor)
+
 
 # ---- Helper: drive fio in the guest --------------------------------------
 def start_fio_in_guest() -> None:
     """Background-fork fio in the guest. Writes to /root/fio.tmp on the
     rootfs (vda) so the daemon's virtio-blk worker actually sees the
-    descriptors. The PID file lets us kill it if anything goes wrong."""
+    descriptors. Stash the PID in a shell variable so kill_fio doesn't
+    have to fork `cat /tmp/fio.pid` — after many add/remove cycles
+    the kernel's page cache for vda-resident binaries (cat, etc.)
+    can be evicted, and re-faulting them through a freshly-re-added
+    virtio-blk hangs the shell. `$!` is a shell builtin variable,
+    no fork. `direct=1` skips the kernel page cache so we're not
+    competing with binary pages for cache lines."""
     cmd = (
-        b"fio --name=stress --rw=randwrite --bs=4k "
+        b"/tmp/fio --name=stress --rw=randwrite --bs=4k "
         b"--size=64M --runtime=" + str(args.fio_runtime).encode() + b" "
-        b"--filename=/root/fio.tmp --direct=0 "
+        b"--filename=/root/fio.tmp --direct=1 "
         b"--output=/tmp/fio.log "
-        b">/dev/null 2>&1 & echo $! > /tmp/fio.pid; "
-        b"echo FIO_STARTED:$(cat /tmp/fio.pid)\r"
+        b">/dev/null 2>&1 & FIO_PID=$!; "
+        b"echo FIO_STARTED:$FIO_PID\r"
     )
     with buf_lock:
         cursor = len(buf)
     send(cmd)
-    idx = wait_for(b"FIO_STARTED:", 30, from_idx=cursor)
+    # Match `FIO_STARTED:<digits>` in execution output, not the
+    # `echo FIO_STARTED:$FIO_PID` command echo (literal `$FIO_PID`).
+    idx = wait_for_re(rb"FIO_STARTED:\d+\r", 30, from_idx=cursor)
     # Sleep so fio actually starts issuing descriptors (the runtime
     # parameter is when it stops; we want it actively writing when we
     # call remove-disk).
@@ -221,17 +271,21 @@ def start_fio_in_guest() -> None:
 
 
 def kill_fio_in_guest() -> None:
-    cmd = b"kill -9 $(cat /tmp/fio.pid 2>/dev/null) 2>/dev/null; rm -f /tmp/fio.pid /root/fio.tmp; echo FIO_KILLED\r"
+    # `$FIO_PID` is the shell variable set by `start_fio_in_guest`;
+    # `kill` is a busybox builtin (no fork, no syscall into vda).
+    # We DO NOT `rm /root/fio.tmp` here — that's an unlink on vda
+    # metadata, and the previous remove-disk has left fio's in-flight
+    # writes stuck in the kernel as D-state I/O against the old
+    # virtio_blk session. The unlink queues behind that and never
+    # completes, wedging the shell. fio overwrites /root/fio.tmp on
+    # each iter anyway, so no cleanup is needed.
+    cmd = b"kill -9 $FIO_PID 2>/dev/null; echo FIO_KILLED\r"
     with buf_lock:
         cursor = len(buf)
     send(cmd)
-    # Best-effort — if connect dropped because remove-disk killed the
-    # virtio-blk worker, the next add-disk's re-mount will reset
-    # everything anyway.
-    try:
-        wait_for(b"FIO_KILLED", 5, from_idx=cursor)
-    except SystemExit:
-        pass
+    # Line-start anchoring (`\nFIO_KILLED`) matches execution output,
+    # not the typed `echo FIO_KILLED` command echo.
+    wait_for_re(rb"\nFIO_KILLED\b", 5, from_idx=cursor)
 
 
 # ---- Soak loop -----------------------------------------------------------

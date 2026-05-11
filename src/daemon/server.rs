@@ -64,6 +64,9 @@ pub fn serve(
     let shared_chip = Arc::new(crate::shared_chip::SharedChip::new(card)?);
     let state = Arc::new(DaemonState::new(card, shared_chip));
     install_signal_handlers(state.shutdown.clone());
+    // (#195) Read the PLIC latch-window investigation knob from env. No-op
+    // unless BHX_PLIC_LATCH_US is set; default behavior is unchanged.
+    crate::virtio::interrupt::init_latch_window_from_env();
     crate::daemon::metrics::spawn_chip_telemetry_poller(Arc::clone(&state));
 
     listener.set_nonblocking(true)?;
@@ -192,7 +195,7 @@ fn probe_initial_chip_state(shared: &crate::shared_chip::SharedChip, card: u32) 
 /// which disk image or network config was attached before, so the user
 /// must re-issue `add-disk` / `add-net` to rewire those. The chip's
 /// guest kernel stays up throughout; virtio descriptor chains re-sync
-/// on the next queue kick once workers come back.
+/// on the next QUEUE_NOTIFY once the dispatcher comes back up.
 fn warm_resume_released(state: &Arc<DaemonState>, released: &[u8]) {
     // Engine path: if any L2CPU is live across the daemon restart,
     // the BRISC firmware on the engine tile is also live (same chip
@@ -943,14 +946,14 @@ fn dispatch_boot(
         slot.blk_dtb_dev_idx
     );
 
-    // Register virtio device handlers with the engine's kick poller.
+    // Register virtio device handlers with the engine's dispatcher.
     // When the guest writes QUEUE_NOTIFY for a registered slot, the
     // poller looks up the entry, walks the descriptor chain via
     // `process_one_chain_for_queue`, and fires the PLIC IRQ.
     {
         let engine_for_init = state.tensix_engine.lock_or_internal_error()?.clone();
-        if let (Some(poller), Some(engine)) = (
-            state.kick_poller.lock_or_internal_error()?.as_ref(),
+        if let (Some(dispatcher), Some(engine)) = (
+            state.dispatcher.lock_or_internal_error()?.as_ref(),
             engine_for_init,
         ) {
             // Helper closure: register one device + initialize its
@@ -981,7 +984,7 @@ fn dispatch_boot(
                     irq,
                     kind,
                 );
-                poller.register_slot(entry);
+                dispatcher.register_slot(entry);
                 dlog!(
                     "[run_boot l2cpu {}] virtio-engine: registered {} on slot {} \
                          (config @ {:#x})",
@@ -1134,13 +1137,13 @@ fn dispatch_boot(
             let _ = extra_fwd;
             if console {
                 // virtio-console wants two halves: the device side
-                // (registered with the kick poller for TX/RX) and a
+                // (registered with the dispatcher for TX/RX) and a
                 // VirtioConsoleSlot on the per-L2CPU slot so the
                 // attach-console RPC + the input-fanout in
                 // dispatch_attach_console can find the input_buf.
                 // Same shape as `start_virtio_console` for the legacy
                 // host-buffer path; the only difference is we skip
-                // spawning a worker (the kick poller handles dispatch).
+                // spawning a worker (the dispatcher handles dispatch).
                 let input_buf = Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::with_capacity(
                         crate::virtio::console::RX_BUFFER_CAP,
@@ -1159,7 +1162,7 @@ fn dispatch_boot(
                 );
                 slot.virtio_console = Some(crate::daemon::VirtioConsoleSlot {
                     // Stub WorkerHandle — the engine path doesn't
-                    // spawn a per-device worker; the kick poller
+                    // spawn a per-device worker; the dispatcher
                     // handles dispatch. Keeping the slot field
                     // populated lets the rest of the daemon (attach,
                     // shutdown, status) treat the engine path
@@ -1177,7 +1180,7 @@ fn dispatch_boot(
             // through `push_chip_output`. Always-on with the engine —
             // the DTB node is also unconditionally emitted, so distro
             // kernels with `console=ttyS0` find a real backing device.
-            poller.register_uart(l2cpu_idx, Arc::clone(&slot.console_hub));
+            dispatcher.register_uart(l2cpu_idx, Arc::clone(&slot.console_hub));
             dlog!(
                 "[run_boot l2cpu {}] uart-engine: registered TX path on slot {}",
                 l2cpu_idx,
@@ -1185,7 +1188,7 @@ fn dispatch_boot(
             );
         } else {
             dlog!(
-                "[run_boot l2cpu {}] virtio-engine: engine + kick poller not up — \
+                "[run_boot l2cpu {}] virtio-engine: engine + dispatcher not up — \
                  skipping device registration",
                 l2cpu_idx
             );
@@ -1232,7 +1235,7 @@ fn handle_existing_slot(
         // dispatch into the slot we're about to tear down), then
         // slot.shutdown() joins workers and drops the L2Cpu Arc. A
         // reorder that put shutdown() before the unregister would
-        // leave a one-iteration window where the kick poller could
+        // leave a one-iteration window where the dispatcher could
         // dereference a freed Arc<L2Cpu>. See CLAUDE.md's "Boot must
         // not race with live workers during board reset" invariant.
         prior
@@ -1290,11 +1293,40 @@ fn maybe_opportunistic_reset_board(
     target_idx: u8,
     card: u32,
 ) -> crate::Result<()> {
-    // Snapshot non-target slot states without holding all four mutexes
-    // simultaneously: identify Running siblings and Parked siblings in
-    // separate passes. Running detection: slot is Some AND its
-    // purgatory cell does NOT read PARKED. Parked detection: slot is
-    // Some AND purgatory cell == PARKED magic.
+    // Hold boot_lock across the entire decide-and-do flow so a parallel
+    // cold-boot RPC can't race past the sibling scan while we're mid-
+    // reset. Without this, 4 simultaneous cold boots all snapshot
+    // "no Running siblings" (because each in-flight boot hasn't yet
+    // populated the slot table), each enters the reset branch, and
+    // the second through fourth resets blip the chip while the first
+    // boot is mid-`L2Cpu::new` — invalidates its mmap pages and the
+    // worker threads SIGBUS on the next L1 access.
+    let _boot_guard = state
+        .boot_lock
+        .lock()
+        .map_err(|_| crate::Error::internal("daemon boot_lock poisoned"))?;
+
+    // Once any boot in this session has reset the chip, the chip is
+    // "ours" — subsequent cold boots don't need to re-reset, and
+    // doing so would punch holes in earlier-booted L2CPU mmaps. The
+    // flag lives for the duration of the daemon process; an external
+    // `tt-smi -r` between boots is operator-initiated recovery, and
+    // the operator is expected to restart the daemon afterwards.
+    if state
+        .chip_reset_this_session
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        dlog!(
+            "[boot l2cpu {}] opportunistic reset_board skipped — \
+             chip was already reset this session",
+            target_idx
+        );
+        return Ok(());
+    }
+
+    // Snapshot non-target slot states. Running detection: slot is
+    // Some AND its purgatory cell does NOT read PARKED. Parked
+    // detection: slot is Some AND purgatory cell == PARKED magic.
     let mut running_siblings = Vec::new();
     let mut parked_siblings = Vec::new();
     for i in 0..4u8 {
@@ -1334,7 +1366,7 @@ fn maybe_opportunistic_reset_board(
 
     // Drop parked-sibling L2Cpu instances + transition slots to None.
     // Console-hub clients (if any) get the goodbye; engine slots
-    // unregister so the kick poller stops dispatching to them.
+    // unregister so the dispatcher stops dispatching to them.
     for &i in &parked_siblings {
         if let Ok(true) = internal_stop(state, i, "opportunistic reset_board") {
             dlog!(
@@ -1345,18 +1377,13 @@ fn maybe_opportunistic_reset_board(
         }
     }
 
-    // Drop the engine + kick poller before the PCIe LDS reset. Their
+    // Drop the engine + dispatcher before the PCIe LDS reset. Their
     // fds point at the about-to-be-reset chardev; holding them across
-    // the reset would leave them pointing at unmapped BARs.
-    let _ = state.kick_poller.lock_or_internal_error()?.take();
+    // the reset would leave them pointing at unmapped BARs. Dropping
+    // the poller joins its thread synchronously.
+    let _ = state.dispatcher.lock_or_internal_error()?.take();
     let _ = state.tensix_engine.lock_or_internal_error()?.take();
 
-    // Hold the boot_lock across reset_board so a concurrent boot RPC
-    // (different thread, different L2CPU) doesn't race with the reset.
-    let _boot_guard = state
-        .boot_lock
-        .lock()
-        .map_err(|_| crate::Error::internal("daemon boot_lock poisoned"))?;
     state
         .shared_chip
         .reset_board(card)
@@ -1364,6 +1391,9 @@ fn maybe_opportunistic_reset_board(
             ctx: "opportunistic reset_board".into(),
             source: e,
         })?;
+    state
+        .chip_reset_this_session
+        .store(true, std::sync::atomic::Ordering::Release);
     dlog!(
         "[boot l2cpu {}] opportunistic reset_board complete",
         target_idx
@@ -1770,7 +1800,7 @@ fn dispatch_release(
 
     // No need to re-spawn workers or update slot bookkeeping: the
     // existing console worker keeps draining the virt UART, the
-    // virtio handlers stay registered with the kick poller, the
+    // virtio handlers stay registered with the dispatcher, the
     // slot's L2Cpu Arc lives on. Status will flip from Parked back
     // to Running on the next status query (we cleared the magic).
     let _ = (rootfs_addr,); // unused on this path until DTB rebuild lands
@@ -2016,7 +2046,7 @@ fn run_boot_sequence(
         //
         // The 8250 *register file* is still set up in BRISC L1 so a
         // patched guest that writes to the fixed UART PA gets its
-        // bytes drained by TRISC0 + the kick poller. Leaving it
+        // bytes drained by TRISC0 + the dispatcher. Leaving it
         // visible to OpenSBI was the regression. Re-add the DTB node
         // (set `uart_addr_for_dtb = Some(uart_pa)`) only when
         // bringing up a distro that *requires* `console=ttyS0` AND
@@ -2038,7 +2068,7 @@ fn run_boot_sequence(
     // patches/0002-bhx-purgatory-magic.patch) which writes the "PARKED__"
     // magic at mem_base + 0xE0000. The host re-releases hart 0 from the
     // parked state on the next `bhx boot` (no chip reset). The pre-#166
-    // BRISC shutdown register + kick-poller event path is gone.
+    // BRISC shutdown register + dispatcher event path is gone.
     let _ = x280_base_for_shutdown;
     let dtb_patched = boot::modify_dtb(
         &dtb_raw,
@@ -2472,17 +2502,17 @@ fn dispatch_add_disk(
     })?;
     let irq = irq_for_blk_dev_idx(dev_idx);
 
-    // Engine path: register a fresh VirtioBlk with the kick poller
+    // Engine path: register a fresh VirtioBlk with the dispatcher
     // and push a stub DiskWorker so `daemon status` reflects the
-    // attach. The kick poller drops kicks for unregistered slots
+    // attach. The dispatcher's drain skips unregistered slots
     // (#71 M5.5b), so a guest probe before this call simply doesn't
     // see the device — same effect as the legacy worker not having
     // started yet. There is no per-device worker thread to spawn;
-    // the kick poller handles dispatch.
+    // the dispatcher handles dispatch.
 
     {
-        if let (Some(poller), Some(engine)) = (
-            state.kick_poller.lock_or_internal_error()?.as_ref(),
+        if let (Some(dispatcher), Some(engine)) = (
+            state.dispatcher.lock_or_internal_error()?.as_ref(),
             state.tensix_engine.lock_or_internal_error()?.clone(),
         ) {
             match crate::virtio::block::VirtioBlk::from_file_with_serial(
@@ -2503,7 +2533,7 @@ fn dispatch_add_disk(
                         irq,
                         crate::virtio::InterruptKind::Block,
                     );
-                    poller.register_slot(entry);
+                    dispatcher.register_slot(entry);
                     slot.disks.push(DiskWorker {
                         path: path.clone(),
                         slot_idx,
@@ -2558,7 +2588,7 @@ fn dispatch_remove_disk(
     validate_l2cpu(l2cpu_idx)?;
 
     // Take the matching disks out under the lock; unregister their
-    // kick-poller slots while still holding the slot mutex (so the
+    // dispatcher slots while still holding the slot mutex (so the
     // poller can't race a fresh kick against a half-detached
     // VirtioBlk); release the lock; then join workers outside.
     // `stop_and_join` blocks until the worker's poll loop notices its
@@ -2615,12 +2645,12 @@ fn dispatch_remove_disk(
                 }
             }
         }
-        // Drop the kick-poller registrations for the slots we're
+        // Drop the dispatcher registrations for the slots we're
         // taking. Done under the slot mutex so a concurrent boot RPC
         // for this L2CPU can't observe a torn state.
-        if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
+        if let Some(dispatcher) = state.dispatcher.lock_or_internal_error()?.as_ref() {
             for d in &taken {
-                poller.unregister_slot(d.slot_idx);
+                dispatcher.unregister_slot(d.slot_idx);
             }
         }
         taken
@@ -2686,11 +2716,11 @@ fn dispatch_add_net(
     }
 
     // Engine path: build the VirtioNet directly + register with the
-    // kick poller. No worker thread; the kick poller's RX poll loop
+    // dispatcher. No worker thread; the dispatcher's RX poll loop
     // (#71 M5.5e) drives slirp's recv side.
 
     {
-        if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
+        if let Some(dispatcher) = state.dispatcher.lock_or_internal_error()?.as_ref() {
             // add-net is a hot-add post-boot path: no profile-pinned
             // hostname here; `format_dhcp_hostname` is fine.
             match crate::virtio::network::VirtioNet::new(&forwards, state.card, l2cpu_idx, None) {
@@ -2705,7 +2735,7 @@ fn dispatch_add_net(
                         crate::regs::virtio_mmio::NET_IRQ,
                         crate::virtio::InterruptKind::Net,
                     );
-                    poller.register_slot(entry);
+                    dispatcher.register_slot(entry);
                     slot.net = Some(WorkerHandle {
                         exit: Arc::new(AtomicBool::new(false)),
                         thread: None,
@@ -2760,14 +2790,14 @@ fn dispatch_remove_net(
 ) -> crate::Result<()> {
     dlog!("[remove_net l2cpu {}] dispatch entry", l2cpu_idx);
     validate_l2cpu(l2cpu_idx)?;
-    // Engine path: drop the kick poller's net registration first
+    // Engine path: drop the dispatcher's net registration first
     // (frees the VirtioNet's slirp connection too via Box drop).
     // No-op when there's no engine registration for this slot.
 
-    if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
+    if let Some(dispatcher) = state.dispatcher.lock_or_internal_error()?.as_ref() {
         let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
             + crate::virtio_engine::DEV_NET;
-        poller.unregister_slot(slot_idx);
+        dispatcher.unregister_slot(slot_idx);
     }
     // Take the net handle under the lock, join outside (same reasoning as
     // dispatch_remove_disk).
@@ -2812,7 +2842,7 @@ fn dispatch_add_console(
     // doesn't need to special-case engine-vs-legacy.
 
     {
-        if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
+        if let Some(dispatcher) = state.dispatcher.lock_or_internal_error()?.as_ref() {
             let input_buf = Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::with_capacity(crate::virtio::console::RX_BUFFER_CAP),
             ));
@@ -2830,7 +2860,7 @@ fn dispatch_add_console(
                 crate::regs::virtio_mmio::CONSOLE_IRQ,
                 crate::virtio::InterruptKind::Console,
             );
-            poller.register_slot(entry);
+            dispatcher.register_slot(entry);
             slot.virtio_console = Some(crate::daemon::VirtioConsoleSlot {
                 worker: WorkerHandle {
                     exit: Arc::new(AtomicBool::new(false)),
@@ -2861,13 +2891,13 @@ fn dispatch_remove_console(
 ) -> crate::Result<()> {
     dlog!("[remove_console l2cpu {}] dispatch entry", l2cpu_idx);
     validate_l2cpu(l2cpu_idx)?;
-    // Engine path: drop kick-poller registration first (frees the
+    // Engine path: drop dispatcher registration first (frees the
     // VirtioConsole's input_buf reference too).
 
-    if let Some(poller) = state.kick_poller.lock_or_internal_error()?.as_ref() {
+    if let Some(dispatcher) = state.dispatcher.lock_or_internal_error()?.as_ref() {
         let slot_idx = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU
             + crate::virtio_engine::DEV_CONSOLE;
-        poller.unregister_slot(slot_idx);
+        dispatcher.unregister_slot(slot_idx);
     }
     // Take the slot under the lock, join outside.
     let vc = {
@@ -2890,7 +2920,7 @@ fn dispatch_remove_console(
 // Stop / Shutdown
 // ---------------------------------------------------------------------------
 
-/// Drop every kick-poller registration for `l2cpu_idx` before the
+/// Drop every dispatcher registration for `l2cpu_idx` before the
 /// caller tears down the L2CpuSlot. Without this the poller keeps
 /// holding `Arc<L2Cpu>` for a stale slot — when the operator
 /// re-boots that L2CPU, the now-stale L2Cpu sticks around behind the
@@ -2903,18 +2933,18 @@ fn dispatch_remove_console(
 /// `virtio_engine::DEVS_PER_L2CPU`).
 fn unregister_engine_slots(state: &Arc<DaemonState>, l2cpu_idx: u8) {
     // Best-effort — called from teardown paths (dispatch_stop,
-    // serve()'s shutdown loop) where a poisoned poller mutex means
-    // the daemon is on its way out anyway. Silently skip in that
-    // case rather than crashing harder.
-    let Ok(poller_guard) = state.kick_poller.lock() else {
+    // serve()'s shutdown loop) where a poisoned dispatcher mutex
+    // means the daemon is on its way out anyway. Silently skip in
+    // that case rather than crashing harder.
+    let Ok(dispatcher_guard) = state.dispatcher.lock() else {
         return;
     };
-    if let Some(poller) = poller_guard.as_ref() {
+    if let Some(dispatcher) = dispatcher_guard.as_ref() {
         let base = (l2cpu_idx as u32) * crate::virtio_engine::DEVS_PER_L2CPU;
         for dev_idx in 0..crate::virtio_engine::DEVS_PER_L2CPU {
-            poller.unregister_slot(base + dev_idx);
+            dispatcher.unregister_slot(base + dev_idx);
         }
-        poller.unregister_uart(l2cpu_idx);
+        dispatcher.unregister_uart(l2cpu_idx);
     }
 }
 

@@ -607,64 +607,36 @@ pub static CONSOLE_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
 /// `run_device` loop. See #62.
 pub static RNG_INTERRUPTS_TOTAL: PerL2cpuCounter = PerL2cpuCounter::new();
 
-// --- BRISC ↔ daemon ring overflow (#101) ---
+// --- V2 dispatch (#187 / #189) ---
 
-/// Cumulative count of `kick_ring_push` calls the firmware dropped
-/// because the ring was already full. Bumped from the daemon poller
-/// when it observes `STATS_OFF_KICK_DROPS` advance — see
-/// `tensix_data_plane::run_kick_consumer`.
-pub static KICK_DROPS_TOTAL: Counter = Counter::new();
+/// Cumulative count of guest QUEUE_NOTIFY events BRISC has observed.
+/// The daemon polls `STATS_OFF_NOTIFY_EVENTS` and adds each delta
+/// to this counter. Used by the burst regression test (#186) to
+/// confirm the workload reached the dispatch path.
+pub static NOTIFY_EVENTS_TOTAL: Counter = Counter::new();
 
-/// All-time max observed (producer - consumer) gap on the kick ring.
-/// Set by the daemon poller in `run_poll_loop` each time it observes
-/// a new high-water mark. Pairs with `bhx_kick_drops_total` to show
-/// "how close are we skirting overflow even when no drops fired
-/// yet" — useful for tuning kick ring size / FAST_SLEEP without
-/// waiting for an actual drop to confirm a margin problem (#184).
-pub static KICK_RING_HIGH_WATER: Gauge = Gauge::new();
+/// Cumulative count of poll iterations where the daemon dispatched
+/// at least one (slot, queue) pair via the V2 dirty bitmap. The
+/// burst regression test asserts `> 0` to confirm V2 dispatch is
+/// active.
+pub static DISPATCH_PASSES_TOTAL: Counter = Counter::new();
 
-/// Most recent observed (producer - consumer) gap on the kick ring,
-/// snapshotted each main-loop iteration. Pairs with the high-water
-/// gauge to distinguish "we hit a peak briefly, but we're idle now"
-/// from "we're sustained at the peak right now."
-pub static KICK_RING_CURRENT_GAP: Gauge = Gauge::new();
-
-/// Cumulative count of avail-ring entries the daemon recovered via
-/// the post-kick-drop rescan path (#184). When BRISC drops a kick,
-/// the descriptor is still sitting in the guest's avail ring; the
-/// daemon scans all active queues and processes anything pending,
-/// turning a dropped kick from a 30 s kernel-timeout-then-retry
-/// stall into a temporary latency hit. A high
-/// `bhx_kick_rescued_total` paired with `bhx_kick_drops_total`
-/// going up means the rescue path is doing its job; the drops
-/// happened but the install (or whatever workload) didn't stall.
-pub static KICK_RESCUED_TOTAL: Counter = Counter::new();
-
-/// Whether kick-ring backpressure is currently engaged (#184). When
-/// the kick-ring fill crosses 75%, the daemon writes
-/// VRING_USED_F_NO_NOTIFY into every active queue's used.flags;
-/// the guest's `virtqueue_kick_prepare` checks this bit and skips
-/// the QUEUE_NOTIFY MMIO write, throttling kick production at
-/// the source. Released at 25% (hysteresis to avoid bouncing).
-/// 0 = released (normal), 1 = engaged (guest is throttled).
-pub static KICK_THROTTLE_ENGAGED: Gauge = Gauge::new();
-
-/// Cumulative count of kick-ring backpressure ENGAGE transitions.
-/// Pairs with `bhx_kick_throttle_engaged`: a steady stream of
-/// transitions means the workload is regularly hitting the high-
-/// water threshold; one transition followed by a long quiet
-/// period means it spiked once.
-pub static KICK_THROTTLE_TRANSITIONS_TOTAL: Counter = Counter::new();
+/// Cumulative count of (slot, queue) pairs the V2 bitmap drain has
+/// dispatched. Sums to roughly the cumulative count of guest
+/// QUEUE_NOTIFYs the daemon processed (one per dirty bit cleared
+/// with a non-empty avail ring).
+pub static DISPATCH_QUEUES_DRAINED: Counter = Counter::new();
 
 /// Cumulative count of QUEUE_SEL changes BRISC processed while the
 /// previous SEL's QUEUE_READY was still 1 — the race window the M7.2
 /// fix (#71, commit 1345f3e) was designed to close. Non-zero means
 /// BRISC's sweep is borderline against a stock kernel's
 /// `writel(SEL=N+1); readl(QUEUE_READY)` — that kernel can read the
-/// stale 1 and bail virtio probe with -ENOENT. Bumped from the daemon
-/// poller when `STATS_OFF_SEL_READY_RACES` advances. Surfaces as
-/// `bhx_sel_ready_races_total` in /metrics; pairs with the `[kick-
-/// poller] BRISC observed N SEL→READY race window(s)` log line.
+/// stale 1 and bail virtio probe with -ENOENT. Bumped by the
+/// dispatcher when `STATS_OFF_SEL_READY_RACES` advances; surfaces
+/// as `bhx_sel_ready_races_total` in /metrics. (Per-event dlog
+/// removed in #189 per the loud-counters memory note — surface via
+/// the metric only, not via every-iter log spam.)
 pub static SEL_READY_RACES_TOTAL: Counter = Counter::new();
 
 /// Cumulative count of OLD-sel rescue captures BRISC made — the
@@ -1013,59 +985,29 @@ pub fn render_prometheus(state: &DaemonState) -> String {
         }
     }
 
-    // ----- BRISC ↔ daemon ring overflow (#101) -----
+    // ----- V2 dispatch (#187 / #189) -----
 
     write_counter(
         &mut out,
-        "bhx_kick_drops_total",
-        "Cumulative count of kick_ring_push calls dropped because the ring \
-         was full (BRISC backpressure).",
-        KICK_DROPS_TOTAL.get(),
-    );
-    write_gauge(
-        &mut out,
-        "bhx_kick_ring_high_water",
-        "All-time max observed (producer - consumer) gap on the kick ring \
-         in this daemon session. Surfaces 'how close are we skirting \
-         overflow' even when bhx_kick_drops_total stays at 0 — useful \
-         for tuning kick ring size / FAST_SLEEP under heavy I/O loads.",
-        KICK_RING_HIGH_WATER.get(),
-    );
-    write_gauge(
-        &mut out,
-        "bhx_kick_ring_current_gap",
-        "Most recent observed (producer - consumer) gap on the kick ring. \
-         Pairs with bhx_kick_ring_high_water to distinguish a brief peak \
-         from a sustained backlog.",
-        KICK_RING_CURRENT_GAP.get(),
+        "bhx_notify_events_total",
+        "Cumulative count of guest QUEUE_NOTIFY events BRISC has \
+         observed. Mirrors STATS_OFF_NOTIFY_EVENTS.",
+        NOTIFY_EVENTS_TOTAL.get(),
     );
     write_counter(
         &mut out,
-        "bhx_kick_rescued_total",
-        "Cumulative count of avail-ring entries the daemon recovered via \
-         the post-kick-drop rescan path. A high count paired with \
-         bhx_kick_drops_total advancing means the rescue path is doing \
-         its job — drops happened but the workload didn't stall on \
-         kernel virtio-blk 30s timeouts.",
-        KICK_RESCUED_TOTAL.get(),
-    );
-    write_gauge(
-        &mut out,
-        "bhx_kick_throttle_engaged",
-        "Whether kick-ring backpressure is currently engaged: 0 = \
-         normal, 1 = guest is throttled via VRING_USED_F_NO_NOTIFY \
-         set in every active queue's used.flags. Engages at 75% \
-         kick-ring fill, releases at 25% (hysteresis).",
-        KICK_THROTTLE_ENGAGED.get(),
+        "bhx_dispatch_passes_total",
+        "Cumulative count of poll iterations that dispatched at least \
+         one (slot, queue) pair via the V2 dirty bitmap.",
+        DISPATCH_PASSES_TOTAL.get(),
     );
     write_counter(
         &mut out,
-        "bhx_kick_throttle_transitions_total",
-        "Cumulative count of kick-ring backpressure ENGAGE transitions. \
-         A steady stream of transitions means the workload is regularly \
-         hitting the high-water threshold; a single transition followed \
-         by a long quiet period means it spiked once.",
-        KICK_THROTTLE_TRANSITIONS_TOTAL.get(),
+        "bhx_dispatch_queues_drained",
+        "Cumulative count of (slot, queue) pairs dispatched via the \
+         V2 dirty bitmap. Roughly the count of guest kicks the daemon \
+         turned into a non-empty avail walk.",
+        DISPATCH_QUEUES_DRAINED.get(),
     );
     write_counter(
         &mut out,
@@ -1944,10 +1886,16 @@ mod tests {
             "bhx_worker_poll_iterations_total{worker=\"virtio_blk\",idx=\"0\",tier=\"fast\"} ",
             "bhx_worker_poll_iterations_total{worker=\"chip_console\",idx=\"3\",tier=\"idle\"} ",
             "bhx_worker_tier_seconds_total{worker=\"virtio_net\",idx=\"2\",tier=\"slow\"} ",
-            // BRISC ↔ daemon ring overflow (#101).
-            "# HELP bhx_kick_drops_total",
-            "# TYPE bhx_kick_drops_total counter",
-            "\nbhx_kick_drops_total ",
+            // V2 dispatch (#187 / #189).
+            "# HELP bhx_notify_events_total",
+            "# TYPE bhx_notify_events_total counter",
+            "\nbhx_notify_events_total ",
+            "# HELP bhx_dispatch_passes_total",
+            "# TYPE bhx_dispatch_passes_total counter",
+            "\nbhx_dispatch_passes_total ",
+            "# HELP bhx_dispatch_queues_drained",
+            "# TYPE bhx_dispatch_queues_drained counter",
+            "\nbhx_dispatch_queues_drained ",
             "# HELP bhx_uart_feed_drops_total",
             "# TYPE bhx_uart_feed_drops_total counter",
             "bhx_uart_feed_drops_total{idx=\"0\"} ",

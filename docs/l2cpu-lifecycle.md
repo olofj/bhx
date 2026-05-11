@@ -42,7 +42,7 @@ path:
 | `state.l2cpus[i]: Mutex<Option<L2CpuSlot>>` | always present in `DaemonState`; `Some` only while the slot has been booted (or warm-resumed) |
 | `L2CpuSlot.l2cpu: Arc<L2Cpu>` | constructed at cold boot, dropped at slot teardown. Holds the per-L2CPU `dup_fd` + 8 GiB VA + two persistent 4 GiB TLB windows. |
 | `L2CpuSlot.console_worker / disks / net / virtio_console / virtio_rng` | spawned at cold boot, `stop_and_join`ed on slot teardown |
-| `state.tensix_engine` and `state.kick_poller` | shared across all 4 L2CPUs on the card; brought up on first cold boot, dropped on chip-wide reset (`tt-smi -r` or `reset_board`) |
+| `state.tensix_engine` and `state.dispatcher` | shared across all 4 L2CPUs on the card; brought up on first cold boot, dropped on chip-wide reset (`tt-smi -r` or `reset_board`) |
 | OpenSBI `_fw_start..._fw_reserved_space_end` in L2CPU DRAM | written once at cold boot, preserved across SBI SRST → warmboot loop, **wiped by `reset_board`** (DRAM training overwrites it) |
 | OpenSBI `sbi_scratch[]`, `sbi_ipi_data[]`, `sbi_hsm_data[]` | persistent across the warmboot loop; published PAs in the bhx-purgatory status block at cold init |
 | Bhx-purgatory status block (DRAM at `mem_base + 0xE0000`, 4 KiB) | reserved-memory carve-out in DTB; written by OpenSBI at cold init (Phase 5 metadata) and `final_exit` (Phase 1/2/4a status); read by the daemon over NoC |
@@ -56,15 +56,19 @@ Stopped/Wedged → (Phase 6 opportunistic reset_board if safe) → Running
 ```
 
 - Trigger: `bhx boot -l N`.
-- Pre-flight: if no other slot is `Running`, daemon drops parked
-  siblings + kick poller + tensix engine and calls
-  `SharedChip::reset_board`. Parked siblings transition Parked → Stopped.
+- Pre-flight: if no other slot is `Running` AND
+  `chip_reset_this_session` is unset, daemon drops parked siblings
+  + dispatcher + tensix engine and calls `SharedChip::reset_board`,
+  then sets the flag. Parked siblings transition Parked → Stopped.
+  Subsequent cold boots in the same daemon session see the flag set
+  and skip the reset (the chip is "ours" already; re-resetting would
+  invalidate the just-booted L2CPU's mmaps and SIGBUS its workers).
 - `run_boot_sequence` constructs `L2Cpu::new`, modifies DTB, calls
   `boot_l2cpu` (writes OpenSBI / kernel / DTB / initramfs into DRAM),
   configures prefetchers, calls `reset_x280` (PLL step + release
   bit OR-in). Per-hart reset vectors point at OpenSBI's `_start`.
 - Post-boot: `make_slot_from_l2cpu` spawns `chip_console`, registers
-  virtio devices with the kick poller, attaches disks/net.
+  virtio devices with the dispatcher, attaches disks/net.
 - Slot transitions to `Running` once the install completes.
 
 The pre-flight `reset_board` is the only chip-wide reset in normal
@@ -87,9 +91,9 @@ Running → Parked
 - Daemon's `dispatch_status` reads the status block on each query;
   when it sees PARKED, returns the slot as `Parked`.
 - Daemon-side workers stay alive — chip-console keeps polling the
-  virtuart, kick poller stays registered. They're idle (the chip
-  side isn't generating new traffic) but immediately ready to serve
-  when hart 0 wakes back up.
+  virtuart, the dispatcher's per-slot virtio registrations stay in
+  place. They're idle (the chip side isn't generating new traffic)
+  but immediately ready to serve when hart 0 wakes back up.
 
 ### Operator-driven force-park
 

@@ -206,12 +206,12 @@ pub struct DaemonState {
     /// off. `Mutex` so concurrent boots serialize the bring-up
     /// (only the first one runs the firmware load + reset release).
     pub tensix_engine: Mutex<Option<Arc<crate::tensix_engine::TensixEngine>>>,
-    /// Daemon-side kick poller (#71 M5.5a). Spawned alongside the
-    /// engine bring-up; consumes the kick ring (BRISC → daemon)
-    /// and (in M5.5b+) dispatches each kick to the relevant
-    /// per-(slot, queue) device handler. Lifetime tied to
-    /// `DaemonState`: dropped on daemon shutdown.
-    pub kick_poller: Mutex<Option<crate::tensix_data_plane::KickPoller>>,
+    /// Daemon-side V2 dispatcher. Spawned alongside the engine
+    /// bring-up; polls the per-(slot, queue) dirty bitmap in BRISC
+    /// L1 and dispatches each set bit to the relevant device
+    /// handler. Lifetime tied to `DaemonState`: dropped on daemon
+    /// shutdown.
+    pub dispatcher: Mutex<Option<crate::tensix_data_plane::Dispatcher>>,
     /// Most recent ARC telemetry snapshot. Populated by the
     /// chip-telemetry poller every few seconds; read by the metrics
     /// exporter on each `/metrics` scrape. `None` until the first
@@ -220,15 +220,22 @@ pub struct DaemonState {
     /// chip access broke or the firmware regressed).
     pub chip_telemetry: Mutex<Option<crate::telemetry::Telemetry>>,
     /// Card-wide gate around the `dispatch_boot` decide-and-do-reset
-    /// step (#162). Without it, two concurrent boots in the same iter
-    /// both observe `running=true` from the previous iter, both call
-    /// `reset_board()`, and the second blip lands while the first
-    /// boot is mid-`L2Cpu::new`, killing it. With the lock the first
-    /// boot's `reset_board` clears `running`; the second boot then
-    /// sees `running=false` and skips. After release, both boots
-    /// proceed in parallel through the per-L2CPU image-load path,
-    /// which has been concurrent-safe under load.
+    /// step. Held while scanning sibling slots and (if needed) calling
+    /// `reset_board`, so a parallel cold boot can't race past the scan
+    /// and trigger a second reset that would invalidate the first
+    /// boot's L2Cpu mmaps.
     pub boot_lock: Mutex<()>,
+    /// Set the first time `maybe_opportunistic_reset_board` actually
+    /// resets this card during this daemon session; subsequent cold
+    /// boots check it under `boot_lock` and skip the reset. Without
+    /// this gate, 4-way parallel cold boots all see "no Running
+    /// siblings" (because each parallel boot is in flight, not yet
+    /// reflected in the slot table) and each schedules its own
+    /// reset_board — the second and later resets land while the
+    /// earlier-booted L2CPUs hold mmap pages, SIGBUSing the worker
+    /// threads. Once any boot has reset the chip, the chip is "ours"
+    /// for the rest of the session and re-reset is unnecessary.
+    pub chip_reset_this_session: AtomicBool,
     /// Per-L2CPU shutdown scrollback tails (#160). Captured at
     /// `internal_stop` time as the last
     /// [`crate::daemon::console_hub::SHUTDOWN_TAIL_BYTES`] of the live
@@ -304,9 +311,10 @@ impl DaemonState {
             ],
             shared_chip,
             tensix_engine: Mutex::new(None),
-            kick_poller: Mutex::new(None),
+            dispatcher: Mutex::new(None),
             chip_telemetry: Mutex::new(None),
             boot_lock: Mutex::new(()),
+            chip_reset_this_session: AtomicBool::new(false),
             shutdown_tails: [
                 Mutex::new(Vec::new()),
                 Mutex::new(Vec::new()),
@@ -330,13 +338,13 @@ impl DaemonState {
         }
         let eng = crate::tensix_engine::TensixEngine::bring_up(self.card, &self.shared_chip)?;
         let arc = Arc::new(eng);
-        // Spawn the kick poller against the same Arc so it consumes
-        // events the BRISC firmware produces. The poller's thread
+        // Spawn the dispatcher against the same Arc so it polls the
+        // dirty bitmap the firmware produces. The dispatcher's thread
         // holds its own clone of the Arc; the engine outlives the
-        // poller because the poller's drop joins its thread before
-        // releasing the reference.
-        let poller = crate::tensix_data_plane::KickPoller::spawn(Arc::clone(&arc));
-        *self.kick_poller.lock().unwrap() = Some(poller);
+        // dispatcher because the dispatcher's drop joins its thread
+        // before releasing the reference.
+        let dispatcher = crate::tensix_data_plane::Dispatcher::spawn(Arc::clone(&arc));
+        *self.dispatcher.lock().unwrap() = Some(dispatcher);
         *guard = Some(Arc::clone(&arc));
         Ok(arc)
     }
@@ -358,8 +366,8 @@ impl DaemonState {
         }
         let eng = crate::tensix_engine::TensixEngine::adopt_running(self.card, &self.shared_chip)?;
         let arc = Arc::new(eng);
-        let poller = crate::tensix_data_plane::KickPoller::spawn(Arc::clone(&arc));
-        *self.kick_poller.lock().unwrap() = Some(poller);
+        let dispatcher = crate::tensix_data_plane::Dispatcher::spawn(Arc::clone(&arc));
+        *self.dispatcher.lock().unwrap() = Some(dispatcher);
         *guard = Some(arc);
         Ok(())
     }

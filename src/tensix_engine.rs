@@ -218,6 +218,28 @@ impl TensixEngine {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
+        // (#193) Overwrite `STATS_OFF_VERSION` with the daemon's
+        // authoritative build_id + protocol version. The firmware's
+        // own startup write here carries whatever build_id was baked
+        // into the .bin at make-time — `brisc-firmware/Makefile`'s
+        // FW_BUILD_ID is sticky against mtime-based dependency
+        // tracking, so a commit that doesn't touch firmware sources
+        // leaves the .bin re-stamping skipped while build.rs's
+        // computation advances. Past that point, the chip-side value
+        // and `ve::FW_BUILD_ID` diverge, and `adopt_running` below
+        // refuses to attach with "build_id mismatch" until a manual
+        // `make -C brisc-firmware clean`.
+        //
+        // Re-writing the value here from the daemon's constants
+        // makes the daemon's `FW_BUILD_ID` the single source of
+        // truth — the firmware still writes its own value first
+        // (harmless overwrite-by-daemon, also serves as a sensible
+        // fallback if the daemon crashes between firmware-init and
+        // this write), but the steady-state contents reflect the
+        // daemon binary that did the most recent `bring_up`.
+        let stamped_version = (ve::FW_BUILD_ID << 8) | proto::PROTOCOL_VERSION;
+        tile.write_l1_u32(ve::STATS_BASE + ve::STATS_OFF_VERSION, stamped_version);
+
         // M5 (#71) handshake. BRISC blocks in `wait_for_hello_and_ack`
         // until we send hello, so this also gates the firmware's
         // entry into the steady-state poll loop.
@@ -315,15 +337,23 @@ impl TensixEngine {
             .into());
         }
         let firmware_version = tile.read_l1_u32(ve::STATS_BASE + ve::STATS_OFF_VERSION);
-        // Firmware encodes BRISC_VIRTIO_FW_VERSION as
-        // `<build_id 24-bit><protocol 8-bit>`. The low byte tracks
-        // `TENSIX_PROTOCOL_VERSION` (the wire-format protocol), the
-        // upper 24 bits are the build_id (git short hash / sha256
-        // prefix of firmware sources). The daemon refuses to adopt
-        // unless BOTH match — protocol mismatch is a wire-format
-        // break, build_id mismatch means the chip's firmware is from
-        // a different daemon build than ours and may have different
-        // behavior even at the same protocol version.
+        // `STATS_OFF_VERSION` carries `<build_id 24-bit><protocol 8-bit>`.
+        // The low byte is `TENSIX_PROTOCOL_VERSION` (wire-format
+        // protocol). The upper 24 bits are the daemon's `FW_BUILD_ID`
+        // — written by `bring_up` after the firmware-side init pass
+        // completes (#193). Pre-#193 the firmware's own init pass
+        // wrote this and the value could drift from `ve::FW_BUILD_ID`
+        // when make's mtime tracking skipped a stamp; now the daemon
+        // overwrites with its authoritative constant so the
+        // chip-side value reflects whichever daemon binary did the
+        // most recent `bring_up`. Mismatch here means:
+        //   - protocol byte differs: wire-format break across daemon
+        //     ↔ firmware versions.
+        //   - build_id differs: the chip's BRISC was loaded by a
+        //     daemon binary built from different firmware sources
+        //     than this one (and we never re-loaded since); behavior
+        //     may diverge even at the same protocol version.
+        // Either way, refuse to adopt and ask for `tt-smi -r`.
         let firmware_protocol = firmware_version & 0xff;
         let firmware_build_id = (firmware_version >> 8) & 0x00ff_ffff;
         let expected_build_id = ve::FW_BUILD_ID & 0x00ff_ffff;
@@ -388,62 +418,10 @@ impl TensixEngine {
         })
     }
 
-    /// Snapshot of the kick ring header. Diagnostic; the actual
-    /// data-plane consumer in M5+ will read producer_seq in a tight
-    /// loop and consume entries.
-    pub fn kick_ring_header(&self) -> (u32, u32, u32) {
-        let producer = self.tile.read_l1_u32(
-            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_PRODUCER_SEQ,
-        );
-        let consumer = self.tile.read_l1_u32(
-            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_CONSUMER_SEQ,
-        );
-        let entries = self.tile.read_l1_u32(
-            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_RING_ENTRIES,
-        );
-        (producer, consumer, entries)
-    }
-
-    /// Read one kick entry by ring index (`producer_seq` modulo the
-    /// ring-entries count). Returns the raw 4 u32s; the M5 consumer
-    /// in the daemon parses them via `tensix_proto::KickEntry`.
-    pub fn read_kick_entry(&self, idx: u32) -> [u32; 4] {
-        let off = proto::CTRL_BASE
-            + proto::CTRL_OFF_KICK_RING
-            + (idx % proto::KICK_RING_ENTRIES) * proto::KICK_ENTRY_SIZE;
-        [
-            self.tile.read_l1_u32(off),
-            self.tile.read_l1_u32(off + 4),
-            self.tile.read_l1_u32(off + 8),
-            self.tile.read_l1_u32(off + 12),
-        ]
-    }
-
-    /// Read the kick ring's producer sequence — what the kick poller
-    /// thread tight-loops on to detect new entries.
-    pub fn kick_producer_seq(&self) -> u32 {
-        self.tile.read_l1_u32(
-            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_PRODUCER_SEQ,
-        )
-    }
-
-    /// Update the kick ring's consumer sequence. The kick poller
-    /// thread bumps this after consuming each batch of entries; BRISC
-    /// could (in a future flow-control extension) read it to know
-    /// when to stop producing if the ring is full. Today BRISC
-    /// doesn't read it, but we still update it for accurate
-    /// diagnostics in `daemon status`.
-    pub fn set_kick_consumer_seq(&self, seq: u32) {
-        self.tile.write_l1_u32(
-            proto::CTRL_BASE + proto::CTRL_OFF_KICK_RING_HDR + proto::KICK_HDR_OFF_CONSUMER_SEQ,
-            seq,
-        );
-    }
-
     /// Read a u32 anywhere in the engine tile's L1 — used by the
-    /// data-plane worker to fetch per-queue desc/avail/used pointers
-    /// from the firmware's shadow region. Generic so we don't have
-    /// to add a per-field accessor for every shadow slot.
+    /// dispatcher to fetch per-queue desc/avail/used pointers from
+    /// the firmware's shadow region. Generic so we don't have to
+    /// add a per-field accessor for every shadow slot.
     pub fn read_l1_u32(&self, addr: u32) -> u32 {
         self.tile.read_l1_u32(addr)
     }
@@ -451,42 +429,39 @@ impl TensixEngine {
     /// Write a u32 anywhere in the engine tile's L1. Counterpart to
     /// `read_l1_u32`; useful for debug commands that simulate a
     /// guest MMIO write directly into the reg file (skipping the
-    /// L2CPU's own TLB), and for the M5.5b daemon-driven init path
-    /// when we set up per-queue state.
+    /// L2CPU's own TLB), and for the daemon-driven init path when
+    /// we set up per-queue state.
     pub fn write_l1_u32(&self, addr: u32, value: u32) {
         self.tile.write_l1_u32(addr, value);
     }
 
-    /// Host VA pointing at L1 byte `addr`. Used by paths that need a
-    /// raw `*mut u32` into the reg file — notably
-    /// `InterruptController::set_interrupt`, which RMWs
-    /// `MMIO_INTERRUPT_STATUS` before kicking the PLIC. The pointer
-    /// is valid as long as the engine (and its `TensixTile`) is
-    /// alive.
-    pub fn l1_ptr(&self, addr: u32) -> *mut u8 {
-        self.tile.l1_ptr(addr)
+    /// Volatile single-byte read from L1. The V2 dispatcher uses
+    /// this to poll `CTRL_OFF_DIRTY[slot][q]`. See `TensixTile`'s
+    /// equivalent for the volatility and alignment story.
+    pub fn read_l1_u8(&self, addr: u32) -> u8 {
+        self.tile.read_l1_u8(addr)
     }
 
-    /// Append a CompletionEntry to the L1 completion ring and bump
-    /// producer_seq. Called from the data-plane worker after writing
-    /// a used-ring entry, so BRISC's poll loop wakes up and (in a
-    /// future PLIC IRQ extension) signals the L2CPU directly. Today
-    /// the daemon-side worker fires the PLIC IRQ itself; the
-    /// completion ring entry is for diagnostics + future use.
-    pub fn push_completion(&self, slot: u16, queue_idx: u16, used_idx: u32) {
-        let producer_addr =
-            proto::CTRL_BASE + proto::CTRL_OFF_COMPL_RING_HDR + proto::COMPL_HDR_OFF_PRODUCER_SEQ;
-        let producer = self.tile.read_l1_u32(producer_addr);
-        let idx = producer % proto::COMPL_RING_ENTRIES;
-        let entry_off =
-            proto::CTRL_BASE + proto::CTRL_OFF_COMPL_RING + idx * proto::COMPL_ENTRY_SIZE;
-        // Pack slot + queue_idx into the first u32 the same way the
-        // firmware reads it.
-        self.tile
-            .write_l1_u32(entry_off, (slot as u32) | ((queue_idx as u32) << 16));
-        self.tile.write_l1_u32(entry_off + 4, used_idx);
-        self.tile
-            .write_l1_u32(producer_addr, producer.wrapping_add(1));
+    /// Volatile single-byte write to L1. The V2 dispatcher uses
+    /// this to clear dirty bits after observation.
+    pub fn write_l1_u8(&self, addr: u32, value: u8) {
+        self.tile.write_l1_u8(addr, value);
+    }
+
+    /// Volatile half-word write to L1. The V2 dispatcher uses
+    /// this to publish the post-dispatch `processed[qi]` cursor.
+    pub fn write_l1_u16(&self, addr: u32, value: u16) {
+        self.tile.write_l1_u16(addr, value);
+    }
+
+    /// Host VA pointing at L1 byte `addr`. Used by paths that need a
+    /// raw `*mut u8` into the reg file — `InterruptController::set_interrupt`
+    /// (RMW on `MMIO_INTERRUPT_STATUS`), and the V2 dirty-bitmap
+    /// drain (volatile `read_volatile` / `write_volatile` of single
+    /// bytes / u16 cursor entries). The pointer is valid as long as
+    /// the engine (and its `TensixTile`) is alive.
+    pub fn l1_ptr(&self, addr: u32) -> *mut u8 {
+        self.tile.l1_ptr(addr)
     }
 
     /// Read TRISC0's heartbeat (M6.1, #79). Bumped each iteration of
@@ -498,7 +473,7 @@ impl TensixEngine {
     }
 
     /// Write the active-slots bitmap directly. Diagnostic — production
-    /// code uses [`crate::tensix_data_plane::KickPoller::register_uart`]
+    /// code uses [`crate::tensix_data_plane::Dispatcher::register_uart`]
     /// and friends, which compute the mask from the registries.
     pub fn write_active_slots(&self, mask: u32) {
         self.tile

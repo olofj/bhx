@@ -68,140 +68,102 @@
 // ----- Stats page layout (L1 + 0x4000) -----
 //
 // All u32. Order is part of the wire contract (the daemon reads at
-// offsets, not via a struct shared with the firmware).
+// offsets, not via a struct shared with the firmware). Repacked
+// after the V1 retirement (#190) and again now (post-V2.1 cleanup)
+// to drop dead deprecated slots; offsets shifted, no backwards
+// compatibility — TENSIX_PROTOCOL_VERSION gates this.
+
+// --- Identity / liveness ---
 #define STATS_OFF_VERSION         0x000  // BRISC_VIRTIO_FW_VERSION
-#define STATS_OFF_MAGIC           0x004  // 0xB155 — "BRISC virtio loaded"
+#define STATS_OFF_MAGIC           0x004  // STATS_MAGIC_LOADED
 #define STATS_OFF_HEARTBEAT       0x008  // BRISC main-loop iteration count
-#define STATS_OFF_STATUS_CHANGES  0x010  // count of STATUS write events
-#define STATS_OFF_SEL_CHANGES     0x014  // count of QUEUE_SEL write events
-#define STATS_OFF_NOTIFY_EVENTS   0x018  // count of QUEUE_NOTIFY write events
-#define STATS_OFF_READY_EVENTS    0x01c  // count of QUEUE_READY write events
-#define STATS_OFF_LAST_NOTIFY     0x020  // last (slot << 16 | queue_idx)
-#define STATS_OFF_COMPL_EVENTS    0x024  // count of completion entries consumed
-#define STATS_OFF_LAST_COMPL      0x028  // last (slot << 16 | queue_idx) consumed
-#define STATS_OFF_KICK_DROPS      0x02c  // count of kick_ring_push drops (#101)
-// SEL→READY race-window detector: number of times BRISC processed a
-// QUEUE_SEL change while the previous SEL's QUEUE_READY was still 1.
-// During that window, a guest doing `writel(SEL=N+1); readl(QUEUE_
-// READY)` back-to-back can read the stale 1 and bail with -ENOENT
-// from vp_modern's queue setup. Closing the window means BRISC's
-// sweep beats the guest's writel→readl gap; this counter lets the
-// daemon surface a non-zero count as "race window observed, sweep is
-// borderline." Mirrored as `STATS_OFF_SEL_READY_RACES` on the Rust
-// side. Goes with TENSIX_PROTOCOL_VERSION (no bump — the field is
-// purely additive read-only stats).
-#define STATS_OFF_SEL_READY_RACES 0x030
-// #124 timing probe: BRISC samples `mcycle` to put real numbers on
-// loop period and SEL→READY critical-path duration. Stored as the
-// MAX seen since stats reset. mcycle low-32 wraps every ~3.2 s at
-// 1.35 GHz; per-iteration deltas are in the hundreds-to-low-thousands
-// of cycles so wrap doesn't bother subtraction (uint wraps cleanly).
+
+// --- MMIO event counters (per-write totals) ---
+#define STATS_OFF_STATUS_CHANGES  0x010
+#define STATS_OFF_SEL_CHANGES     0x014
+#define STATS_OFF_NOTIFY_EVENTS   0x018
+#define STATS_OFF_READY_EVENTS    0x01c
+#define STATS_OFF_LAST_NOTIFY     0x020  // packed (slot << 16) | queue_idx
+
+// --- SEL→READY race-window diagnostics ---
 //
-// MAX_SWEEP_CYCLES: top-of-loop to top-of-loop. Worst case sweep
-// period — the relevant number for racing the kernel's writel→readl
-// gap (kernel's writel can land just after BRISC starts a slow sweep).
+// SEL_READY_RACES: BRISC observed a QUEUE_SEL change while the
+// previous SEL's QUEUE_READY was still 1. During that window a
+// guest doing `writel(SEL=N+1); readl(QUEUE_READY)` back-to-back
+// can read the stale 1 and bail with -ENOENT in vp_modern's queue
+// setup. Closing the window means BRISC's sweep beats the guest's
+// writel→readl gap; this counter lets the daemon surface a non-zero
+// count as "race window observed, sweep is borderline."
 //
-// MAX_SEL_PATH_CYCLES: handle_queue_sel_change entry to right after
-// the QUEUE_READY=0 + FENCE_W. The actual time BRISC holds the
-// kernel waiting on its readl response after a SEL write.
+// READY_CAPTURE_SEL_RACES: handle_queue_ready_change snapshots the
+// 7 setup fields atomically, then re-reads SEL; if it changed
+// mid-snapshot the kernel raced past us and the snapshot is mixed
+// across queues — bail and bump.
 //
-// LAST_SWEEP_CYCLES: most recent sweep. Helpful when MAX is suspect
-// (e.g., a single early outlier from cold-cache effects).
-#define STATS_OFF_MAX_SWEEP_CYCLES    0x034
-#define STATS_OFF_MAX_SEL_PATH_CYCLES 0x038
-#define STATS_OFF_LAST_SWEEP_CYCLES   0x03c
-// Per-slot poll_one_device sub-section maxes (#124 follow-up: fence
-// cuts didn't move sweep_max so we need to find what does). All in
-// BRISC cycles. Each is the max observed across all (slot, iter)
-// pairs since stats reset, NOT per-iter — so the three don't sum to
-// max_sweep (different slots/iters can dominate each).
-//   PRECAP:   poll_one_device entry → just before BLIND CAPTURE
-//   BLINDCAP: BLIND CAPTURE block (7 read+writes per active queue)
-//   POSTCAP:  after BLIND CAPTURE → end of poll_one_device
+// QUEUE_SETUPS: successful capture (queue activation).
+// QUEUE_TEARDOWNS: READY=0 events (queue disable; kernel will
+// rewrite addrs on next vm_setup_vq).
 //
-// All three are deprecated post-#120 — BLIND CAPTURE was removed in
-// favour of atomic capture-on-READY=1 in `handle_queue_ready_change`,
-// so PRECAP/POSTCAP no longer bracket meaningful work. Reads will be 0.
-#define STATS_OFF_MAX_PRECAP_CYCLES   0x040
-#define STATS_OFF_MAX_BLINDCAP_CYCLES 0x044
-#define STATS_OFF_MAX_POSTCAP_CYCLES  0x048
-// #120 atomic capture stats. handle_queue_ready_change snapshots the
-// 7 setup fields (NUM, DESC_LO/HI, DRIVER_LO/HI, DEVICE_LO/HI) on the
-// READY=0→1 transition. After the snapshot, BRISC re-reads SEL; if
-// it changed mid-capture the kernel raced past us and the snapshot
-// is mixed across queues — bail and bump SEL_RACES.
+// BRISC_OLD_SEL_RESCUE: BRISC saw a SEL change with no prior
+// successful capture for the old sel (kernel raced past in
+// `setup; READY=1; SEL=N+1`); BRISC snapshots the still-visible
+// kernel writes into shadow_q[old_sel] before the shadow swap.
 //
-// SETUPS counts successful captures (queue activations). TEARDOWNS
-// counts READY=0 events (queue disable, kernel will rewrite addrs on
-// next vm_setup_vq). Together they replace the lumped READY_EVENTS
-// counter for "how many virtio commands has BRISC actually processed."
-#define STATS_OFF_READY_CAPTURE_SEL_RACES 0x04c
-#define STATS_OFF_QUEUE_SETUPS            0x050
-#define STATS_OFF_QUEUE_TEARDOWNS         0x054
-// #132 TRISC1 DEVICE_FEATURES_SEL watch. Counts every observed change
-// of DEVICE_FEATURES_SEL (across all slots). Used to verify the
-// SEL-watch is firing during distro probes — non-zero on any cold
-// boot is the expected, healthy state.
-#define STATS_OFF_DEV_FEAT_SEL_CHANGES    0x058
-// #156 TRISC1-side QUEUE_SEL race-window observations. Bumped each
-// time TRISC1's SEL-watch loop sees a SEL change AND the visible
-// QUEUE_READY for the prior SEL is still 1 (i.e. TRISC1's zero of
-// READY is the cleanup the kernel needs before its post-SEL readl
-// returns 0). Compare to the BRISC-side STATS_OFF_SEL_READY_RACES
-// counter:
-//   * BRISC counter > 0  → BOTH BRISC and TRISC1 were too slow; the
-//     kernel almost certainly read READY=1 and `vm_setup_vq` returned
-//     -ENOENT (counted race).
-//   * BRISC counter = 0 AND TRISC1 counter > 0 → TRISC1 cleaned up
-//     before BRISC saw, so BRISC's check came back to a clean slate.
-//     The kernel may have raced TRISC1 silently — gap is invisible
-//     from the firmware side but lives in the (TRISC1_RACES - BRISC_RACES)
-//     differential.
-#define STATS_OFF_TRISC1_SEL_RACES        0x05c
-// #156 TRISC1 timing diagnostics. All in BRISC-clock cycles (mcycle
-// low half). Updated as max-since-stats-reset.
-//   MAX_TRISC1_REACTION_CYCLES: cycles from "TRISC1 observed SEL
-//     change" (just after the read_u32) to "READY=0 published with
-//     FENCE_W" (just after the fence). This is TRISC1's per-event
-//     critical-path cost. If we're losing the race against the
-//     kernel's writel(SEL); readl(READY); back-to-back, this is
-//     where the time goes — including any L1 bank arbitration
-//     stall against concurrent BRISC writes.
-//   MAX_TRISC1_OUTER_CYCLES: cycles for a full TRISC1 outer iter
-//     (one sweep across all active virtio slots). Per-slot revisit
-//     time = this / num_active_slots. If BRISC's init_device or
-//     capture writes are stalling TRISC1's reads via the bank
-//     arbiter, this ratchets up.
-#define STATS_OFF_MAX_TRISC1_REACTION_CYCLES  0x060
-#define STATS_OFF_MAX_TRISC1_OUTER_CYCLES     0x064
-// Sweep-cycle histogram (#124 follow-up). MAX is misleading because
-// `init_device` on STATUS=0 burns ~1200 cycles in a 320-store wipe
-// loop, dominating the max even though it runs before the kernel's
-// SEL→READY write sequence. The buckets give us the distribution
-// shape: how many fast iters, how many medium, how many slow. Each
-// bucket is a u32 counter incremented per sweep that falls in its
-// range; the bench harness reads them and computes typical / p99.
-//   B0: <  256 cycles  (~< 190 ns)  — idle / 0-active-slots iters
-//   B1:   256-511     (~190-380 ns) — 1-2 slots, no kernel writes
-//   B2:   512-1023    (~380-760 ns)
-//   B3:  1024-2047    (~760-1520 ns) — busy probe, multiple handlers
-//   B4: >= 2048       (~>= 1520 ns)  — the init_device outlier band
-// Steady-state sweep max — like STATS_OFF_MAX_SWEEP_CYCLES but
-// EXCLUDES iters where init_device fired (the kernel writing
-// STATUS=0 → handle_status_change wipes 320 words = ~1240 cycles
-// in PRECAP, which dominates max but is a one-shot that doesn't
-// overlap the SEL→READY race window). This is the race-relevant
-// number; the original max stays for context.
-#define STATS_OFF_MAX_STEADY_SWEEP_CYCLES 0x068
-// #155 BRISC OLD-sel rescue at SEL change. When BRISC observes a
-// SEL change but `handle_queue_ready_change` never fired for the
-// old sel (kernel raced past in vm_setup_vq's
-// `setup; READY=1; SEL=N+1` sequence), BRISC snapshots the visible
-// regs (still holding kernel's last writes for old sel) into
-// shadow_q[old_sel] BEFORE the shadow swap overwrites visible NUM.
-// Lives on BRISC's main loop, not TRISC1's hot path, so it doesn't
-// slow the SEL→READY race response.
-#define STATS_OFF_BRISC_OLD_SEL_RESCUE    0x06c
+// DEV_FEAT_SEL_CHANGES: TRISC1 SEL-watch diagnostic (every observed
+// change of DEVICE_FEATURES_SEL across all slots).
+//
+// TRISC1_SEL_RACES: TRISC1's SEL-watch loop saw a SEL change AND
+// visible QUEUE_READY for the prior SEL was still 1. Compare to
+// SEL_READY_RACES — TRISC1>0 with BRISC=0 means TRISC1 cleaned up
+// before BRISC observed.
+#define STATS_OFF_SEL_READY_RACES         0x024
+#define STATS_OFF_READY_CAPTURE_SEL_RACES 0x028
+#define STATS_OFF_QUEUE_SETUPS            0x02c
+#define STATS_OFF_QUEUE_TEARDOWNS         0x030
+#define STATS_OFF_BRISC_OLD_SEL_RESCUE    0x034
+#define STATS_OFF_DEV_FEAT_SEL_CHANGES    0x038
+#define STATS_OFF_TRISC1_SEL_RACES        0x03c
+
+// --- Timing probes (#124, #156) ---
+//
+// All in BRISC-clock cycles (mcycle low half — wraps every ~3.2 s
+// at 1.35 GHz; per-iter deltas are hundreds to low thousands of
+// cycles, so wrap doesn't bother subtraction). Updated as
+// max-since-stats-reset unless noted.
+//
+// MAX_SWEEP_CYCLES: top-of-main-loop to top-of-main-loop. Worst-
+// case sweep period — the relevant number for racing the kernel's
+// writel→readl gap.
+//
+// MAX_STEADY_SWEEP_CYCLES: like above but EXCLUDES iters where
+// `init_device` fired (STATUS=0 → ~1240-cycle wipe loop dominates
+// max but is a one-shot that doesn't overlap the SEL→READY race
+// window). The race-relevant number.
+//
+// MAX_SEL_PATH_CYCLES: handle_queue_sel_change entry to just after
+// the QUEUE_READY=0 + FENCE_W. The duration BRISC holds the kernel
+// waiting on its readl response after a SEL write.
+//
+// LAST_SWEEP_CYCLES: most recent sweep period. Useful when MAX
+// looks suspect (e.g., a single early outlier from cold-cache
+// effects swamping everything).
+//
+// MAX_TRISC1_REACTION_CYCLES: cycles from "TRISC1 observed SEL
+// change" to "READY=0 published with FENCE_W". TRISC1's per-event
+// critical-path cost.
+//
+// MAX_TRISC1_OUTER_CYCLES: cycles for a full TRISC1 outer iter
+// (sweep across all active virtio slots). Per-slot revisit time =
+// this / num_active_slots.
+#define STATS_OFF_MAX_SWEEP_CYCLES            0x040
+#define STATS_OFF_MAX_STEADY_SWEEP_CYCLES     0x044
+#define STATS_OFF_MAX_SEL_PATH_CYCLES         0x048
+#define STATS_OFF_LAST_SWEEP_CYCLES           0x04c
+#define STATS_OFF_MAX_TRISC1_REACTION_CYCLES  0x050
+#define STATS_OFF_MAX_TRISC1_OUTER_CYCLES     0x054
+
+// 0x058–0x0FC: reserved for future stats. Bump TENSIX_PROTOCOL_VERSION
+// when adding fields here so a daemon ↔ firmware mismatch is loud.
 
 #define STATS_MAGIC_LOADED        0x0000B155u
 
@@ -223,11 +185,14 @@
 // with DEVS_PER_L2CPU = 8) so shadow + reg writes stay in the same
 // Tensix L1 bank — Tensix L1 is banked, and `fence w, w` is a
 // hart-local store fence that does not enforce global ordering of
-// stores across banks. When SHADOW_BASE was at 0x40000 (a bank apart
-// from the reg files and the kick ring at 0x5000), a shadow write
-// followed by a kick-ring producer-seq bump appeared out-of-order to
-// the daemon: it saw the kick first and read a half-formed avail
-// address, dropping the kick.
+// stores across banks. When SHADOW_BASE was at 0x40000 (a bank
+// apart from the reg files at 0x10000 and the CTRL region at
+// 0x5000), a shadow write followed by a CTRL-region write (V1: a
+// kick-ring producer-seq bump; V2: a DIRTY-byte set) appeared
+// out-of-order to the daemon: it saw the CTRL update first and
+// read a half-formed avail address. Different surface in V1 vs V2
+// (overflow vs cache-coherence-style staleness) but same root
+// cause — keep shadow co-banked with reg files.
 //
 // Originally 0x20000 (with NUM_SLOTS=16 → reg files ended at
 // 0x20000); new bump puts shadow at 0x30000 (NUM_SLOTS=32 → reg
@@ -327,11 +292,13 @@ static inline void store_u32(uintptr_t addr, uint32_t v) {
 }
 
 // Fenced store. Use ONLY when the next thing to happen is an
-// externally-observed write (kick ring producer_seq bump after a
-// kick entry; QUEUE_READY=0 clear on the SEL→READY race-critical
-// path; reset-vector handoff at boot). Each `fence w, w` costs
-// ~10-30 cycles on BRISC; chained fences (one per write) were
-// behind the worst-case sweep duration before #123's diagnosis.
+// externally-observed write (QUEUE_READY=0 clear on the
+// SEL→READY race-critical path; reset-vector handoff at boot;
+// hello-ack publish). The V2 dirty-byte set in handle_queue_notify
+// is a single-byte store and explicitly does NOT fence — see the
+// comment there. Each `fence w, w` costs ~10-30 cycles on BRISC;
+// chained fences (one per write) were behind the worst-case sweep
+// duration before #123's diagnosis.
 static inline void write_u32(uintptr_t addr, uint32_t v) {
     *l1_u32(addr) = v;
     FENCE_W();
@@ -494,7 +461,8 @@ static void init_device(unsigned slot) {
     // QUEUE_NOTIFY: clear to sentinel (-1) so the first poll
     // after init_device doesn't fire a spurious "queue 0" notify
     // on the zeroed reg file. Guest writes any queue index
-    // (including 0) → next poll sees value != -1 → kick fires.
+    // (including 0) → next poll sees value != -1 → V2 DIRTY byte
+    // gets set.
     *l1_u32(reg_addr(slot, VIRTIO_MMIO_QUEUE_NOTIFY)) = 0xFFFFFFFFu;
 
     // SW_IMPL=1 tells the patched kernel "this is a software
@@ -684,17 +652,18 @@ static void handle_queue_ready_change(unsigned slot, uint32_t sel, uint32_t read
                 *l1_u32(shadow_queue_addr(slot, sel, FIELDS[f].shadow_off)) = cap[f];
             }
             // Force the shadow writes to commit to their L1 bank
-            // before any subsequent kick reaches the daemon. fence w,w
-            // (already implicit in `write_u32` for visible regs above)
-            // is hart-local; it drains BRISC's store queue but does
-            // not order writes across L1 banks. Shadow lives at
-            // SHADOW_BASE (bank A); the kick ring + producer_seq live
-            // at CTRL_BASE (bank B). Without forcing bank commit, the
-            // daemon could see a producer_seq bump (bank B propagated)
-            // before the shadow stores (bank A still pending) — and
-            // read DESC_LO=0 with DESC_HI=0x4000 in the worst case.
-            // The load below blocks until the bank acknowledges, same
-            // pattern as `brisc_set_trisc0_reset`'s `(void)*reg`.
+            // before any subsequent NOTIFY reaches the daemon.
+            // fence w,w (already implicit in `write_u32` for visible
+            // regs above) is hart-local; it drains BRISC's store
+            // queue but does not order writes across L1 banks.
+            // Shadow lives at SHADOW_BASE (bank A); the V2 DIRTY
+            // byte lives at CTRL_BASE (bank B). Without forcing
+            // bank commit, the daemon could see a DIRTY=1 (bank B
+            // propagated) before the shadow stores (bank A still
+            // pending) and read DESC_LO=0 with DESC_HI=0x4000 in
+            // the worst case. The load below blocks until the bank
+            // acknowledges, same pattern as
+            // `brisc_set_trisc0_reset`'s `(void)*reg`.
             FENCE_W();
             (void)*l1_u32(shadow_queue_addr(slot, sel, SHADOW_Q_OFF_DEVICE_HI));
             inc_stat(STATS_OFF_QUEUE_SETUPS);
@@ -713,126 +682,55 @@ static void handle_queue_ready_change(unsigned slot, uint32_t sel, uint32_t read
         *l1_u32(shadow_queue_addr(slot, sel, SHADOW_Q_OFF_DEVICE_HI)) = 0;
         inc_stat(STATS_OFF_QUEUE_TEARDOWNS);
     }
-    // No FENCE_W here: shadow is BRISC-private and the next kick
-    // for this queue will fence inside `kick_ring_push` before the
-    // producer-seq bump, which transitively orders these stores
-    // against any daemon-side shadow read.
+    // V2 (#188): the daemon walks ring metadata from guest DRAM via
+    // its own mmap path; shadow remains a BRISC-private snapshot
+    // used only inside the firmware's poll loop. No fence needed —
+    // the next sweep's reads of these stores stay within this hart.
     inc_stat(STATS_OFF_READY_EVENTS);
 }
 
-// ----- M5 (#71) wire-protocol helpers -----
+// ----- Wire-protocol helpers -----
 
 static inline uintptr_t ctrl_addr(unsigned off) {
     return (uintptr_t)(CTRL_BASE + off);
 }
 
-// Per-slot epoch — bumped on STATUS=0 reset so kicks pre-dating the
-// reset can be filtered out by the daemon. BRISC-private; lives in
-// the shadow region.
-static inline uintptr_t epoch_addr(unsigned slot) {
-    return shadow_addr(slot, SNAP_BASE_OFF + 0x10);
-}
-
-// Append one KickEntry to the L1 kick ring and bump the producer
-// counter. The daemon polls `producer_seq` via the chip-side TLB
-// and drains entries in `[consumer_seq..producer_seq)`. Same SPSC
-// pattern as a virtio split virtqueue, but with the ring in BRISC
-// L1 rather than guest DRAM.
+// Guest wrote QUEUE_NOTIFY=q. Set the per-(slot, queue) dirty byte
+// in `CTRL_OFF_DIRTY`. The daemon clears the byte and dispatches
+// each pass; a single-byte store on RV32I is atomic, so no fence
+// is needed and the level-sensitive bitmap can't overflow under
+// any guest burst.
 //
-// Pre-#101 we wrote unconditionally; under daemon backpressure (slow
-// `process_one_chain_for_queue` on a disk stall etc.) BRISC would
-// overwrite unread entries and the daemon would consume garbage
-// re-runs of the ring. Now we check fullness first: if the ring is
-// already at `KICK_RING_ENTRIES - 1` outstanding, drop the kick and
-// bump `STATS_OFF_KICK_DROPS` so the daemon can surface the
-// pressure rather than silently corrupting state. We don't block —
-// BRISC is preemption-free and a stalled daemon will only get worse
-// if firmware also stalls.
-static void kick_ring_push(unsigned slot, uint32_t queue_idx) {
-    uint32_t seq = read_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_PRODUCER_SEQ));
-    uint32_t consumer = read_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_CONSUMER_SEQ));
-    uint32_t outstanding = seq - consumer;
-    if (outstanding >= KICK_RING_ENTRIES) {
-        uint32_t drops = read_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_KICK_DROPS);
-        // Stat counter — no fence; daemon reads at ms timescale.
-        store_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_KICK_DROPS, drops + 1u);
-        return;
-    }
-    uint32_t epoch = read_u32(epoch_addr(slot));
-    uint32_t idx = seq & (KICK_RING_ENTRIES - 1u);
-    uintptr_t entry = ctrl_addr(CTRL_OFF_KICK_RING + idx * KICK_ENTRY_SIZE);
-    *l1_u32(entry + KICK_ENTRY_OFF_SLOT) = ((uint32_t)slot & 0xFFFFu) | ((queue_idx & 0xFFFFu) << 16);
-    *l1_u32(entry + KICK_ENTRY_OFF_SEQ) = seq;
-    *l1_u32(entry + KICK_ENTRY_OFF_EPOCH) = epoch;
-    FENCE_W();
-    // Bump the producer AFTER the entry is fully written so a
-    // racing daemon read either misses the entry entirely or sees
-    // it in a consistent state.
-    write_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_PRODUCER_SEQ), seq + 1u);
-}
-
-// Guest wrote QUEUE_NOTIFY=q. Append a KickEntry to the kick ring so
-// the daemon's poll loop wakes up and drains the device's avail
-// ring. Also records (slot, q) in the stats page for diagnostics.
+// The MAX_QUEUES_PER_SLOT bound guards against a misbehaving guest
+// writing an out-of-range queue index. Real virtio drivers stay
+// well below the cap (block=1, net=2, console=2-4).
 static void handle_queue_notify(unsigned slot, uint32_t q) {
     *l1_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_LAST_NOTIFY) =
         ((uint32_t)slot << 16) | (q & 0xFFFFu);
-    kick_ring_push(slot, q);
+    if (q < MAX_QUEUES_PER_SLOT) {
+        *((volatile uint8_t *)ctrl_addr(CTRL_OFF_DIRTY + slot * MAX_QUEUES_PER_SLOT + q)) = 1u;
+    }
     inc_stat(STATS_OFF_NOTIFY_EVENTS);
 }
 
-// Guest wrote STATUS. If 0, the device is being reset — wipe the per-
-// device state, reinitialize the read-only regs, and bump the per-
-// slot epoch so any kicks recorded for the previous incarnation are
-// filterable on the daemon side.
-// Set when handle_status_change fires init_device this main-loop
+// Set when `handle_status_change` fires `init_device` this main-loop
 // iter, so the top-of-loop steady-state max doesn't get poisoned by
 // the ~1240-cycle wipe. Cleared after the per-iter max update.
 static int init_device_fired_this_iter;
 
+// Guest wrote STATUS. If 0, the device is being reset — wipe the
+// per-device state and reinitialize the read-only regs. The daemon
+// notices the same MMIO_STATUS=0 transition in its per-poll status
+// sweep and resets its own per-(slot, queue) `processed[]` cursor
+// — see `crate::tensix_data_plane::run_poll_loop` (V2; replaced
+// the V1 per-kick epoch field).
 static void handle_status_change(unsigned slot, uint32_t status, uint32_t prev) {
     (void)prev;
     if (status == 0) {
-        uint32_t e = read_u32(epoch_addr(slot));
         init_device(slot);
-        // init_device wipes the shadow region, including epoch — so
-        // re-establish it after. Daemon reads epoch on the next
-        // kick; the kick path's own fence orders this for it. No
-        // local fence.
-        store_u32(epoch_addr(slot), e + 1u);
         init_device_fired_this_iter = 1;
     }
     inc_stat(STATS_OFF_STATUS_CHANGES);
-}
-
-// Drain the completion ring (daemon → BRISC). Each entry tells us
-// "slot S queue Q has a new used_idx; please IRQ the L2CPU." In
-// this M5 first cut we only record the event in stats; the actual
-// PLIC IRQ to the L2CPU stays daemon-driven (the NIU register
-// dance for BRISC-side NoC writes lands in a follow-up).
-static void poll_completion_ring(void) {
-    uint32_t producer = read_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_PRODUCER_SEQ));
-    uint32_t consumer = read_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_CONSUMER_SEQ));
-    if (consumer == producer) {
-        // Steady state: nothing to drain. Skip the publish — writing
-        // the same CONSUMER_SEQ back with a FENCE_W on every main-loop
-        // iteration is pure overhead and widens the SEL→READY race
-        // window we're trying to shrink (#123).
-        return;
-    }
-    do {
-        uint32_t idx = consumer & (COMPL_RING_ENTRIES - 1u);
-        uintptr_t entry = ctrl_addr(CTRL_OFF_COMPL_RING + idx * COMPL_ENTRY_SIZE);
-        uint32_t slot_q = *l1_u32(entry);  // [15:0] slot, [31:16] queue
-        // Stash for diagnostics; same packed format as LAST_NOTIFY.
-        *l1_u32((uintptr_t)BRISC_VIRTIO_STATS_BASE + STATS_OFF_LAST_COMPL) = slot_q;
-        inc_stat(STATS_OFF_COMPL_EVENTS);
-        consumer += 1u;
-    } while (consumer != producer);
-    // No fence: the daemon polls CONSUMER_SEQ for backpressure
-    // diagnostics, not for ordering with anything BRISC writes after.
-    // Microsecond visibility delay is fine.
-    store_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_CONSUMER_SEQ), consumer);
 }
 
 // ----- Main poll loop -----
@@ -861,15 +759,15 @@ static void poll_one_device(unsigned slot) {
     // QUEUE_READY — RW. Must run BEFORE QUEUE_NOTIFY: the kernel
     // virtio-mmio sequence writes READY=1 then NOTIFY in tight
     // succession, and BRISC observes both in a single sweep. The
-    // READY handler atomically captures the queue setup fields into
-    // shadow (#120); the NOTIFY handler pushes a kick-ring entry
-    // with FENCE_W around the producer-seq bump. Running NOTIFY
-    // first published the kick to the daemon BEFORE the capture
-    // committed shadow, so the daemon read the kick and saw stale
-    // setup values — the pointers-out-of-range drop seen in soak.
-    // Running READY first means the capture writes precede the
-    // NOTIFY-handler's fence, which transitively orders them
-    // against the daemon's view of `producer_seq`.
+    // READY handler atomically captures the queue setup fields
+    // into shadow (#120); the NOTIFY handler sets the V2 DIRTY
+    // byte. Running NOTIFY first would let the daemon observe
+    // DIRTY=1 BEFORE the capture committed shadow — daemon reads
+    // stale setup values, hits the pointers-out-of-range drop seen
+    // in soak. Running READY first means the capture writes
+    // precede the NOTIFY-handler's DIRTY set, which transitively
+    // orders them against the daemon's view of CTRL_OFF_DIRTY via
+    // the explicit cross-bank fence in handle_queue_ready_change.
     //
     // Persisting any non-zero write to shadow then clears the
     // visible reg back to 0. The legacy host-buffer path
@@ -1183,10 +1081,10 @@ static void trisc0_uart_poll_one(unsigned l2cpu_idx) {
 //
 // Why BRISC instead of the host: ownership cleanup. With this, the
 // daemon never directly touches TRISC0's reset state — TRISC0 is a
-// BRISC-internal implementation detail behind the kick-ring +
-// (Phase B) byte-feed-ring abstraction. The lifecycle is exactly
-// aligned with the bitmap state, which is how an operator already
-// thinks about UART-on-this-L2CPU.
+// BRISC-internal implementation detail behind the byte-feed-ring
+// abstraction. The lifecycle is exactly aligned with the bitmap
+// state, which is how an operator already thinks about
+// UART-on-this-L2CPU.
 
 #define TENSIX_SOFT_RESET_ADDR    0xFFB121B0u
 #define SOFT_RESET_TRISC0         (1u << 12)
@@ -1327,20 +1225,22 @@ void trisc0_main(void) {
     }
 }
 
-// ----- M5 (#71) handshake -----
+// ----- Cold-start handshake -----
 
 // Initialize the control-plane region: zero the hello/hello-ack/
-// kick-ring/compl-ring slots, then publish ring sizes. Daemon must
-// not write its hello until BRISC has done this — but in practice
-// the daemon waits for the M3 stats-magic before issuing hello, and
-// stats-magic is published only after `init_proto`, so the
-// ordering is enforced by construction.
+// dirty/processed slots. Daemon must not write its hello until
+// BRISC has done this — but in practice the daemon waits for the
+// M3 stats-magic before issuing hello, and stats-magic is published
+// only after `init_proto`, so the ordering is enforced by
+// construction.
+//
+// V2 (#188): the zero-sweep is the only init the bitmap path needs.
+// DIRTY + PROCESSED arrays are sized implicitly by NUM_SLOTS *
+// MAX_QUEUES_PER_SLOT and need no published header.
 static void init_proto(void) {
     for (unsigned off = 0; off < CTRL_SIZE; off += 4) {
         *l1_u32(ctrl_addr(off)) = 0;
     }
-    *l1_u32(ctrl_addr(CTRL_OFF_KICK_RING_HDR + KICK_HDR_OFF_RING_ENTRIES)) = KICK_RING_ENTRIES;
-    *l1_u32(ctrl_addr(CTRL_OFF_COMPL_RING_HDR + COMPL_HDR_OFF_RING_ENTRIES)) = COMPL_RING_ENTRIES;
     FENCE_W();
 }
 
@@ -1379,8 +1279,8 @@ void main(void) {
     // poll loop. Without this, a guest could (in theory) start
     // probing before the daemon has agreed on the protocol version
     // — the L1 reg files are already initialized by init_device, so
-    // the device looks valid, but the kick FIFO would have no
-    // consumer.
+    // the device looks valid, but the V2 dirty bitmap would have no
+    // drainer.
     wait_for_hello_and_ack();
 
     uint32_t heartbeat = 0;
@@ -1488,7 +1388,6 @@ void main(void) {
         brisc_drive_trisc0_lifecycle(active);
         brisc_drive_trisc1_lifecycle(virtio_active);
         brisc_drive_trisc2_lifecycle(virtio_active);
-        poll_completion_ring();
         heartbeat += 1u;
         // Don't fence on every iteration — heartbeat is observed at
         // human timescales (debug status), so once per ~1024 sweeps
@@ -1517,9 +1416,9 @@ void main(void) {
 //   * Update `last_sel[slot]`.
 //
 // What stays on BRISC:
-//   * The full `poll_one_device` per slot (NOTIFY/kick ring,
-//     STATUS, BLINDCAP, drv-feat snap, sel-gen echo, NUM_MAX/NUM
-//     mirroring on SEL change). BRISC's existing
+//   * The full `poll_one_device` per slot (NOTIFY → V2 DIRTY byte,
+//     STATUS, drv-feat snap, sel-gen echo, NUM_MAX/NUM mirroring
+//     on SEL change). BRISC's existing
 //     `handle_queue_sel_change` still also writes
 //     QUEUE_READY=0 on its own slower cadence — that's a harmless
 //     idempotent backstop (TRISC1 will usually have cleared it

@@ -216,6 +216,69 @@ impl TensixTile {
         self.l1_window.write32(offset as u64, value);
     }
 
+    /// Volatile single-byte read from L1. Used by the V2 dispatcher
+    /// to poll the per-(slot, queue) dirty bitmap. Volatile because
+    /// BRISC may be writing the same byte concurrently — the
+    /// compiler must not coalesce repeated reads into a register
+    /// snapshot.
+    pub fn read_l1_u8(&self, offset: u32) -> u8 {
+        assert!(
+            (offset as usize) < TENSIX_L1_SIZE,
+            "L1 u8 read offset 0x{:x} >= L1 size",
+            offset
+        );
+        // SAFETY: offset bounds-checked above; the L1 window is a
+        // valid, aligned mapping for the lifetime of the tile.
+        unsafe { std::ptr::read_volatile(self.l1_window.get_window().add(offset as usize)) }
+    }
+
+    /// Volatile single-byte write to L1. Counterpart to
+    /// `read_l1_u8`; the V2 dispatcher uses it to clear dirty bits
+    /// after observation. Single-byte stores are atomic on RV32I,
+    /// so concurrent BRISC re-sets after the clear are race-free
+    /// (BRISC's set just becomes the next-pass observation).
+    pub fn write_l1_u8(&self, offset: u32, value: u8) {
+        assert!(
+            (offset as usize) < TENSIX_L1_SIZE,
+            "L1 u8 write offset 0x{:x} >= L1 size",
+            offset
+        );
+        // SAFETY: same as `read_l1_u8`.
+        unsafe {
+            std::ptr::write_volatile(self.l1_window.get_window().add(offset as usize), value);
+        }
+    }
+
+    /// Volatile half-word write to L1. The V2 dispatcher uses it to
+    /// publish the post-dispatch `processed[qi]` cursor (a u16) into
+    /// `CTRL_OFF_PROCESSED`. Volatile because the daemon is the
+    /// sole writer but readers (warm-resume probes from a freshly
+    /// spawned daemon) must observe the latest value, not a cached
+    /// snapshot.
+    pub fn write_l1_u16(&self, offset: u32, value: u16) {
+        assert!(
+            (offset as usize) + 2 <= TENSIX_L1_SIZE,
+            "L1 u16 write offset 0x{:x} + 2 > L1 size",
+            offset
+        );
+        // u16 stores must be 2-byte aligned for the underlying
+        // PCIe MMIO; debug-trip on misalignment.
+        debug_assert_eq!(
+            offset & 1,
+            0,
+            "L1 u16 write offset 0x{:x} unaligned",
+            offset
+        );
+        // SAFETY: bounds + alignment checked; pointer cast is
+        // sound for an aligned address in our valid mapping.
+        unsafe {
+            std::ptr::write_volatile(
+                self.l1_window.get_window().add(offset as usize) as *mut u16,
+                value,
+            );
+        }
+    }
+
     /// Host VA pointing at L1 byte `offset`. Used by code paths that
     /// need a raw pointer (e.g. `InterruptController::set_interrupt`,
     /// which takes `*mut u32`). Caller is responsible for keeping

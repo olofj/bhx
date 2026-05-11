@@ -5,6 +5,102 @@ Notable changes per release. Format loosely follows
 this project does not yet promise SemVer compatibility on the RPC
 wire format or library API surface (we're not 1.0).
 
+## Unreleased
+
+V2 virtio-dispatch redesign. The kick ring + completion ring + host-
+side throttle that grew up around #184 are gone; in their place is a
+per-(slot, queue) dirty bitmap in BRISC L1. The bitmap is level-
+sensitive — guest QUEUE_NOTIFY storms coalesce into a single set
+byte, so the dispatch path can't fall behind under any burst. Wire
+incompatible with 0.9.0; `TENSIX_PROTOCOL_VERSION` bumped 4 → 5.
+
+### Added
+
+- **V2 dirty-bitmap dispatch** (`#187` / `#188` / `#189`). BRISC
+  writes 1 to `CTRL_OFF_DIRTY[slot][queue]` on every guest
+  QUEUE_NOTIFY; the daemon's `Dispatcher` clears the byte and
+  dispatches each pass. Replaces V1's 2048-entry kick ring +
+  daemon-side `consume_kick_ring_pass` consumer.
+- **V2 processed-cursor table** at `CTRL_OFF_PROCESSED`. Daemon
+  publishes `used.idx` after each successful dispatch so
+  warm-resume reads cursors directly without re-probing guest
+  DRAM.
+- **`bhx_notify_events_total`, `bhx_dispatch_passes_total`,
+  `bhx_dispatch_queues_drained`** Prometheus counters surface the
+  new dispatch path. The burst regression test (`scripts/
+  soak_virtio_burst.py`) asserts `dispatch_passes_total > 0` to
+  confirm the workload reached the new path.
+- **`scripts/soak_virtio_burst.py`** — multi-queue burst regression
+  test. Sustains 16-job direct=1 fio randwrite + a tight
+  `printf` loop to `/dev/console`, samples `/metrics` every 1 s,
+  and verifies the daemon log contains zero
+  `kick.*drop|rescue|throttle.*ENGAGE` matches.
+- **`DaemonState.chip_reset_this_session`** flag — gates
+  `maybe_opportunistic_reset_board` so 4-way parallel cold boots
+  reset the chip exactly once, not once per L2CPU. Without this
+  the second-and-later resets blip the chip while earlier-booted
+  L2CPUs hold mmap pages, SIGBUSing their workers.
+- **`Dispatcher` (was `KickPoller`)** with documented testability
+  seam (`CtrlL1Access` trait); `drain_dirty_bitmap` is unit-tested
+  against an in-memory L1 fake covering all five visit/clear
+  semantics cases plus the address-formula pins.
+
+### Changed
+
+- **`KickPoller` → `Dispatcher`**, plus `kick_poller` → `dispatcher`
+  field on `DaemonState`, `tensix-kick-poller` → `tensix-dispatcher`
+  thread name, `[kick-poller]` → `[dispatcher]` log tag,
+  `kicks_consumed` → `dispatches_total`,
+  `last_kick_slot_queue` → `last_dispatch_slot_queue`. Pure
+  rename; no behavior change. V1 vocabulary scrubbed throughout
+  the codebase (firmware, daemon, scripts, docs).
+- **`CTRL_SIZE` shrinks 36 KiB → 4 KiB**. V2 footprint is ~1.5 KiB;
+  the rest is reserved for future fields.
+- **Stats-page offsets repacked** — V1 `STATS_OFF_KICK_DROPS`,
+  `STATS_OFF_COMPL_EVENTS`, `STATS_OFF_LAST_COMPL` retired with
+  V1 (#190); deprecated PRECAP / BLINDCAP / POSTCAP slots dropped
+  in this cleanup pass. `proto::PROTOCOL_VERSION` is the gate on
+  the layout shift.
+- **`TensixEngine`** gains typed L1 helpers (`read_l1_u8`,
+  `write_l1_u8`, `write_l1_u16`) so the V2 dispatcher's volatile
+  byte / halfword accesses go through one centralized
+  `unsafe`-block per primitive instead of inline ad-hoc casts.
+- **`scripts/soak_fio_remove_disk.py`** — three pre-existing harness
+  bugs fixed: regex matching against execution-output (instead of
+  false-matching the typed-back command echo), staged fio binary
+  in tmpfs to dodge vda-page-cache eviction across many remove/add
+  cycles, dropped `rm /root/fio.tmp` from kill_fio (the unlink
+  queued behind D-state fio I/O on the just-yanked disk and
+  wedged the shell). 100/100 iter run now passes cleanly.
+
+### Removed
+
+- **`KickEntry` / `CompletionEntry` types**, their offsets, and the
+  `STATS_OFF_KICK_DROPS` / `STATS_OFF_COMPL_*` stats. The V1
+  Rust-side `consume_kick_ring_pass`, the throttle state machine
+  (`THROTTLE_HIGH_PCT` / `THROTTLE_LOW_PCT` / `set_used_no_notify
+  _for_all_queues` / `rescan_all_queues`), the
+  `bhx_kick_drops_total` / `bhx_kick_ring_high_water` /
+  `bhx_kick_ring_current_gap` / `bhx_kick_rescued_total` /
+  `bhx_kick_throttle_engaged` /
+  `bhx_kick_throttle_transitions_total` metrics, and the
+  `[kick-poller] BRISC dropped N kicks` log line are all gone.
+- **BRISC firmware: `kick_ring_push`, `poll_completion_ring`,
+  per-slot `epoch_addr`** RMW (V1's STATUS=0 detector — V2 reads
+  MMIO_STATUS directly), kick-ring + completion-ring init in
+  `init_proto`. Firmware text shrinks 5012 → 4844 bytes.
+
+### Notes
+
+- `CTRL_OFF_STATE_LOG` was reserved in early V2 patches but never
+  written; dropped during cleanup. 0x0400..CTRL_SIZE in the V2
+  layout is reserved for future fields with the convention "bump
+  `proto::PROTOCOL_VERSION` on any addition."
+- The `Registry` mutex is still held across the entire
+  `drain_dirty_bitmap` pass — same shape as V1, not a regression.
+  See FIXME comment on the type alias for the per-slot RwLock /
+  snapshotted-view refactor when add/remove SLAs need tightening.
+
 ## 0.9.0 — 2026-05-05
 
 First release-candidate-shaped cut. Boots stock distros end-to-end on

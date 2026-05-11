@@ -28,9 +28,11 @@ project — don't skip it.
 As of M6.9 (#71) the legacy host-buffer #64 path is gone — there is
 exactly one virtio control plane: BRISC firmware on a Tensix tile
 serving all four L2CPUs through `process_one_chain_for_queue` in
-`src/virtio/mod.rs`, dispatched from the kick poller in
-`src/tensix_data_plane.rs`. The only remaining feature flag is
-`slirp` (libvdeslirp/libslirp link for virtio-net).
+`src/virtio/mod.rs`, dispatched from the V2 dispatcher (#187 / #189)
+in `src/tensix_data_plane.rs`. The dispatcher polls a per-(slot,
+queue) dirty bitmap in BRISC L1 — the V1 kick ring + completion ring
++ throttle paths were retired in #190. The only remaining feature
+flag is `slirp` (libvdeslirp/libslirp link for virtio-net).
 
 Ambition does not mean scope creep. Stay ruthless about simplicity:
 - Don't invent abstractions for hypothetical future needs.
@@ -109,7 +111,7 @@ scripts/  (see scripts/README.md)
 
 brisc-firmware/        # BRISC + TRISC0 firmware for the Tensix virtio engine
 ├── start.S            # multi-core entry; hart-ID dispatch via reset-PC override
-├── virtio.c           # register-file emulation + UART poll + kick ring + handshake
+├── virtio.c           # register-file emulation + UART poll + V2 dirty bitmap + handshake
 ├── hello.c            # minimal heartbeat-only firmware (#67 M1 smoke)
 ├── include/           # virtio_layout.h, uart_layout.h, tensix_proto.h shared with Rust
 ├── prebuilt/          # checked-in *.bin fallback when sfpi toolchain absent
