@@ -285,11 +285,12 @@ pub mod isa_emu_pmu {
     pub const ZICBOM: u32 = 11;
     pub const ZICBOZ: u32 = 12;
     pub const ZCMOP: u32 = 13;
-    /// Reserved — Freisen's patch carries decode for these but the
-    /// bhx OpenSBI build doesn't enable `CONFIG_EMU_ZBC` /
-    /// `CONFIG_EMU_SUPM`. Counters for them will read zero. Kept
-    /// here so the ID space matches the C-side enum.
     pub const ZBC: u32 = 14;
+    /// Pointer masking. Counter only increments if the guest sets up
+    /// pointer-masking via SBI FWFT and then traps on a PM-related
+    /// page fault — most stock distro userspaces won't, so this
+    /// counter typically reads zero in practice. See the EMU_SUPM
+    /// Kconfig help in `0003-isa-ext-emu.patch`.
     pub const SUPM: u32 = 15;
 
     /// Compile-time-checkable list of all defined event IDs and the
@@ -311,8 +312,8 @@ pub mod isa_emu_pmu {
         (ZICBOM, "Zicbom"),
         (ZICBOZ, "Zicboz"),
         (ZCMOP, "Zcmop"),
-        (ZBC, "Zbc (reserved)"),
-        (SUPM, "Supm (reserved)"),
+        (ZBC, "Zbc"),
+        (SUPM, "Supm"),
     ];
 
     /// Compose the `perf` raw `config` value for a given event ID.

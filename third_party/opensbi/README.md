@@ -109,8 +109,13 @@ alphabetical order, so adding more later is drop-in:
   trap-based emulation of RVA22/RVA23 ISA extensions so the X280
   (RVA22-class Gen.1) can run stock RVA23 distros like Ubuntu
   25.10/26.04. The Makefile flips `CONFIG_SBI_ISA_EXT_EMU=y` +
-  `CONFIG_EMU_RVB23=y` in the platform defconfig after the patch
-  applies. See #163.
+  `CONFIG_EMU_RVB23=y` + `CONFIG_EMU_ZBC=y` + `CONFIG_EMU_SUPM=y`
+  in the platform defconfig after the patch applies. See #163.
+- `0004-isa-ext-emu-pmu.patch` — bhx downstream PMU device that
+  surfaces per-hart per-extension hit counts via SBI's
+  platform-firmware-event mechanism. Guest perf attaches with raw
+  `config = 0xC000_0000_0000_0000 | <event_id>`; `bhx debug
+  isa-emu-events` prints the event-ID table. See #199.
 
 ## Bumping OpenSBI
 

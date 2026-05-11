@@ -1582,8 +1582,8 @@ fn run_isa_emu_events() -> std::io::Result<()> {
     println!();
     println!("...or pick a specific extension from the table below.");
     println!();
-    println!("  ID  Extension         perf config (raw)");
-    println!("----  ----------------  -------------------");
+    println!("  ID  Extension  perf config (raw)");
+    println!("----  ---------  -------------------");
     for (id, name) in EVENTS {
         // The NONE pseudo-event isn't observable from userspace — the
         // firmware rejects it in validate_encoding — so don't print a
@@ -1591,7 +1591,7 @@ fn run_isa_emu_events() -> std::io::Result<()> {
         if *id == NONE {
             continue;
         }
-        println!("{:>4}  {:<16}  r{:016x}", id, name, perf_config(*id));
+        println!("{:>4}  {:<9}  r{:016x}", id, name, perf_config(*id));
     }
     println!();
     println!("Counter is 64-bit and never wraps in realistic timeframes.");

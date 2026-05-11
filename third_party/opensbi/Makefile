@@ -127,14 +127,20 @@ $(SB_SRCDIR)/Makefile: $(PATCH_FILES)
 	done
 	@# (bhx#163) Enable the trap-based ISA extension emulator and turn
 	@# on the RVB23 subset that covers the gap between X280 (Gen.1,
-	@# RVA22-class) and a stock RVA23 distro (Ubuntu 25.10+). Skips
-	@# EMU_ALL because that auto-selects EMU_ZBC and EMU_ZVBB, neither
-	@# of which we carry (Zvbb lives in patch v3 3/3, not vendored).
+	@# RVA22-class) and a stock RVA23 distro (Ubuntu 25.10+). RVB23
+	@# pulls in Zicond / Zimop / Zawrs / Zfa / Zcb / Zcmop and (via
+	@# its RVA22 dependency) Zicbom / Zicboz / Zfhmin / Zba / Zbb /
+	@# Zbs. We additionally enable EMU_ZBC + EMU_SUPM because the
+	@# decode for both is already in patch 0003 and the SBI PMU
+	@# patch in 0004 reserves event-data IDs for them; turning them
+	@# on keeps the wire format complete instead of advertising
+	@# always-zero counters. Skips EMU_ALL because that selects
+	@# EMU_ZVBB which lives in Freisen v3 3/3 (not vendored).
 	@# Append-to-defconfig flow: Kconfiglib picks these up alongside
 	@# the platform's existing defaults during the OpenSBI build's
 	@# olddefconfig pass.
-	@echo "==> Enabling SBI_ISA_EXT_EMU + EMU_RVB23 in generic defconfig"
-	@printf 'CONFIG_SBI_ISA_EXT_EMU=y\nCONFIG_EMU_RVB23=y\n' \
+	@echo "==> Enabling ISA-emu configs in generic defconfig"
+	@printf 'CONFIG_SBI_ISA_EXT_EMU=y\nCONFIG_EMU_RVB23=y\nCONFIG_EMU_ZBC=y\nCONFIG_EMU_SUPM=y\n' \
 		>> $(SB_SRCDIR)/platform/generic/configs/defconfig
 	@touch $@
 

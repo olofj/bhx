@@ -1,81 +1,52 @@
-From b659ead36da8fc5e489753ea4becebd500e41dca Mon Sep 17 00:00:00 2001
+From 569be0f3e8cce268477c2c5fccf84f8fdfafa5f5 Mon Sep 17 00:00:00 2001
 From: Olof Johansson <olof.johansson@gmail.com>
-Date: Mon, 11 May 2026 11:52:23 -0700
+Date: Mon, 11 May 2026 12:02:51 -0700
 Subject: [PATCH] lib: sbi: add ISA-emu PMU hook + bhx PMU device
 
 Adds a generic per-extension hit-counter hook for the trap-based ISA
-emulator:
+emulator with a symmetric init hook:
 
 - include/sbi/sbi_insn_emu_pmu.h declares an extension-ID enum
-  (SBI_INSN_EMU_EXT_*) and sbi_insn_emu_pmu_inc().
-- lib/sbi/sbi_insn_emu_pmu.c provides a weak no-op default so
-  sbi_insn_emu*.c always links.
+  (SBI_INSN_EMU_EXT_*), sbi_insn_emu_pmu_inc(), and
+  sbi_insn_emu_pmu_init().
+- lib/sbi/sbi_insn_emu_pmu.c provides weak no-op defaults so
+  sbi_insn_emu*.c and sbi_init.c always link.
 - sbi_insn_emu.c / sbi_insn_emu_fp.c track the matching extension
   through their decode trees and call sbi_insn_emu_pmu_inc() before
   each successful return.
+- sbi_init.c cold + warm paths call sbi_insn_emu_pmu_init() after
+  sbi_pmu_init().
 
 Adds a bhx-specific reflection that exposes the counters via SBI PMU
-platform firmware events (event_code = SBI_PMU_FW_PLATFORM,
-event_data = SBI_INSN_EMU_EXT_*):
+platform firmware events:
 
-- include/sbi/bhx_emu_pmu.h declares bhx_emu_pmu_init().
-- lib/sbi/bhx_emu_pmu.c implements the sbi_pmu_device callbacks +
-  provides a strong override of sbi_insn_emu_pmu_inc() that records
-  per-hart counts in sbi_scratch.
-- sbi_init.c cold + warm boot paths call bhx_emu_pmu_init().
+- lib/sbi/bhx_emu_pmu.c implements the sbi_pmu_device callbacks and
+  provides strong overrides of sbi_insn_emu_pmu_inc() and
+  sbi_insn_emu_pmu_init().
+- Per-hart counts live in sbi_scratch (allocated lazily by the first
+  init call). Each hart re-zeros its own slot on warm-init.
 
 Guest perf attaches with raw config = 0xC000_0000_0000_0000 |
-event_id.
+SBI_INSN_EMU_EXT_*.
 ---
- include/sbi/bhx_emu_pmu.h      |  23 ++++
- include/sbi/sbi_insn_emu_pmu.h |  60 ++++++++++
- lib/sbi/bhx_emu_pmu.c          | 195 +++++++++++++++++++++++++++++++++
+ include/sbi/sbi_insn_emu_pmu.h |  70 ++++++++++++
+ lib/sbi/bhx_emu_pmu.c          | 201 +++++++++++++++++++++++++++++++++
  lib/sbi/objects.mk             |   2 +
  lib/sbi/sbi_init.c             |  20 ++++
  lib/sbi/sbi_insn_emu.c         |  89 +++++++++++++++
  lib/sbi/sbi_insn_emu_fp.c      |  83 ++++++++++++++
- lib/sbi/sbi_insn_emu_pmu.c     |  19 ++++
- 8 files changed, 491 insertions(+)
- create mode 100644 include/sbi/bhx_emu_pmu.h
+ lib/sbi/sbi_insn_emu_pmu.c     |  24 ++++
+ 7 files changed, 489 insertions(+)
  create mode 100644 include/sbi/sbi_insn_emu_pmu.h
  create mode 100644 lib/sbi/bhx_emu_pmu.c
  create mode 100644 lib/sbi/sbi_insn_emu_pmu.c
 
-diff --git a/include/sbi/bhx_emu_pmu.h b/include/sbi/bhx_emu_pmu.h
-new file mode 100644
-index 00000000..8c3fb486
---- /dev/null
-+++ b/include/sbi/bhx_emu_pmu.h
-@@ -0,0 +1,23 @@
-+/*
-+ * SPDX-License-Identifier: BSD-2-Clause
-+ *
-+ * bhx ISA-extension-emulation PMU device. Implementation of
-+ * sbi_insn_emu_pmu_inc() that surfaces per-hart hit counts via
-+ * OpenSBI's platform-firmware-event PMU mechanism (event_code =
-+ * SBI_PMU_FW_PLATFORM, event_data = one of the SBI_INSN_EMU_EXT_*
-+ * IDs declared in <sbi/sbi_insn_emu_pmu.h>). See bhx#199 for the
-+ * design + the userspace `perf` recipe.
-+ */
-+
-+#ifndef __BHX_EMU_PMU_H__
-+#define __BHX_EMU_PMU_H__
-+
-+#include <sbi/sbi_types.h>
-+
-+/* Cold-init: allocate the per-hart scratch state and register the
-+ * PMU device. Call from sbi_init.c after sbi_pmu_init(). Idempotent
-+ * across harts — first call allocates, subsequent ones just zero
-+ * their own scratch slot. */
-+int bhx_emu_pmu_init(void);
-+
-+#endif /* __BHX_EMU_PMU_H__ */
 diff --git a/include/sbi/sbi_insn_emu_pmu.h b/include/sbi/sbi_insn_emu_pmu.h
 new file mode 100644
-index 00000000..141101d4
+index 00000000..b2a2371a
 --- /dev/null
 +++ b/include/sbi/sbi_insn_emu_pmu.h
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,70 @@
 +/*
 + * SPDX-License-Identifier: BSD-2-Clause
 + *
@@ -135,24 +106,35 @@ index 00000000..141101d4
 + */
 +void sbi_insn_emu_pmu_inc(int ext);
 +
++/*
++ * Cold + warm boot hook. Called unconditionally from sbi_init.c
++ * after sbi_pmu_init() on both the cold-boot and warm-boot paths.
++ * The default weak implementation is a no-op; a platform-specific
++ * PMU device file overrides this with a strong definition that
++ * allocates per-hart scratch + registers an sbi_pmu_device.
++ * Idempotent across harts.
++ */
++int sbi_insn_emu_pmu_init(void);
++
 +#endif /* __SBI_INSN_EMU_PMU_H__ */
 diff --git a/lib/sbi/bhx_emu_pmu.c b/lib/sbi/bhx_emu_pmu.c
 new file mode 100644
-index 00000000..faad493e
+index 00000000..a2cf8fc1
 --- /dev/null
 +++ b/lib/sbi/bhx_emu_pmu.c
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,201 @@
 +// SPDX-License-Identifier: BSD-2-Clause
 +/*
 + * bhx ISA-extension-emulation PMU device.
 + *
-+ * Provides the bhx implementation of sbi_insn_emu_pmu_inc() from
-+ * <sbi/sbi_insn_emu_pmu.h>. Counts trap-handler invocations for each
-+ * emulated extension (Zcb, Zba, Zbb, Zbs, Zicond, Zimop, Zawrs, Zfa,
-+ * Zfhmin, Zicbom, Zicboz, Zcmop) plus an aggregate "any emulated insn
-+ * fired" counter, and exposes them via OpenSBI's platform-firmware-
-+ * event PMU mechanism (event_code = SBI_PMU_FW_PLATFORM, event_data
-+ * = the matching SBI_INSN_EMU_EXT_* sub-event ID).
++ * Provides the bhx strong overrides of sbi_insn_emu_pmu_inc() and
++ * sbi_insn_emu_pmu_init() from <sbi/sbi_insn_emu_pmu.h>. Counts
++ * trap-handler invocations for each emulated extension (Zcb, Zba,
++ * Zbb, Zbs, Zicond, Zimop, Zawrs, Zfa, Zfhmin, Zicbom, Zicboz,
++ * Zcmop, Zbc, Supm) plus an aggregate "any emulated insn fired"
++ * counter, and exposes them via OpenSBI's platform-firmware-event
++ * PMU mechanism (event_code = SBI_PMU_FW_PLATFORM, event_data =
++ * the matching SBI_INSN_EMU_EXT_* sub-event ID).
 + *
 + * Guest perf attaches with raw `config = 0xC000_0000_0000_0000 |
 + * sub_event_id`. Linux's drivers/perf/riscv_pmu_sbi.c routes
@@ -167,7 +149,6 @@ index 00000000..faad493e
 + * years at 1 GHz emu rate). See bhx#199 for design.
 + */
 +
-+#include <sbi/bhx_emu_pmu.h>
 +#include <sbi/sbi_console.h>
 +#include <sbi/sbi_ecall_interface.h>
 +#include <sbi/sbi_error.h>
@@ -321,7 +302,13 @@ index 00000000..faad493e
 +	.fw_counter_stop		= counter_stop,
 +};
 +
-+int bhx_emu_pmu_init(void)
++/*
++ * Strong override of the generic sbi_insn_emu_pmu_init() hook.
++ * Allocates per-hart scratch storage on first call, zeros this
++ * hart's slot on every call, and (re-)registers the bhx PMU device
++ * with the SBI PMU core.
++ */
++int sbi_insn_emu_pmu_init(void)
 +{
 +	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
 +	struct bhx_emu_pmu_state *st;
@@ -351,14 +338,14 @@ index ed48782c..96907094 100644
  libsbi-objs-y += sbi_ipi.o
  libsbi-objs-y += sbi_irqchip.o
 diff --git a/lib/sbi/sbi_init.c b/lib/sbi/sbi_init.c
-index 01c27c7b..4a543e9f 100644
+index 01c27c7b..fc845116 100644
 --- a/lib/sbi/sbi_init.c
 +++ b/lib/sbi/sbi_init.c
 @@ -7,6 +7,7 @@
   *   Anup Patel <anup.patel@wdc.com>
   */
  
-+#include <sbi/bhx_emu_pmu.h>
++#include <sbi/sbi_insn_emu_pmu.h>
  #include <sbi/riscv_asm.h>
  #include <sbi/riscv_atomic.h>
  #include <sbi/riscv_barrier.h>
@@ -370,9 +357,9 @@ index 01c27c7b..4a543e9f 100644
 +	 * generic PMU is up. Best-effort: if the scratch allocator's
 +	 * out of room, we log + continue without counters rather than
 +	 * hanging the chip on a non-essential observability path. */
-+	rc = bhx_emu_pmu_init();
++	rc = sbi_insn_emu_pmu_init();
 +	if (rc) {
-+		sbi_printf("%s: bhx-isa-emu PMU init failed (error %d) — "
++		sbi_printf("%s: ISA-emu PMU init failed (error %d) — "
 +			   "boot proceeds without emu hit counters\n",
 +			   __func__, rc);
 +	}
@@ -387,9 +374,9 @@ index 01c27c7b..4a543e9f 100644
 +	/* (bhx#199) Per-hart re-init: zero this hart's counter slot
 +	 * and re-register the PMU device. The scratch offset was
 +	 * allocated by hart 0 during cold-init. */
-+	rc = bhx_emu_pmu_init();
++	rc = sbi_insn_emu_pmu_init();
 +	if (rc)
-+		sbi_printf("%s: bhx-isa-emu PMU re-init failed (error %d)\n",
++		sbi_printf("%s: ISA-emu PMU re-init failed (error %d)\n",
 +			   __func__, rc);
 +
  	rc = sbi_dbtr_init(scratch, false);
@@ -1362,19 +1349,19 @@ index 48ee498d..349367c4 100644
  #endif
 diff --git a/lib/sbi/sbi_insn_emu_pmu.c b/lib/sbi/sbi_insn_emu_pmu.c
 new file mode 100644
-index 00000000..99a5b9f4
+index 00000000..3eb36c3a
 --- /dev/null
 +++ b/lib/sbi/sbi_insn_emu_pmu.c
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,24 @@
 +// SPDX-License-Identifier: BSD-2-Clause
 +/*
-+ * Weak default implementation of the ISA-emulation PMU increment
-+ * hook. Linked into every build so sbi_insn_emu*.c always resolves
-+ * the symbol; a platform-specific PMU device (e.g. bhx_emu_pmu.c)
-+ * overrides with a strong definition to count and expose the events.
++ * Weak default implementations of the ISA-emulation PMU hooks. Linked
++ * into every build so sbi_insn_emu*.c and sbi_init.c always resolve
++ * the symbols; a platform-specific PMU device (e.g. bhx_emu_pmu.c)
++ * overrides with strong definitions to count and expose the events.
 + *
 + * Marked weak rather than `static inline` so callers compile to
-+ * normal `call` sites that the linker resolves to either this stub
++ * normal `call` sites that the linker resolves to either these stubs
 + * or the platform override — keeping the emu hot path's branch
 + * structure identical regardless of which implementation is in use.
 + */
@@ -1384,6 +1371,11 @@ index 00000000..99a5b9f4
 +__attribute__((weak)) void sbi_insn_emu_pmu_inc(int ext)
 +{
 +	(void)ext;
++}
++
++__attribute__((weak)) int sbi_insn_emu_pmu_init(void)
++{
++	return 0;
 +}
 -- 
 2.47.3
