@@ -1,52 +1,163 @@
-From 569be0f3e8cce268477c2c5fccf84f8fdfafa5f5 Mon Sep 17 00:00:00 2001
+From 237bf7e3cdc684fa50845b68ff5d688eacd52752 Mon Sep 17 00:00:00 2001
 From: Olof Johansson <olof.johansson@gmail.com>
-Date: Mon, 11 May 2026 12:02:51 -0700
-Subject: [PATCH] lib: sbi: add ISA-emu PMU hook + bhx PMU device
+Date: Mon, 11 May 2026 12:22:50 -0700
+Subject: [PATCH] lib: sbi: ISA-emu PMU hook + bhx PMU device + host-readable
+ publish
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
-Adds a generic per-extension hit-counter hook for the trap-based ISA
-emulator with a symmetric init hook:
+Adds a generic per-extension hit-counter hook for the trap-based
+ISA emulator + a bhx-specific PMU device with two read paths
+(guest perf and host PCIe).
 
-- include/sbi/sbi_insn_emu_pmu.h declares an extension-ID enum
-  (SBI_INSN_EMU_EXT_*), sbi_insn_emu_pmu_inc(), and
-  sbi_insn_emu_pmu_init().
-- lib/sbi/sbi_insn_emu_pmu.c provides weak no-op defaults so
-  sbi_insn_emu*.c and sbi_init.c always link.
+Generic side (upstreamable shape):
+- include/sbi/sbi_insn_emu_pmu.h declares enum sbi_insn_emu_ext
+  (NONE, ANY, per-extension IDs, UNHANDLED), sbi_insn_emu_pmu_inc()
+  and sbi_insn_emu_pmu_init().
+- lib/sbi/sbi_insn_emu_pmu.c provides weak no-op defaults.
 - sbi_insn_emu.c / sbi_insn_emu_fp.c track the matching extension
-  through their decode trees and call sbi_insn_emu_pmu_inc() before
-  each successful return.
-- sbi_init.c cold + warm paths call sbi_insn_emu_pmu_init() after
-  sbi_pmu_init().
+  through their decode trees and call sbi_insn_emu_pmu_inc()
+  before each successful return.
+- sbi_illegal_insn.c::truly_illegal_insn() calls
+  sbi_insn_emu_pmu_inc(SBI_INSN_EMU_EXT_UNHANDLED) — single
+  chokepoint for every illegal-insn the emulator could not handle,
+  including opcode-table fall-throughs (e.g. RVV Zvbb).
+- sbi_init.c cold + warm paths call sbi_insn_emu_pmu_init().
 
-Adds a bhx-specific reflection that exposes the counters via SBI PMU
-platform firmware events:
-
-- lib/sbi/bhx_emu_pmu.c implements the sbi_pmu_device callbacks and
-  provides strong overrides of sbi_insn_emu_pmu_inc() and
-  sbi_insn_emu_pmu_init().
-- Per-hart counts live in sbi_scratch (allocated lazily by the first
-  init call). Each hart re-zeros its own slot on warm-init.
+bhx-specific reflection:
+- include/sbi/bhx_emu_pmu_publish.h declares the
+  bhx_emu_pmu_publish wire format (magic 0x554d5042 \"BPMU\",
+  version, max_harts, max_events, per-(hart,event) counters).
+- lib/sbi/bhx_emu_pmu.c implements the sbi_pmu_device callbacks
+  and the strong overrides of inc/init.
+- firmware/fw_base.S parks a pointer to bhx_emu_pmu_publish at
+  fw_jump.bin + 0x88 (sibling slot to the debug_descriptor pointer
+  at + 0x80) so the bhx daemon can locate the struct over PCIe
+  without guest cooperation.
 
 Guest perf attaches with raw config = 0xC000_0000_0000_0000 |
-SBI_INSN_EMU_EXT_*.
+SBI_INSN_EMU_EXT_*; bhx host reader follows the +0x88 pointer.
+Both read paths see the same per-hart counter array.
 ---
- include/sbi/sbi_insn_emu_pmu.h |  70 ++++++++++++
- lib/sbi/bhx_emu_pmu.c          | 201 +++++++++++++++++++++++++++++++++
- lib/sbi/objects.mk             |   2 +
- lib/sbi/sbi_init.c             |  20 ++++
- lib/sbi/sbi_insn_emu.c         |  89 +++++++++++++++
- lib/sbi/sbi_insn_emu_fp.c      |  83 ++++++++++++++
- lib/sbi/sbi_insn_emu_pmu.c     |  24 ++++
- 7 files changed, 489 insertions(+)
+ firmware/fw_base.S                |  10 +-
+ include/sbi/bhx_emu_pmu_publish.h |  67 ++++++++++++
+ include/sbi/sbi_insn_emu_pmu.h    |  83 ++++++++++++++
+ lib/sbi/bhx_emu_pmu.c             | 175 ++++++++++++++++++++++++++++++
+ lib/sbi/objects.mk                |   2 +
+ lib/sbi/sbi_illegal_insn.c        |  10 ++
+ lib/sbi/sbi_init.c                |  20 ++++
+ lib/sbi/sbi_insn_emu.c            |  89 +++++++++++++++
+ lib/sbi/sbi_insn_emu_fp.c         |  83 ++++++++++++++
+ lib/sbi/sbi_insn_emu_pmu.c        |  24 ++++
+ 10 files changed, 562 insertions(+), 1 deletion(-)
+ create mode 100644 include/sbi/bhx_emu_pmu_publish.h
  create mode 100644 include/sbi/sbi_insn_emu_pmu.h
  create mode 100644 lib/sbi/bhx_emu_pmu.c
  create mode 100644 lib/sbi/sbi_insn_emu_pmu.c
 
+diff --git a/firmware/fw_base.S b/firmware/fw_base.S
+index 08b35f34..b1445cf1 100644
+--- a/firmware/fw_base.S
++++ b/firmware/fw_base.S
+@@ -50,9 +50,17 @@ _start:
+ 	/* TT: Place debug_descriptor pointer at a fixed address */
+ 	.align 7  # Align to 128-byte boundary (0x80)
+ 	.dword debug_descriptor - _start + FW_TEXT_START
++	/* bhx: pointer to the ISA-emulation PMU publish struct. The
++	 * bhx host daemon reads 8 bytes at fw_jump.bin + 0x88 to
++	 * locate `bhx_emu_pmu_publish` in DRAM, then scrapes per-hart
++	 * counter snapshots via PCIe. See
++	 * include/sbi/bhx_emu_pmu_publish.h. */
++	.dword bhx_emu_pmu_publish - _start + FW_TEXT_START
+ 	/* TT: The zebu snapshot restore code needs 4K * 8 cores space here  */
+ 	/* each NOP is 2 bytes */
+-	.rept 8 * (4096/2)
++	/* 4 NOPs (= 8 bytes) removed to keep total layout size identical
++	 * after adding the bhx_emu_pmu_publish pointer above. */
++	.rept 8 * (4096/2) - 4
+ 	nop
+ 	.endr
+ 1:
+diff --git a/include/sbi/bhx_emu_pmu_publish.h b/include/sbi/bhx_emu_pmu_publish.h
+new file mode 100644
+index 00000000..9132b077
+--- /dev/null
++++ b/include/sbi/bhx_emu_pmu_publish.h
+@@ -0,0 +1,67 @@
++/*
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Host-readable mirror of the bhx ISA-emulation PMU counters.
++ *
++ * The bhx PMU device's read-side path (sbi_pmu_device fw_counter_*)
++ * is the SBI-ecall route used by `perf` inside the guest. This
++ * struct adds a *second* read route for the bhx host: an aligned,
++ * statically-placed counter array that the host can scrape over
++ * PCIe without any guest cooperation — useful when the guest is
++ * wedged, hasn't booted to a userspace where perf would run, or
++ * the operator just wants a one-shot "what's the emu firing on
++ * right now" snapshot from outside.
++ *
++ * Both read paths see the same memory: sbi_insn_emu_pmu_inc()
++ * updates this struct in place. The host locates it by reading
++ * the 8-byte pointer that fw_base.S parks at fw_jump.bin + 0x88
++ * (sibling slot to the debug_descriptor pointer at +0x80).
++ *
++ * Wire-format invariants — never reorder, only append:
++ *   magic       = BHX_EMU_PMU_MAGIC ("BPMU" little-endian)
++ *   version     = 1 today; bump for any layout change
++ *   max_harts   = static upper bound on hartid (X280 has 1/L2CPU)
++ *   max_events  = SBI_INSN_EMU_EXT_MAX at firmware build time
++ *   counts[h][e] = per-hart, per-event 64-bit counter
++ */
++
++#ifndef __BHX_EMU_PMU_PUBLISH_H__
++#define __BHX_EMU_PMU_PUBLISH_H__
++
++#include <sbi/sbi_ecall_interface.h>
++#include <sbi/sbi_insn_emu_pmu.h>
++#include <sbi/sbi_pmu.h>
++#include <sbi/sbi_types.h>
++
++/* "BPMU" stored little-endian. The host validates this byte-for-byte
++ * before trusting the rest of the struct. */
++#define BHX_EMU_PMU_MAGIC	0x554d5042u
++#define BHX_EMU_PMU_VERSION	1u
++
++/* Upper bound on hartid we track. X280 has 1 hart per L2CPU so a
++ * given firmware image only ever sees hartid == 0; sized generously
++ * so a future multi-hart platform doesn't truncate. */
++#define BHX_EMU_PMU_MAX_HARTS	8
++
++struct bhx_emu_pmu_publish {
++	u32	magic;		/* BHX_EMU_PMU_MAGIC */
++	u32	version;	/* BHX_EMU_PMU_VERSION */
++	u32	max_harts;	/* BHX_EMU_PMU_MAX_HARTS */
++	u32	max_events;	/* SBI_INSN_EMU_EXT_MAX */
++
++	/* Per-hart counter array. counts[h][SBI_INSN_EMU_EXT_ANY]
++	 * tracks every entry into the emulator path; per-extension
++	 * slots track successful emulation; UNHANDLED tracks
++	 * truly_illegal_insn() hits. */
++	u64	counts[BHX_EMU_PMU_MAX_HARTS][SBI_INSN_EMU_EXT_MAX];
++
++	/* PMU-side counter-binding table — perf invokes counter_start
++	 * to bind a hardware-counter slot to a sub-event ID. Mirrors
++	 * the old scratch-state field; kept here so the published
++	 * struct is self-contained. */
++	int	ctr_to_event[BHX_EMU_PMU_MAX_HARTS][SBI_PMU_FW_CTR_MAX];
++};
++
++extern struct bhx_emu_pmu_publish bhx_emu_pmu_publish;
++
++#endif /* __BHX_EMU_PMU_PUBLISH_H__ */
 diff --git a/include/sbi/sbi_insn_emu_pmu.h b/include/sbi/sbi_insn_emu_pmu.h
 new file mode 100644
-index 00000000..b2a2371a
+index 00000000..87f778fc
 --- /dev/null
 +++ b/include/sbi/sbi_insn_emu_pmu.h
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,83 @@
 +/*
 + * SPDX-License-Identifier: BSD-2-Clause
 + *
@@ -70,7 +181,8 @@ index 00000000..b2a2371a
 +/*
 + * Extension identifiers passed to sbi_insn_emu_pmu_inc(). One per
 + * emulated extension, plus NONE (sentinel for un-classified call
-+ * sites) and ANY (aggregate). Append-only — never re-purpose an
++ * sites), ANY (aggregate), and UNHANDLED (illegal-insn traps the
++ * emulator could not handle). Append-only — never re-purpose an
 + * existing value; downstream PMU devices use these as wire-format
 + * sub-event IDs.
 + */
@@ -91,6 +203,19 @@ index 00000000..b2a2371a
 +	SBI_INSN_EMU_EXT_ZCMOP		= 13,
 +	SBI_INSN_EMU_EXT_ZBC		= 14,
 +	SBI_INSN_EMU_EXT_SUPM		= 15,
++	/*
++	 * Counts illegal-instruction traps that reached
++	 * truly_illegal_insn() — i.e. the emulator either had no
++	 * decode for the insn (e.g. an RVV vandn.vv Zvbb insn lands
++	 * on a truly_illegal_insn slot in the dispatcher table) or
++	 * dispatched and fell through without a matching case. The
++	 * usable invariant is `ANY - sum(handled_ext) == UNHANDLED`.
++	 * Userspace perf can sample this counter directly to see how
++	 * often the X280 is hitting something the emulator can't
++	 * help with — typically a signal that another patch (Zvbb,
++	 * Zvbc, …) is needed.
++	 */
++	SBI_INSN_EMU_EXT_UNHANDLED	= 16,
 +	SBI_INSN_EMU_EXT_MAX
 +};
 +
@@ -111,18 +236,17 @@ index 00000000..b2a2371a
 + * after sbi_pmu_init() on both the cold-boot and warm-boot paths.
 + * The default weak implementation is a no-op; a platform-specific
 + * PMU device file overrides this with a strong definition that
-+ * allocates per-hart scratch + registers an sbi_pmu_device.
-+ * Idempotent across harts.
++ * registers an sbi_pmu_device. Idempotent across harts.
 + */
 +int sbi_insn_emu_pmu_init(void);
 +
 +#endif /* __SBI_INSN_EMU_PMU_H__ */
 diff --git a/lib/sbi/bhx_emu_pmu.c b/lib/sbi/bhx_emu_pmu.c
 new file mode 100644
-index 00000000..a2cf8fc1
+index 00000000..dddfdfbc
 --- /dev/null
 +++ b/lib/sbi/bhx_emu_pmu.c
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,175 @@
 +// SPDX-License-Identifier: BSD-2-Clause
 +/*
 + * bhx ISA-extension-emulation PMU device.
@@ -132,87 +256,79 @@ index 00000000..a2cf8fc1
 + * trap-handler invocations for each emulated extension (Zcb, Zba,
 + * Zbb, Zbs, Zicond, Zimop, Zawrs, Zfa, Zfhmin, Zicbom, Zicboz,
 + * Zcmop, Zbc, Supm) plus an aggregate "any emulated insn fired"
-+ * counter, and exposes them via OpenSBI's platform-firmware-event
-+ * PMU mechanism (event_code = SBI_PMU_FW_PLATFORM, event_data =
-+ * the matching SBI_INSN_EMU_EXT_* sub-event ID).
++ * counter, and an UNHANDLED counter for traps that reached
++ * truly_illegal_insn() without the emulator helping.
 + *
-+ * Guest perf attaches with raw `config = 0xC000_0000_0000_0000 |
-+ * sub_event_id`. Linux's drivers/perf/riscv_pmu_sbi.c routes
-+ * `config>>62 == 0b11` straight through to event_data. The
-+ * fw_event_* callbacks on the sbi_pmu_device below are the read-side
-+ * for those counters; the write-side is sbi_insn_emu_pmu_inc() called
-+ * by each emulator entry point in sbi_insn_emu*.c.
++ * Two read paths share one storage:
 + *
-+ * Per-hart counter array lives in sbi_scratch at an offset allocated
-+ * at cold init. Counter values are unsigned 64-bit, never saturate
-+ * in any realistic workload (1e18 emulated insns would take ~10
-+ * years at 1 GHz emu rate). See bhx#199 for design.
++ *  - Guest-side: SBI PMU platform firmware events (event_code =
++ *    SBI_PMU_FW_PLATFORM, event_data = SBI_INSN_EMU_EXT_*). Linux
++ *    perf with raw `config = 0xC000_0000_0000_0000 | event_id`
++ *    routes here via riscv_pmu_sbi.c.
++ *
++ *  - Host-side: a statically-placed `bhx_emu_pmu_publish` struct
++ *    that the bhx daemon reads over PCIe by following a pointer
++ *    parked at fw_jump.bin + 0x88 (sibling to the debug_descriptor
++ *    pointer at +0x80). No guest cooperation needed — useful when
++ *    the guest is wedged or hasn't reached a perf-capable userspace.
++ *
++ * Per-hart counters live directly in the publish struct (BSS — zero
++ * at boot). No sbi_scratch allocation needed.
 + */
 +
++#include <sbi/bhx_emu_pmu_publish.h>
++#include <sbi/riscv_asm.h>
 +#include <sbi/sbi_console.h>
 +#include <sbi/sbi_ecall_interface.h>
 +#include <sbi/sbi_error.h>
-+#include <sbi/sbi_hartmask.h>
 +#include <sbi/sbi_insn_emu_pmu.h>
 +#include <sbi/sbi_pmu.h>
-+#include <sbi/sbi_scratch.h>
 +#include <sbi/sbi_string.h>
 +
 +/*
-+ * Per-hart state. Sized to fit in sbi_scratch comfortably:
-+ *   counts[]     = SBI_INSN_EMU_EXT_MAX * 8 bytes
-+ *   ctr_to_event = SBI_PMU_FW_CTR_MAX * 4 bytes
-+ * Together well under 256 bytes.
++ * The publish struct itself. Statically initialized with magic/
++ * version so the host can validate the page contents without
++ * trusting that init has run. Counters land in BSS (zero) and
++ * accumulate from there.
 + */
-+struct bhx_emu_pmu_state {
-+	uint64_t counts[SBI_INSN_EMU_EXT_MAX];
-+	/* For each FW counter slot (0..SBI_PMU_FW_CTR_MAX-1), which
-+	 * sub-event the guest bound to it. 0 = unbound. Set by
-+	 * counter_start, cleared by counter_stop. */
-+	int ctr_to_event[SBI_PMU_FW_CTR_MAX];
++struct bhx_emu_pmu_publish bhx_emu_pmu_publish
++__attribute__((aligned(64))) = {
++	.magic		= BHX_EMU_PMU_MAGIC,
++	.version	= BHX_EMU_PMU_VERSION,
++	.max_harts	= BHX_EMU_PMU_MAX_HARTS,
++	.max_events	= SBI_INSN_EMU_EXT_MAX,
 +};
 +
-+static unsigned long bhx_emu_pmu_state_offset;
-+
-+static struct bhx_emu_pmu_state *state_of(uint32_t hartid)
-+{
-+	struct sbi_scratch *scratch;
-+
-+	if (!bhx_emu_pmu_state_offset)
-+		return NULL;
-+	scratch = sbi_hartid_to_scratch(hartid);
-+	if (!scratch)
-+		return NULL;
-+	return sbi_scratch_offset_ptr(scratch, bhx_emu_pmu_state_offset);
-+}
-+
 +/*
-+ * Strong definition of the generic emu-PMU increment hook. Replaces
-+ * the weak no-op in sbi_insn_emu_pmu.c when the bhx PMU device is
-+ * linked in.
++ * Strong override of the generic emu-PMU increment hook. Bumps the
++ * per-(hart, ext) counter plus the per-hart ANY aggregate. NONE /
++ * out-of-range is a silent no-op so emu call sites can pass an
++ * un-classified match-tracker variable without branching.
 + */
 +void sbi_insn_emu_pmu_inc(int ext)
 +{
-+	struct sbi_scratch *scratch;
-+	struct bhx_emu_pmu_state *st;
++	u32 hartid;
 +
-+	/* NONE / out-of-range = silent no-op so callers can pass an
-+	 * un-classified match-tracker variable without branching. */
 +	if (ext <= 0 || ext >= SBI_INSN_EMU_EXT_MAX)
 +		return;
-+	if (!bhx_emu_pmu_state_offset)
++	hartid = current_hartid();
++	if (hartid >= BHX_EMU_PMU_MAX_HARTS)
 +		return;
-+
-+	scratch = sbi_scratch_thishart_ptr();
-+	st = sbi_scratch_offset_ptr(scratch, bhx_emu_pmu_state_offset);
 +	/* Per-hart counter — no cross-hart access from the hot path,
 +	 * plain increment is fine. The read-side
 +	 * (fw_counter_read_value) runs in the SBI ecall context which
 +	 * may be on a different hart, but a torn 64-bit read on a
 +	 * counter that's actively incrementing is acceptable: perf
 +	 * tolerates it the same way it tolerates rdtsc skew. */
-+	st->counts[ext]++;
-+	st->counts[SBI_INSN_EMU_EXT_ANY]++;
++	bhx_emu_pmu_publish.counts[hartid][ext]++;
++	/* ANY is bumped on every non-ANY inc — including UNHANDLED.
++	 * The invariant `ANY - sum(handled_ext) == UNHANDLED` holds
++	 * because UNHANDLED is a non-ANY ext that bumps itself once
++	 * plus ANY once. Skipping the ANY bump when ext == ANY keeps
++	 * a direct `sbi_insn_emu_pmu_inc(SBI_INSN_EMU_EXT_ANY)` call
++	 * (none today, but possible) from double-counting. */
++	if (ext != SBI_INSN_EMU_EXT_ANY)
++		bhx_emu_pmu_publish.counts[hartid][SBI_INSN_EMU_EXT_ANY]++;
 +}
 +
 +static int validate_encoding(uint32_t hartid, uint64_t event_data)
@@ -226,68 +342,61 @@ index 00000000..a2cf8fc1
 +static bool counter_match_encoding(uint32_t hartid, uint32_t ctr_idx,
 +				   uint64_t event_data)
 +{
-+	struct bhx_emu_pmu_state *st = state_of(hartid);
-+
-+	if (!st || ctr_idx >= SBI_PMU_FW_CTR_MAX)
++	if (hartid >= BHX_EMU_PMU_MAX_HARTS || ctr_idx >= SBI_PMU_FW_CTR_MAX)
 +		return false;
-+	return st->ctr_to_event[ctr_idx] == (int)event_data;
++	return bhx_emu_pmu_publish.ctr_to_event[hartid][ctr_idx]
++		== (int)event_data;
 +}
 +
 +static int counter_width(void)
 +{
 +	/* 63 = "64-bit counter, but only 63 bits visible" — matches
-+	 * what other SBI PMU platforms report. Counters never wrap in
-+	 * realistic timeframes. */
++	 * what other SBI PMU platforms report. Counters never wrap
++	 * in realistic timeframes. */
 +	return 63;
 +}
 +
 +static uint64_t counter_read_value(uint32_t hartid, uint32_t ctr_idx)
 +{
-+	struct bhx_emu_pmu_state *st = state_of(hartid);
 +	int event_id;
 +
-+	if (!st || ctr_idx >= SBI_PMU_FW_CTR_MAX)
++	if (hartid >= BHX_EMU_PMU_MAX_HARTS || ctr_idx >= SBI_PMU_FW_CTR_MAX)
 +		return 0;
-+	event_id = st->ctr_to_event[ctr_idx];
++	event_id = bhx_emu_pmu_publish.ctr_to_event[hartid][ctr_idx];
 +	if (event_id <= 0 || event_id >= SBI_INSN_EMU_EXT_MAX)
 +		return 0;
-+	return st->counts[event_id];
++	return bhx_emu_pmu_publish.counts[hartid][event_id];
 +}
 +
 +static void counter_write_value(uint32_t hartid, uint32_t ctr_idx,
 +				uint64_t value)
 +{
-+	struct bhx_emu_pmu_state *st = state_of(hartid);
 +	int event_id;
 +
-+	if (!st || ctr_idx >= SBI_PMU_FW_CTR_MAX)
++	if (hartid >= BHX_EMU_PMU_MAX_HARTS || ctr_idx >= SBI_PMU_FW_CTR_MAX)
 +		return;
-+	event_id = st->ctr_to_event[ctr_idx];
++	event_id = bhx_emu_pmu_publish.ctr_to_event[hartid][ctr_idx];
 +	if (event_id <= 0 || event_id >= SBI_INSN_EMU_EXT_MAX)
 +		return;
-+	st->counts[event_id] = value;
++	bhx_emu_pmu_publish.counts[hartid][event_id] = value;
 +}
 +
 +static int counter_start(uint32_t hartid, uint32_t ctr_idx,
 +			 uint64_t event_data)
 +{
-+	struct bhx_emu_pmu_state *st = state_of(hartid);
-+
-+	if (!st || ctr_idx >= SBI_PMU_FW_CTR_MAX)
++	if (hartid >= BHX_EMU_PMU_MAX_HARTS || ctr_idx >= SBI_PMU_FW_CTR_MAX)
 +		return SBI_EINVAL;
 +	if (event_data == 0 || event_data >= SBI_INSN_EMU_EXT_MAX)
 +		return SBI_EINVAL;
-+	st->ctr_to_event[ctr_idx] = (int)event_data;
++	bhx_emu_pmu_publish.ctr_to_event[hartid][ctr_idx] = (int)event_data;
 +	return 0;
 +}
 +
 +static int counter_stop(uint32_t hartid, uint32_t ctr_idx)
 +{
-+	struct bhx_emu_pmu_state *st = state_of(hartid);
-+
-+	if (!st || ctr_idx >= SBI_PMU_FW_CTR_MAX)
++	if (hartid >= BHX_EMU_PMU_MAX_HARTS || ctr_idx >= SBI_PMU_FW_CTR_MAX)
 +		return SBI_EINVAL;
-+	st->ctr_to_event[ctr_idx] = 0;
++	bhx_emu_pmu_publish.ctr_to_event[hartid][ctr_idx] = 0;
 +	return 0;
 +}
 +
@@ -304,23 +413,12 @@ index 00000000..a2cf8fc1
 +
 +/*
 + * Strong override of the generic sbi_insn_emu_pmu_init() hook.
-+ * Allocates per-hart scratch storage on first call, zeros this
-+ * hart's slot on every call, and (re-)registers the bhx PMU device
-+ * with the SBI PMU core.
++ * Registers the bhx PMU device with the SBI PMU core. The publish
++ * struct itself is statically initialized in BSS so cold + warm
++ * reentry just re-points sbi_pmu's device pointer at us.
 + */
 +int sbi_insn_emu_pmu_init(void)
 +{
-+	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
-+	struct bhx_emu_pmu_state *st;
-+
-+	if (!bhx_emu_pmu_state_offset) {
-+		bhx_emu_pmu_state_offset = sbi_scratch_alloc_offset(
-+			sizeof(struct bhx_emu_pmu_state));
-+		if (!bhx_emu_pmu_state_offset)
-+			return SBI_ENOMEM;
-+	}
-+	st = sbi_scratch_offset_ptr(scratch, bhx_emu_pmu_state_offset);
-+	sbi_memset(st, 0, sizeof(*st));
 +	sbi_pmu_set_device(&bhx_emu_pmu);
 +	return 0;
 +}
@@ -337,6 +435,34 @@ index ed48782c..96907094 100644
  libsbi-objs-y += sbi_init.o
  libsbi-objs-y += sbi_ipi.o
  libsbi-objs-y += sbi_irqchip.o
+diff --git a/lib/sbi/sbi_illegal_insn.c b/lib/sbi/sbi_illegal_insn.c
+index aebd3d4a..192fc2c5 100644
+--- a/lib/sbi/sbi_illegal_insn.c
++++ b/lib/sbi/sbi_illegal_insn.c
+@@ -21,6 +21,7 @@
+ #include <sbi/sbi_illegal_insn.h>
+ #include <sbi/sbi_insn_emu.h>
+ #include <sbi/sbi_insn_emu_fp.h>
++#include <sbi/sbi_insn_emu_pmu.h>
+ #include <sbi/sbi_pmu.h>
+ #include <sbi/sbi_trap.h>
+ #include <sbi/sbi_unpriv.h>
+@@ -30,6 +31,15 @@ int truly_illegal_insn(ulong insn, struct sbi_trap_regs *regs)
+ {
+ 	struct sbi_trap_info trap;
+ 
++	/* Single chokepoint for every illegal-insn the emulator could
++	 * not (or would not) handle — both opcode-table fall-throughs
++	 * (e.g. an OP-V Zvbb insn that lands on a truly_illegal_insn
++	 * slot in illegal_insn_table[]) and inner-decode misses inside
++	 * sbi_insn_emu_*() helpers. Counted via the same PMU plumbing
++	 * as successful emulation so userspace `perf` sees ANY,
++	 * per-ext, and UNHANDLED through one event_data namespace. */
++	sbi_insn_emu_pmu_inc(SBI_INSN_EMU_EXT_UNHANDLED);
++
+ 	trap.cause = CAUSE_ILLEGAL_INSTRUCTION;
+ 	trap.tval  = insn;
+ 	trap.tval2 = 0;
 diff --git a/lib/sbi/sbi_init.c b/lib/sbi/sbi_init.c
 index 01c27c7b..fc845116 100644
 --- a/lib/sbi/sbi_init.c

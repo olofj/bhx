@@ -292,6 +292,13 @@ pub mod isa_emu_pmu {
     /// counter typically reads zero in practice. See the EMU_SUPM
     /// Kconfig help in `0003-isa-ext-emu.patch`.
     pub const SUPM: u32 = 15;
+    /// Illegal-instruction traps the emulator could not handle —
+    /// opcode-table fall-throughs (e.g. RVV Zvbb) plus inner-decode
+    /// misses inside `sbi_insn_emu_*()` helpers. `ANY - sum(handled
+    /// extensions) == UNHANDLED` is the usable invariant; when this
+    /// counter moves on a workload that fails, another patch (Zvbb,
+    /// Zvbc, …) is needed before the workload can run.
+    pub const UNHANDLED: u32 = 16;
 
     /// Compile-time-checkable list of all defined event IDs and the
     /// short human-readable name used in `bhx debug isa-emu-events`
@@ -314,7 +321,63 @@ pub mod isa_emu_pmu {
         (ZCMOP, "Zcmop"),
         (ZBC, "Zbc"),
         (SUPM, "Supm"),
+        (UNHANDLED, "UNHANDLED"),
     ];
+
+    /// Wire-format constants for the host-readable counter mirror
+    /// (`struct bhx_emu_pmu_publish` in
+    /// `third_party/opensbi/opensbi-src/include/sbi/bhx_emu_pmu_publish.h`).
+    /// The bhx daemon reads the 8-byte pointer at fw_jump.bin + 0x88
+    /// (sibling slot to the debug_descriptor pointer at +0x80) to
+    /// locate this struct in L2CPU DRAM, then scrapes per-hart
+    /// counter snapshots.
+    ///
+    /// Offset, magic, and version are part of the firmware ABI —
+    /// any layout change in the firmware must bump VERSION and the
+    /// host side must check it.
+    pub const PUBLISH_PTR_OFFSET: u64 = 0x88;
+    /// "BPMU" interpreted little-endian as a u32.
+    pub const PUBLISH_MAGIC: u32 = 0x554d_5042;
+    pub const PUBLISH_VERSION: u32 = 1;
+    /// Static cap on per-hart slots in the publish array — must
+    /// match `BHX_EMU_PMU_MAX_HARTS` on the firmware side.
+    pub const PUBLISH_MAX_HARTS: usize = 8;
+
+    /// Maximum hartid index actually populated for the X280 (1 hart
+    /// per L2CPU). The publish struct sizes for up to `PUBLISH_MAX_HARTS`
+    /// but only `[0]` ever moves on Blackhole.
+    pub const X280_HART_IDX: usize = 0;
+
+    /// Total number of event slots in the firmware enum, including
+    /// the `NONE` sentinel — equal to `SBI_INSN_EMU_EXT_MAX` on the
+    /// C side. The `counts[hart]` array is sized by this.
+    pub const EVENT_COUNT: usize = (UNHANDLED as usize) + 1;
+
+    /// Layout-compatible Rust mirror of the firmware-side
+    /// `struct bhx_emu_pmu_publish`. `#[repr(C)]` + field order must
+    /// match the C struct exactly.
+    ///
+    /// The `counts` second-dimension size is hardcoded to `MAX`
+    /// (= the highest event ID + 1); a future firmware that adds
+    /// events must bump `PUBLISH_VERSION` and update this struct in
+    /// lockstep. The Rust unit tests assert
+    /// `size_of::<Publish>() == expected_bytes`.
+    #[repr(C, align(64))]
+    #[derive(Debug)]
+    pub struct Publish {
+        pub magic: u32,
+        pub version: u32,
+        pub max_harts: u32,
+        pub max_events: u32,
+        /// `counts[hart][event_id]`. `event_id` indexes into the
+        /// `EVENTS` table; only `1..=UNHANDLED` are meaningful (0 is
+        /// the NONE sentinel and never moves).
+        pub counts: [[u64; EVENT_COUNT]; PUBLISH_MAX_HARTS],
+        /// `ctr_to_event[hart][ctr_idx]` — perf-side counter binding
+        /// state. Not consumed by the host reader; mirrored so the
+        /// struct size matches the firmware exactly.
+        pub ctr_to_event: [[i32; 16]; PUBLISH_MAX_HARTS],
+    }
 
     /// Compose the `perf` raw `config` value for a given event ID.
     pub const fn perf_config(event_id: u32) -> u64 {
@@ -421,7 +484,31 @@ mod tests {
         // The last entry's ID + 1 is the C-side `_MAX` sentinel.
         // Hardcoded so a future enum extension on the C side without
         // a matching Rust update fails this test loudly.
-        assert_eq!(isa_emu_pmu::EVENTS.len(), 16);
+        assert_eq!(isa_emu_pmu::EVENTS.len(), 17);
+        assert_eq!(isa_emu_pmu::EVENT_COUNT, 17);
+    }
+
+    /// The host PMU reader interprets the firmware-published struct
+    /// by casting a window pointer to `Publish`. Layout must match
+    /// the C side exactly or the counter offsets land in the wrong
+    /// fields — likely silently. Pin the field offsets so a future
+    /// edit fails loudly.
+    #[test]
+    fn isa_emu_pmu_publish_layout_matches_firmware() {
+        use isa_emu_pmu::Publish;
+        // 4 × u32 header = 16 bytes.
+        assert_eq!(std::mem::offset_of!(Publish, magic), 0);
+        assert_eq!(std::mem::offset_of!(Publish, version), 4);
+        assert_eq!(std::mem::offset_of!(Publish, max_harts), 8);
+        assert_eq!(std::mem::offset_of!(Publish, max_events), 12);
+        assert_eq!(std::mem::offset_of!(Publish, counts), 16);
+        // counts: 8 harts × 17 events × 8 bytes = 1088. Next field at 16 + 1088 = 1104.
+        assert_eq!(std::mem::offset_of!(Publish, ctr_to_event), 16 + 1088);
+        // Struct alignment is 64 (cache line), so size rounds up
+        // accordingly. 1104 + (8 × 16 × 4) = 1616; rounded up to a
+        // multiple of 64 is 1664.
+        assert_eq!(std::mem::size_of::<Publish>(), 1664);
+        assert_eq!(std::mem::align_of::<Publish>(), 64);
     }
 
     #[test]

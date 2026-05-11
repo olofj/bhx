@@ -573,6 +573,25 @@ enum DebugAction {
     /// an integration check without booting any L2CPU. Bypasses the
     /// daemon.
     TensixEngine,
+    /// Snapshot the ISA-emulation hit counters live from the chip.
+    ///
+    /// Reads the firmware-published counter mirror over PCIe — no
+    /// guest cooperation needed. Works even if the guest hasn't
+    /// reached a userspace where `perf` could run, or has wedged.
+    /// Output is one row per non-zero event ID; pass `--all` for
+    /// all four L2CPUs.
+    IsaEmuCounters {
+        /// Read all four L2CPUs instead of just the one selected
+        /// by `-l`. Slots that aren't booted (firmware never ran
+        /// → magic mismatch) are skipped silently.
+        #[arg(long)]
+        all: bool,
+        /// Show every event ID including those with a zero count.
+        /// Default behavior is to suppress zero rows for a clean
+        /// snapshot.
+        #[arg(long)]
+        show_zero: bool,
+    },
     /// Print the SBI PMU event IDs for ISA-extension-emulation hit counters.
     ///
     /// Lists each emulated extension with its sub-event ID and a
@@ -1481,7 +1500,10 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
     let daemon_up = daemon::lifetime::is_running(card);
     let writes_chip = !matches!(
         action,
-        DebugAction::ReadResetReg | DebugAction::TelemetryDump { .. } | DebugAction::PickTile,
+        DebugAction::ReadResetReg
+            | DebugAction::TelemetryDump { .. }
+            | DebugAction::PickTile
+            | DebugAction::IsaEmuCounters { .. },
     );
     // TensixEngine bring-up writes to the chip (loads firmware,
     // drives reset). It belongs in the writes-chip set below.
@@ -1554,6 +1576,9 @@ fn run_debug_cmd(card: u32, l2cpu: usize, action: DebugAction) -> std::io::Resul
             gap_us,
             no_lsr_poll,
         } => run_uart_loopback(card, &chip, l2cpu as u8, count, gap_us, no_lsr_poll),
+        DebugAction::IsaEmuCounters { all, show_zero } => {
+            run_isa_emu_counters(&chip, l2cpu, all, show_zero)
+        }
         // Handled at the top of the function before chip plumbing.
         DebugAction::IsaEmuEvents => unreachable!(),
     }
@@ -1596,7 +1621,192 @@ fn run_isa_emu_events() -> std::io::Result<()> {
     println!();
     println!("Counter is 64-bit and never wraps in realistic timeframes.");
     println!("ANY (id=1) is the aggregate — increments on every emulation.");
+    println!("UNHANDLED (id=16) counts illegal-insn traps the emulator");
+    println!("could not handle (e.g. RVV Zvbb on the X280).");
+    println!();
+    println!("To snapshot live counters from the host without involving the guest:");
+    println!("  bhx debug isa-emu-counters         # selected L2CPU (-l)");
+    println!("  bhx debug isa-emu-counters --all   # every booted L2CPU");
     Ok(())
+}
+
+/// Snapshot the live ISA-emulation hit counters by reading the
+/// firmware-published mirror over PCIe.
+///
+/// fw_jump.bin parks an 8-byte pointer to `bhx_emu_pmu_publish` at
+/// offset 0x88 (sibling to the debug_descriptor pointer at +0x80).
+/// We chase that pointer, validate the magic / version, and dump the
+/// counts array.
+fn run_isa_emu_counters(
+    chip: &shared_chip::SharedChip,
+    l2cpu: usize,
+    all: bool,
+    show_zero: bool,
+) -> std::io::Result<()> {
+    let targets: Vec<usize> = if all { (0..4).collect() } else { vec![l2cpu] };
+    let mut any_printed = false;
+    for idx in targets {
+        if idx > 3 {
+            return Err(crate::Error::bad_request("l2cpu must be 0..3").into());
+        }
+        match snapshot_isa_emu_counters_for_l2cpu(chip, idx) {
+            Ok(snap) => {
+                if any_printed {
+                    println!();
+                }
+                any_printed = true;
+                print_isa_emu_counter_snapshot(idx, &snap, show_zero);
+            }
+            Err(EmuCountersError::NotBooted) => {
+                if !all {
+                    println!(
+                        "L2CPU {}: firmware not running (publish pointer is 0/~0).",
+                        idx
+                    );
+                    println!(
+                        "          boot the L2CPU first: bhx boot -l {} -d rootfs.ext4",
+                        idx
+                    );
+                }
+                // In --all mode, just skip un-booted L2CPUs silently.
+            }
+            Err(EmuCountersError::BadMagic { got }) => {
+                eprintln!(
+                    "L2CPU {}: PMU publish magic mismatch (got {:#010x}, want {:#010x}) — \
+                     stale firmware, or chip released without our OpenSBI",
+                    idx,
+                    got,
+                    crate::regs::isa_emu_pmu::PUBLISH_MAGIC,
+                );
+            }
+            Err(EmuCountersError::BadVersion { got }) => {
+                eprintln!(
+                    "L2CPU {}: PMU publish version mismatch (got {}, want {}) — \
+                     bhx and OpenSBI patches out of sync; rebuild both",
+                    idx,
+                    got,
+                    crate::regs::isa_emu_pmu::PUBLISH_VERSION,
+                );
+            }
+            Err(EmuCountersError::Io(e)) => return Err(e),
+        }
+    }
+    if !any_printed && all {
+        println!("No L2CPUs have the PMU publish struct visible (none booted?).");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum EmuCountersError {
+    /// The publish pointer at fw_jump+0x88 is 0 or ~0 — firmware
+    /// hasn't run on this L2CPU yet.
+    NotBooted,
+    BadMagic {
+        got: u32,
+    },
+    BadVersion {
+        got: u32,
+    },
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for EmuCountersError {
+    fn from(e: std::io::Error) -> Self {
+        EmuCountersError::Io(e)
+    }
+}
+
+/// One-shot counter snapshot for a single L2CPU. Returns a copy of
+/// the firmware's publish struct so the caller doesn't have to hold
+/// the TLB window open while printing.
+fn snapshot_isa_emu_counters_for_l2cpu(
+    chip: &shared_chip::SharedChip,
+    idx: usize,
+) -> std::result::Result<crate::regs::isa_emu_pmu::Publish, EmuCountersError> {
+    use crate::regs::isa_emu_pmu::{Publish, PUBLISH_MAGIC, PUBLISH_PTR_OFFSET, PUBLISH_VERSION};
+    use std::ptr;
+
+    let l2cpu = l2cpu::L2Cpu::new(idx, chip)?;
+    let starting = l2cpu.starting_address();
+
+    // Read the 8-byte publish pointer in two halves. Our actual
+    // pointers always have the upper 32 bits zero (L2CPU DRAM phys
+    // is well under 4 GiB), but read both halves anyway so a future
+    // memory map change doesn't silently truncate.
+    let ptr_lo = l2cpu.read32(starting + PUBLISH_PTR_OFFSET)? as u64;
+    let ptr_hi = l2cpu.read32(starting + PUBLISH_PTR_OFFSET + 4)? as u64;
+    let publish_pa = (ptr_hi << 32) | ptr_lo;
+    // 0 / ~0 are the obvious "no firmware running" sentinels. We
+    // also reject anything below L2CPU DRAM base or not 8-byte
+    // aligned: when an L2CPU is held in reset (or running stock
+    // firmware without our patch) the bytes at fw_jump + 0x88 are
+    // whatever the DRAM was initialized to, often a valid-looking
+    // but garbage pointer that would let a volatile u32 read land
+    // on an unaligned address and SIGBUS / panic. Treat any of
+    // these as "not booted with our firmware."
+    if publish_pa == 0
+        || publish_pa == !0u64
+        || publish_pa < starting
+        || !publish_pa.is_multiple_of(8)
+    {
+        return Err(EmuCountersError::NotBooted);
+    }
+
+    let window = l2cpu.get_persistent_2m_window(publish_pa)?;
+    let publish_ptr = window.get_window() as *const Publish;
+
+    // Magic + version go through volatile reads because the firmware
+    // statically initializes them at link time but a stale / wrong-
+    // firmware image (or an L2CPU that ran something other than our
+    // patched OpenSBI) lands here with garbage.
+    let magic = unsafe { ptr::read_volatile(&(*publish_ptr).magic) };
+    if magic != PUBLISH_MAGIC {
+        return Err(EmuCountersError::BadMagic { got: magic });
+    }
+    let version = unsafe { ptr::read_volatile(&(*publish_ptr).version) };
+    if version != PUBLISH_VERSION {
+        return Err(EmuCountersError::BadVersion { got: version });
+    }
+
+    // Copy the whole struct out so we can drop the window. Counter
+    // reads are racy with concurrent firmware writes by design
+    // (single 64-bit field; perf tolerates this the same way).
+    let snap = unsafe { ptr::read_volatile(publish_ptr) };
+    Ok(snap)
+}
+
+fn print_isa_emu_counter_snapshot(
+    idx: usize,
+    snap: &crate::regs::isa_emu_pmu::Publish,
+    show_zero: bool,
+) {
+    use crate::regs::isa_emu_pmu::{EVENTS, NONE, X280_HART_IDX};
+
+    let counts = &snap.counts[X280_HART_IDX];
+    println!(
+        "L2CPU {} ISA-emulation counters (version {}, hart {}):",
+        idx, snap.version, X280_HART_IDX
+    );
+    println!("  ID  Extension  count");
+    println!("----  ---------  ---------------");
+    let mut nonzero = 0usize;
+    for (id, name) in EVENTS {
+        if *id == NONE {
+            continue;
+        }
+        let v = counts[*id as usize];
+        if v == 0 && !show_zero {
+            continue;
+        }
+        if v > 0 {
+            nonzero += 1;
+        }
+        println!("{:>4}  {:<9}  {:>15}", id, name, v);
+    }
+    if nonzero == 0 && !show_zero {
+        println!("(all counters zero — pass --show-zero to confirm)");
+    }
 }
 
 /// Bring up the Tensix virtio engine via `TensixEngine::bring_up` —
