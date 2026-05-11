@@ -349,7 +349,11 @@ pub mod isa_emu_pmu {
     ///
     ///   - v1 (initial): NONE..SUPM + UNHANDLED (17 slots).
     ///   - v2: appended ZVBB (18 slots).
-    pub const PUBLISH_VERSION: u32 = 2;
+    ///   - v3: appended `first_unhandled_insn[]` /
+    ///     `first_unhandled_mepc[]` per-hart capture; the
+    ///     firmware also now zeros per-hart state on every
+    ///     warm reboot so counters reflect the current boot.
+    pub const PUBLISH_VERSION: u32 = 3;
     /// Static cap on per-hart slots in the publish array — must
     /// match `BHX_EMU_PMU_MAX_HARTS` on the firmware side.
     pub const PUBLISH_MAX_HARTS: usize = 8;
@@ -388,6 +392,18 @@ pub mod isa_emu_pmu {
         /// state. Not consumed by the host reader; mirrored so the
         /// struct size matches the firmware exactly.
         pub ctr_to_event: [[i32; 16]; PUBLISH_MAX_HARTS],
+        /// Captured encoding of the first illegal-insn this hart
+        /// trapped on that the emulator could not handle. Zero
+        /// when no such trap has occurred (or the firmware just
+        /// re-zeroed its per-hart slot on warm-reboot init). The
+        /// 32-bit half holds full-width insns; compressed (16-bit)
+        /// insns land in the low halfword.
+        pub first_unhandled_insn: [u64; PUBLISH_MAX_HARTS],
+        /// Guest PC where the captured insn lives. Useful for
+        /// `objdump -d` cross-referencing inside the guest once
+        /// the operator identifies the binary via
+        /// `cat /proc/<pid>/maps`.
+        pub first_unhandled_mepc: [u64; PUBLISH_MAX_HARTS],
     }
 
     /// Compose the `perf` raw `config` value for a given event ID.
@@ -515,10 +531,12 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Publish, counts), 16);
         // counts: 8 harts × 18 events × 8 bytes = 1152. Next field at 16 + 1152 = 1168.
         assert_eq!(std::mem::offset_of!(Publish, ctr_to_event), 16 + 1152);
-        // Struct alignment is 64 (cache line), so size rounds up
-        // accordingly. 1168 + (8 × 16 × 4) = 1680; rounded up to a
-        // multiple of 64 is 1728.
-        assert_eq!(std::mem::size_of::<Publish>(), 1728);
+        // ctr_to_event: 8 × 16 × 4 = 512. Next field at 1168 + 512 = 1680.
+        assert_eq!(std::mem::offset_of!(Publish, first_unhandled_insn), 1680);
+        // first_unhandled_insn: 8 × 8 = 64. Next field at 1680 + 64 = 1744.
+        assert_eq!(std::mem::offset_of!(Publish, first_unhandled_mepc), 1744);
+        // first_unhandled_mepc: 8 × 8 = 64. Raw end at 1808; aligned to 64 = 1856.
+        assert_eq!(std::mem::size_of::<Publish>(), 1856);
         assert_eq!(std::mem::align_of::<Publish>(), 64);
     }
 

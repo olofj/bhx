@@ -1844,6 +1844,50 @@ fn print_isa_emu_counter_snapshot(
     if nonzero == 0 && !show_zero {
         println!("(all counters zero — pass --show-zero to confirm)");
     }
+    // Surface the first-unhandled-insn capture if the firmware
+    // recorded one. Compressed insns sit in the low halfword
+    // (the high half stays zero); detect and format accordingly.
+    let insn = snap.first_unhandled_insn[X280_HART_IDX];
+    let mepc = snap.first_unhandled_mepc[X280_HART_IDX];
+    if insn != 0 {
+        println!();
+        let is_compressed = (insn & 0x3) != 0x3;
+        let (encoding_hex, byte_seq) = if is_compressed {
+            let v = insn as u16;
+            (
+                format!("0x{:04x}", v),
+                format!("{:02x} {:02x}", v & 0xff, v >> 8),
+            )
+        } else {
+            let v = insn as u32;
+            (
+                format!("0x{:08x}", v),
+                format!(
+                    "{:02x} {:02x} {:02x} {:02x}",
+                    v & 0xff,
+                    (v >> 8) & 0xff,
+                    (v >> 16) & 0xff,
+                    (v >> 24) & 0xff,
+                ),
+            )
+        };
+        println!(
+            "First unhandled insn:  {} at guest PC {:#x}{}",
+            encoding_hex,
+            mepc,
+            if is_compressed { " (compressed)" } else { "" }
+        );
+        println!("To disassemble (host):");
+        println!(
+            "  printf '\\x{}' | riscv64-linux-gnu-objdump -D -b binary -m riscv:rv64 /dev/stdin",
+            byte_seq.replace(' ', "\\x")
+        );
+        println!("To identify in the guest:");
+        println!(
+            "  use the PC ({:#x}) + /proc/<pid>/maps + objdump -d on the matching binary",
+            mepc
+        );
+    }
 }
 
 /// Bring up the Tensix virtio engine via `TensixEngine::bring_up` —
