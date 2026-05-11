@@ -1657,18 +1657,44 @@ fn run_isa_emu_counters(
                 any_printed = true;
                 print_isa_emu_counter_snapshot(idx, &snap, show_zero);
             }
-            Err(EmuCountersError::NotBooted) => {
+            Err(EmuCountersError::NotBooted {
+                debug_descriptor_off,
+                publish_off,
+            }) => {
                 if !all {
+                    // A "valid-looking" debug_descriptor offset is
+                    // 8-byte aligned and small enough to plausibly
+                    // land in fw_jump.bin's .data section (a few MB
+                    // at most). Anything else means we're reading
+                    // un-initialized DRAM, not a running firmware.
+                    let dbg_plausible = debug_descriptor_off != 0
+                        && debug_descriptor_off != !0u64
+                        && debug_descriptor_off.is_multiple_of(8)
+                        && debug_descriptor_off < 0x100_0000;
                     println!(
-                        "L2CPU {}: firmware not running (publish pointer is 0/~0).",
-                        idx
+                        "L2CPU {}: firmware not running (publish pointer = {:#x}, want non-zero aligned).",
+                        idx, publish_off
                     );
                     println!(
-                        "          boot the L2CPU first: bhx boot -l {} -d rootfs.ext4",
-                        idx
+                        "          fw_jump+0x80 (debug_descriptor) = {:#x}",
+                        debug_descriptor_off
                     );
+                    if !dbg_plausible {
+                        println!(
+                            "          debug_descriptor reads as garbage — L2CPU isn't booted:"
+                        );
+                        println!("          bhx boot -l {} -d rootfs.ext4", idx);
+                    } else {
+                        println!(
+                            "          debug_descriptor is valid; the running firmware predates"
+                        );
+                        println!("          the PMU publish patch. Rebuild + reboot the L2CPU:");
+                        println!("          make -C third_party/opensbi");
+                        println!("          bhx daemon stop && bhx daemon start");
+                        println!("          bhx boot -l {} --force …", idx);
+                    }
                 }
-                // In --all mode, just skip un-booted L2CPUs silently.
+                // In --all mode, just skip un-booted slots silently.
             }
             Err(EmuCountersError::BadMagic { got }) => {
                 eprintln!(
@@ -1699,9 +1725,15 @@ fn run_isa_emu_counters(
 
 #[derive(Debug)]
 enum EmuCountersError {
-    /// The publish pointer at fw_jump+0x88 is 0 or ~0 — firmware
-    /// hasn't run on this L2CPU yet.
-    NotBooted,
+    /// The publish pointer at fw_jump+0x88 is 0 / ~0 / misaligned —
+    /// firmware hasn't run on this L2CPU yet or is running a build
+    /// that predates the PMU publish patch. Carries the raw bytes
+    /// we read so a single-target invocation can print them; --all
+    /// suppresses to avoid spamming for every unbooted slot.
+    NotBooted {
+        debug_descriptor_off: u64,
+        publish_off: u64,
+    },
     BadMagic {
         got: u32,
     },
@@ -1736,22 +1768,27 @@ fn snapshot_isa_emu_counters_for_l2cpu(
     // memory map change doesn't silently truncate.
     let ptr_lo = l2cpu.read32(starting + PUBLISH_PTR_OFFSET)? as u64;
     let ptr_hi = l2cpu.read32(starting + PUBLISH_PTR_OFFSET + 4)? as u64;
-    let publish_pa = (ptr_hi << 32) | ptr_lo;
+    // The .dword in fw_base.S stores `symbol - _start + FW_TEXT_START`.
+    // With our build FW_TEXT_START is effectively 0, so the value is
+    // the symbol's offset from the start of fw_jump.bin. The host PA
+    // is L2CPU's DRAM base plus that offset — same convention
+    // chip_console.rs uses for the debug_descriptor pointer at +0x80.
+    let publish_off = (ptr_hi << 32) | ptr_lo;
     // 0 / ~0 are the obvious "no firmware running" sentinels. We
-    // also reject anything below L2CPU DRAM base or not 8-byte
-    // aligned: when an L2CPU is held in reset (or running stock
-    // firmware without our patch) the bytes at fw_jump + 0x88 are
-    // whatever the DRAM was initialized to, often a valid-looking
-    // but garbage pointer that would let a volatile u32 read land
-    // on an unaligned address and SIGBUS / panic. Treat any of
-    // these as "not booted with our firmware."
-    if publish_pa == 0
-        || publish_pa == !0u64
-        || publish_pa < starting
-        || !publish_pa.is_multiple_of(8)
-    {
-        return Err(EmuCountersError::NotBooted);
+    // also reject offsets that aren't 8-byte aligned: when an L2CPU
+    // is held in reset (or running stock firmware without our patch)
+    // the bytes at fw_jump + 0x88 are whatever the DRAM was
+    // initialized to, often a valid-looking but garbage offset that
+    // would let a volatile u32 read land on an unaligned address.
+    if publish_off == 0 || publish_off == !0u64 || !publish_off.is_multiple_of(8) {
+        let dbg_lo = l2cpu.read32(starting + 0x80)? as u64;
+        let dbg_hi = l2cpu.read32(starting + 0x84)? as u64;
+        return Err(EmuCountersError::NotBooted {
+            debug_descriptor_off: (dbg_hi << 32) | dbg_lo,
+            publish_off,
+        });
     }
+    let publish_pa = starting + publish_off;
 
     let window = l2cpu.get_persistent_2m_window(publish_pa)?;
     let publish_ptr = window.get_window() as *const Publish;
