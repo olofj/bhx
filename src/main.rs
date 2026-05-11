@@ -1891,6 +1891,46 @@ fn print_isa_emu_counter_snapshot(
             mepc
         );
     }
+    // Full dedup table of every distinct encoding the emulator
+    // couldn't handle this boot. Sorted by hit count descending —
+    // dominant unhandled encodings rise to the top.
+    let table = &snap.unhandled_table[X280_HART_IDX];
+    let mut entries: Vec<_> = table.iter().filter(|e| e.insn != 0).collect();
+    if !entries.is_empty() {
+        entries.sort_by_key(|e| std::cmp::Reverse(e.count));
+        println!();
+        println!(
+            "All unhandled encodings this boot ({} distinct):",
+            entries.len()
+        );
+        println!(" count  encoding    class                                  first PC");
+        println!("------  ----------  -------------------------------------  ------------------");
+        for e in entries {
+            let is_compressed = (e.insn & 0x3) != 0x3;
+            let encoding = if is_compressed {
+                format!("    0x{:04x}", e.insn as u16)
+            } else {
+                format!("0x{:08x}", e.insn as u32)
+            };
+            let class = classify_riscv_major_opcode(e.insn, is_compressed);
+            println!(
+                "{:>6}  {}  {:<37}  {:#018x}",
+                e.count, encoding, class, e.first_mepc
+            );
+        }
+    }
+    let overflow = snap.unhandled_overflow[X280_HART_IDX];
+    if overflow > 0 {
+        println!();
+        println!(
+            "Overflow: {} unhandled traps had encodings the table couldn't fit",
+            overflow
+        );
+        println!(
+            "(more than {} distinct encodings this boot — grow the table or filter the workload).",
+            crate::regs::isa_emu_pmu::UNHANDLED_TABLE_SIZE
+        );
+    }
 }
 
 /// Map the 32-bit or 16-bit insn encoding to its major opcode class.

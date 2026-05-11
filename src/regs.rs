@@ -353,7 +353,12 @@ pub mod isa_emu_pmu {
     ///     `first_unhandled_mepc[]` per-hart capture; the
     ///     firmware also now zeros per-hart state on every
     ///     warm reboot so counters reflect the current boot.
-    pub const PUBLISH_VERSION: u32 = 3;
+    ///   - v4: appended per-hart `unhandled_table[]` dedup
+    ///     histogram (32 entries × `{insn, first_mepc, count}`)
+    ///     plus `unhandled_overflow[]` for encodings that
+    ///     didn't fit. Lets the host enumerate every distinct
+    ///     unhandled encoding seen this boot.
+    pub const PUBLISH_VERSION: u32 = 4;
     /// Static cap on per-hart slots in the publish array — must
     /// match `BHX_EMU_PMU_MAX_HARTS` on the firmware side.
     pub const PUBLISH_MAX_HARTS: usize = 8;
@@ -367,6 +372,23 @@ pub mod isa_emu_pmu {
     /// the `NONE` sentinel — equal to `SBI_INSN_EMU_EXT_MAX` on the
     /// C side. The `counts[hart]` array is sized by this.
     pub const EVENT_COUNT: usize = (ZVBB as usize) + 1;
+
+    /// Per-hart capacity of the unhandled-insn dedup table.
+    /// Mirrors `BHX_EMU_PMU_UNHANDLED_TABLE_SIZE` on the firmware
+    /// side.
+    pub const UNHANDLED_TABLE_SIZE: usize = 32;
+
+    /// Layout-matched mirror of `struct bhx_emu_pmu_unhandled_entry`.
+    /// `insn == 0` means the slot is unused (a real RVI / RVC
+    /// instruction never encodes to zero in any code path that
+    /// reaches `truly_illegal_insn`).
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone)]
+    pub struct UnhandledEntry {
+        pub insn: u64,
+        pub first_mepc: u64,
+        pub count: u64,
+    }
 
     /// Layout-compatible Rust mirror of the firmware-side
     /// `struct bhx_emu_pmu_publish`. `#[repr(C)]` + field order must
@@ -404,6 +426,16 @@ pub mod isa_emu_pmu {
         /// the operator identifies the binary via
         /// `cat /proc/<pid>/maps`.
         pub first_unhandled_mepc: [u64; PUBLISH_MAX_HARTS],
+        /// Per-hart dedup table of distinct encodings the emulator
+        /// couldn't handle this boot. Use `unhandled_overflow[h]`
+        /// to detect when the table didn't have room for some
+        /// observed encoding.
+        pub unhandled_table: [[UnhandledEntry; UNHANDLED_TABLE_SIZE]; PUBLISH_MAX_HARTS],
+        /// Per-hart count of unhandled traps whose encoding didn't
+        /// fit in `unhandled_table` because all slots were taken
+        /// by earlier distinct encodings. Non-zero ⇒ the table is
+        /// a partial view of what's failing.
+        pub unhandled_overflow: [u64; PUBLISH_MAX_HARTS],
     }
 
     /// Compose the `perf` raw `config` value for a given event ID.
@@ -535,8 +567,14 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Publish, first_unhandled_insn), 1680);
         // first_unhandled_insn: 8 × 8 = 64. Next field at 1680 + 64 = 1744.
         assert_eq!(std::mem::offset_of!(Publish, first_unhandled_mepc), 1744);
-        // first_unhandled_mepc: 8 × 8 = 64. Raw end at 1808; aligned to 64 = 1856.
-        assert_eq!(std::mem::size_of::<Publish>(), 1856);
+        // first_unhandled_mepc: 8 × 8 = 64. Next field at 1744 + 64 = 1808.
+        assert_eq!(std::mem::offset_of!(Publish, unhandled_table), 1808);
+        // unhandled_table: 8 harts × 32 entries × 24 bytes/entry = 6144. Next at 7952.
+        assert_eq!(std::mem::offset_of!(Publish, unhandled_overflow), 7952);
+        // unhandled_overflow: 8 × 8 = 64. Raw end at 8016; aligned to 64 = 8064.
+        assert_eq!(std::mem::size_of::<Publish>(), 8064);
+        // Per-entry layout invariant.
+        assert_eq!(std::mem::size_of::<isa_emu_pmu::UnhandledEntry>(), 24);
         assert_eq!(std::mem::align_of::<Publish>(), 64);
     }
 
