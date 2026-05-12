@@ -1607,8 +1607,8 @@ fn run_isa_emu_events() -> std::io::Result<()> {
     println!();
     println!("...or pick a specific extension from the table below.");
     println!();
-    println!("  ID  Extension  perf config (raw)");
-    println!("----  ---------  -------------------");
+    println!("  ID  Extension      perf config (raw)");
+    println!("----  -------------  -------------------");
     for (id, name) in EVENTS {
         // The NONE pseudo-event isn't observable from userspace — the
         // firmware rejects it in validate_encoding — so don't print a
@@ -1616,7 +1616,7 @@ fn run_isa_emu_events() -> std::io::Result<()> {
         if *id == NONE {
             continue;
         }
-        println!("{:>4}  {:<9}  r{:016x}", id, name, perf_config(*id));
+        println!("{:>4}  {:<13}  r{:016x}", id, name, perf_config(*id));
     }
     println!();
     println!("Counter is 64-bit and never wraps in realistic timeframes.");
@@ -1825,8 +1825,8 @@ fn print_isa_emu_counter_snapshot(
         "L2CPU {} ISA-emulation counters (version {}, hart {}):",
         idx, snap.version, X280_HART_IDX
     );
-    println!("  ID  Extension  count");
-    println!("----  ---------  ---------------");
+    println!("  ID  Extension      count");
+    println!("----  -------------  ---------------");
     let mut nonzero = 0usize;
     for (id, name) in EVENTS {
         if *id == NONE {
@@ -1839,7 +1839,7 @@ fn print_isa_emu_counter_snapshot(
         if v > 0 {
             nonzero += 1;
         }
-        println!("{:>4}  {:<9}  {:>15}", id, name, v);
+        println!("{:>4}  {:<13}  {:>15}", id, name, v);
     }
     if nonzero == 0 && !show_zero {
         println!("(all counters zero — pass --show-zero to confirm)");
