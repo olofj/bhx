@@ -330,6 +330,7 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             memory_override,
             hostname_override,
             cloud_init,
+            extra_bootargs,
         } => dispatch_boot(
             &sock,
             &state,
@@ -348,6 +349,7 @@ fn handle_client(mut sock: UnixStream, state: Arc<DaemonState>) {
             memory_override,
             hostname_override,
             cloud_init,
+            extra_bootargs,
         ),
         Request::AttachConsole { l2cpu, mode } => {
             dispatch_attach_console(&sock, &state, l2cpu, mode)
@@ -794,6 +796,7 @@ fn dispatch_boot(
     memory_override: Option<u64>,
     hostname_override: Option<String>,
     cloud_init: Option<String>,
+    extra_bootargs: Option<String>,
 ) -> crate::Result<()> {
     // U-Boot mode reads kernel + initrd from disk at runtime, so the
     // daemon's preloaded initramfs would be unreachable. Reject up
@@ -807,8 +810,8 @@ fn dispatch_boot(
         initramfs
     };
     dlog!(
-        "[boot l2cpu {}] dispatch_boot entry: opensbi={} payload={:?} dtb={} initramfs={:?} root={} disk={:?} network={} console={} rng={} force={} mem_override={:?} hostname_override={:?} cloud_init={:?}",
-        l2cpu_idx, opensbi, payload, dtb, initramfs, root_device, disk, network, console, rng, force, memory_override, hostname_override, cloud_init
+        "[boot l2cpu {}] dispatch_boot entry: opensbi={} payload={:?} dtb={} initramfs={:?} root={} disk={:?} network={} console={} rng={} force={} mem_override={:?} hostname_override={:?} cloud_init={:?} extra_bootargs={:?}",
+        l2cpu_idx, opensbi, payload, dtb, initramfs, root_device, disk, network, console, rng, force, memory_override, hostname_override, cloud_init, extra_bootargs
     );
     validate_l2cpu(l2cpu_idx)?;
 
@@ -918,6 +921,7 @@ fn dispatch_boot(
         rng,
         cloud_init.is_some(),
         memory_override,
+        extra_bootargs.as_deref(),
     )
     .map_err(|e| {
         dlog!("[boot l2cpu {}] boot sequence failed: {}", l2cpu_idx, e);
@@ -2088,6 +2092,7 @@ fn run_boot_sequence(
     has_rng: bool,
     has_cidata: bool,
     memory_override: Option<u64>,
+    extra_bootargs: Option<&str>,
 ) -> io::Result<BootArtifacts> {
     use crate::regs::boot_image;
 
@@ -2332,6 +2337,7 @@ fn run_boot_sequence(
         &virtio_nodes,
         uart_addr_for_dtb,
         has_console,
+        extra_bootargs,
     )?;
 
     let initramfs_pb = initramfs.map(std::path::PathBuf::from);

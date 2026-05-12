@@ -252,6 +252,7 @@ pub fn modify_dtb(
     virtio_nodes: &[VirtioMmioNode],
     uart_addr: Option<u64>,
     virtio_console_attached: bool,
+    extra_bootargs: Option<&str>,
 ) -> crate::Result<Vec<u8>> {
     let mem_end = mem_start + mem_size;
     crate::dlog!(
@@ -310,7 +311,7 @@ pub fn modify_dtb(
     } else {
         "earlycon=sbi keep_bootcon"
     };
-    let bootargs = match boot_device {
+    let base_bootargs = match boot_device {
         BootDevice::Vda(dev) => {
             format!("rw {} root=/dev/{}", console_args, dev)
         }
@@ -323,10 +324,15 @@ pub fn modify_dtb(
         ),
         BootDevice::Uboot => console_args.to_string(),
     };
+    let bootargs = match extra_bootargs {
+        Some(extra) if !extra.is_empty() => format!("{} {}", base_bootargs, extra),
+        _ => base_bootargs,
+    };
     crate::dlog!(
-        "[modify_dtb]   bootargs = {:?} (virtio_console_attached={})",
+        "[modify_dtb]   bootargs = {:?} (virtio_console_attached={}, extra={:?})",
         bootargs,
-        virtio_console_attached
+        virtio_console_attached,
+        extra_bootargs,
     );
     let mut bootargs_bytes = bootargs.into_bytes();
     bootargs_bytes.push(0);
@@ -709,7 +715,17 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x8000_0000u64; // 2 GiB
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(read_memory_reg(&out, mem_start), (mem_start, mem_size));
     }
 
@@ -723,7 +739,17 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let override_size = 0x4000_0000u64; // 1 GiB instead of physical 4 GiB
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, override_size, &[], None, true).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            override_size,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(read_memory_reg(&out, mem_start), (mem_start, override_size));
     }
 
@@ -741,7 +767,17 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x1_0000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
 
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let path = format!("/reserved-memory/bhx-opensbi-firmware@{:x}", mem_start);
@@ -771,7 +807,17 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x1_0000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
-        let cold = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
+        let cold = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         let path = format!("/reserved-memory/bhx-opensbi-firmware@{:x}", mem_start);
         let pre = Fdt::open_into(&cold, 0).unwrap();
         assert!(pre.path_offset(&path).unwrap().is_none());
@@ -805,7 +851,17 @@ mod tests {
         let mem_start = 0x4000_b000_0000u64;
         let mem_size = 0x8000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(read_memory_reg(&out, mem_start), (mem_start, mem_size));
 
         let fdt = Fdt::open_into(&out, 0).unwrap();
@@ -830,6 +886,7 @@ mod tests {
             &[],
             None,
             true,
+            None,
         )
         .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
@@ -859,6 +916,7 @@ mod tests {
             &[],
             None,
             true,
+            None,
         )
         .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
@@ -881,7 +939,17 @@ mod tests {
         let expected_base = mem_end - crate::regs::virtio_mmio::RESERVED_SIZE;
 
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let res = fdt
             .path_offset("/reserved-memory/memory@4000afa00000")
@@ -917,7 +985,17 @@ mod tests {
                 irq: DISK_IRQ - i as u32,
             })
             .collect();
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &nodes, None, true).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &nodes,
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
 
         for spec in &nodes {
@@ -948,7 +1026,17 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x1_0000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, false).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         let chosen = fdt.path_offset("/chosen").unwrap().unwrap();
         let args = fdt.getprop(chosen, "bootargs").unwrap();
@@ -983,7 +1071,17 @@ mod tests {
         let mem_start = 0x4000_3000_0000u64;
         let mem_size = 0x1_0000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
-        let out = modify_dtb(FIXTURE_DTB, &dev, mem_start, mem_size, &[], None, true).unwrap();
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         let fdt = Fdt::open_into(&out, 0).unwrap();
         for i in 0..4u64 {
             let addr = mem_start + mem_size - crate::regs::virtio_mmio::MMIO_SLOT_SIZE * (i + 1);
@@ -1012,7 +1110,17 @@ mod tests {
         // the verify call from modify_dtb's return path.
         let mem_start = 0x4000_3000_0000u64;
         let dev = BootDevice::Vda("vda".to_string());
-        let dtb = modify_dtb(FIXTURE_DTB, &dev, mem_start, 0x1_0000_0000, &[], None, true).unwrap();
+        let dtb = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            0x1_0000_0000,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
         verify_dtb_invariants(&dtb, mem_start).expect("happy-path DTB must verify");
     }
 
@@ -1030,6 +1138,89 @@ mod tests {
             msg.contains("bhx-purgatory"),
             "expected bhx-purgatory complaint, got {:?}",
             msg
+        );
+    }
+
+    #[test]
+    fn modify_dtb_extra_bootargs_appended() {
+        let mem_start = 0x4000_3000_0000u64;
+        let mem_size = 0x1_0000_0000u64;
+        let dev = BootDevice::Vda("vda".to_string());
+        let out = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            true,
+            Some("loglevel=7 systemd.debug-shell=1"),
+        )
+        .unwrap();
+        let fdt = Fdt::open_into(&out, 0).unwrap();
+        let chosen = fdt.path_offset("/chosen").unwrap().unwrap();
+        let args = fdt.getprop(chosen, "bootargs").unwrap();
+        let s = std::str::from_utf8(&args[..args.len() - 1]).unwrap();
+        assert!(
+            s.contains("loglevel=7"),
+            "bootargs missing loglevel: {:?}",
+            s
+        );
+        assert!(
+            s.contains("systemd.debug-shell=1"),
+            "bootargs missing systemd.debug-shell: {:?}",
+            s
+        );
+        // Base args must still be present.
+        assert!(
+            s.contains("root=/dev/vda"),
+            "bootargs missing root: {:?}",
+            s
+        );
+        assert!(
+            s.contains("console=hvc0"),
+            "bootargs missing console: {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn modify_dtb_empty_extra_bootargs_unchanged() {
+        // An empty string extra_bootargs must not add a trailing space.
+        let mem_start = 0x4000_3000_0000u64;
+        let mem_size = 0x1_0000_0000u64;
+        let dev = BootDevice::Vda("vda".to_string());
+        let base = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        let with_empty = modify_dtb(
+            FIXTURE_DTB,
+            &dev,
+            mem_start,
+            mem_size,
+            &[],
+            None,
+            true,
+            Some(""),
+        )
+        .unwrap();
+        let fdt_base = Fdt::open_into(&base, 0).unwrap();
+        let fdt_empty = Fdt::open_into(&with_empty, 0).unwrap();
+        let chosen_base = fdt_base.path_offset("/chosen").unwrap().unwrap();
+        let chosen_empty = fdt_empty.path_offset("/chosen").unwrap().unwrap();
+        let args_base = fdt_base.getprop(chosen_base, "bootargs").unwrap();
+        let args_empty = fdt_empty.getprop(chosen_empty, "bootargs").unwrap();
+        assert_eq!(
+            args_base, args_empty,
+            "empty extra_bootargs must not change the cmdline"
         );
     }
 }
