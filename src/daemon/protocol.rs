@@ -34,7 +34,7 @@ pub enum Request {
         /// at runtime. In `Uboot` mode the daemon does not preload an
         /// initramfs and `modify_dtb` leaves bootargs to U-Boot. See
         /// #44 for the umbrella.
-        payload: BootPayload,
+        payload: Box<BootPayload>,
         dtb: String,
         /// Initramfs to preload into DRAM. Ignored in `Uboot` mode
         /// (U-Boot reads the initrd from disk).
@@ -101,6 +101,11 @@ pub enum Request {
         /// clients deserialize without this field via `serde(default)`.
         #[serde(default)]
         cloud_init: Option<String>,
+        /// Extra kernel command-line parameters appended verbatim after
+        /// the daemon-generated bootargs. Older clients that omit this
+        /// field deserialize to `None` via `serde(default)`.
+        #[serde(default)]
+        extra_bootargs: Option<String>,
     },
     /// Attach a console fd. Daemon replies with `ok` and sends the fd via
     /// SCM_RIGHTS; client pumps bytes between its tty and the passed fd.
@@ -470,7 +475,7 @@ mod tests {
         let req = Request::Boot {
             l2cpu: 2,
             opensbi: "fw_jump.bin".into(),
-            payload: BootPayload::Kernel("Image".into()),
+            payload: Box::new(BootPayload::Kernel("Image".into())),
             dtb: "blackhole-card.dtb".into(),
             initramfs: None,
             root_device: "vda".into(),
@@ -483,18 +488,19 @@ mod tests {
             memory_override: None,
             hostname_override: None,
             cloud_init: None,
+            extra_bootargs: None,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).unwrap();
         let decoded: Request = read_frame(Cursor::new(&buf)).unwrap();
-        assert!(matches!(
-            decoded,
+        match decoded {
             Request::Boot {
                 l2cpu: 2,
-                payload: BootPayload::Kernel(_),
+                ref payload,
                 ..
-            }
-        ));
+            } => assert!(matches!(*payload.as_ref(), BootPayload::Kernel(_))),
+            other => panic!("expected Boot variant, got {:?}", other),
+        }
     }
 
     #[test]
@@ -502,7 +508,7 @@ mod tests {
         let req = Request::Boot {
             l2cpu: 0,
             opensbi: "fw_jump.bin".into(),
-            payload: BootPayload::Uboot("u-boot.bin".into()),
+            payload: Box::new(BootPayload::Uboot("u-boot.bin".into())),
             dtb: "blackhole-card.dtb".into(),
             initramfs: None,
             root_device: "vda".into(),
@@ -515,16 +521,17 @@ mod tests {
             memory_override: None,
             hostname_override: None,
             cloud_init: None,
+            extra_bootargs: None,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).unwrap();
         let decoded: Request = read_frame(Cursor::new(&buf)).unwrap();
         match decoded {
-            Request::Boot {
-                payload: BootPayload::Uboot(p),
-                ..
-            } => assert_eq!(p, "u-boot.bin"),
-            other => panic!("expected uboot variant, got {:?}", other),
+            Request::Boot { payload, .. } => match *payload {
+                BootPayload::Uboot(p) => assert_eq!(p, "u-boot.bin"),
+                other => panic!("expected Uboot variant, got {:?}", other),
+            },
+            other => panic!("expected Boot variant, got {:?}", other),
         }
     }
 
@@ -703,7 +710,7 @@ mod tests {
             let req = Request::Boot {
                 l2cpu: 1,
                 opensbi: "a".into(),
-                payload: BootPayload::Kernel("b".into()),
+                payload: Box::new(BootPayload::Kernel("b".into())),
                 dtb: "c".into(),
                 initramfs: None,
                 root_device: "vda".into(),
@@ -716,6 +723,7 @@ mod tests {
                 memory_override: None,
                 hostname_override: None,
                 cloud_init: None,
+                extra_bootargs: None,
             };
             let mut buf = Vec::new();
             write_frame(&mut buf, &req).unwrap();
@@ -811,7 +819,7 @@ mod tests {
         let req = Request::Boot {
             l2cpu: 0,
             opensbi: "a".into(),
-            payload: BootPayload::Kernel("b".into()),
+            payload: Box::new(BootPayload::Kernel("b".into())),
             dtb: "c".into(),
             initramfs: None,
             root_device: "vda".into(),
@@ -824,6 +832,7 @@ mod tests {
             memory_override: Some(0x4000_0000),
             hostname_override: Some("debian-bench".into()),
             cloud_init: None,
+            extra_bootargs: None,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).unwrap();
@@ -850,5 +859,53 @@ mod tests {
         assert_eq!(s, r#""wedged""#);
         let parsed: L2CpuState = serde_json::from_str(r#""wedged""#).unwrap();
         assert_eq!(parsed, L2CpuState::Wedged);
+    }
+
+    #[test]
+    fn boot_extra_bootargs_roundtrips() {
+        let req = Request::Boot {
+            l2cpu: 0,
+            opensbi: "a".into(),
+            payload: Box::new(BootPayload::Kernel("b".into())),
+            dtb: "c".into(),
+            initramfs: None,
+            root_device: "vda".into(),
+            disk: None,
+            network: false,
+            extra_fwd: vec![],
+            console: true,
+            rng: false,
+            force: false,
+            memory_override: None,
+            hostname_override: None,
+            cloud_init: None,
+            extra_bootargs: Some("loglevel=7 systemd.debug-shell=1".into()),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &req).unwrap();
+        let decoded: Request = read_frame(Cursor::new(&buf)).unwrap();
+        match decoded {
+            Request::Boot { extra_bootargs, .. } => {
+                assert_eq!(
+                    extra_bootargs.as_deref(),
+                    Some("loglevel=7 systemd.debug-shell=1")
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn boot_extra_bootargs_defaults_none_on_old_payload() {
+        // Older clients that omit extra_bootargs must still decode
+        // successfully; the field must default to None.
+        let json = r#"{"op":"boot","l2cpu":0,"opensbi":"a","payload":{"kind":"kernel","path":"b"},"dtb":"c","root_device":"vda"}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::Boot { extra_bootargs, .. } => {
+                assert!(extra_bootargs.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

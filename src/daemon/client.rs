@@ -66,13 +66,14 @@ pub fn boot(
     memory_override: Option<u64>,
     hostname_override: Option<String>,
     cloud_init: Option<String>,
+    extra_bootargs: Option<String>,
 ) -> io::Result<()> {
     write_frame(
         &mut *sock,
         &Request::Boot {
             l2cpu,
             opensbi,
-            payload,
+            payload: Box::new(payload),
             dtb,
             initramfs,
             root_device,
@@ -85,6 +86,7 @@ pub fn boot(
             memory_override,
             hostname_override,
             cloud_init,
+            extra_bootargs,
         },
     )?;
     expect_ok(read_frame(&mut *sock)?)

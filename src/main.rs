@@ -235,6 +235,16 @@ enum Commands {
         /// auto-attach entirely).
         #[arg(long = "no-cidata")]
         no_cidata: bool,
+        /// Extra kernel command-line parameters appended after the
+        /// daemon-generated bootargs.
+        ///
+        /// The daemon already sets `console=`, `earlycon=`, `root=`,
+        /// and `initrd=` based on the boot mode. Use `--append` to
+        /// tack on anything extra, e.g.
+        /// `--append "loglevel=7 systemd.debug-shell=1"`.
+        /// The string is appended verbatim with a single space separator.
+        #[arg(long = "append")]
+        append: Option<String>,
     },
     /// Attach a terminal to a booted L2CPU's console via the daemon.
     Connect {
@@ -856,6 +866,7 @@ fn main() -> std::process::ExitCode {
             profile,
             cloud_init,
             no_cidata,
+            append,
         }) => {
             let (card, l2cpu) = resolve_target(&cli.l2cpu, cli.ttdevice)?;
             // `--image <name>` is a registry-name shortcut: resolve
@@ -970,6 +981,7 @@ fn main() -> std::process::ExitCode {
                 memory,
                 hostname,
                 cloud_init,
+                append,
             )?;
             if attach {
                 run_connect_client(card, l2cpu, daemon::protocol::ConsoleMode::Rw)?;
@@ -1254,6 +1266,7 @@ fn run_boot_client(
     memory_override: Option<u64>,
     hostname_override: Option<String>,
     cloud_init: Option<String>,
+    extra_bootargs: Option<String>,
 ) -> std::io::Result<()> {
     // Bundle disk + network into the Boot RPC so the virtio workers come up
     // together with the L2CPU reset release. The guest kernel hits its VFS
@@ -1298,6 +1311,7 @@ fn run_boot_client(
         memory_override,
         hostname_override,
         cloud_init,
+        extra_bootargs,
     )
 }
 
@@ -2949,6 +2963,7 @@ fn run_boot_via_profile(
         memory_override,
         hostname_override,
         cloud_init_path,
+        None,
     )
 }
 
