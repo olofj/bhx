@@ -39,7 +39,7 @@
 # Pinned bhx-fork commit. The upstream base version is informational;
 # OPENSBI_SHA is what's actually checked out.
 OPENSBI_VERSION := 1.8.1+bhx
-OPENSBI_SHA := 91c870b4
+OPENSBI_SHA := 29748dbc
 OPENSBI_REPO := https://github.com/olofj/opensbi.git
 OPENSBI_BRANCH := bhx
 

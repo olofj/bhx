@@ -303,6 +303,13 @@ pub mod isa_emu_pmu {
     /// extension for stock RVA23U64 userspaces (Ubuntu 26.04 /
     /// glibc-RVA23) on the X280, which has RVV 1.0 but no Zvbb.
     pub const ZVBB: u32 = 17;
+    /// Vector instruction that trapped with `mstatus.VS == 0` —
+    /// Linux's lazy vector-enable bounce. New task hits its first
+    /// vector insn → illegal-instruction → Linux's S-mode handler
+    /// enables VS for the task → retry executes natively. Filtered
+    /// out of `UNHANDLED` so that counter reflects real
+    /// emulator-coverage gaps. Real-work total = `ANY - VS_OFF_BOUNCE`.
+    pub const VS_OFF_BOUNCE: u32 = 18;
 
     /// Compile-time-checkable list of all defined event IDs and the
     /// short human-readable name used in `bhx debug isa-emu-events`
@@ -327,6 +334,7 @@ pub mod isa_emu_pmu {
         (SUPM, "Supm"),
         (UNHANDLED, "UNHANDLED"),
         (ZVBB, "Zvbb"),
+        (VS_OFF_BOUNCE, "VS-off-bounce"),
     ];
 
     /// Wire-format constants for the host-readable counter mirror
@@ -358,7 +366,10 @@ pub mod isa_emu_pmu {
     ///     plus `unhandled_overflow[]` for encodings that
     ///     didn't fit. Lets the host enumerate every distinct
     ///     unhandled encoding seen this boot.
-    pub const PUBLISH_VERSION: u32 = 4;
+    ///   - v5: appended `VS_OFF_BOUNCE` event (id 18). Filters
+    ///     Linux's lazy-vector-enable bounces out of `UNHANDLED`
+    ///     so that counter reflects only real emulator gaps.
+    pub const PUBLISH_VERSION: u32 = 5;
     /// Static cap on per-hart slots in the publish array — must
     /// match `BHX_EMU_PMU_MAX_HARTS` on the firmware side.
     pub const PUBLISH_MAX_HARTS: usize = 8;
@@ -371,7 +382,7 @@ pub mod isa_emu_pmu {
     /// Total number of event slots in the firmware enum, including
     /// the `NONE` sentinel — equal to `SBI_INSN_EMU_EXT_MAX` on the
     /// C side. The `counts[hart]` array is sized by this.
-    pub const EVENT_COUNT: usize = (ZVBB as usize) + 1;
+    pub const EVENT_COUNT: usize = (VS_OFF_BOUNCE as usize) + 1;
 
     /// Per-hart capacity of the unhandled-insn dedup table.
     /// Mirrors `BHX_EMU_PMU_UNHANDLED_TABLE_SIZE` on the firmware
@@ -543,8 +554,8 @@ mod tests {
         // The last entry's ID + 1 is the C-side `_MAX` sentinel.
         // Hardcoded so a future enum extension on the C side without
         // a matching Rust update fails this test loudly.
-        assert_eq!(isa_emu_pmu::EVENTS.len(), 18);
-        assert_eq!(isa_emu_pmu::EVENT_COUNT, 18);
+        assert_eq!(isa_emu_pmu::EVENTS.len(), 19);
+        assert_eq!(isa_emu_pmu::EVENT_COUNT, 19);
     }
 
     /// The host PMU reader interprets the firmware-published struct
@@ -561,18 +572,18 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Publish, max_harts), 8);
         assert_eq!(std::mem::offset_of!(Publish, max_events), 12);
         assert_eq!(std::mem::offset_of!(Publish, counts), 16);
-        // counts: 8 harts × 18 events × 8 bytes = 1152. Next field at 16 + 1152 = 1168.
-        assert_eq!(std::mem::offset_of!(Publish, ctr_to_event), 16 + 1152);
-        // ctr_to_event: 8 × 16 × 4 = 512. Next field at 1168 + 512 = 1680.
-        assert_eq!(std::mem::offset_of!(Publish, first_unhandled_insn), 1680);
-        // first_unhandled_insn: 8 × 8 = 64. Next field at 1680 + 64 = 1744.
-        assert_eq!(std::mem::offset_of!(Publish, first_unhandled_mepc), 1744);
-        // first_unhandled_mepc: 8 × 8 = 64. Next field at 1744 + 64 = 1808.
-        assert_eq!(std::mem::offset_of!(Publish, unhandled_table), 1808);
-        // unhandled_table: 8 harts × 32 entries × 24 bytes/entry = 6144. Next at 7952.
-        assert_eq!(std::mem::offset_of!(Publish, unhandled_overflow), 7952);
-        // unhandled_overflow: 8 × 8 = 64. Raw end at 8016; aligned to 64 = 8064.
-        assert_eq!(std::mem::size_of::<Publish>(), 8064);
+        // counts: 8 harts × 19 events × 8 bytes = 1216. Next field at 16 + 1216 = 1232.
+        assert_eq!(std::mem::offset_of!(Publish, ctr_to_event), 16 + 1216);
+        // ctr_to_event: 8 × 16 × 4 = 512. Next field at 1232 + 512 = 1744.
+        assert_eq!(std::mem::offset_of!(Publish, first_unhandled_insn), 1744);
+        // first_unhandled_insn: 8 × 8 = 64. Next field at 1744 + 64 = 1808.
+        assert_eq!(std::mem::offset_of!(Publish, first_unhandled_mepc), 1808);
+        // first_unhandled_mepc: 8 × 8 = 64. Next field at 1808 + 64 = 1872.
+        assert_eq!(std::mem::offset_of!(Publish, unhandled_table), 1872);
+        // unhandled_table: 8 harts × 32 entries × 24 bytes/entry = 6144. Next at 8016.
+        assert_eq!(std::mem::offset_of!(Publish, unhandled_overflow), 8016);
+        // unhandled_overflow: 8 × 8 = 64. Raw end at 8080; aligned to 64 = 8128.
+        assert_eq!(std::mem::size_of::<Publish>(), 8128);
         // Per-entry layout invariant.
         assert_eq!(std::mem::size_of::<isa_emu_pmu::UnhandledEntry>(), 24);
         assert_eq!(std::mem::align_of::<Publish>(), 64);
