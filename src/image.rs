@@ -156,6 +156,48 @@ pub const KNOWN_IMAGES: &[KnownImage] = &[
         extract_partition: false,
         needs_bootloader: true,
     },
+    // Ubuntu 26.04 LTS — current LTS as of 2026-04. Cloud image
+    // variant (`server-cloudimg-riscv64.img`, qcow2) from
+    // cloud-images.ubuntu.com, NOT the cdimage preinstalled-server.
+    // Picking the cloudimg explicitly: preinstalled-server-26.04
+    // ships a *built-in* `CIDATA` vfat partition on the disk
+    // populated with `.sample` placeholders, which cloud-init's
+    // NoCloud datasource finds before our externally-attached seed
+    // and short-circuits on (no real user-data inside, no
+    // continuation to next datasource). The cloudimg variant has
+    // no built-in CIDATA and behaves the same as every other
+    // distro in this registry — cloud-init picks up our seed from
+    // the daemon-attached virtio-blk and provisions `bhx`/`bhx`
+    // on first boot.
+    //
+    // This is also the boot path RVA23U64 work targets: 26.04
+    // userspace is compiled `-march=rva23u64`, which is why the
+    // OpenSBI Zvbb emulator (`olofj/opensbi:bhx`) is needed for
+    // stock boot on the X280.
+    //
+    // Intentionally does *not* claim the generic `"ubuntu"` alias —
+    // that stays on the better-shaken-out 24.04 entry. Operators
+    // targeting 26.04 reference it as `ubuntu-26.04` (or `resolute`)
+    // explicitly until the boot path is at parity.
+    KnownImage {
+        name: "ubuntu-26.04",
+        url: "https://cloud-images.ubuntu.com/releases/resolute/release/ubuntu-26.04-server-cloudimg-riscv64.img",
+        description: "Ubuntu 26.04 LTS (Resolute Raccoon) — cloud image for riscv64",
+        aliases: &["resolute"],
+        format: ImageFormat::Qcow2,
+        compression: Compression::None,
+        default_size: "10G",
+        // Same as the other cloud-init-enabled images — the disk's
+        // vendor-built `ubuntu` user is overridden by the default
+        // NoCloud seed that `bhx cloud-init seed` / `bhx image pull`
+        // generate, which provisions `bhx` / `bhx` per
+        // cloud_init::DEFAULT_{USER,PASSWORD}.
+        default_user: "bhx",
+        default_password: "bhx",
+        cloud_init: true,
+        extract_partition: false,
+        needs_bootloader: true,
+    },
     // ========================================================================
     // Fedora 42 (riscv64). Two flavors mirror the Debian pattern:
     //   * fedora-42         — Server-Host-Generic, .raw.xz (whole disk).
