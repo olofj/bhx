@@ -398,7 +398,7 @@ fn run_poll_loop(
         let mut rx_drained = false;
         {
             let mut map = registry.lock().unwrap();
-            for (_slot, reg) in map.iter_mut() {
+            for reg in map.values_mut() {
                 if !matches!(
                     reg.interrupt_kind,
                     InterruptKind::Net | InterruptKind::Console
@@ -672,7 +672,7 @@ fn run_poll_loop(
         }
         {
             let map = uart_registry.lock().unwrap();
-            for (&l2cpu_idx, _) in map.iter() {
+            for &l2cpu_idx in map.keys() {
                 if (l2cpu_idx as u32) >= crate::virtio_engine::NUM_L2CPUS {
                     continue;
                 }

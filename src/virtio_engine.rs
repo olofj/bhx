@@ -120,7 +120,7 @@ pub const MMIO_CONFIG: u32 = 0x100;
 // ----- Constants the firmware writes -----
 
 pub const MAGIC: u32 = 0x7472_6976; // "virt" little-endian
-const _MAGIC_IS_VIRT_LE: () = assert!(MAGIC == u32::from_le_bytes([b'v', b'i', b'r', b't']));
+const _MAGIC_IS_VIRT_LE: () = assert!(MAGIC == u32::from_le_bytes(*b"virt"));
 pub const VERSION: u32 = 2;
 pub const VENDOR_ID: u32 = 0x5554_4254; // "TBTU" — keep in sync with virtio.c
 

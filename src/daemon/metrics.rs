@@ -1905,7 +1905,7 @@ mod tests {
                 out.contains(needle),
                 "rendered output missing {:?}; first 200 chars:\n{}",
                 needle,
-                &out.chars().take(200).collect::<String>()
+                out.chars().take(200).collect::<String>()
             );
         }
     }
